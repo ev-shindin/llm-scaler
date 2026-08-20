@@ -582,10 +582,16 @@ so_namespaces_of() {
             | .metadata.namespace' 2>/dev/null || true
 }
 
-# so_existing_info echoes `name min max cost` for the ScaledObject already targeting a
-# workload, if any. Adoption has to patch THAT object: creating our own alongside
-# it would put two ScaledObjects on one target, which is two HPAs writing the same
-# replica count — the exact failure the skip-by-default exists to avoid.
+# so_existing_info echoes `name min max cost policy is_wva` for the ScaledObject
+# already targeting a workload, if any. Adoption has to patch THAT object:
+# creating our own alongside it would put two ScaledObjects on one target,
+# which is two HPAs writing the same replica count — the exact failure the
+# skip-by-default (below, for a non-WVA existing object) exists to avoid.
+#
+# is_wva is "true"/"false": whether a trigger already names a
+# wva-external-scaler. Different risk levels — an object already assigned to
+# WVA has nothing to protect by defaulting to no, while one some other scaler
+# owns (hand-tuned, GitOps-managed) does.
 #
 # The bounds come with the name because an `adopt` row must show the bounds the
 # workload actually has, not the ones a fresh install would have picked. A plan
@@ -597,6 +603,18 @@ so_namespaces_of() {
 # defaults below are KEDA's own for an absent field.
 so_existing_info() {
     local ns="$1" target="$2"
+    # US-separated (\037), like so_plan_rows -- NOT a plain space. scalingPolicy
+    # is legitimately empty on most objects, and `IFS=' ' read` collapses a run
+    # of spaces into one delimiter, silently vanishing an empty field and
+    # shifting every later field one place left. See so_plan_rows's own comment
+    # for the incident this class of bug caused.
+    #
+    # Last field: the same scalerAddress prefix test used everywhere else a
+    # trigger is checked for already being WVAs (see so_pause_rows,
+    # so_repoint_stale). "Already assigned to WVA" and "some other scaler
+    # entirely" are different risk levels for defaulting apply: below, and
+    # only a scalerAddress already naming a wva-external-scaler proves the
+    # former.
     kubectl get scaledobject -n "$ns" -o json 2>/dev/null \
         | jq -r --arg t "$target" '
             .items[]
@@ -607,15 +625,18 @@ so_existing_info() {
                 ([ .spec.triggers[]? | select(.type | startswith("external"))
                    | .metadata.variantCost // empty ] | first // "10.0"),
                 ([ .spec.triggers[]? | select(.type | startswith("external"))
-                   | .metadata.scalingPolicy // empty ] | first // "") ]
-            | join(" ")' 2>/dev/null \
+                   | .metadata.scalingPolicy // empty ] | first // ""),
+                (([ .spec.triggers[]?.metadata.scalerAddress // ""
+                    | select(startswith("wva-external-scaler.")) ] | length > 0)
+                 | tostring) ]
+            | join("")' 2>/dev/null \
         | head -1
 }
 
 # so_existing_name echoes just the name, for callers that only ask whether one is
 # there. Re-read at apply time: a plan can be applied long after it was written.
 so_existing_name() {
-    so_existing_info "$1" "$2" | awk '{print $1}'
+    so_existing_info "$1" "$2" | awk -F'\037' '{print $1}'
 }
 
 # so_discover writes the plan to stdout: the documented preamble, then one entry
@@ -625,7 +646,7 @@ so_existing_name() {
 # deliberate act rather than an undiscoverable one.
 so_discover() {
     local ns name args labels objlabels model pool kind apply note
-    local existing existing_name existing_min existing_max existing_cost existing_policy
+    local existing existing_name existing_min existing_max existing_cost existing_policy existing_is_wva
     local min max cost policy
     so_plan_preamble
     echo "plan:"
@@ -696,21 +717,32 @@ so_discover() {
                 fi
                 existing=$(so_existing_info "$ns" "$name")
                 if [ -n "$existing" ]; then
-                    # Default is to leave it alone: it may be hand-tuned or
-                    # GitOps-managed. `apply: adopt` is how you say you want it
-                    # pointed at WVA — the case when you are adding WVA to a
-                    # cluster whose workloads something else already scales.
-                    #
-                    # Its own bounds are carried into the entry, so adopting it
-                    # unedited changes only who decides the count.
-                    read -r existing_name existing_min existing_max existing_cost existing_policy <<< "$existing"
+                    # Its own bounds are carried into the entry either way, so
+                    # adopting or re-applying unedited changes only who decides
+                    # the count, never the count itself.
+                    IFS=$'\037' read -r existing_name existing_min existing_max existing_cost existing_policy existing_is_wva <<< "$existing"
                     min="$existing_min"; max="$existing_max"; cost="$existing_cost"
                     policy="$existing_policy"
-                    apply=no
-                    # Appended, not assigned: a workload can both be scaled by
-                    # something else and have no readable model, and adopting it
-                    # would then point a ScaledObject at an empty modelID.
-                    note="${note:+$note }Already scaled by ScaledObject $existing_name (min $existing_min, max $existing_max). Set apply: adopt to point that one at WVA instead of adding a second."
+                    if [ "$existing_is_wva" = "true" ]; then
+                        # Already assigned to WVA -- nothing to protect by
+                        # defaulting to no here. Re-applying just refreshes the
+                        # object in place (this is exactly the modelID-drift
+                        # repair path: so_verify_scaledobjects finds the same
+                        # entry, and the fix is to re-run this plan unedited).
+                        apply=adopt
+                        note="${note:+$note }Already targets WVA (ScaledObject $existing_name, min $existing_min, max $existing_max) — apply: adopt refreshes it in place. Set apply: no to leave it untouched."
+                    else
+                        # Leave it alone by default: it may be hand-tuned or
+                        # GitOps-managed by something that is not WVA.
+                        # `apply: adopt` is how you say you want it pointed at
+                        # WVA instead — the case when you are adding WVA to a
+                        # cluster whose workloads something else already scales.
+                        apply=no
+                        # Appended, not assigned: a workload can both be scaled by
+                        # something else and have no readable model, and adopting it
+                        # would then point a ScaledObject at an empty modelID.
+                        note="${note:+$note }Already scaled by ScaledObject $existing_name (min $existing_min, max $existing_max). Set apply: adopt to point that one at WVA instead of adding a second."
+                    fi
                 fi
                 pool=$(so_pool "$ns" "$labels")
                 so_plan_entry "$apply" "$ns" "$kind" "$name" "$model" \
@@ -778,7 +810,7 @@ so_discover() {
 # which is the failure this whole function exists to remove.
 so_discover_fma_requesters() {
     local ns="$1" name model_label model apply note pool
-    local existing existing_name existing_min existing_max existing_cost existing_policy
+    local existing existing_name existing_min existing_max existing_cost existing_policy existing_is_wva
     local min max cost policy sibling scrapers launchers
 
     while IFS='|' read -r name model_label; do
@@ -851,11 +883,16 @@ so_discover_fma_requesters() {
 
         existing=$(so_existing_info "$ns" "$name")
         if [ -n "$existing" ]; then
-            read -r existing_name existing_min existing_max existing_cost existing_policy <<< "$existing"
+            IFS=$'\037' read -r existing_name existing_min existing_max existing_cost existing_policy existing_is_wva <<< "$existing"
             min="$existing_min"; max="$existing_max"; cost="$existing_cost"
             policy="$existing_policy"
-            apply=no
-            note="${note:+$note }Already scaled by ScaledObject $existing_name (min $existing_min, max $existing_max). Set apply: adopt to point that one at WVA instead of adding a second."
+            if [ "$existing_is_wva" = "true" ]; then
+                apply=adopt
+                note="${note:+$note }Already targets WVA (ScaledObject $existing_name, min $existing_min, max $existing_max) — apply: adopt refreshes it in place. Set apply: no to leave it untouched."
+            else
+                apply=no
+                note="${note:+$note }Already scaled by ScaledObject $existing_name (min $existing_min, max $existing_max). Set apply: adopt to point that one at WVA instead of adding a second."
+            fi
         fi
 
         # Empty for a requester, and correctly so: an InferencePool selects the
@@ -1754,4 +1791,125 @@ so_list() {
         return 0
     fi
     so_pause_show "$rows"
+}
+
+# so_verify_scaledobjects reports whether every discovered model server's
+# ScaledObject still targets the model its container actually serves.
+#
+# Built after a real incident: a Deployment's serving model was changed by
+# hand without also updating the ScaledObject already scaling it. Nothing
+# re-syncs that automatically -- this file only ever writes modelID once, at
+# creation -- so WVA kept evaluating decisions for a model no scraped metric
+# ever matched, and applied ZERO scaling decisions for an entire run. Silently:
+# the HPA still read a healthy ratio, and the controller logged nothing wrong.
+#
+# Read-only: reuses install_default_scaledobjects in plan mode, so this goes
+# through the same discovery any real fix runs through -- deriving modelID
+# from a live container's actual `vllm serve` args, the code behind
+# `make scaledobjects-apply ... apply: adopt` -- rather than a second,
+# divergent implementation. Never calls so_apply_plan, never mutates anything.
+so_verify_scaledobjects() {
+    local plan_file
+    plan_file=$(mktemp -t wva-verify-plan.XXXXXX.yaml)
+
+    # Silenced on both streams: log_info/log_success write to stderr, and this
+    # call's own "plan written, edit it" messaging is about a temp file this
+    # function deletes before returning -- irrelevant to what verify reports.
+    WVA_DEFAULT_SO=plan WVA_DEFAULT_SO_PLAN="$plan_file" install_default_scaledobjects >/dev/null 2>&1
+
+    echo
+    echo "=== modelID drift check ==="
+    printf '%-55s %-20s %s\n' "WORKLOAD" "SERVES" "STATUS"
+
+    local drift=0 unregistered=0 unresolved=0 ok=0
+    local apply p_ns kind name model minr maxr cost policy existing configured
+    while IFS=$'\037' read -r apply p_ns kind name model minr maxr cost policy; do
+        [ -n "$name" ] || continue
+        if [ -z "$model" ]; then
+            printf '%-55s %-20s %s\n' "$p_ns/$name" "(unreadable)" "SKIP"
+            unresolved=$((unresolved + 1))
+            continue
+        fi
+        existing=$(so_existing_name "$p_ns" "$name")
+        if [ -z "$existing" ]; then
+            printf '%-55s %-20s %s\n' "$p_ns/$name" "$model" "UNREGISTERED"
+            unregistered=$((unregistered + 1))
+            continue
+        fi
+        configured=$(kubectl get scaledobject -n "$p_ns" "$existing" -o json 2>/dev/null \
+            | jq -r '[.spec.triggers[]? | select(.type | startswith("external")) | .metadata.modelID // empty] | first // empty')
+        if [ "$configured" = "$model" ]; then
+            printf '%-55s %-20s %s\n' "$p_ns/$name" "$model" "OK"
+            ok=$((ok + 1))
+        else
+            printf '%-55s %-20s %s\n' "$p_ns/$name" "$model" "DRIFT ($existing: ${configured:-(empty)})"
+            drift=$((drift + 1))
+        fi
+    done < <(so_plan_rows "$plan_file")
+    rm -f "$plan_file"
+
+    echo
+    echo "verify-scaledobjects: $ok ok, $drift drift, $unregistered unregistered, $unresolved unresolved"
+    if [ "$drift" -gt 0 ]; then
+        log_warning "  DRIFT: a ScaledObject's modelID no longer matches what its container serves."
+        log_warning "    WVA silently applies zero decisions for that workload -- it never matches a"
+        log_warning "    scraped metric. Fix through the code that owns this config, not by hand-patching:"
+        log_warning "      make scaledobjects-plan   # edit that entry's apply: to adopt"
+        log_warning "      make scaledobjects-apply WVA_DEFAULT_SO_PLAN=<edited file>"
+    fi
+    if [ "$unregistered" -gt 0 ]; then
+        log_warning "  UNREGISTERED: a discovered model server has no ScaledObject at all --"
+        log_warning "    it is never autoscaled by WVA. Review with:  make scaledobjects-plan"
+    fi
+
+    [ "$drift" -eq 0 ] && [ "$unregistered" -eq 0 ]
+}
+
+# so_verify_fma reports whether every FMA launcher pod, in every target
+# namespace, is actually covered by a scrape target.
+#
+# Reuses wva_launcher_scrapers -- the same "would this monitor generate a
+# target" test so_discover_fma_requesters already runs at line ~868 while
+# building a ScaledObject plan -- as its own read-only check, so it also
+# catches a namespace with no FMA requester ScaledObject planned this run (an
+# apply: no entry, or none discovered at all) where the plan output would
+# otherwise never mention launcher scraping.
+#
+# A namespace with no launcher pods is reported, not skipped: on a
+# cluster-scoped install it says plainly which namespaces run no FMA at all,
+# rather than leaving their absence from the table looking like an oversight.
+so_verify_fma() {
+    echo
+    echo "=== FMA launcher scrape check ==="
+    printf '%-40s %-10s %s\n' "NAMESPACE" "LAUNCHERS" "STATUS"
+
+    local ns launchers scrapers unscraped=0 none=0 ok=0
+    for ns in $(so_target_namespaces); do
+        launchers=$(kubectl get pods -n "$ns" -l app.kubernetes.io/component=launcher \
+            --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${launchers:-0}" -eq 0 ]; then
+            printf '%-40s %-10s %s\n' "$ns" "0" "-"
+            none=$((none + 1))
+            continue
+        fi
+        scrapers=$(wva_launcher_scrapers "$ns" | paste -sd, -)
+        if [ -n "$scrapers" ]; then
+            printf '%-40s %-10s %s\n' "$ns" "$launchers" "OK ($scrapers)"
+            ok=$((ok + 1))
+        else
+            printf '%-40s %-10s %s\n' "$ns" "$launchers" "UNSCRAPED"
+            unscraped=$((unscraped + 1))
+        fi
+    done
+
+    echo
+    echo "verify-fma: $ok ok, $unscraped unscraped, $none with no launcher pods"
+    if [ "$unscraped" -gt 0 ]; then
+        log_warning "  UNSCRAPED: launcher pods present but nothing generates a scrape target for them."
+        log_warning "    That FMA variant scales blind -- WVA never sees its engine metrics, and the HPA"
+        log_warning "    still reads a healthy ratio the whole time. Fix:"
+        log_warning "      kubectl apply -k config/fma-launcher-metrics -n <ns>   # or WVA_FMA_LAUNCHER_METRICS=true at install"
+    fi
+
+    [ "$unscraped" -eq 0 ]
 }
