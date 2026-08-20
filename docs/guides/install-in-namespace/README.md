@@ -32,6 +32,11 @@ Prometheus when it cannot — so a Prometheus that already scrapes your EPP cove
 it. Without the gate, neither path has anything to read, and scale-from-zero
 never fires while ordinary scaling works.
 
+Every install/preflight check that can refuse below is described, with why and
+the fix, in [First-line troubleshooting](../../deployment/operations.md#first-line-troubleshooting).
+`SKIP_CHECKS=true` bypasses all of them and installs anyway; the controller
+then sizes from whatever signals do exist, and stays silent about the rest.
+
 <!-- guide:env.static.namespace start -->
 ```bash
 export NAMESPACE=<your-namespace>

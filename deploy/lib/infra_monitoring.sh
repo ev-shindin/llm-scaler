@@ -250,13 +250,13 @@ wva_report_modelserver_metrics() {
         log_success "  Model-server metrics: WVA's own PodMonitor is in place."
         return 0
     fi
-    log_warning "  Model-server metrics: NOTHING scrapes the $servers model server(s) in $ns."
-    log_warning "    WVA sizes workloads from vllm:* series. With none, it holds at minReplicas and says so only in its log — the HPA still reads a healthy '1/1 (avg)', so nothing looks wrong."
-    log_warning "    This is llm-d's step 3, \"(Optional) Enable monitoring\" — optional for llm-d, required for WVA. From an llm-d checkout:"
-    log_warning "      kubectl apply -n $ns -k \$REPO_ROOT/guides/recipes/modelserver/components/monitoring"
-    log_warning "      (and .../components/monitoring-pd as well, for a prefill/decode split)"
-    log_warning "    No llm-d checkout? This repo carries an equivalent covering both roles:"
-    log_warning "      kubectl apply -n $ns -k config/modelserver-metrics"
+    log_warning "  Monitoring not enabled for your llm-d servers; please enable Model-server metrics."
+    log_warning "    This is llm-d's step 3, \"(Optional) Enable monitoring\" — optional for llm-d, required for WVA."
+    log_warning "      From an llm-d checkout:"
+    log_warning "        kubectl apply -n $ns -k \$REPO_ROOT/guides/recipes/modelserver/components/monitoring"
+    log_warning "        (and .../components/monitoring-pd as well, for a prefill/decode split)"
+    log_warning "      Or directly:"
+    log_warning "        kubectl apply -n $ns -k config/modelserver-metrics"
     return 1
 }
 
@@ -266,7 +266,8 @@ wva_report_modelserver_metrics() {
 # "(Optional) Enable monitoring" -- optional FOR LLM-D, required for WVA -- so a
 # correctly-followed llm-d install can leave a namespace WVA cannot size anything in,
 # and every symptom of that is silent. Refusing here asks the caller to finish llm-d,
-# which is where the fix actually lives.
+# which is where the fix actually lives. Full rationale lives once in the guide's
+# "How it works" section, not repeated here.
 #
 # SKIP_CHECKS=true is the bypass, and the only one. A per-check WVA_ALLOW_* flag was
 # tried and removed: the scenario is already selected by WVA_SCOPE, and a second knob
@@ -277,13 +278,7 @@ wva_report_modelserver_metrics() {
 # better answer and a bigger change; refusing is the honest interim.
 wva_require_modelserver_metrics() {
     wva_report_modelserver_metrics && return 0
-    log_error "Refusing to continue: nothing scrapes the llm-d model servers in ${WVA_WATCH_NS:-$WVA_NS}.
-
-WVA sizes workloads from their vllm:* series, so with none it would hold everything at
-minReplicas while reporting healthy. Apply one of the monitors above (llm-d's own, or
-this repo's equivalent), or install without the checks:
-
-  SKIP_CHECKS=true"
+    log_error "Refusing to continue — fix monitoring above, or SKIP_CHECKS=true (see docs/deployment/operations.md#first-line-troubleshooting)."
 }
 
 # There is deliberately no wva_ensure_modelserver_metrics — the installer does not
@@ -930,9 +925,8 @@ wva_report_epp_flowcontrol() {
             log_warning "    Confirm by hand:  kubectl get --raw /api/v1/namespaces/$ns/services/$svc:metrics/proxy/metrics | head"
         else
             missing=$((missing + 1))
-            log_warning "  EPP metrics: NOTHING scrapes $svc."
-            log_warning "    The model-level arrival rate is a PromQL query over inference_extension_scheduler_attempts_total, so with the EPP unscraped it reads 0 and the THROUGHPUT ANALYZER has no demand to size from."
-            log_warning "    llm-d ships the monitors: kubectl apply -n $ns -k \$REPO_ROOT/guides/recipes/observability   (or the epp-metrics PodMonitor/ServiceMonitor its guides create)"
+            log_warning "  Router monitoring not enabled; please enable EPP metrics."
+            log_warning "    llm-d ships the monitors: kubectl apply -n $ns -k \$REPO_ROOT/guides/recipes/observability"
         fi
 
         state=$(wva_epp_flowcontrol_state "$ns" "$svc")
@@ -941,9 +935,7 @@ wva_report_epp_flowcontrol() {
                 log_success "  EPP flow control: enabled on $svc (its config declares featureGates: [flowControl])." ;;
             off)
                 missing=$((missing + 1))
-                log_warning "  EPP flow control: NOT enabled on $svc — the scheduler queue is missing."
-                log_warning "    Scale-from-zero can never fire: at 0 replicas that queue is the only evidence anyone is asking for the model."
-                log_warning "    wva_unmeasured_queue — the detector for 'serving through pods WVA cannot attribute' — also reads 0 forever, because it is sourced from this same queue. The safety net is disabled by the absence it exists to catch."
+                log_warning "  Router queue not enabled; please turn on flow control for EPP."
                 log_warning "    Enable it in the EPP's EndpointPickerConfig:"
                 log_warning "        featureGates:"
                 log_warning "        - flowControl"
@@ -988,12 +980,5 @@ wva_report_epp_flowcontrol() {
 # only place anybody is looking.
 wva_require_epp_metrics() {
     wva_report_epp_flowcontrol && return 0
-    log_error "Refusing to continue: WVA cannot see the EPP signals it sizes workloads from (details above).
-
-Fix the EPP — the reference above is llm-d's own — or install without the checks:
-
-  SKIP_CHECKS=true
-
-Installed that way the controller runs and sizes from engine metrics only: no
-scale-from-zero, no queued-demand signal, and wva_unmeasured_queue blind."
+    log_error "Refusing to continue — fix the EPP above, or SKIP_CHECKS=true (see docs/deployment/operations.md#first-line-troubleshooting)."
 }

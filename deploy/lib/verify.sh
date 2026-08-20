@@ -39,9 +39,37 @@ verify_deployment() {
     local wva_deploy
     wva_deploy=$(kubectl get deployment -n "$WVA_NS" -l "$WVA_CONTROLLER_LABEL_SELECTOR" \
         -o name 2>/dev/null | head -1)
+
+    # Nothing in $WVA_NS -- before reporting a rollout failure against a
+    # namespace that may simply be the wrong one, check whether a WVA controller
+    # is running somewhere else entirely. Only reachable when $WVA_NS was never
+    # confirmed by the caller (an install always deploys into $WVA_NS first, so
+    # its own verify_deployment call finds this branch already covered); this is
+    # for a standalone `make verify-deployment` run against an unset or guessed
+    # WVA_NS.
+    if [ -z "$wva_deploy" ]; then
+        if kubectl auth can-i list deployments -A >/dev/null 2>&1; then
+            local elsewhere elsewhere_count
+            elsewhere=$(kubectl get deployment -A -l "$WVA_CONTROLLER_LABEL_SELECTOR" \
+                -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u)
+            elsewhere_count=$(printf '%s\n' "$elsewhere" | grep -c . || true)
+            if [ "${elsewhere_count:-0}" -eq 1 ]; then
+                log_warning "No WVA controller in $WVA_NS -- but one is running in $elsewhere. Re-run with WVA_NS=$elsewhere (or NAMESPACE=$elsewhere for a namespace-scoped install, since that is what resolves WVA_NS by default)."
+                return 1
+            elif [ "${elsewhere_count:-0}" -gt 1 ]; then
+                log_warning "No WVA controller in $WVA_NS, and more than one WVA runs on this cluster: $(printf '%s' "$elsewhere" | paste -sd, -). Pick one with WVA_NS=<ns>."
+                return 1
+            fi
+            # Else: genuinely none anywhere. Fall through -- the diagnostics below
+            # report that correctly, and there is nothing else to redirect to.
+        else
+            log_warning "Cannot confirm whether a WVA controller runs elsewhere -- listing Deployments cluster-wide is not permitted for this identity. If you know its namespace, pass WVA_NS=<ns> (or NAMESPACE=<ns> for a namespace-scoped install)."
+        fi
+    fi
+
     if [ -n "$wva_deploy" ] && kubectl rollout status "$wva_deploy" -n "$WVA_NS" \
         --timeout="${WVA_VERIFY_TIMEOUT:-180s}" >/dev/null 2>&1; then
-        log_success "WVA controller is running and ready"
+        log_success "WVA controller is running and ready in $WVA_NS"
     else
         all_good=false
         log_warning "WVA controller did NOT become ready within ${WVA_VERIFY_TIMEOUT:-180s}."
@@ -253,8 +281,27 @@ verify_deployment() {
         else
             # Not found is not the same as broken, and saying "nothing scales"
             # here would be a false alarm on any cluster whose KEDA does not
-            # carry this label.
-            log_info "No KEDA operator matched $KEDA_OPERATOR_LABEL_SELECTOR anywhere on the cluster. A platform-managed KEDA may not carry that label — confirm with: kubectl get scaledobject -A"
+            # carry this label -- which is exactly the platform-managed case.
+            #
+            # A stronger signal sits right in the managed namespace, once one
+            # exists: a ScaledObject KEDA has actually reconciled to READY. Only
+            # useful in namespace scope (cluster scope would need enumerating
+            # every managed namespace, not just one), and only once a workload
+            # has been registered -- so this is a no-op the first time
+            # verify_deployment runs, as part of an install, before step 3
+            # ("Register the workloads") has created anything. It becomes a real
+            # confirmation on a later, standalone `make verify-deployment`.
+            local keda_ns=""
+            [ "$(wva_install_scope)" = "namespace" ] && keda_ns="${WVA_WATCH_NS:-$WVA_NS}"
+            if [ -n "$keda_ns" ] && kubectl get scaledobject -n "$keda_ns" \
+                    -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
+                    | grep -qx 'True'; then
+                log_success "KEDA is running — confirmed by a READY ScaledObject in $keda_ns (its operator pod just carries no label this check recognizes; a platform-managed KEDA often does not)."
+            elif [ -n "$keda_ns" ]; then
+                log_info "No KEDA operator matched $KEDA_OPERATOR_LABEL_SELECTOR anywhere on the cluster, and no READY ScaledObject in $keda_ns confirms it that way either. A platform-managed KEDA may not carry that label — confirm with: kubectl get scaledobject -n $keda_ns"
+            else
+                log_info "No KEDA operator matched $KEDA_OPERATOR_LABEL_SELECTOR anywhere on the cluster. A platform-managed KEDA may not carry that label — confirm with: kubectl get scaledobject -A"
+            fi
         fi
     elif [ "$SCALER_BACKEND" = "none" ]; then
         log_info "Scaler backend skipped (SCALER_BACKEND=none) — assuming external metrics API is pre-installed"

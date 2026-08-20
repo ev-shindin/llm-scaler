@@ -485,6 +485,19 @@ undeploy-wva-on-openshift: ## Remove WVA from OpenShift. Pass the same SCOPE and
 check-prereqs: ## Phase 1, read-only: tools, permissions, the namespace and the Prometheus it found. ENVIRONMENT=kubernetes|openshift, SCOPE=namespace|cluster.
 	$(call wva_check,$(ENVIRONMENT_INSTALL))
 
+## Health check: is the WVA controller running, and did model-server metrics
+## actually arrive? Runs the exact same check deploy-wva runs at the end of
+## every install (deploy/lib/verify.sh), exposed here to re-run any time with
+## no install attached. `kubectl rollout status` returns immediately when the
+## rollout is already complete, so this doesn't sit around waiting on a
+## controller that has been healthy for days.
+.PHONY: verify-deployment
+verify-deployment: ## Is the controller running, and are metrics flowing? Read-only. WVA_NS=<ns>, NAMESPACE=<ns>.
+	@$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) WVA_SCOPE=$(SCOPE) \
+		bash -c 'source deploy/lib/common.sh; source deploy/lib/constants.sh; source deploy/lib/infra_monitoring.sh; source deploy/lib/verify.sh; \
+			export DEPLOY_PROMETHEUS=$${DEPLOY_PROMETHEUS:-true}; export DEPLOY_OPERATIONAL_DASHBOARD=$${DEPLOY_OPERATIONAL_DASHBOARD:-true}; export SCALER_BACKEND=$${SCALER_BACKEND:-keda}; export MONITORING_NAMESPACE=$${MONITORING_NAMESPACE:-workload-variant-autoscaler-monitoring}; \
+			wva_bootstrap_env; verify_deployment'
+
 ## List the llm-d model servers WVA would create ScaledObjects for, and stop.
 ## Writes an editable YAML plan; nothing is applied. A ScaledObject is how a
 ## workload REGISTERS with WVA, so this is the step between "installed" and
@@ -520,6 +533,27 @@ scaledobjects-repoint: ## Repoint ScaledObjects naming a missing WVA at the inst
 	@$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) WVA_SCOPE=$(SCOPE) \
 		$(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) \
 		bash -c 'source deploy/lib/common.sh; source deploy/lib/scaledobject.sh; wva_bootstrap_env; so_repoint_stale'
+
+## Health check: does every registered ScaledObject's modelID still match what
+## its container actually serves? Catches a hand-changed serving model that
+## nothing re-syncs -- WVA then silently applies zero decisions for that
+## workload, forever, with the HPA reading a healthy ratio the whole time.
+.PHONY: verify-scaledobjects
+verify-scaledobjects: ## Rescan model servers and check every ScaledObject's modelID for drift. Read-only.
+	@$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) WVA_SCOPE=$(SCOPE) \
+		$(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) \
+		bash -c 'source deploy/lib/common.sh; source deploy/lib/scaledobject.sh; wva_bootstrap_env; so_verify_scaledobjects'
+
+## Health check: is every FMA launcher pod actually being scraped? A launcher
+## declares no container ports, so a monitor that merely SELECTS one produces
+## no target -- and that variant's engine metrics never arrive while the HPA
+## still reads healthy. Reuses the same detection so_discover_fma_requesters
+## already runs while building a ScaledObject plan.
+.PHONY: verify-fma
+verify-fma: ## Check every FMA launcher pod has a scrape target. Read-only. WVA_NS=<ns>, NAMESPACE=<ns>.
+	@$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) WVA_SCOPE=$(SCOPE) \
+		$(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) \
+		bash -c 'source deploy/lib/common.sh; source deploy/lib/scaledobject.sh; wva_bootstrap_env; so_verify_fma'
 
 # The environment the so-* targets share. Same shape the scaledobjects-* targets
 # pass inline: WVA_NS and NAMESPACE only when the CALLER set them, so an unset

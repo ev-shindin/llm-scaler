@@ -7,25 +7,46 @@ Verifying WVA works, watching what it decides, and the first things to check whe
 ## Verifying the install
 
 Every command on this page uses `$NS` for the namespace the **controller** runs
-in. That is whatever `WVA_NS` was at install time, not a fixed name — the default
-is `workload-variant-autoscaler-system`, but a per-team install is somewhere else.
-Find it rather than assume it:
+in — not a fixed name, since a per-team or cluster-scoped install can be
+anywhere.
+
+Start by running:
 
 ```bash
-# the namespace WVA is actually installed in
-NS=$(kubectl get deploy -A -l app.kubernetes.io/name=workload-variant-autoscaler \
-       -o jsonpath='{.items[0].metadata.namespace}')
-echo "$NS"
+make verify-deployment
 ```
+
+It reports the namespace it found the controller in ("WVA controller is
+running and ready in `<ns>`"), or — if there is more than one WVA on this
+cluster, or none — lists every candidate and stops rather than guess; choose
+yours from that list.
+
+For a namespace-scoped install (the common case — the controller runs in the
+same namespace it manages):
+
+```bash
+NS="${NAMESPACE:-}"
+```
+
+For a cluster-scoped install, or one installed with `WVA_NS` set explicitly:
+
+```bash
+NS="${WVA_NS:-}"
+```
+
+Confirm registration matches what is actually serving:
+
+```bash
+make verify-scaledobjects
+```
+
+For more detail, straight from the controller and KEDA:
 
 ```bash
 kubectl get pods -n "$NS"                     # the controller is Running
-kubectl get scaledobject -A                   # your managed workloads
-kubectl get hpa -A                            # KEDA created one per ScaledObject
+kubectl get scaledobject -n "$NAMESPACE"      # your managed workloads
+kubectl get hpa -n "$NAMESPACE"               # KEDA created one per ScaledObject
 ```
-
-If that returns more than one namespace, this cluster is running one WVA per
-namespace; pick the one managing the workload you are looking at.
 
 A ScaledObject with a KEDA HPA whose `CurrentMetrics` is populated means the whole
 chain works: WVA was called, decided, and KEDA received the answer. An empty
@@ -298,13 +319,18 @@ simulator and the e2e suites, are in [Testing](../developer-guide/testing.md).
 
 | symptom | most likely cause | check |
 | --- | --- | --- |
-| WVA pod not `Running` | image pull, resources, or Prometheus unreachable | `kubectl describe pod -n $NS -l app.kubernetes.io/name=workload-variant-autoscaler` |
-| "Metrics unavailable" in the logs | the ServiceMonitor does not select your model pods, so the series never reach Prometheus | `kubectl get servicemonitor -A`, then Prometheus `/targets` |
+| WVA pod not `Running` | image pull, resources, or Prometheus unreachable | `make verify-deployment`, then `kubectl describe pod -n $NS -l app.kubernetes.io/name=workload-variant-autoscaler` |
+| "Metrics unavailable" in the logs | the ServiceMonitor does not select your model pods, so the series never reach Prometheus | `make verify-deployment`, then `kubectl get servicemonitor -A` and Prometheus `/targets` |
 | HPA exists but `CurrentMetrics` is empty | KEDA never got an answer — usually the trigger's `scalerAddress` or a missing `modelID` | `kubectl describe hpa -n <ns> keda-hpa-<so-name>` |
 | nothing scales, no errors | a limiter is declared and the workload's accelerator does not resolve, so it gets no GPU budget | `kubectl logs -n $NS -l app.kubernetes.io/name=workload-variant-autoscaler \| grep -i accelerator` |
 | a model never wakes from zero | the EPP flow-control queue is not reaching WVA | see [Troubleshooting](../developer-guide/troubleshooting.md) |
 | `READY False` on the ScaledObject, and the HPA's `TARGETS` reads `cpu: <unknown>/80%` | KEDA could not fetch the metric spec from WVA, so it fell back to a CPU metric. The trigger names a scaler it cannot reach — most often a `scalerAddress` naming a **different install's namespace** than the controller actually runs in. `make scaledobjects-repoint` fixes exactly this: it rewrites `scalerAddress` on objects that ask for WVA but name a namespace where no scaler runs, and leaves one pointing at a second live install alone | `kubectl get scaledobject -A -o custom-columns=NAME:.metadata.name,ADDR:.spec.triggers[0].metadata.scalerAddress` then `kubectl get svc -A \| grep external-scaler` |
-| demand looks far too low for the load you are driving, and `has N ready pod(s) but none attributed` appears each cycle | FMA is in the namespace and nothing is scraping its launcher pods, so the traffic they serve is invisible | see [FMA launcher pods](#fma-launcher-pods) |
+| demand looks far too low for the load you are driving, and `has N ready pod(s) but none attributed` appears each cycle | FMA is in the namespace and nothing is scraping its launcher pods, so the traffic they serve is invisible | `make verify-fma`, see also [FMA launcher pods](#fma-launcher-pods) |
+| WVA applies no decisions for a workload, silently, though the HPA reads a healthy ratio the whole time | the ScaledObject's `modelID` no longer matches what the container actually serves — a hand-changed model that nothing re-syncs | `make verify-scaledobjects` |
+| `check-prereqs`/`deploy-wva` refuses: "No llm-d found in `<ns>`" | the namespace holds no llm-d model servers yet | finish the llm-d install in `<ns>`, or `SKIP_CHECKS=true` |
+| refuses: "Monitoring not enabled for your llm-d servers; please enable Model-server metrics" | nothing scrapes the model servers — WVA would hold every workload at `minReplicas` and say so only in its log | `kubectl apply -n <ns> -k config/modelserver-metrics` (or llm-d's own `guides/recipes/modelserver/components/monitoring`) |
+| refuses: "Router monitoring not enabled; please enable EPP metrics" | nothing scrapes the EPP — the throughput analyzer has no arrival-rate signal (`inference_extension_scheduler_attempts_total` reads 0) | `kubectl apply -n <ns> -k $REPO_ROOT/guides/recipes/observability` |
+| refuses: "Router queue not enabled; please turn on flow control for EPP" | the `flowControl` feature gate is off — scale-from-zero and `wva_unmeasured_queue` have no queue-depth signal to read | add `featureGates: [flowControl]` to the EPP's `EndpointPickerConfig`; llm-d ships a ready values file at `guides/workload-autoscaling/keda-epp-queue/<guide>/router.values.yaml` |
 
 ### `no children to pick from` after a reinstall
 
