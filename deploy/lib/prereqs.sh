@@ -453,68 +453,18 @@ almost certainly wrong: a typo, a stale NAMESPACE export, or the wrong cluster.
     if [ "$count" -gt 0 ] 2>/dev/null; then
         log_success "  $managed holds $count llm-d model server(s) for it to manage."
     else
-        log_warning "  $managed holds NO llm-d model servers (nothing labelled $(so_serving_markers | paste -sd'/' -))."
-
-        # "Where else might they be" is a convenience for the warning text, not
-        # part of the STOP decision below: $managed's own count came from
-        # wva_model_server_count, which is scoped to $managed and needs no
-        # cluster-wide rights, so a tenant who cannot list Deployments across the
-        # cluster still gets a fully-formed count for THEIR OWN namespace and the
-        # same STOP everyone else gets. Making the STOP conditional on this
-        # unrelated permission bypassed it for exactly the namespace-scoped
-        # tenant this scenario is written for -- the normal RBAC posture here,
-        # not an edge case.
-        #
-        # The label set comes from so_serving_markers, not a single marker: model
-        # servers are found by the shared list, and naming only one here would
-        # report "nothing labelled X" for a workload carrying one of the others.
-        if ! kubectl auth can-i list deployments -A >/dev/null 2>&1; then
-            log_warning "    This check cannot search the rest of the cluster for them (listing workloads cluster-wide is not permitted for you)."
-            log_warning "    If your models are elsewhere, name it:  WVA_NS=<their namespace>"
-        else
-            local elsewhere
-            elsewhere="$(wva_namespaces_with_model_servers)"
-            if [ -n "$elsewhere" ]; then
-                log_warning "    They are in: $(printf '%s ' $elsewhere)"
-            else
-                # Nowhere on the cluster. WVA scales llm-d; it does not install it,
-                # and should not — which model, which accelerator, which well-lit
-                # path and whose HuggingFace token are the deployment decision, not
-                # an autoscaler's. Point at the people whose decision it is.
-                log_warning "    There are none anywhere on this cluster. WVA scales llm-d model servers; deploy one first:"
-                log_warning "      https://github.com/llm-d/llm-d/tree/main/guides"
-                log_warning "    For a GPU-free local cluster to try WVA against: make create-kind-cluster && make deploy-e2e-infra"
-            fi
-        fi
-        log_warning "    A namespace-scoped controller manages only the namespace it runs in, so this one would install cleanly, report healthy, and scale nothing."
-
-        # And then STOP. This is the OBJECTS TO SCALE question -- WVA's premise, not
-        # its output -- and with no llm-d model servers there is nothing for the
-        # scenario to act on. Continuing produces a controller that reports healthy
-        # and scales nothing, and exiting 0 on that made the preflight's most
-        # important finding advisory: scripted installs read the status, not the log.
-        #
-        # Note what does NOT reach here. The count reads the pod TEMPLATE, so a
-        # workload parked at zero replicas still counts -- `so-park`, scale-to-zero
-        # and a mid-rollout are all invisible to this. Only an ABSENT Deployment
-        # gets this far.
+        # Terse by design: the STOP itself is the actionable message, and every
+        # rationale that used to live here (why an empty namespace is a silent
+        # failure rather than a warning, the "where else are they" convenience,
+        # the permission-scoped exemption from an earlier revision) now lives once
+        # in the guide's "How it works" section, not repeated at every call site.
         #
         # kind-emulator is exempt: the e2e path provisions llm-d and WVA in one
-        # sequence and owns the ordering itself. SKIP_CHECKS=true is the bypass, and
-        # the only one -- a per-check WVA_ALLOW_* flag was tried and removed, because
-        # the scenario is already selected by WVA_SCOPE and a second knob for the
-        # same decision is a second thing to get wrong.
-        #
-        # Cluster scope never reaches here: it returns above, because a
-        # cluster-scoped controller manages namespaces that need not exist yet.
+        # sequence and owns the ordering itself. SKIP_CHECKS=true is the bypass.
+        # Cluster scope never reaches here: it returns above.
         if [ "${ENVIRONMENT:-}" != "kind-emulator" ]; then
-            log_error "  Refusing to continue: $managed holds no llm-d model servers.
-
-WVA scales llm-d; it does not install it. Finish the llm-d install in this namespace,
-or name the namespace it is already serving from:
-
-  name the right namespace:        NAMESPACE=<namespace> make <target>
-  or install without the checks:   SKIP_CHECKS=true"
+            log_error "  No llm-d found in $managed. Please install llm-d on $managed."
+            log_error "    SKIP_CHECKS=true to continue anyway — see docs/deployment/operations.md#first-line-troubleshooting"
         fi
     fi
 }
