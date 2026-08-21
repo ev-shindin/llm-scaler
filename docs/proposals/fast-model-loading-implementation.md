@@ -273,6 +273,19 @@ invariant:        free >= sleepMinSize   (maintained by scaling the pool)
 `sleepMinSize` is the K of the loss model in the review: the number of concurrent
 spikes the pool can cover before one is blocked.
 
+**Per pool, not per model — decided.** A per-model reserve would mean N reserved
+GPUs for N models, which is precisely the per-model headroom a pool is supposed
+to beat, and it would beat it while serving no traffic. The entire proposition is
+that **K shared slots cover N models**, and that only works if the reserve is
+shared: whichever model spikes takes a free Pod, and the Pod is fungible because
+what makes it usable for a given model is residency, not reservation.
+
+The consequence to hold onto is that a reserve of K is drawn down by ANY model in
+the pool. Two models spiking together consume two Pods, so `sleepMinSize` is
+sized against concurrent spikes across the whole pool — which is the loss model,
+and why spike independence (review §2.4) is the assumption that decides whether
+the number can be small.
+
 ### 7a.2 Scale-up: borrow N, and start N
 
 WVA decides a variant needs `N` more replicas. Both things happen at once:
