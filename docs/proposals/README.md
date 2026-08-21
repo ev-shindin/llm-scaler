@@ -8,9 +8,17 @@ system works today.
 ## Fast Model Actuation and warm capacity
 
 The largest cluster, and the one most likely to be read out of order. Read the
-design first; the others are the reasoning and the measurements behind it.
+review first; the others are the reasoning and the measurements behind it.
 
-- **[Warm-pool design](fma-warm-pool-design.md)** — **start here.** A shared pool
+- **[Fast model loading, from first principles](fast-model-loading.md)** —
+  **start here.** Restates the problem commercially before technically: the
+  competitor is a spare replica, not doing nothing, so the pool has exactly one
+  thing to sell — one slot covering many models. Sizes that with a loss model,
+  names the assumption that can end the project (spike correlation), and lists
+  the measurements to take before any code is written.
+- **[Warm-pool design](fma-warm-pool-design.md)** — superseded on framing and
+  economics by the review above; still the reference for per-step timings, the
+  measured prerequisites and the sequencing detail. A shared pool
   of GPU-holding Pods so capacity for any model arrives in seconds instead of
   ~41 s. Configuration, per-step timings with measured provenance, what is reused
   from FMA, and five measured prerequisites.
