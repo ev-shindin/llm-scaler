@@ -16,6 +16,10 @@ review first; the others are the reasoning and the measurements behind it.
   thing to sell — one slot covering many models. Sizes that with a loss model,
   names the assumption that can end the project (spike correlation), and lists
   the measurements to take before any code is written.
+- **[Warm pool implementation](fast-model-loading-implementation.md)** — how to
+  build it: objects, the supervisor API, how a woken model joins its
+  InferencePool, the cache policy, the RBAC increase a readiness gate needs, and
+  a three-week breakdown for phase 1.
 - **[Warm-pool design](fma-warm-pool-design.md)** — superseded on framing and
   economics by the review above; still the reference for per-step timings, the
   measured prerequisites and the sequencing detail. A shared pool

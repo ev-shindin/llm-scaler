@@ -305,10 +305,17 @@ Recommendation, given the inputs:
 
 ## 5. Architecture, reduced to its minimum
 
-The mechanism does not need FMA. That conclusion is already in the record — the
-warm-pool master notes "essentially just the launcher" is reused and "the FMA fork
-is NOT on the critical path" — and it can be taken further: the launcher is not
-needed either.
+The mechanism does not need FMA's Kubernetes half. That conclusion is already in
+the record — the warm-pool master notes "essentially just the launcher" is reused
+and "the FMA fork is NOT on the critical path".
+
+**It cannot be taken further than that.** An earlier draft of this section claimed
+the launcher was unnecessary too; that is wrong. A GPU is allocated to a
+*container*, so several models resident on one GPU means several vLLM processes in
+one container, which needs a supervisor to spawn, sleep, wake and kill them —
+which is what the launcher is. Reuse it or write a minimal one, but something
+plays that role. See
+[the implementation design](fast-model-loading-implementation.md).
 
 **A pool is an ordinary Deployment.** One per `(accelerator, TP size, tier)`.
 
