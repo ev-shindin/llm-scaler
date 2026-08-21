@@ -58,8 +58,8 @@ const (
 )
 
 // ModelRef names a model as WVA knows it: the workload's namespace and the
-// variant whose InferencePool the woken copy must join, plus the engine
-// arguments that make a copy of it.
+// variant whose InferencePool the woken copy must join, plus what it takes to
+// make and place a copy of it.
 type ModelRef struct {
 	// Namespace is the workload's namespace, not the pool's.
 	Namespace string
@@ -69,6 +69,12 @@ type ModelRef struct {
 	// replicas' -- a different --gpu-memory-utilization is a different
 	// torch.compile cache key, and a cache miss costs ~9 s of extra compile.
 	EngineOptions string
+	// PoolLabels are the labels that make a Pod a member of this model's
+	// InferencePool: the target pool's own `spec.selector.matchLabels`, resolved
+	// by the caller from the InferencePool rather than assumed here. Selectors
+	// belong to the tenant, and one that requires something other than
+	// llm-d.ai/model is not a hypothetical.
+	PoolLabels map[string]string
 }
 
 // Membership is one model's residency in one Pod.
@@ -102,28 +108,34 @@ type Pool interface {
 	// will eventually be wrong about it.
 	ListWarm(ctx context.Context) ([]Membership, error)
 
-	// Warm makes a model resident and asleep -- admission. It costs a full
-	// model load (~33-37 s measured) and transient GPU memory of roughly the
-	// weights, so the Pod it lands on is out of the reserve until it finishes.
-	Warm(ctx context.Context, model ModelRef, tier Tier) error
+	// Warm makes a model resident and asleep in a given Pod -- admission. It
+	// costs a full model load (~33-37 s measured) and transient GPU memory of
+	// roughly the weights, so that Pod is out of the reserve until it finishes.
+	//
+	// The Pod is the CALLER's choice. Placement is policy -- spreading copies so
+	// that expected concurrent wakes per Pod stay within what a Pod can serve --
+	// and policy does not belong behind this boundary.
+	Warm(ctx context.Context, pod types.NamespacedName, model ModelRef, tier Tier) error
 
-	// Activate wakes a resident model and puts it into service: label, wake,
-	// confirm the engine answers, point the Pod's serving port at it.
+	// Activate wakes a resident model in a given Pod and puts it into service:
+	// label, wake, confirm the engine answers, point the Pod's serving port at
+	// it. A model may be resident in several Pods, so which one serves is the
+	// caller's decision.
 	//
 	// The label goes first deliberately. Readiness is what admits traffic, so
 	// labelling early costs nothing and takes the EPP's ~460 ms admit latency
 	// off the critical path.
-	Activate(ctx context.Context, model ModelRef) (Endpoint, error)
+	Activate(ctx context.Context, pod types.NamespacedName, model ModelRef) (Endpoint, error)
 
 	// Deactivate returns a serving model to the reserve: clear the serving
 	// port, drain, unlabel, sleep.
 	//
 	// The proxy is cleared FIRST because it is the gate. Sleeping while traffic
 	// can still arrive is the Ready-but-asleep window, which is a 503.
-	Deactivate(ctx context.Context, model ModelRef) error
+	Deactivate(ctx context.Context, pod types.NamespacedName, model ModelRef) error
 
 	// Evict removes a model from a Pod entirely, freeing its host memory.
-	Evict(ctx context.Context, model ModelRef) error
+	Evict(ctx context.Context, pod types.NamespacedName, model ModelRef) error
 }
 
 // Free reports whether a Pod can serve a wake: every instance asleep, and none

@@ -42,7 +42,7 @@ func newFakeEngine(t *testing.T) *fakeEngine {
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/is_sleeping":
 			_, _ = w.Write([]byte(`{"is_sleeping":` + boolText(f.sleeping) + `}`))
-		case r.URL.Path == "/health":
+		case r.URL.Path == healthPath:
 			if time.Now().Before(f.servingAt) {
 				http.Error(w, "not ready", http.StatusServiceUnavailable)
 				return
@@ -55,6 +55,8 @@ func newFakeEngine(t *testing.T) *fakeEngine {
 	t.Cleanup(f.server.Close)
 	return f
 }
+
+const healthPath = "/health"
 
 func queryOf(r *http.Request) string {
 	if r.URL.RawQuery == "" {
@@ -117,7 +119,7 @@ func TestWakeWaitsForTheEngineToAnswer(t *testing.T) {
 	if calls[0] != "POST /wake_up" {
 		t.Fatalf("wake must come first: %v", calls)
 	}
-	if calls[len(calls)-1] != "GET /health" {
+	if calls[len(calls)-1] != "GET "+healthPath {
 		t.Fatalf("wake must end by confirming the engine answers: %v", calls)
 	}
 }

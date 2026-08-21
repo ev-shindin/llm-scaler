@@ -13,6 +13,8 @@ import (
 // realProxy runs the actual proxy control handler, so these tests exercise the
 // two halves against each other rather than against a restatement of the
 // protocol.
+const loopback9001 = "127.0.0.1:9001"
+
 func realProxy(t *testing.T) (*Proxy, *proxy.Server) {
 	t.Helper()
 	server := proxy.New(proxy.DefaultConfig)
@@ -33,7 +35,7 @@ func TestPointAndClearDriveTheRealProxy(t *testing.T) {
 	}
 	// The address is Pod-LOCAL: the proxy shares a network namespace with the
 	// engines, so it dials 127.0.0.1 whatever the Pod's cluster IP is.
-	if got := server.Upstream(); got != "127.0.0.1:9001" {
+	if got := server.Upstream(); got != loopback9001 {
 		t.Fatalf("upstream = %q, want the loopback address", got)
 	}
 
