@@ -217,6 +217,9 @@ Absent ──Warm()──► Loading ──(engine up)──► Asleep
                                                                   Asleep
 ```
 
+While a model is in `Loading`, its Pod is `admitting` (§7a.1) and is not part of
+the reserve.
+
 `Waking -> fail` is not hypothetical: two of three unbound sleepers could not be
 woken (review §3.1). Our Pods hold their GPUs, which should remove the cause, but
 the transition must exist and must fall back to the cold path rather than retry —
@@ -226,10 +229,52 @@ a sleeper that fails to wake is corrupt and gets evicted.
 
 The mechanism is small; the policy is the product.
 
-- **Admission.** Which models get warmed. Start with: models that scaled to zero in
-  the last N hours, ranked by request share, refusing any model whose predicted
-  wake is not materially better than its cold start (review §3.5). Admission needs
-  transient GPU memory ≈ full weights, so **admit only to idle Pods**.
+### Admission — what earns a place in the warm set
+
+Admission and eviction are separate decisions, and conflating them is the classic
+way to build a cache that thrashes. Eviction asks "what do I drop when full";
+admission asks "is this worth keeping at all".
+
+**Not plain demand-filling.** The obvious policy — model X missed, so load X — is
+wrong here for three reasons:
+
+1. **It spends the reserve exactly when it is scarce.** A Pod that is admitting
+   cannot serve a wake, so filling on a miss during a burst removes a Pod from
+   the reserve at the moment concurrent spikes are arriving. That inverts what
+   `sleepMinSize` exists to guarantee.
+2. **One-hit wonders pollute the warm set.** Models that spike once and never
+   again would evict models that spike often. The standard answer is a frequency
+   filter — admit on the SECOND miss within a window, not the first — which is
+   the idea behind 2Q and TinyLFU.
+3. **The model is about to be served anyway.** The ordinary replicas are already
+   starting; a warm copy pays only on the NEXT spike, which may be hours away.
+
+So residency has three sources, in descending order of confidence:
+
+| source | policy | why |
+| --- | --- | --- |
+| **parked models** | admit eagerly, bypassing the filter | no ordinary replicas exist, so the pool is their only fast path, and the next wake is near-certain. The alternative is a guaranteed ~41 s |
+| **popular models** | **preload** while the pool is idle, top-C by request share | prefetch beats demand-fill when the distribution is known, and skew is what makes a small warm set work |
+| **everything else** | admit on the second miss in a window | keeps one-off models out |
+
+Every source is subject to the same two guards:
+
+```
+admit(model, pod) requires:
+    free - 1 >= sleepMinSize          # never spend the reserve to fill the cache
+    no borrow blocked recently        # not during a burst
+    predicted_wake(model) << cold_start(model)   # refuse models a pool cannot help
+```
+
+The last guard is review §3.5 made operational: at TP=8 or 70 B, every mechanism
+converges to seconds and the pool should decline rather than underperform
+quietly.
+
+**The parameters are empirical, and the tool to settle them exists.**
+`internal/warmpool/estimator` already carries `FillOnMiss` for exactly this: replay
+a trace with demand-fill on and off, with and without a frequency filter, and read
+the hit rates. Baking a window length or a C into the design now would be guessing
+where measuring is cheap.
 - **Eviction.** LRU by last-use, with explicit pinning. LRU is right because this
   is a cache and popularity is skewed; pinning exists because the operator knows
   things the recency signal does not.
@@ -254,20 +299,28 @@ pool capacity, and gives it back when the ordinary replicas arrive.
 The invariant is one awake instance per Pod, so a pool Pod is in exactly one of
 two states:
 
-| state | meaning | in its InferencePool? | Ready? |
-| --- | --- | --- | --- |
-| **free** | every instance asleep | no | **no** — `/readyz` 503 |
-| **lent** | one instance awake, serving | yes, for that model | yes |
+| state | meaning | can serve a wake? | in its InferencePool? | Ready? |
+| --- | --- | --- | --- | --- |
+| **free** | every instance asleep | yes | no | **no** — `/readyz` 503 |
+| **admitting** | loading a model to make it resident | **no**, for ~33-37 s | no | no |
+| **lent** | one instance awake, serving | no | yes, for that model | yes |
+
+**`admitting` is a state, not a detail.** A Pod loading a model cannot serve a
+wake for anything else, and admission needs transient GPU memory of roughly the
+full weights. A Pod that is admitting is therefore NOT part of the reserve, and
+counting it as free is how a pool comes to report a reserve it cannot honour.
 
 `sleepMinSize` is the floor on **free** Pods: the reserve the pool keeps for the
 next spike. It is not a count of sleeping *instances* — a Pod with eight models
 resident and one awake is lent, not free, because it can serve no further wake.
 
 ```
-free(pool)      = |{ Pod : every instance asleep }|
+free(pool)      = |{ Pod : every instance asleep, not admitting }|
+admitting(pool) = |{ Pod : loading a model }|
 lent(pool)      = |{ Pod : one instance awake }|
-replicas(pool)  = free + lent          # the pool Deployment's size
-invariant:        free >= sleepMinSize   (maintained by scaling the pool)
+replicas(pool)  = free + admitting + lent      # the pool Deployment's size
+invariant:        free >= sleepMinSize          (maintained by scaling the pool)
+admission rule:   admit only while free - 1 >= sleepMinSize
 ```
 
 `sleepMinSize` is the K of the loss model in the review: the number of concurrent
