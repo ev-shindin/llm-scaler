@@ -447,15 +447,60 @@ caps model size. MIG suits static per-tenant partitioning, not a shared cache.
 | 6 | **Popularity skew** across models | C, the membership budget, and the honest mean-wake claim (§2.3) | hours, from EPP per-model request counts |
 | 7 | **Co-residency penalty** under load | M, awake slots per GPU (§5.1) | one experiment |
 
-1-3 and 6 are queries against metrics WVA and the EPP already emit. **They should be done before
-any code is written**, because they can each independently end the project, and
-that is a feature.
+1-3 and 6 are queries against metrics WVA and the EPP already emit. **They should
+be done before any code is written**, because they can each independently end the
+project, and that is a feature.
+
+### 6.1 They were run, and the cluster cannot answer them (2026-08-21)
+
+Measured on pokprod, 7 days, read-only queries:
+
+| question | result |
+| --- | --- |
+| `lambda`, scale-up events per model | **0.40/hour for one model; 0.00 for the other seven** |
+| correlation | **7 busy 5-minute buckets in 2,016**; never two models at once |
+| popularity skew | 3 models carry traffic; one takes **76%** of requests |
+| `T_ordinary` from `wva_scale_from_zero_wake_seconds` | **no observations at all in 7 days** |
+
+**This is not evidence that spikes are independent. It is evidence of an idle
+cluster.** pokprod is a test and benchmark cluster: the scale-ups in it are our
+own runs, and 7 busy buckets in a week cannot distinguish independent arrivals
+from correlated ones. Nor can 3 active models say anything useful about a Zipf
+exponent over N.
+
+So the gating measurements are **not takeable on the infrastructure we have.**
+Sizing K or C from this data would be fabrication with a citation.
+
+### 6.2 Therefore: ship the measurement, do not guess it
+
+The way out is to stop treating Phase 0 as an analysis we perform once, and make
+it something WVA computes continuously wherever it runs — including on clusters
+we will never see.
+
+A **warm-pool value estimator** in WVA: from the scaling events and per-model
+request counts it already collects, compute what a pool *would* have delivered.
+
+- replay scale-ups against a simulated cache of size C -> **hit rate**;
+- replay them against K slots held for W -> **blocked spikes**;
+- combine with the measured cold start -> **mean wake, with and without a pool**;
+- publish as `wva_warmpool_would_hit_ratio`, `wva_warmpool_would_block_ratio`,
+  `wva_warmpool_would_save_seconds`.
+
+It needs no GPUs, no pool, and no new data source; it is a few hundred lines over
+metrics that exist. It converts the unanswerable question into one **each adopter
+answers on their own fleet**, and it is the honest precondition for asking anyone
+to hold K GPUs. It is also independently useful: a cluster where the estimator
+says "3% hit rate" has learned something real about itself.
+
+**This is now the recommended first deliverable**, ahead of any pool code.
 
 ## 7. Phasing
 
-- **Phase 0 — measure.** Items 1-3. Exit criterion: correlation low enough that
-  `N/K >= 5` at a 2% blocking target, and `T_ordinary >= 15 s`. If either fails,
-  stop, or continue with parking only.
+- **Phase 0 — measure.** Attempted 2026-08-21 and **inconclusive on the available
+  cluster** (§6.1). Replaced by: **build the value estimator (§6.2)** and run it
+  wherever WVA already runs. Exit criterion unchanged in substance — `N/K >= 5` at
+  a 2% blocking target and `T_ordinary >= 15 s` — but now evaluated from a
+  cluster with organic traffic rather than from ours.
 - **Phase 1 — parking on tier A.** One RAM-backed pool, warm parking for
   scaled-to-zero models, driven by the existing scale-to-zero path. Smallest
   surface, existing customer, and the pool sits idle by design so blocking risk
