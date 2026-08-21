@@ -103,12 +103,47 @@ schedulable rather than hopeful.
 
 This is the part with the sharp edges.
 
-**Membership is per model, and it is a label.** The EPP dispatches to Pods that
-its InferencePool selects. A pool Pod joins model A's pool by carrying the label
-that pool selects (`llm-d.ai/model`, already a constant in
-`internal/constants/labels.go`), and leaves by having it removed. Because it is
-per-model, one Pod can be a member of model A's pool and not model B's — which is
-what makes M>1 tractable.
+**Membership is per model, and it is a label on the Pod.** The EPP dispatches to
+Pods that its InferencePool selects, and selectors select Pods, so this is
+Pod-level by construction.
+
+**Apply the target pool's own selector — do not assume a key.** The pool we
+tested selects `{llm-d.ai/inferenceServing: "true", llm-d.ai/model: <name>}`, but
+a selector belongs to the tenant and another may require `llm-d.ai/role=decode`
+or something else. Membership is therefore "apply exactly the labels in that
+InferencePool's `spec.selector.matchLabels`, and remove exactly those at sleep",
+read from the object. WVA already reconciles InferencePools, so it has them;
+hardcoding `llm-d.ai/model` is a bug waiting for the first tenant who differs.
+
+**A Pod carries one value per key, so it belongs to one model's pool at a time.**
+That fits the one-awake invariant — and is an independent reason M>1 does not
+work: even where memory allowed two awake models, the Pod could join only one
+InferencePool, so the second model's traffic would never reach it. Membership
+caps M at 1 regardless of the KV-cache arithmetic.
+
+**Adoption is not a risk.** Adding another Deployment's labels to a Pod would
+normally invite its ReplicaSet to adopt it; Kubernetes only adopts Pods with no
+controller ownerRef, and pool Pods are owned by the pool's own ReplicaSet. The
+decode ReplicaSet's selector also carries `pod-template-hash`, which a pool Pod
+never has.
+
+### Who writes what: local facts, global decisions
+
+| concern | owner | why |
+| --- | --- | --- |
+| **readiness** — "is a model awake in me?" | the **Pod** (proxy `/readyz`) | a local fact, knowable only there |
+| **membership** — "serve model X for that pool" | **WVA** | a global decision, knowable only from cluster state |
+
+They fail safe in opposite directions, which is what makes the pair robust: if
+WVA dies mid-bridge a stale label remains, but readiness still gates, so the Pod
+leaves service the moment its model sleeps; and a misbehaving Pod can drop itself
+out of service but cannot put itself INTO someone's InferencePool.
+
+**The Pod does not label itself**, deliberately. It would need `pods: patch` in
+the namespace — held by the container that runs model code, the least trusted
+component here — plus `inferencepools: get,list` to know which labels to apply.
+And wake and sleep are ordered sequences; two writers invites the race where a
+Pod re-labels itself just as WVA decides to evict it.
 
 **Readiness is per Pod, and it gates everything.** Measured: a NotReady Pod
 receives zero EPP traffic — no dispatch and no polling.
@@ -131,17 +166,24 @@ taking traffic when its model sleeps, which a patched gate cannot manage.
   stream, and it adds a hop. This is the only new networking code in the design,
   and it is the price of the 3.3x coverage in review §5.1.
 
-**Ordering is load-bearing** and is already measured (admit 462 ms, drain 631 ms):
+**Ordering is load-bearing** and is already measured (admit 462 ms, drain 631 ms,
+wake 355 ms, sleep 70 ms):
 
 ```
-wake:   /wake_up  ->  poll until the engine answers  ->  add model label
-                  ->  set gate true                          (Ready)
-sleep:  set gate false OR remove model label
-                  ->  wait ~1 s (2 s margin)  ->  /sleep
+wake:   label  ->  /wake_up  ->  poll until the engine answers  ->  point the proxy
+                                                                   (Ready; traffic arrives)
+sleep:  clear the proxy  (Ready -> false)  ->  drain ~1 s  ->  unlabel  ->  /sleep
 ```
 
-Sleeping before the traffic is gone is precisely the Ready-but-asleep window that
-produces 503s.
+**The label is deliberately first on wake and last on sleep.** Because readiness
+is what actually admits traffic, labelling early costs nothing and takes the
+EPP's ~460 ms admit latency off the critical path -- it overlaps the wake instead
+of following it.
+
+On sleep the proxy is cleared FIRST, because that is the gate. Unlabelling first
+would also work but propagates more slowly and leaves a window where the Pod is
+Ready, still a pool member, and about to sleep -- which is exactly the
+Ready-but-asleep condition that produces 503s.
 
 ## 4. The supervisor API
 
