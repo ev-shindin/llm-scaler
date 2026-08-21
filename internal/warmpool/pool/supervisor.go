@@ -1,12 +1,10 @@
 package pool
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -135,31 +133,7 @@ func (s *Supervisor) Healthy(ctx context.Context) bool {
 }
 
 func (s *Supervisor) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, s.baseURL+path, reader)
-	if err != nil {
-		return nil, fmt.Errorf("build %s %s: %w", method, path, err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, path, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read %s %s: %w", method, path, err)
-	}
-	if resp.StatusCode >= 300 {
-		return nil, statusError{code: resp.StatusCode, method: method, path: path, body: string(payload)}
-	}
-	return payload, nil
+	return doJSON(ctx, s.client, method, s.baseURL+path, body)
 }
 
 // statusError carries the supervisor's own words. A controller that reports
