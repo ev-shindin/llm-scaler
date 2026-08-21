@@ -111,9 +111,16 @@ per-model, one Pod can be a member of model A's pool and not model B's — which
 what makes M>1 tractable.
 
 **Readiness is per Pod, and it gates everything.** Measured: a NotReady Pod
-receives zero EPP traffic — no dispatch and no polling. A readiness **gate**
-(`wva.llm-d.ai/warm-ready`) declared in the template lets WVA hold the Pod out of
-service until an engine actually answers, and drop it on drain.
+receives zero EPP traffic — no dispatch and no polling.
+
+An earlier draft proposed a readiness **gate** that WVA patches. **That was
+wrong, and needlessly expensive.** The proxy already knows whether a model is
+awake, so an ordinary `readinessProbe` against its `/readyz` does the same job:
+200 when a model is awake, 503 otherwise. FMA reaches the same conclusion from
+the other side — it never writes Pod status at all, and derives the serving port
+from the requester's own readinessProbe. Two things follow: the controller needs
+no `pods/status` permission (§9), and a Pod whose controller has died still stops
+taking traffic when its model sleeps, which a patched gate cannot manage.
 
 **The port is the constraint that limits M.** The EPP dials the InferencePool's
 `targetPortNumber` — typically 8000 — and only one process in a Pod can bind it.
@@ -268,20 +275,15 @@ Today the manager ClusterRole has `pods: get, list, watch`. The pool needs:
 
 | resource | verb | why |
 | --- | --- | --- |
-| `pods/status` | `patch` | set the readiness gate condition |
 | `pods` | `patch` | add/remove the model label (membership) |
 | `deployments` | `create, update, patch` | own the pool Deployments |
 
-**Patching pod status cluster-wide is a notable privilege**, and it should be
-scoped to the pool namespace rather than granted cluster-wide wherever the install
-allows it. This belongs in the prereqs phase of the installer, and it is the kind
-of thing that will be asked about in review, so it should be stated in the guide
-rather than discovered in a ClusterRole diff.
-
-**Trap, already paid for:** a JSON *merge* patch on pod conditions REPLACES the
-array and wipes `Ready`. Conditions carry `patchMergeKey: type` — use a
-**strategic** merge. This exact patch produced a spurious measurement once
-already.
+**`pods/status` is NOT needed**, which is the second thing the readiness probe
+buys (§3). An earlier draft asked for it to satisfy a readiness gate and called
+it "a notable privilege" — correctly, which is why not needing it matters. It
+also retires the trap that came with it: a JSON *merge* patch on pod conditions
+replaces the array and wipes `Ready`, and that patch produced a spurious
+measurement once already. There is now no such patch.
 
 ## 10. Failure modes, and what each degrades to
 

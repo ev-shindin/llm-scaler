@@ -215,3 +215,31 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder) upstreamBody {
 	}
 	return body
 }
+
+func TestReadinessFollowsWhetherAModelIsAwake(t *testing.T) {
+	// The Pod must leave its InferencePool when it sleeps. Doing that through an
+	// ordinary readinessProbe rather than a patched readiness gate is what keeps
+	// the controller out of `pods/status` -- and means a Pod stops taking
+	// traffic even if the controller is gone.
+	s := New(DefaultConfig)
+
+	rec := httptest.NewRecorder()
+	s.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, ReadyPath, nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("asleep Pod must not be ready, got %d", rec.Code)
+	}
+
+	s.SetUpstream("127.0.0.1:9001")
+	rec = httptest.NewRecorder()
+	s.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, ReadyPath, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("awake Pod must be ready, got %d", rec.Code)
+	}
+
+	s.SetUpstream("")
+	rec = httptest.NewRecorder()
+	s.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, ReadyPath, nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Pod must leave the pool when the model sleeps, got %d", rec.Code)
+	}
+}

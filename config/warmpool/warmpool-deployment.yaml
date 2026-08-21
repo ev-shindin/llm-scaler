@@ -105,6 +105,49 @@ spec:
               port: supervisor
             initialDelaySeconds: 5
             periodSeconds: 10
+        # The Pod's serving port. Engines bind their own ports for life and a
+        # sleeping process keeps its socket, so they cannot take turns binding
+        # the port the InferencePool dials. This owns it and follows whichever
+        # model is awake; WVA re-points it through the control endpoint.
+        - name: proxy
+          image: ghcr.io/ev-shindin/warmpool-proxy:v2
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8000
+            - --control-port=8002
+            - --v=2
+          ports:
+            - name: serving
+              containerPort: 8000
+              protocol: TCP
+            - name: proxy-control
+              containerPort: 8002
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy-control
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            # THIS is what holds the Pod out of its InferencePool while it
+            # sleeps: /readyz answers 200 only when a model is awake here.
+            #
+            # An ordinary probe rather than a readiness GATE that WVA patches --
+            # Fast Model Actuation reaches the same conclusion from the other
+            # side, never writing Pod status and leaving readiness to the
+            # kubelet. So the controller needs no `pods/status` permission, and
+            # a Pod whose controller has died still stops taking traffic when
+            # its model sleeps.
+            httpGet:
+              path: /readyz
+              port: proxy-control
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
       volumes:
         - name: model-cache
           persistentVolumeClaim:

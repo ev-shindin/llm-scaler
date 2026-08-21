@@ -180,6 +180,28 @@ func copyThenHalfClose(dst, src net.Conn, done chan<- struct{}) {
 // UpstreamPath is where the control endpoint lives.
 const UpstreamPath = "/upstream"
 
+// ReadyPath is the Pod's readiness probe.
+const ReadyPath = "/readyz"
+
+// ReadyHandler reports whether this Pod should receive traffic: it is ready
+// exactly when a model is awake in it.
+//
+// This is how the Pod is kept out of its InferencePool while asleep, and it is
+// deliberately an ordinary readinessProbe rather than a readiness GATE that WVA
+// patches. Fast Model Actuation reaches the same conclusion from the other side:
+// it never writes Pod status, and derives the serving port from the requester's
+// own readinessProbe, leaving readiness to the kubelet. Doing the same here
+// means the controller needs no `pods/status` permission, and a Pod whose
+// controller has died still stops taking traffic when its model sleeps.
+func (s *Server) ReadyHandler(w http.ResponseWriter, _ *http.Request) {
+	if s.Upstream() == "" {
+		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
+}
+
 type upstreamBody struct {
 	Address string `json:"address"`
 }
