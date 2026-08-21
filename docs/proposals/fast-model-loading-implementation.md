@@ -243,6 +243,191 @@ The mechanism is small; the policy is the product.
 All four are pure functions over `[]Membership` plus demand — unit-testable with no
 cluster, which is where the test weight should sit.
 
+## 7a. Scaling logic: borrow the bridge, return it, keep a reserve
+
+The pool exists to cover the ~41 s (measured: 33-37 s here) between "more
+capacity is wanted" and "an ordinary replica serves". So a scale-up **borrows**
+pool capacity, and gives it back when the ordinary replicas arrive.
+
+### 7a.1 Pod states, and what `sleepMinSize` counts
+
+The invariant is one awake instance per Pod, so a pool Pod is in exactly one of
+two states:
+
+| state | meaning | in its InferencePool? | Ready? |
+| --- | --- | --- | --- |
+| **free** | every instance asleep | no | **no** — `/readyz` 503 |
+| **lent** | one instance awake, serving | yes, for that model | yes |
+
+`sleepMinSize` is the floor on **free** Pods: the reserve the pool keeps for the
+next spike. It is not a count of sleeping *instances* — a Pod with eight models
+resident and one awake is lent, not free, because it can serve no further wake.
+
+```
+free(pool)      = |{ Pod : every instance asleep }|
+lent(pool)      = |{ Pod : one instance awake }|
+replicas(pool)  = free + lent          # the pool Deployment's size
+invariant:        free >= sleepMinSize   (maintained by scaling the pool)
+```
+
+`sleepMinSize` is the K of the loss model in the review: the number of concurrent
+spikes the pool can cover before one is blocked.
+
+### 7a.2 Scale-up: borrow N, and start N
+
+WVA decides a variant needs `N` more replicas. Both things happen at once:
+
+```
+on scale_up(variant, N):
+    ordinary.desired += N                       # ~33-37 s to serve
+    candidates = free pods with `variant` resident
+    borrow     = min(N, |candidates|)
+    for pod in first `borrow` candidates:       # ~0.44 s each to serve
+        wake(pod, variant)                      # /wake_up, then point the proxy
+        label(pod, variant)                     # joins the InferencePool
+        pod.hold_until = now + maxHoldSeconds
+    record: hits=borrow, blocked=(N - borrow if candidates exhausted)
+            misses=(N - borrow if variant not resident anywhere)
+```
+
+Both paths run; neither waits for the other. If the pool covers the whole spike
+the user sees capacity in under a second; if it covers none the behaviour is
+exactly today's. **Nothing is worse than today in any branch** — that is what
+makes the pool safe to switch on.
+
+`blocked` and `misses` are recorded separately because they say different things:
+a block means the reserve was too small (raise `sleepMinSize`), a miss means the
+warm set was wrong (raise the warm set, or change what is admitted to it).
+
+### 7a.3 Handover: return as soon as the ordinary replicas serve
+
+```
+on ordinary.ready >= ordinary.desired (for the variant):
+    for pod in lent pods of `variant`:
+        unlabel(pod)                  # leaves the InferencePool
+        wait drain (~0.7 s measured)
+        clear the proxy upstream      # /readyz -> 503, Pod NotReady
+        sleep(pod, variant)           # ~70 ms
+```
+
+Ordering is load-bearing and already measured: unlabel and drain **before**
+sleeping, because sleeping first leaves a Ready-but-asleep window, which is
+exactly the 503 condition.
+
+`maxHoldSeconds` bounds it. If the ordinary replicas never arrive — quota,
+unschedulable, image pull — the borrowed Pod is returned anyway, with an event
+saying why. That is deliberate: holding indefinitely converts insurance into
+capacity, and a pool permanently lent to one variant covers nobody else. The
+variant then degrades to what it would have had without a pool.
+
+### 7a.4 Scale-down: return borrowed Pods first
+
+```
+on scale_down(variant, N):
+    give_back = min(N, |lent pods of variant|)
+    return those Pods first (as in 7a.3)
+    ordinary.desired -= (N - give_back)
+```
+
+Two reasons this order, not the other:
+
+- A borrowed Pod is **temporary by construction**; an ordinary replica is the
+  steady state. Shrinking the steady state while a bridge is still up would
+  leave the variant depending on capacity that is about to be taken away.
+- A returned Pod immediately becomes reserve for **every** model in the pool,
+  whereas an ordinary replica freed to the cluster helps only whoever the
+  scheduler gives its GPU to next.
+
+### 7a.5 The accounting rule, which is where this goes wrong
+
+**Pool capacity must not be counted as capacity when deciding how much to
+scale.** A lent Pod serves traffic, so it lowers queueing and per-replica load on
+the ordinary replicas. If the optimizer sees that relief, it concludes no
+scale-up is needed, the ordinary replicas never arrive, the handover never
+fires — and the pool stays lent forever, having *prevented* the very scale-up it
+exists to cover. The mechanism would quietly convert itself from insurance into
+permanent capacity for whichever variant spiked first.
+
+So:
+
+```
+demand   = measured from the ROUTER (arrival rate, queue at the EPP)  -- includes
+           traffic served by lent Pods, which is correct: it is real demand
+capacity = ordinary READY replicas x per-replica capacity             -- lent Pods
+           are excluded, deliberately
+desired  = f(demand, capacity)   as today
+```
+
+Concretely, in this codebase: `wva_current_replicas` comes from the scale target,
+which is the ordinary Deployment, so the *count* is already right. What is not
+automatically right is **attribution** — a lent Pod carries the variant's
+`llm-d.ai/model` label to join the InferencePool, so the collector will otherwise
+scrape it as a replica of that variant and average its metrics in. Pool Pods must
+be excluded from replica attribution by their `app.kubernetes.io/component:
+warm-pool` label, while the router-side demand metrics stay untouched.
+
+This is the same shape as the FMA attribution problem already documented in
+`fma-aware-attribution.md`: an engine serving a variant from a Pod that no
+ScaledObject owns. The difference is that here we own both sides, so the rule can
+simply be stated and enforced.
+
+### 7a.6 Replenishing the reserve
+
+After a borrow, `free` has dropped. Two ways back, in order of preference:
+
+1. **A handover returns the Pod** — the normal case, and free again in ~1 s.
+2. **Grow the pool** when `free < sleepMinSize` and the shortfall persists past a
+   debounce window: `replicas(pool) += sleepMinSize - free`. A new Pod is useful
+   only once it has models resident, and admission costs a full load (~37 s), so
+   growth is slow by nature and must not be triggered by a transient borrow.
+
+Shrinking back is the mirror, and deliberately lazier: `free > sleepMinSize +
+slack` for a sustained period. A Pod deleted is a warm set thrown away, so the
+cost of shrinking too eagerly is paid on the next spike as misses.
+
+**`sleepMinSize` is a floor, not a target.** The pool may hold more free Pods than
+it — that is what makes a burst of concurrent spikes survivable.
+
+### 7a.7 Edge cases, and what each does
+
+| case | behaviour |
+| --- | --- |
+| `N` > free Pods with the model resident | borrow what exists, record the rest as blocked; ordinary path covers them |
+| model resident nowhere | miss; optionally admit it to a free Pod for *next* time (policy) |
+| a second spike for the same variant while lent | borrow another free Pod; a lent Pod cannot be lent twice |
+| ordinary replicas arrive before the wake finishes | sleep immediately; the wake was wasted, not harmful |
+| lent Pod dies | it leaves the InferencePool with the Pod; ordinary path unaffected |
+| scale to zero with the variant still resident | this is parking: keep it resident, no ordinary replicas at all |
+| WVA restarts while Pods are lent | reconcile from observed state -- lent is discoverable from labels plus the supervisor's instance list, not from memory |
+
+### 7a.8 Configuration
+
+```yaml
+pools:
+  - name: h100-tp1-ram
+    replicas: 4              # free + lent
+    sleepMinSize: 2          # floor on free -- the reserve
+    maxHoldSeconds: 120      # a borrowed Pod is returned by then, always
+    growDebounceSeconds: 60  # how long free < sleepMinSize before growing
+    shrinkSlack: 1           # free must exceed sleepMinSize by this to shrink
+```
+
+### 7a.9 What to measure once it runs
+
+Both ratios that decide whether any of this pays, plus the two that say which
+knob is wrong:
+
+```
+wva_warmpool_free_pods                 vs sleepMinSize  -- is the reserve holding?
+wva_warmpool_borrow_total{outcome}     hit | blocked | miss
+wva_warmpool_bridge_seconds            borrow -> handover: how long a bridge lasts
+wva_warmpool_hold_expired_total        bridges returned because ordinary never came
+```
+
+`bridge_seconds` is the honest measure of what the pool is worth: it should track
+the ordinary start time (~33-37 s). If it sits at `maxHoldSeconds`, ordinary
+scale-ups are failing and the pool is masking it.
+
 ## 8. Configuration
 
 ConfigMap, in the shape the repo already uses for scaling policy:
