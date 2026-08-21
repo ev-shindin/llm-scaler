@@ -33,6 +33,43 @@ Reuse-versus-rewrite of the supervisor is a real decision, deferred to §11: the
 FMA launcher is proven and has the CRUD API already, but it arrives with the
 dual-pods assumptions attached.
 
+### 1a. And the reuse case is stronger than "the supervisor"
+
+A sweep of the older documents (prompted by asking whether FMA already supports
+M>1) says the pool may not need building at all:
+
+- **`maxInstances: 4` per launcher and `--sleeper-limit=2` per GPU are already
+  running on pokprod.** Several models resident on one GPU is a *flag*, not a
+  feature to build. A sleeper costs ~1.4 GiB of GPU memory, so on an 80 GiB card
+  memory is nowhere near binding — **`--sleeper-limit` is**, and it is
+  controller-global rather than per pool (upstream ask 4).
+- **Requester Pods already solve the traffic problem** that §3 solves with labels
+  and a router. Each requester is an ordinary Pod with its own IP, so port 8000
+  is free in every one, membership is ordinary Deployment labelling, and the
+  requester's TCP proxy landed upstream in `2c01cf8`. **That deletes item 9 (the
+  model-aware local router) from §11 entirely.**
+- The shared-pool plan's conclusion was explicit: **"Do not fork FMA"** — the
+  mechanism is a flag plus an allocation policy, and the allocation policy is
+  WVA's job. Which is the same conclusion §7 of this document reaches from the
+  other direction.
+
+**So the recommendation changes.** Do not build a parallel pool. Take FMA's
+launcher-plus-requester as the data plane, raise `--sleeper-limit` to the number
+of models a GPU should cover, and put the allocation policy in WVA — which is
+what it is for. What remains genuinely unresolved is narrower and sharper than
+"should we fork":
+
+| question | status |
+| --- | --- |
+| GPU ownership: launcher holds no GPU, requester does | the parking failure mode. Needs inversion (a fork) **or** acceptance that only bound sleepers are reliable |
+| warmth decay: the populator reaps launchers | no knob until upstream ask 2 (`minLauncherCount`) |
+| per-pool `--sleeper-limit` | upstream ask 4 |
+| a launcher hosting several instances cannot be scraped | upstream ask 3 — this one blocks *measuring* M>1 |
+
+The rest of this document — objects, ports, state machine, policy, RBAC — still
+describes what WVA must do, whether the Pods are ours or FMA's. Read §2-§4 as the
+shape of a pool we build only if reusing FMA's is refused.
+
 ## 2. Objects
 
 One **Deployment per pool**, where a pool is a `(accelerator, TP size, tier)`

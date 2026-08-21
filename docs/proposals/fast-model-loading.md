@@ -222,24 +222,56 @@ used by others while our sleeper's card held 1,399 MiB and was the only one free
 
 **Consequence:** a warm copy that does not own its device is not merely slower, it
 is unreliable. Every design where the sleeper is a passenger (FMA launchers
-request no GPU; the requester holds it) inherits this. It also re-explains the
-whole measurement history — 0 woke/3 rebuilt twice, then 1 woke/2 rebuilt — better
-than the GPU-UUID mismatch story that preceded it.
+request no GPU; the requester holds it) inherits this.
+
+**But this is not the only failure mode, and an earlier draft of this section
+wrongly implied it explains the whole measurement history.** There are two, and
+they bite in different situations:
+
+| failure | cause | evidence | who suffers |
+| --- | --- | --- | --- |
+| requester lands where no warm capacity is | binding is **node-local** | 0 woke / 3 rebuilt: two requesters landed on nodes hosting no launcher at all | **burst** |
+| sleeper's device was released and taken | GPU held by the requester, not the sleeper | 2 of 3 unbound sleepers unwakeable, `cumem` errors | **parking** |
+
+The first is fixed, by configuration, and the result is decisive: pinning
+requesters to the launcher node set and changing nothing else gave **3 woke / 0
+rebuilt at 2 s, 3 s, 3 s — roughly 90 s down to 3 s, with no code change.**
+
+So warm wakes already work today when placement is right. The GPU-ownership
+problem is specific to a sleeper that must survive while **no requester holds the
+device** — which is exactly the parking case, and not the burst case.
 
 ### 3.2 Storage-backed sleep does not pay on shared storage, and we do not fully know why
 
-Level-2 sleep discards weights and re-reads them on wake. Measured on this
-cluster's shared filesystem: **8 B model, ~37 s [M]** — against a ~41 s cold
-start. Nearly the whole benefit is gone.
+Level-2 sleep discards weights and re-reads them on wake. The often-quoted "8 B
+wakes in ~37 s on this PVC" is an **extrapolation [P], not a measurement** — and
+tracking it down resolves what an earlier draft called an unexplained gap.
 
-But the raw bandwidth measurement does not explain that. `B_storage` measured
-**1.7 GB/s cold** (O_DIRECT), and 8 B at fp16 is ~16 GB, predicting **~9.4 s [P]**.
-The measured wake is **four times** the bandwidth prediction.
+Two different numbers exist for the same filesystem, and they measure different
+things:
 
-**Something other than read bandwidth dominates level-2 wake, and it has not been
-identified.** That gap matters directly now that local NVMe is permitted: if the
-missing 27 s is engine re-initialisation rather than I/O, faster disks will not
-recover it, and the NVMe tier will disappoint exactly as the shared tier did.
+| figure | method | implied bandwidth |
+| --- | --- | --- |
+| 1.5 GB safetensors read in **~2.8 s [M]** | as the engine actually loads it | **~430-540 MB/s** |
+| **1.7 GB/s [M]** cold | raw sequential, O_DIRECT | 4x higher |
+
+The 37 s came from extrapolating the first to 16 GB; the 9.4 s from the second.
+There is no missing 27 s — there is an engine load path running at roughly a
+quarter of the device's raw sequential bandwidth, which is ordinary.
+
+**The consequence still stands, and is now better founded:** what a faster disk
+buys is bounded by the loader, not by the disk. Before committing to an NVMe
+tier, measure the engine's *effective* load bandwidth on NVMe, not the device's.
+
+**And storage is not what makes a cold start slow.** Measured directly: the same
+1.5 GB read takes ~2.8 s whether or not that launcher has ever served the model,
+because `/model-cache` is a shared RWX mount and there is no per-node download.
+Of a ~41 s cold start, `torch.compile` is only ~3 s once the shared compile cache
+hits (12.35 s on a miss), engine init ~9.3 s, weights ~2.8 s. **The remaining
+~32 s is process spawn, vLLM import, weight load, profiling, warmup and API
+startup** — none of which a cache removes and all of which sleep mode skips.
+That is the real reason a warm wake wins, and it is stronger than "we avoid
+reading the weights".
 Identifying it is a prerequisite, not a detail.
 
 ### 3.3 What is already settled and needs no further work
@@ -341,12 +373,29 @@ admission refusal per §3.5.
 
 ### 5.1 Awake slots per GPU
 
-A Pod may hold **M simultaneously awake instances** on one GPU, not one. This was
-measured to work mechanically -- two instances on the same GPU UUID, the sleeper
-at 1,399 MiB alongside a live instance at 14,339 MiB, back to 1,399 MiB on delete
-with no leak and the sleeper's state undisturbed -- but no design used it.
+A Pod may hold **M simultaneously awake instances** on one GPU, not one.
 
-It should, because more servers pay superlinearly in a loss system:
+**What the existing measurements actually show, stated precisely, because an
+earlier draft of this section overstated them:**
+
+- one **sleeper** (1,399 MiB) coexisting with one **awake** instance at
+  `--gpu-memory-utilization 0.15` (14,339 MiB) on the same GPU UUID, back to
+  1,399 MiB on delete, no leak, sleep state undisturbed;
+- `total=2 running=2` in one launcher — but on **two different GPUs**;
+- the cluster already runs `--sleeper-limit=2` (sleepers per GPU) and
+  `maxInstances: 4` (instances per launcher).
+
+**Two simultaneously awake instances on ONE GPU has not been demonstrated**, and
+the shared-pool plan asserts the opposite is the practical case: "only one
+instance per GPU can be awake at a realistic `gpu-memory-utilization`".
+
+That is the real constraint on M, and it is a budget, not a barrier: two awake
+instances need utilisation split between them, so each gets roughly half the KV
+cache and therefore half the batch width. The coverage below is what M buys; the
+KV split is what it costs, and no measurement of that trade exists yet.
+
+The arithmetic is still worth having, because more servers pay superlinearly in a
+loss system:
 
 | GPUs held | M=1 | M=2 | M=3 |
 | --- | --- | --- | --- |
@@ -370,8 +419,10 @@ bridge holds its slot longer, so W scales with it:
 | 2.0x | 120 s | 108 | 65 |
 | 3.0x | 180 s | 72 | 65 |
 
-Even at 3x, M=2 still wins. What is unmeasured is the penalty itself under
-concurrent load -- one experiment, and it sets M rather than deciding it.
+Even at 3x, M=2 still wins **if two awake instances are possible at all**. Two
+things are unmeasured, not one: whether two engines can be awake on one GPU at a
+utilisation that leaves each a usable KV cache, and the throughput penalty when
+they are. The first decides whether M>1 exists; the second sets its value.
 
 Like sleep level, **M is a pool property, not a runtime knob**: vLLM fixes
 `gpu_memory_utilization` at process start and Pod resources are immutable. It also
@@ -407,8 +458,18 @@ that is a feature.
   stop, or continue with parking only.
 - **Phase 1 — parking on tier A.** One RAM-backed pool, warm parking for
   scaled-to-zero models, driven by the existing scale-to-zero path. Smallest
-  surface, existing customer, no fork, and the pool sits idle by design so
-  blocking risk is lowest.
+  surface, existing customer, and the pool sits idle by design so blocking risk
+  is lowest.
+
+  **With one blocker that has to be solved first, and it was missed in the first
+  draft of this document.** Warmth decays while a model is parked: FMA's
+  populator reaps launchers it considers excess, so a model parked for minutes
+  wakes warm and one parked overnight wakes cold. `retentionPeriod` chooses when
+  a model parks; **nothing chooses how long its warmth survives**, and there is
+  no knob until upstream ask 2 (`minLauncherCount`) lands. Until then **no wake
+  SLO can honestly be quoted for a long-parked model** — which is most of the
+  parking case. Phase 1 therefore needs either that upstream change, a fork, or
+  an explicit scope of "recently parked only".
 - **Phase 2 — burst on the same pool.** Same mechanism, hold timeouts and
   handover to ordinary replicas. Requires phase 0 to have passed.
 - **Phase 3 — tier B, only if item 4 says it exists.**
