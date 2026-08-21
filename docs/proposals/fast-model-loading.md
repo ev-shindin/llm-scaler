@@ -81,7 +81,64 @@ Read as coverage, at a 2% blocking target and a 60 s hold:
 At one spike per model per hour, **K=4 covers 65 models** — 4 GPUs where per-model
 headroom would need 65, a 94% saving. That is the case, and it is a strong one.
 
-### 2.3 The assumption the whole case rests on
+### 2.3 Capacity is not coverage: the pool is a cache
+
+The loss model above answers "is a slot free?". It quietly assumes any free slot
+can serve any model, and that is false: **a slot only helps if that Pod already
+holds the model's weights.** Otherwise the spike pays full admission and gets
+today's behaviour. Coverage is therefore two independent questions:
+
+- **capacity** — is a slot free? Erlang B, §2.2.
+- **membership** — is my model resident anywhere? A *cache* question, and one the
+  earlier documents never asked.
+
+With P Pods each holding a warm set of S models, the pool holds `C = P x S`
+memberships across N models. So the pool is a **cache of loaded models**, sized by
+the working set rather than by the model count, and inference popularity is
+strongly skewed, which is what makes a small cache viable:
+
+| N models | skew | C=16 | C=32 | C=64 | C=128 |
+| --- | --- | --- | --- | --- | --- |
+| 100 | Zipf s=1.0 | 65% | 78% | 91% | 100% |
+| 200 | Zipf s=1.0 | 58% | 69% | 81% | 92% |
+| 500 | Zipf s=1.0 | 50% | 60% | 70% | 80% |
+| 500 | Zipf s=0.8 | 34% | 43% | 55% | 68% |
+
+**A miss costs exactly what today costs** — the cold path — so the pool degrades
+gracefully and can be switched off without risk. That also fixes the headline
+claim, which was overstated:
+
+```
+effective mean wake  =  hit x ~3 s  +  (1 - hit) x ~41 s
+```
+
+| N=200, Zipf s=1.0 | hit rate | mean wake |
+| --- | --- | --- |
+| C=16 | 58% | 19.1 s |
+| C=32 | 69% | 14.8 s |
+| C=64 | 81% | 10.3 s |
+| C=128 | 92% | 5.9 s |
+
+**The pool does not deliver 3 s. It delivers ~3 s to most spikes and ~41 s to the
+rest** — a mean around 10 s at a plausible size, against 41 s today. That is the
+number to put in front of anyone paying for it, and it is still a 4x improvement.
+
+**This also gives the tiers their real job.** Memberships at level 1 cost host RAM
+equal to the weights — 64 warm copies of an 8 B model is ~1 TB across the pool.
+Level 2 memberships cost almost nothing in RAM.
+
+> **Tier A buys cache SPEED. Tier B buys cache SIZE.**
+
+Which is a two-level cache: hot models resident in RAM, warm models on local
+disk, everything else cold. That is a better argument for building both tiers
+than the current design's ("we have not measured which wins"), and it is
+conditional on the same open question — whether level-2 wake is I/O-bound at all
+(§3.2).
+
+**Sizing therefore needs two numbers, not one:** K slots for capacity, C
+memberships for coverage. Only K was ever discussed.
+
+### 2.4 The assumption the whole case rests on
 
 **Spikes must be close to independent.** Erlang B assumes arrivals do not
 coordinate. Real inference traffic often does: a business-hours ramp lifts every
@@ -106,7 +163,7 @@ The rest of the sizing inputs are equally measurable and equally unmeasured:
 **No pool should be built before these three numbers exist.** They are hours of
 querying, not weeks of engineering, and they decide both K and whether to proceed.
 
-### 2.4 The sensitivity that can kill the burst case
+### 2.5 The sensitivity that can kill the burst case
 
 ```
 payout per spike = T_ordinary - T_wake
@@ -126,7 +183,7 @@ door (§4.4).
 back to parking only. Parking survives, because at zero replicas the alternative
 is not a faster start but no start at all.
 
-### 2.5 Where parking's economics differ
+### 2.6 Where parking's economics differ
 
 For a parked model there is no spare replica to compare against — the model is at
 zero by choice. The comparison is:
@@ -274,17 +331,65 @@ consequence: anti-affinity of models across Pods (models on one card contend for
 the single awake slot), eviction when the warm set is full, hold timeouts, and
 admission refusal per §3.5.
 
+
+### 5.1 Awake slots per GPU
+
+A Pod may hold **M simultaneously awake instances** on one GPU, not one. This was
+measured to work mechanically -- two instances on the same GPU UUID, the sleeper
+at 1,399 MiB alongside a live instance at 14,339 MiB, back to 1,399 MiB on delete
+with no leak and the sleeper's state undisturbed -- but no design used it.
+
+It should, because more servers pay superlinearly in a loss system:
+
+| GPUs held | M=1 | M=2 | M=3 |
+| --- | --- | --- | --- |
+| K=2 | 13 models | 65 | 136 |
+| K=4 | 65 | 217 | 396 |
+| K=8 | 217 | 589 | 997 |
+
+**3.3x the coverage for the same GPUs at K=4.** The objection is that co-resident
+engines split HBM bandwidth and decode is bandwidth-bound, so both run slower --
+disqualifying for steady-state serving. **It is not disqualifying here**, because
+the pool serves only during the bridge, so the penalty is bounded in time by
+construction, and a degraded bridge beats 41 s of nothing.
+
+The conclusion is robust to being wrong about the size of the penalty. A slower
+bridge holds its slot longer, so W scales with it:
+
+| bridge penalty | W | M=2 covers | vs M=1 |
+| --- | --- | --- | --- |
+| 1.0x | 60 s | 217 | 65 |
+| 1.5x | 90 s | 145 | 65 |
+| 2.0x | 120 s | 108 | 65 |
+| 3.0x | 180 s | 72 | 65 |
+
+Even at 3x, M=2 still wins. What is unmeasured is the penalty itself under
+concurrent load -- one experiment, and it sets M rather than deciding it.
+
+Like sleep level, **M is a pool property, not a runtime knob**: vLLM fixes
+`gpu_memory_utilization` at process start and Pod resources are immutable. It also
+relaxes an existing design rule -- models on one card no longer contend for a
+single awake slot, so the warm set wants spreading such that expected concurrent
+wakes per Pod stay under M, rather than blanket anti-affinity.
+
+**MIG is the wrong tool for this.** Slices are fixed at node configuration time
+and cannot be resized without draining the node, which is backwards for a pool
+whose entire value is dynamic reuse across heterogeneous models; and the slice
+caps model size. MIG suits static per-tenant partitioning, not a shared cache.
+
 ## 6. What must be measured, in order
 
 | # | measurement | decides | cost |
 | --- | --- | --- | --- |
-| 1 | Spike **correlation** across models (§2.3) | whether a shared pool works at all | hours, from existing metrics |
-| 2 | `lambda` and `W` (§2.3) | K, and the coverage ratio | hours, same source |
-| 3 | `T_ordinary` on the target cluster | whether the burst case survives (§2.4) | already instrumented |
+| 1 | Spike **correlation** across models (§2.4) | whether a shared pool works at all | hours, from existing metrics |
+| 2 | `lambda` and `W` (§2.4) | K, and the coverage ratio | hours, same source |
+| 3 | `T_ordinary` on the target cluster | whether the burst case survives (§2.5) | already instrumented |
 | 4 | The 27 s gap in level-2 wake (§3.2) | whether tier B exists | one experiment |
 | 5 | Concurrent-wake bandwidth | whether K wakes at once share a bottleneck | one experiment |
+| 6 | **Popularity skew** across models | C, the membership budget, and the honest mean-wake claim (§2.3) | hours, from EPP per-model request counts |
+| 7 | **Co-residency penalty** under load | M, awake slots per GPU (§5.1) | one experiment |
 
-1-3 are queries against metrics WVA already emits. **They should be done before
+1-3 and 6 are queries against metrics WVA and the EPP already emit. **They should be done before
 any code is written**, because they can each independently end the project, and
 that is a feature.
 
@@ -307,7 +412,7 @@ is the phase whose economics can be invalidated by work happening elsewhere.
 
 ## 8. Open questions
 
-- **Correlation is unmeasured and can end this.** (§2.3)
+- **Correlation is unmeasured and can end this.** (§2.4)
 - **The level-2 27 s gap is unexplained.** (§3.2)
 - **Multi-node (LWS) sleep has never been demonstrated**, and vLLM's own RFC defers
   it. Out of scope until phase 3 at the earliest.
