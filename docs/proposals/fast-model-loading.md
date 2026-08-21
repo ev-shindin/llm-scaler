@@ -199,6 +199,42 @@ most of the responsiveness of min=1. Its buyer is anyone who wants to park model
 but cannot accept a 41 s first request — and its coverage ratio is even better
 than burst's, because parked models spike rarely by definition.
 
+## 2.7 The pool was built and measured (2026-08-21)
+
+Not a projection. A GPU-**holding** pool Pod was deployed to pokprod
+(`config/warmpool/`), two models were made resident in it, and every number below
+was measured on it the same day.
+
+| step | measured |
+| --- | --- |
+| create an instance -> engine serving | **~37 s** |
+| `/sleep` level 1 | **~70 ms**, GPU 77,782 MiB -> **1,386 MiB** |
+| `/wake_up` | **~355 ms** |
+| engine answers after wake | **~8 ms** |
+| **full switch: sleep one model, wake another, first answer** | **~437 ms** |
+| output after a wake | correct (`2+2=` -> `4`) |
+
+Four consecutive switches in both directions: 435, 439, 440, 435 ms. **A ~41 s
+cold start becomes ~0.44 s** — two orders of magnitude, and an order better than
+the 2-3 s FMA wakes, because nothing here binds a Pod or schedules anything: both
+models are already resident in the Pod that serves them.
+
+Two models on one 80 GiB card: **75,670 MiB awake alongside 1,466 MiB asleep.**
+That is the warm-set arithmetic made concrete — a sleeper costs ~1.4 GiB, so the
+warm set per GPU is bounded by what the AWAKE model leaves behind.
+`--gpu-memory-utilization` is therefore the knob that trades KV cache for
+coverage: at 0.90 about four sleepers fit beside the awake model; at 0.50 roughly
+twenty-eight would.
+
+**And no sleeper failed to wake.** The failure that motivated this whole design —
+two of three unbound sleepers dead with `cumem` errors — did not occur, because
+the Pod holds its GPUs for as long as it holds models.
+
+What this does NOT yet show: traffic actually served through an InferencePool
+(the proxy and readiness gate are built but not wired), behaviour under
+concurrent load, more than two models, or anything about how often a real fleet
+would hit rather than miss (§6.1).
+
 ## 3. What measurement already forces
 
 These are settled by experiment and constrain any design, whatever mechanism it

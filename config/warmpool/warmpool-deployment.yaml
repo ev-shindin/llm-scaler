@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wva-warm-pool
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  # K: how many models the pool can have AWAKE at once, one per Pod. Start at 1
+  # and size it from measurement -- the loss model in
+  # docs/proposals/fast-model-loading.md turns spike rate and hold time into K,
+  # and neither has been measured on a fleet with organic traffic.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workload-variant-autoscaler
+      app.kubernetes.io/component: warm-pool
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workload-variant-autoscaler
+        app.kubernetes.io/component: warm-pool
+        # Membership in a model's InferencePool is added and removed by WVA at
+        # wake and sleep. Nothing here claims a model: an idle pool Pod belongs
+        # to no InferencePool and receives no traffic.
+    spec:
+      # The NVIDIA device plugin hands GPUs to a CONTAINER, so every engine in
+      # this Pod lives in one container under the supervisor.
+      runtimeClassName: nvidia-legacy
+      containers:
+        - name: inference-server
+          # The launcher published by Fast Model Actuation: it spawns and
+          # supervises vLLM engines inside this container. Copied into
+          # warmpool/supervisor/ so the source is readable here; the image is
+          # theirs because it is the one proven on this cluster.
+          image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              exec python3 /app/launcher.py \
+              --host 0.0.0.0 \
+              --log-level info \
+              --port=8001
+          ports:
+            - name: supervisor
+              containerPort: 8001
+              protocol: TCP
+          env:
+            # Every cache under the shared PVC, so a model loaded once is loaded
+            # for every Pod: measured on this cluster, a 1.5 GB weight read takes
+            # ~2.8 s whether or not this node has served the model before, and
+            # the shared torch.compile cache cuts compilation from 12.35 s to
+            # 3.08 s.
+            - name: HOME
+              value: /model-cache
+            - name: HF_HOME
+              value: /model-cache
+            - name: VLLM_CACHE_ROOT
+              value: /model-cache/vllm
+            - name: FLASHINFER_WORKSPACE_DIR
+              value: /model-cache/flashinfer
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/triton
+            - name: XDG_CACHE_HOME
+              value: /model-cache
+            - name: XDG_CONFIG_HOME
+              value: /model-cache/config
+            # vLLM 0.22+ computes an inductor cache dir at import through
+            # getpass.getuser(), which raises KeyError under OpenShift's
+            # arbitrary UID because it has no /etc/passwd entry. Seeding USER
+            # makes getpass read the environment instead.
+            # https://github.com/vllm-project/vllm/issues/44548
+            - name: USER
+              value: vllm
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            limits:
+              # THE ONE STRUCTURAL DIFFERENCE FROM FMA. Its controller strips
+              # this from the launcher Pod (removeGPUResourceLimits) and gives
+              # the GPU to a transient requester instead. When that requester
+              # goes, the allocation is released while sleeping engines still
+              # hold cumem handles into that device -- and another tenant takes
+              # it. Measured: two of three unbound sleepers could not be woken
+              # at all. The pool keeps its GPUs for as long as it keeps models.
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+          readinessProbe:
+            # The supervisor being up says nothing about whether a model is
+            # awake -- that is what WVA's readiness gate is for. This probe only
+            # reports that the Pod can accept instructions.
+            httpGet:
+              path: /health
+              port: supervisor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-pvc
