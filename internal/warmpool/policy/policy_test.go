@@ -265,6 +265,55 @@ func TestGrowByReportsTheShortfallAgainstTheFloor(t *testing.T) {
 	}
 }
 
+func TestGrowByDoesNotDoubleCountAdmissions(t *testing.T) {
+	// admissions() removes what it takes from `free` in place, so subtracting
+	// them again reported a shortfall that did not exist -- harmless while
+	// GrowBy only logs, wrong the moment it drives growth.
+	c := cfg()
+	c.SleepMinSize = 2
+	c.MaxInstancesPerPod = 4
+	in := Input{
+		Memberships: []pool.Membership{
+			resident("a", "x", pool.Asleep),
+			resident("b", "y", pool.Asleep),
+			resident("c", "z", pool.Asleep),
+		},
+		Variants: []VariantDemand{{Model: model("parked"), Parked: true}},
+		Now:      now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 1 {
+		t.Fatalf("expected one admission: %+v", got.Admit)
+	}
+	// Three free, one spent on the admission, floor of two: exactly met, so
+	// nothing is short. Chosen so the two formulas DIFFER -- subtracting the
+	// admission twice would report 1. A wider margin hides the defect.
+	if got.GrowBy != 0 {
+		t.Fatalf("GrowBy = %d, want 0 (2 free against a floor of 2)", got.GrowBy)
+	}
+}
+
+func TestAnIdlePodCountsAsReserveAndHoldsNothing(t *testing.T) {
+	// A Pod with nothing resident is represented by a placeholder membership.
+	// It must count toward the reserve -- otherwise a fresh pool reports zero
+	// free and can never admit its first model -- while holding no model.
+	c := cfg()
+	c.SleepMinSize = 0
+	idle := pool.Membership{Pod: pod("empty"), State: pool.Absent}
+	in := Input{
+		Memberships: []pool.Membership{idle},
+		Variants:    []VariantDemand{{Model: model("parked"), Parked: true}},
+		Now:         now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 1 || got.Admit[0].Pod != pod("empty") {
+		t.Fatalf("a fresh pool must be able to admit into its idle Pod: %+v", got.Admit)
+	}
+	if len(got.Borrow) != 0 || len(got.Blocked) != 0 {
+		t.Fatalf("and nothing borrowed or blocked: %+v", got)
+	}
+}
+
 func TestAdmissionSpreadsAcrossPods(t *testing.T) {
 	// Copies piling into one Pod would share a single wake slot, so the roomiest
 	// Pod takes the next model.

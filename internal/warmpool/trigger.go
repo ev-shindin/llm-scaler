@@ -25,6 +25,11 @@ type DecisionTrigger struct {
 	fired       chan struct{}
 	unsubscribe []func()
 	watched     map[types.NamespacedName]bool
+	// stop ends the per-target goroutines. The store's cancel only removes the
+	// registration and never closes the channel, so a goroutine ranging over it
+	// would park forever -- one leaked per watched target, every time this is
+	// rebuilt.
+	stop chan struct{}
 }
 
 // NewDecisionTrigger watches the given scale targets.
@@ -36,6 +41,7 @@ func NewDecisionTrigger(store *decision.Store, targets []types.NamespacedName) *
 		// need one reconcile, not one each. A full buffer already means "go
 		// round again", which is exactly what a second signal would say.
 		fired: make(chan struct{}, 1),
+		stop:  make(chan struct{}),
 	}
 	for _, target := range targets {
 		t.watch(target)
@@ -67,10 +73,18 @@ func (t *DecisionTrigger) watch(target types.NamespacedName) {
 	t.mu.Unlock()
 
 	go func() {
-		for range updates {
+		for {
 			select {
-			case t.fired <- struct{}{}:
-			default: // a reconcile is already pending; one is enough
+			case <-t.stop:
+				return
+			case _, open := <-updates:
+				if !open {
+					return
+				}
+				select {
+				case t.fired <- struct{}{}:
+				default: // a reconcile is already pending; one is enough
+				}
 			}
 		}
 	}()
@@ -104,7 +118,11 @@ func (t *DecisionTrigger) WatchRegistry(ctx context.Context, reg *registry.Regis
 	}
 }
 
-// Close releases every subscription.
+// Close releases every subscription and stops the goroutines reading them.
+//
+// Both halves are needed: the store's cancel removes the registration but never
+// closes the channel, so without the stop signal each goroutine parks on a
+// receive that can no longer fire.
 func (t *DecisionTrigger) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -113,4 +131,9 @@ func (t *DecisionTrigger) Close() {
 	}
 	t.unsubscribe = nil
 	t.watched = map[types.NamespacedName]bool{}
+	select {
+	case <-t.stop: // Close is idempotent
+	default:
+		close(t.stop)
+	}
 }

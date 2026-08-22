@@ -30,7 +30,17 @@ package controller
 // +kubebuilder:rbac:groups="",resources=nodes/status,verbs=get;list;watch
 
 // Core resources read during optimization and metrics collection.
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//
+// Pods also take `patch`, and only for the warm pool: joining a woken pool Pod
+// to a model's InferencePool means writing that pool's selector labels onto it,
+// and leaving means removing them. Without this every borrow fails at the label
+// write -- and worse, every RETURN fails after the proxy has already been
+// cleared, leaving a Pod out of service with an awake model still holding its
+// GPU and no timeout that recovers it.
+//
+// `pods/status` is deliberately NOT taken: readiness is reported by the pool
+// Pod's own probe, so nothing here writes Pod status.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // Note: Namespace watch permission is required for label-based namespace opt-in for namespace-local ConfigMaps.

@@ -10,13 +10,13 @@
 // the proxy points at the awake instance. Waking model B after model A means
 // re-pointing, not rebinding.
 //
-// The shape is taken from Fast Model Actuation's requester proxy
-// (pkg/server/requester/proxy), which solves the adjacent problem of a requester
-// forwarding to a launcher's instance. The difference is the one that matters
-// here: that proxy is configured ONCE and refuses a second target, because a
-// requester serves one backend for its lifetime. A pool's upstream changes on
-// every wake, so this one is switchable, and it forwards with the standard
-// library rather than adding a dependency to the controller's module.
+// It is an HTTP reverse proxy rather than a TCP one, which matters for two
+// reasons found in review. The upstream is resolved PER REQUEST, so a client
+// holding a keep-alive connection across a wake reaches the model that is awake
+// now rather than the one that was awake when it connected. And responses are
+// not truncated: a raw byte pump that stops when either direction closes cuts
+// off a streamed completion the moment the client half-closes its request side,
+// which is the ordinary shape of LLM traffic.
 package proxy
 
 import (
@@ -24,9 +24,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"sync/atomic"
 	"time"
 
@@ -47,16 +47,17 @@ var DefaultConfig = Config{
 	DialTimeout: 10 * time.Second,
 }
 
-// Server forwards TCP connections to the currently awake instance.
+// Server forwards HTTP requests to the currently awake instance.
 //
 // The zero upstream is meaningful: it means no model is awake, which is a normal
-// state for an idle pool Pod. Connections arriving then are closed rather than
-// queued, because the Pod's readiness gate should already be holding traffic away
-// and a queued connection would hide that it is not.
+// state for an idle pool Pod. Requests arriving then are refused rather than
+// queued, because the readiness probe should already be holding traffic away and
+// a queued request would hide that it is not.
 type Server struct {
 	cfg      Config
 	upstream atomic.Pointer[string]
 	listener atomic.Pointer[net.Listener]
+	proxy    *httputil.ReverseProxy
 }
 
 // New creates a Server. Nothing listens until Run is called.
@@ -64,21 +65,65 @@ func New(cfg Config) *Server {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = DefaultConfig.DialTimeout
 	}
-	return &Server{cfg: cfg}
+	s := &Server{cfg: cfg}
+	s.proxy = &httputil.ReverseProxy{
+		Director: func(r *http.Request) {
+			// Resolved per request, so a wake takes effect on the next request
+			// rather than the next connection.
+			r.URL.Scheme = "http"
+			r.URL.Host = s.Upstream()
+		},
+		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: cfg.DialTimeout}).DialContext,
+			MaxIdleConnsPerHost: 32,
+		},
+		// Stream token by token rather than buffering: a completion is the
+		// output this proxy exists to carry, and buffering it would undo the
+		// latency the pool is built for.
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			klog.FromContext(r.Context()).V(2).Info("warm-pool proxy could not reach the awake instance",
+				"upstream", s.Upstream(), "err", err)
+			http.Error(w, "the awake instance did not answer", http.StatusBadGateway)
+		},
+	}
+	return s
 }
 
-// SetUpstream points the proxy at addr ("host:port"). An empty addr means no
-// model is awake and connections should be refused.
+// ErrUpstreamNotLocal rejects an upstream outside this Pod.
+var ErrUpstreamNotLocal = errors.New("upstream must be loopback: a pool Pod may only serve its own engines")
+
+// SetUpstream points the proxy at addr ("host:port"), which must be loopback.
 //
-// Existing connections are left alone: they are already proxied to the instance
-// that was awake when they arrived, and a wake is always preceded by draining
-// the previous model, so there is nothing to cut short.
-func (s *Server) SetUpstream(addr string) {
+// Loopback-only is a security boundary, not a convenience. This proxy sits in a
+// Pod carrying a tenant's InferencePool labels and receiving their traffic, so an
+// upstream pointing anywhere else would send prompts and completions there --
+// and would mark the Pod Ready while doing it. The only legitimate value is an
+// engine in this same Pod, which shares its network namespace.
+//
+// An empty addr means no model is awake.
+func (s *Server) SetUpstream(addr string) error {
 	if addr == "" {
 		s.upstream.Store(nil)
-		return
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("address must be host:port: %w", err)
+	}
+	if !isLoopback(host) {
+		return fmt.Errorf("%w: got %q", ErrUpstreamNotLocal, host)
 	}
 	s.upstream.Store(&addr)
+	return nil
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Upstream reports the current target, or "" when no model is awake.
@@ -102,7 +147,7 @@ func (s *Server) Addr() string {
 //
 // It binds immediately rather than waiting for an upstream, so that a Pod's
 // serving port exists from the moment the Pod does. What decides whether traffic
-// arrives is the readiness gate, not whether this socket is open.
+// arrives is readiness, not whether this socket is open.
 func (s *Server) Run(ctx context.Context) error {
 	logger := klog.FromContext(ctx).WithName("warmpool-proxy")
 
@@ -114,67 +159,32 @@ func (s *Server) Run(ctx context.Context) error {
 	s.listener.Store(&listener)
 	logger.Info("Warm-pool proxy listening", "addr", listener.Addr().String())
 
+	server := &http.Server{
+		Handler:           http.HandlerFunc(s.serve),
+		ReadHeaderTimeout: 30 * time.Second,
+		// No write timeout: a completion may stream for minutes, and cutting it
+		// off would be the truncation this design exists to avoid.
+	}
 	go func() {
 		<-ctx.Done()
-		_ = listener.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				logger.V(2).Info("Warm-pool proxy stopped")
-				return nil
-			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return fmt.Errorf("accept: %w", err)
-		}
-		go s.forward(ctx, conn)
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve: %w", err)
 	}
+	logger.V(2).Info("Warm-pool proxy stopped")
+	return nil
 }
 
-// forward copies between the caller and the awake instance in both directions,
-// half-closing each side as it finishes so that a client which has sent its
-// whole request still receives the whole response.
-func (s *Server) forward(ctx context.Context, client net.Conn) {
-	defer func() { _ = client.Close() }()
-	logger := klog.FromContext(ctx).WithName("warmpool-proxy")
-
-	target := s.Upstream()
-	if target == "" {
-		logger.V(4).Info("Refusing connection: no model is awake in this Pod")
+func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	if s.Upstream() == "" {
+		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
 		return
 	}
-
-	dialer := net.Dialer{Timeout: s.cfg.DialTimeout}
-	backend, err := dialer.DialContext(ctx, "tcp", target)
-	if err != nil {
-		logger.V(2).Info("Cannot reach the awake instance", "target", target, "err", err)
-		return
-	}
-	defer func() { _ = backend.Close() }()
-
-	done := make(chan struct{}, 2)
-	go copyThenHalfClose(backend, client, done)
-	go copyThenHalfClose(client, backend, done)
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
-}
-
-// halfCloser is implemented by *net.TCPConn: it lets one direction finish while
-// the other is still in flight, which a plain Close would cut off.
-type halfCloser interface{ CloseWrite() error }
-
-func copyThenHalfClose(dst, src net.Conn, done chan<- struct{}) {
-	_, _ = io.Copy(dst, src)
-	if hc, ok := dst.(halfCloser); ok {
-		_ = hc.CloseWrite()
-	}
-	done <- struct{}{}
+	s.proxy.ServeHTTP(w, r)
 }
 
 // UpstreamPath is where the control endpoint lives.
@@ -206,12 +216,13 @@ type upstreamBody struct {
 	Address string `json:"address"`
 }
 
-// Upstreamhandler serves the control endpoint: GET reports the current target,
+// UpstreamHandler serves the control endpoint: GET reports the current target,
 // PUT re-points the proxy, DELETE clears it.
 //
 // Unlike the FMA proxy this was modelled on, PUT may be called repeatedly: the
 // upstream changes every time a different model is woken in this Pod, which is
-// the normal case rather than an error.
+// the normal case rather than an error. It is refused for any address outside
+// this Pod -- see SetUpstream.
 func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -222,16 +233,13 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("decode body: %v", err), http.StatusBadRequest)
 			return
 		}
-		if body.Address != "" {
-			if _, _, err := net.SplitHostPort(body.Address); err != nil {
-				http.Error(w, fmt.Sprintf("address must be host:port: %v", err), http.StatusBadRequest)
-				return
-			}
+		if err := s.SetUpstream(body.Address); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
-		s.SetUpstream(body.Address)
 		writeJSON(w, http.StatusOK, upstreamBody{Address: s.Upstream()})
 	case http.MethodDelete:
-		s.SetUpstream("")
+		_ = s.SetUpstream("")
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

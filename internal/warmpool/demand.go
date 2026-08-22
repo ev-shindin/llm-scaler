@@ -72,8 +72,9 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			continue
 		}
 
+		decided, haveDecision := d.Decisions.Get(entry.Namespace, entry.Target.Name)
 		desired := 0
-		if decided, ok := d.Decisions.Get(entry.Namespace, entry.Target.Name); ok {
+		if haveDecision {
 			desired = int(decided.DesiredReplicas)
 		}
 		ready := int(workload.Status.ReadyReplicas)
@@ -89,7 +90,13 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			Ready:   ready,
 			// Parked is the case with no alternative: at zero replicas a cold
 			// start is the whole of the first request's latency.
-			Parked: desired == 0 && ready == 0,
+			//
+			// A DECISION is required, not merely two zeroes. Before WVA has
+			// decided anything -- every variant, on every restart -- desired
+			// reads 0, and a workload that has not started yet reads 0 ready.
+			// Treating that as parked would eagerly admit models nobody asked
+			// for, at ~35 s and a reserve slot each, on every restart.
+			Parked: haveDecision && desired == 0 && ready == 0,
 			// Share stays zero until a popularity source is wired in. Preloading
 			// is therefore inert rather than wrong -- admission still works from
 			// parking and from the frequency filter.

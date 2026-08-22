@@ -154,7 +154,11 @@ func Decide(in Input, cfg Config) Plan {
 	}
 
 	// 4. What the reserve will be once this plan is carried out.
-	if short := cfg.SleepMinSize - (len(free) - len(plan.Admit)); short > 0 {
+	//
+	// `free` has already had borrows and admissions removed from it in place, so
+	// it IS the post-plan reserve. Subtracting the admissions again would count
+	// them twice and report a shortfall that does not exist.
+	if short := cfg.SleepMinSize - len(free); short > 0 {
 		plan.GrowBy = short
 	}
 	return plan
@@ -309,6 +313,9 @@ func holding(byPod map[types.NamespacedName][]pool.Membership, free map[types.Na
 }
 
 func residentSomewhere(byPod map[types.NamespacedName][]pool.Membership, variant string) bool {
+	if variant == "" {
+		return false // the empty variant marks an idle Pod, not a model
+	}
 	for _, inPod := range byPod {
 		for _, m := range inPod {
 			if m.Model.Variant == variant {
@@ -325,11 +332,11 @@ func residentSomewhere(byPod map[types.NamespacedName][]pool.Membership, variant
 func roomiestFreePod(byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool, cfg Config) (types.NamespacedName, bool) {
 	best, found := types.NamespacedName{}, false
 	for p := range free {
-		if cfg.MaxInstancesPerPod > 0 && len(byPod[p]) >= cfg.MaxInstancesPerPod {
+		if cfg.MaxInstancesPerPod > 0 && pool.Resident(byPod[p]) >= cfg.MaxInstancesPerPod {
 			continue
 		}
-		if !found || len(byPod[p]) < len(byPod[best]) ||
-			(len(byPod[p]) == len(byPod[best]) && p.String() < best.String()) {
+		if !found || pool.Resident(byPod[p]) < pool.Resident(byPod[best]) ||
+			(pool.Resident(byPod[p]) == pool.Resident(byPod[best]) && p.String() < best.String()) {
 			best, found = p, true
 		}
 	}

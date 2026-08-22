@@ -154,18 +154,32 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 	}
 
 	for _, action := range plan.Borrow {
+		// Recorded BEFORE the attempt, not after. A borrow that fails partway --
+		// labelled and awake but never pointed at -- still reads as lent to the
+		// next cycle, and with no start time its age is recomputed as zero
+		// forever, so the hold timeout could never reclaim it. Recording first
+		// means the timeout applies whatever the attempt does.
+		r.recordBorrow(action)
+
 		if _, err := r.Pool.Activate(ctx, action.Pod, action.Model); err != nil {
-			// The engine did not come back. The variant falls through to its
-			// ordinary scale-up, which is already under way, so this costs
-			// nothing beyond the attempt -- but it IS a miss for the frequency
-			// filter, because a warm copy that cannot wake is not warm.
-			logger.V(1).Info("wake failed; falling through to the cold path",
+			logger.V(1).Info("wake failed; returning the Pod and falling through to the cold path",
 				"pod", action.Pod, "variant", action.Model.Variant, "err", err)
+			// Put it back rather than leave it half-borrowed. Without this one
+			// transient failure removes a Pod from the reserve permanently: it
+			// reads as lent, so nothing retries the variant elsewhere, and it
+			// serves no traffic.
+			if back := r.Pool.Deactivate(ctx, action.Pod, action.Model); back != nil {
+				logger.V(1).Info("could not return a Pod after a failed wake; the hold timeout will reclaim it",
+					"pod", action.Pod, "variant", action.Model.Variant, "err", back)
+			} else {
+				r.forget(action)
+			}
+			// A warm copy that cannot wake is not warm, so it counts as a miss
+			// for the frequency filter.
 			r.recordMiss(action.Model.Variant)
 			metrics.CountWarmPoolBorrow(action.Model.Namespace, action.Model.Variant, OutcomeMiss)
 			continue
 		}
-		r.recordBorrow(action)
 		metrics.CountWarmPoolBorrow(action.Model.Namespace, action.Model.Variant, OutcomeHit)
 	}
 

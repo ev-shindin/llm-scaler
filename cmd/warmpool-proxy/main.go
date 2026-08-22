@@ -58,7 +58,10 @@ func run() int {
 
 	server := proxy.New(proxy.Config{Port: uint16(servePort), DialTimeout: dialTimeout})
 	if upstream != "" {
-		server.SetUpstream(upstream)
+		if err := server.SetUpstream(upstream); err != nil {
+			logger.Error(err, "refusing the initial upstream")
+			return 1
+		}
 	}
 
 	mux := http.NewServeMux()

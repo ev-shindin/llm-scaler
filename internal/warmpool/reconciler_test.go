@@ -21,8 +21,15 @@ type fakePool struct {
 	memberships []pool.Membership
 	calls       []string
 	wakeErr     error
-	warmDelay   time.Duration
-	warmStarted chan struct{}
+	// deactivateErr fails the rollback path, which must still leave the borrow
+	// recorded so the hold timeout can reclaim the Pod.
+	deactivateErr error
+	warmDelay     time.Duration
+	warmStarted   chan struct{}
+	// activated keeps the WHOLE ModelRef, because a reconciler forwarding an
+	// incomplete one (no PoolLabels, no EngineOptions) is refused deep in the
+	// adapter, where a name-only record would not notice.
+	activated []pool.ModelRef
 }
 
 func (f *fakePool) ListWarm(context.Context) ([]pool.Membership, error) {
@@ -48,6 +55,9 @@ func (f *fakePool) Warm(ctx context.Context, p types.NamespacedName, m pool.Mode
 
 func (f *fakePool) Activate(_ context.Context, p types.NamespacedName, m pool.ModelRef) (pool.Endpoint, error) {
 	f.record("activate " + m.Variant + "@" + p.Name)
+	f.mu.Lock()
+	f.activated = append(f.activated, m)
+	f.mu.Unlock()
 	if f.wakeErr != nil {
 		return pool.Endpoint{}, f.wakeErr
 	}
@@ -56,7 +66,7 @@ func (f *fakePool) Activate(_ context.Context, p types.NamespacedName, m pool.Mo
 
 func (f *fakePool) Deactivate(_ context.Context, p types.NamespacedName, m pool.ModelRef) error {
 	f.record("deactivate " + m.Variant + "@" + p.Name)
-	return nil
+	return f.deactivateErr
 }
 
 func (f *fakePool) Evict(_ context.Context, p types.NamespacedName, m pool.ModelRef) error {
@@ -175,7 +185,10 @@ func TestAFailedWakeCountsAsAMiss(t *testing.T) {
 		t.Fatalf("Once: %v", err)
 	}
 	if len(r.Lent()) != 0 {
-		t.Fatalf("a failed wake must not be recorded as a bridge: %v", r.Lent())
+		t.Fatalf("a failed wake must leave nothing lent once rolled back: %v", r.Lent())
+	}
+	if !p.did("deactivate qwen@a") {
+		t.Fatalf("and the Pod must be returned: %v", p.seen())
 	}
 	r.mu.Lock()
 	misses := len(r.missesAt["qwen"])

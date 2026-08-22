@@ -78,6 +78,13 @@ type ModelRef struct {
 }
 
 // Membership is one model's residency in one Pod.
+//
+// A Pod holding NOTHING still produces one Membership, with an empty Variant and
+// State Absent. Without it an idle Pod would be invisible -- memberships are the
+// only view of the pool -- so a fresh pool would report a reserve of zero, and
+// could never admit its first model because admission is budgeted against the
+// reserve. An empty pool that cannot bootstrap is not a hypothetical: it is the
+// shipped manifest, which starts one Pod with nothing resident.
 type Membership struct {
 	Model ModelRef
 	Pod   types.NamespacedName
@@ -181,6 +188,9 @@ func FreePods(all []Membership) int {
 // PodsHolding returns the Pods where a variant is resident and wakeable, which
 // is what decides whether a spike hits or misses.
 func PodsHolding(all []Membership, variant string) []types.NamespacedName {
+	if variant == "" {
+		return nil // the empty variant marks an idle Pod, not a model
+	}
 	var out []types.NamespacedName
 	for pod, inPod := range ByPod(all) {
 		if !Free(inPod) {
@@ -194,4 +204,16 @@ func PodsHolding(all []Membership, variant string) []types.NamespacedName {
 		}
 	}
 	return out
+}
+
+// Resident counts the models actually held in a Pod, ignoring the placeholder
+// that marks an empty one.
+func Resident(inPod []Membership) int {
+	n := 0
+	for _, m := range inPod {
+		if m.Model.Variant != "" {
+			n++
+		}
+	}
+	return n
 }

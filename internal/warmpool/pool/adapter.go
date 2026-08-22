@@ -22,6 +22,8 @@ const (
 	ComponentLabel = "app.kubernetes.io/component"
 	// ComponentValue is the value ComponentLabel carries on pool Pods.
 	ComponentValue = "warm-pool"
+	// NameLabel is the other half of the pool Deployment's own selector.
+	NameLabel = "app.kubernetes.io/name"
 
 	// BasePort is the first port an instance may listen on inside a Pod.
 	// Instance ports are ours to choose, unlike FMA's, which come from the
@@ -124,6 +126,10 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 	}
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
+	if len(instances) == 0 {
+		// An idle Pod is reserve, and must be visible as such. See Membership.
+		return []Membership{{Pod: podRef, State: Absent, Tier: a.tier}}, nil
+	}
 	out := make([]Membership, 0, len(instances))
 	for _, inst := range instances {
 		port := portOf(inst.Options)
@@ -311,6 +317,17 @@ func (a *Adapter) setLabels(ctx context.Context, p *corev1.Pod, labels map[strin
 	if len(labels) == 0 {
 		return errors.New("no pool labels given: membership must come from the InferencePool's own selector")
 	}
+	// A tenant's selector is theirs to write, and generic keys are common. One
+	// naming `app.kubernetes.io/component` or `app.kubernetes.io/name` would
+	// otherwise rewrite this Pod out of its OWN Deployment's selector: the
+	// ReplicaSet then releases it, creating a GPU-holding orphan with no
+	// controller, invisible to ListWarm and recoverable only by hand.
+	for _, guarded := range identityLabels {
+		if want, taken := labels[guarded]; taken && want != p.Labels[guarded] {
+			return fmt.Errorf("refusing to join a pool whose selector rewrites %s (%q -> %q): "+
+				"that label is what makes this Pod part of its own Deployment", guarded, p.Labels[guarded], want)
+		}
+	}
 	patch := client.MergeFrom(p.DeepCopy())
 	if p.Labels == nil {
 		p.Labels = map[string]string{}
@@ -321,18 +338,32 @@ func (a *Adapter) setLabels(ctx context.Context, p *corev1.Pod, labels map[strin
 	return a.client.Patch(ctx, p, patch)
 }
 
+// identityLabels are the ones that make a pool Pod part of its own Deployment.
+// They are never written by a join and never removed by a leave.
+var identityLabels = []string{ComponentLabel, NameLabel}
+
 func (a *Adapter) removeLabels(ctx context.Context, p *corev1.Pod, labels map[string]string) error {
 	patch := client.MergeFrom(p.DeepCopy())
 	for k := range labels {
 		// Never remove what marks this Pod as pool capacity, even if a tenant's
-		// selector happens to name it: without that label the Pod stops being
-		// excluded from replica accounting.
-		if k == ComponentLabel {
+		// selector happens to name it: without those labels the Pod stops being
+		// excluded from replica accounting, and stops matching its own
+		// Deployment.
+		if isIdentityLabel(k) {
 			continue
 		}
 		delete(p.Labels, k)
 	}
 	return a.client.Patch(ctx, p, patch)
+}
+
+func isIdentityLabel(key string) bool {
+	for _, guarded := range identityLabels {
+		if key == guarded {
+			return true
+		}
+	}
+	return false
 }
 
 func portOf(options string) int {
