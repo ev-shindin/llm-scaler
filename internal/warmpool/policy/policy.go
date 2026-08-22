@@ -8,6 +8,7 @@
 package policy
 
 import (
+	"slices"
 	"sort"
 	"time"
 
@@ -118,6 +119,14 @@ func Decide(in Input, cfg Config) Plan {
 			returned[action.Pod] = true
 		}
 	}
+	// And every engine that is awake with nothing using it, whether or not any
+	// variant asked for it back. These are not bridges anyone is holding; they
+	// are GPUs being burned by a sequence that did not finish.
+	orphans := orphanReturns(in.Memberships)
+	for _, action := range orphans {
+		plan.Return = append(plan.Return, action)
+		returned[action.Pod] = true
+	}
 
 	// 2. Borrows: cover what the ordinary replicas cannot yet.
 	free := freePods(byPod, returned)
@@ -155,6 +164,21 @@ func Decide(in Input, cfg Config) Plan {
 			plan.Blocked = append(plan.Blocked, v.Model)
 		}
 	}
+
+	// An orphan whose variant turned out to be short is not garbage: it is
+	// already awake, for the right model. Sleeping it and waking it again
+	// within one plan is pure cost -- a drain, a sleep, and a wake -- so the
+	// return is dropped and the borrow finishes the activation the interrupted
+	// sequence began.
+	//
+	// ORPHANS ONLY. A return that a variant actually asked for must survive
+	// being re-borrowed in the same cycle, because the hold timeout is exactly
+	// that case: a bridge whose ordinary replicas never arrived is returned
+	// while the variant is still short, and the shortfall then takes it again.
+	// Dropping that return would leave the bridge silently in place, and the
+	// observation of how long it lasted -- the signal that a scale-up is
+	// failing behind the pool -- would never be made.
+	plan.Return = dropOrphanReturnsSupersededByBorrows(plan.Return, orphans, plan.Borrow)
 
 	// 3. Admissions, last and most cautiously: never spend the reserve to fill
 	//    the cache, and never during a burst.
@@ -277,13 +301,81 @@ func missesInWindow(in Input, cfg Config, variant string) int {
 	return count
 }
 
+// lentByVariant is what the pool is currently covering: engines that are AWAKE
+// AND BEING USED.
+//
+// Serving only. Waking used to count here too, on the reasoning that a Pod
+// mid-activation is spoken for and must not be handed to someone else. That
+// reasoning is sound but the state cannot occur at this point: a pass observes
+// before it acts, passes are serialised, and Activate runs to completion inside
+// the pass that decided it. So every Waking membership a decision ever sees is
+// an engine that is awake and serving nothing -- see orphanReturns.
 func lentByVariant(all []pool.Membership) map[string][]pool.Membership {
 	out := map[string][]pool.Membership{}
 	for _, m := range all {
-		if m.State == pool.Serving || m.State == pool.Waking {
+		if m.State == pool.Serving {
 			out[m.Model.Variant] = append(out[m.Model.Variant], m)
 		}
 	}
+	return out
+}
+
+// dropOrphanReturnsSupersededByBorrows removes an ORPHAN return whose Pod and
+// variant are borrowed again in the same plan. Returns a variant asked for are
+// left alone -- see the call site.
+func dropOrphanReturnsSupersededByBorrows(returns, orphans, borrows []Action) []Action {
+	if len(orphans) == 0 || len(borrows) == 0 {
+		return returns
+	}
+	key := func(a Action) Borrow { return Borrow{Pod: a.Pod, Variant: a.Model.Variant} }
+
+	redundant := make(map[Borrow]bool, len(orphans))
+	for _, o := range orphans {
+		redundant[key(o)] = true
+	}
+	borrowed := make(map[Borrow]bool, len(borrows))
+	for _, b := range borrows {
+		borrowed[key(b)] = true
+	}
+	return slices.DeleteFunc(returns, func(a Action) bool {
+		return redundant[key(a)] && borrowed[key(a)]
+	})
+}
+
+// orphanReturns hands back every engine that is awake with nothing using it.
+//
+// An engine reaches this state whenever the sequence that woke it did not
+// finish: the controller restarted between a model load and the sleep that
+// should have followed it, an Activate timed out between the wake and the
+// re-point, or a Deactivate failed at its final step. In each case the engine
+// holds its GPU, is in no InferencePool, and has no traffic pointed at it.
+//
+// Counting these as lent -- which is what the code did before -- makes the
+// damage worse rather than better. The variant they are charged to reads as
+// already covered, so a REAL borrow for it is suppressed, and nothing forces
+// the situation open until the hold timeout expires. Since a restart also loses
+// the borrow times, that timeout restarts from zero, so a controller restart
+// that lands mid-admission could idle a GPU for the full hold period and
+// silently withhold capacity from the variant that needed it.
+//
+// Returning them instead is both the smaller statement and the correct one: an
+// engine nobody is using should be asleep, and the Pod it sits in should be back
+// in the reserve. The return sleeps the model rather than evicting it, so the
+// warm set survives.
+func orphanReturns(all []pool.Membership) []Action {
+	var out []Action
+	for _, m := range all {
+		if m.State == pool.Waking {
+			out = append(out, Action{Pod: m.Pod, Model: m.Model})
+		}
+	}
+	// Deterministic, so a plan is reproducible and testable.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Pod != out[j].Pod {
+			return out[i].Pod.String() < out[j].Pod.String()
+		}
+		return out[i].Model.Variant < out[j].Model.Variant
+	})
 	return out
 }
 

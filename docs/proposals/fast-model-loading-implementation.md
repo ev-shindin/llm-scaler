@@ -620,6 +620,7 @@ it — that is what makes a burst of concurrent spikes survivable.
 | lent Pod dies | it leaves the InferencePool with the Pod; ordinary path unaffected |
 | scale to zero with the variant still resident | this is parking: keep it resident, no ordinary replicas at all |
 | WVA restarts while Pods are lent | reconcile from observed state -- lent is discoverable from labels plus the supervisor's instance list, not from memory |
+| WVA restarts MID-ADMISSION | the engine is awake, in no InferencePool, with nothing pointed at it. It is reclaimed on the next pass -- see "orphans" below -- rather than counted as cover for the variant it was loading for |
 
 ### 7a.8 Configuration
 
@@ -710,6 +711,47 @@ also retires the trap that came with it: a JSON *merge* patch on pod conditions
 replaces the array and wipes `Ready`, and that patch produced a spurious
 measurement once already. There is now no such patch.
 
+### 9a. Orphans: an engine that is awake and serving nothing
+
+There is one state the state machine reaches that nobody intends, and it is
+worth naming because the obvious handling of it is wrong.
+
+An engine is AWAKE, in no InferencePool, and has no traffic pointed at it. It
+gets there whenever the sequence that woke it did not finish: the controller
+restarted between a model load and the sleep that should have followed it, an
+Activate timed out between the wake and the re-point, or a Deactivate failed at
+its last step. `stateOf` reports it as `Waking`, because that is what "answers,
+not sleeping, proxy pointed elsewhere" looks like from outside.
+
+The first implementation counted `Waking` as LENT, reasoning that a Pod
+mid-activation is spoken for. That reasoning is sound and the state is not: a
+pass observes before it acts, passes are serialised, and `Activate` runs to
+completion inside the pass that decided it — so every `Waking` a decision ever
+sees is already finished with, one way or the other.
+
+Counting them as lent made the damage worse. The variant they were charged to
+read as covered, so the borrow it actually needed was suppressed, and nothing
+forced the situation open until the hold timeout — which, after a restart, had
+also lost its start time and so began again from zero. A restart landing
+mid-admission could therefore idle a GPU **and** withhold capacity from the
+variant that needed it, for the full hold period, with no signal.
+
+What happens instead:
+
+- if the orphan's variant is SHORT, the borrow finishes what the interrupted
+  sequence began. The engine is already awake for the right model; sleeping it
+  and waking it again would cost a drain, a sleep and a wake to arrive back
+  where it started.
+- otherwise it is returned, which sleeps the model and puts the Pod back in the
+  reserve. The warm set survives; only the GPU is given up.
+
+A return a VARIANT asked for is never dropped this way, even when the same Pod
+is borrowed again in the same cycle. That case is the hold timeout doing its
+job: a bridge whose ordinary replicas never arrived is handed back while the
+variant is still short, the shortfall takes it again, and the observation of how
+long the bridge lasted — the signal that a scale-up is failing behind the pool —
+is made each time round.
+
 ## 10. Failure modes, and what each degrades to
 
 | failure | behaviour | degrades to |
@@ -793,6 +835,23 @@ A shared secret on those ports is deliberately NOT built. Authenticating `:8002`
 while `:8001` sits behind the same rule would be theatre: identical reachability,
 and the unauthenticated one is strictly more dangerous. Closing it means
 authentication inside FMA's launcher, which means forking it.
+
+**The admitted set is one NAMED namespace, and that costs an edit.** An earlier
+version carried a second rule with a bare `podSelector` so a namespace-scoped
+install would work untouched. A bare podSelector matches the policy's own
+namespace — the tenant's — so it admitted anyone who could create a Pod there
+and set two well-known labels: `kubectl run` away from arbitrary execution on
+`:8001`, in a container mounting the shared model cache read-write. It applied
+on cluster-scoped installs too, where it grants nothing needed. Naming the
+namespace confines that exposure to installs which have actually chosen
+co-tenancy, and getting the name wrong fails loudly rather than open — the
+controller is denied, every `/is_sleeping` fails, and the pool simply never
+wakes anything.
+
+Nothing expressible in a NetworkPolicy makes a namespace-scoped install safe
+against its own namespace's occupants, because there the controller and the
+tenant genuinely share a namespace. A cluster that cares should install WVA
+cluster-scoped.
 
 **Probes are `exec`, not `httpGet`.** A kubelet probe originates from the NODE,
 and no NetworkPolicy `from:` selector can name a node — so any restricted port

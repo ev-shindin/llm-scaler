@@ -19,7 +19,8 @@ spec:
   #          only WVA has any business calling it.
   #
   # This is a boundary, not authentication: anything admitted here is still
-  # trusted completely by the supervisor. A shared secret is the other half, and
+  # trusted completely by the supervisor -- which is why the set admitted is
+  # kept as small as a NetworkPolicy can express, one named namespace. A shared secret is the other half, and
   # is deliberately NOT built -- authenticating :8002 while :8001 sits behind the
   # same rule and offers arbitrary execution would be theatre. Closing that gap
   # means authentication inside FMA's launcher, which means forking it.
@@ -62,19 +63,35 @@ spec:
     # already applied, the compensating Deactivate fails at the clear, and the
     # Pod holds its GPU serving nothing until the hold expires.
     #
-    # Both install scopes are covered, because `from:` entries are OR-ed while
-    # the selectors WITHIN one entry are AND-ed. WVA_SCOPE=namespace puts the
-    # controller beside the pool; a cluster-scoped install puts it in its own
-    # namespace. Verified against a namespace-scoped install on a real cluster,
-    # where the second rule alone matched nothing.
+    # >>> EDIT THIS <<< The namespace below must be the one WVA actually runs
+    # in. It defaults to the cluster-scoped install's namespace (Makefile
+    # WVA_NS); a namespace-scoped install (WVA_SCOPE=namespace) puts the
+    # controller beside the pool, so set it to the pool's own namespace.
     #
-    # EDIT the namespace below if a cluster-scoped WVA is installed somewhere
-    # other than the default. The kubernetes.io/metadata.name label is applied
-    # automatically by the API server, so no labelling step is needed.
+    # Getting it wrong fails LOUDLY and safely: the controller is denied, every
+    # /is_sleeping fails, ListWarm reads every instance as Loading, and the pool
+    # simply never wakes anything. It cannot fail open.
     #
-    # Deliberately NOT `namespaceSelector: {}`: matching the controller's labels
-    # in ANY namespace would let anyone who can create a Pod with two well-known
-    # labels reach :8001, which is arbitrary execution.
+    # An earlier version carried a SECOND `from:` entry with a bare podSelector,
+    # to make a namespace-scoped install work without editing anything. That was
+    # a mistake, and it is worth saying why rather than just deleting it. A bare
+    # podSelector matches this policy's OWN namespace -- the tenant's, the one
+    # holding the models -- so it admitted anyone who could create a Pod there
+    # and set two well-known labels. That is `kubectl run` away from arbitrary
+    # execution on :8001, in a container that mounts the shared model cache
+    # read-write, i.e. a write primitive over every tenant's weights. Worse, it
+    # applied on CLUSTER-scoped installs too, where it grants nothing that is
+    # needed and only widens what can reach the pool.
+    #
+    # Requiring the namespace to be named costs one edit and removes that class.
+    # It does not make a namespace-scoped install safe against its own
+    # namespace's occupants -- nothing expressible in a NetworkPolicy can, since
+    # the controller and the tenant genuinely share a namespace there -- but it
+    # confines the exposure to installs that have actually chosen co-tenancy,
+    # rather than handing it to every install by default.
+    #
+    # Deliberately NOT `namespaceSelector: {}` either, for the same reason at
+    # cluster scale.
     - ports:
         - protocol: TCP
           port: 8001
@@ -95,12 +112,8 @@ spec:
           port: 9001
           endPort: 9016
       from:
-        # Namespace-scoped install: the controller is in this namespace.
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: workload-variant-autoscaler
-              control-plane: controller-manager
-        # Cluster-scoped install: the controller is in its own namespace.
+        # The kubernetes.io/metadata.name label is applied automatically by the
+        # API server, so naming a namespace here needs no labelling step.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: workload-variant-autoscaler-system

@@ -11,6 +11,9 @@ import (
 
 var now = time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 
+// qwenVariant is the variant most of these cases are about.
+const qwenVariant = "qwen"
+
 func cfg() Config {
 	return Config{
 		SleepMinSize:       1,
@@ -76,7 +79,7 @@ func TestAMissIsNotABlock(t *testing.T) {
 		Now:         now,
 	}
 	got := Decide(byModelAbsent, cfg())
-	if len(got.Missed) != 1 || got.Missed[0].Variant != "qwen" {
+	if len(got.Missed) != 1 || got.Missed[0].Variant != qwenVariant {
 		t.Fatalf("a model resident nowhere is a MISS: %+v", got)
 	}
 	if len(got.Blocked) != 0 {
@@ -513,7 +516,7 @@ func TestAResidentVariantWithNoFreeHolderIsBlockedNotMissed(t *testing.T) {
 	if len(got.Missed) != 0 {
 		t.Errorf("a resident variant did not miss: %+v", got.Missed)
 	}
-	if len(got.Blocked) != 1 || got.Blocked[0].Variant != "qwen" {
+	if len(got.Blocked) != 1 || got.Blocked[0].Variant != qwenVariant {
 		t.Fatalf("want qwen blocked, got %+v", got.Blocked)
 	}
 }
@@ -547,5 +550,93 @@ func TestAVariantResidentOnlyInALoadingPodIsBlocked(t *testing.T) {
 	got := Decide(in, cfg())
 	if len(got.Blocked) != 1 || len(got.Missed) != 0 {
 		t.Fatalf("blocked=%+v missed=%+v, want blocked", got.Blocked, got.Missed)
+	}
+}
+
+func TestAnAwakeEngineNobodyIsUsingIsHandedBack(t *testing.T) {
+	// The state a controller restart leaves behind. Warm creates an instance,
+	// waits for it to serve, and only then sleeps it; a restart between those
+	// last two steps leaves an engine awake, in no InferencePool, with nothing
+	// pointed at it -- burning a GPU for no one.
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "qwen", pool.Waking)},
+		Variants:    []VariantDemand{demand("qwen", 1, 1)},
+		Now:         now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 1 {
+		t.Fatalf("an awake engine nobody is using must be handed back: %+v", got.Return)
+	}
+	if got.Return[0].Pod != pod("a") || got.Return[0].Model.Variant != qwenVariant {
+		t.Errorf("returned %+v, want qwen from pod a", got.Return[0])
+	}
+}
+
+func TestAnOrphanDoesNotCountAsCoverForItsVariant(t *testing.T) {
+	// The damage the old accounting did. An orphan charged to a variant made it
+	// read as already covered, so the borrow it actually needed was suppressed
+	// -- and because a restart also loses the borrow times, the hold timeout
+	// that would eventually free the Pod restarted from zero.
+	in := Input{
+		Memberships: []pool.Membership{
+			resident("a", "qwen", pool.Waking), // awake, serving nothing
+			resident("b", "qwen", pool.Asleep),
+		},
+		Variants: []VariantDemand{demand("qwen", 2, 1)},
+		Now:      now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Borrow) != 1 {
+		t.Fatalf("the shortfall must be covered rather than read as already met: %+v", got.Borrow)
+	}
+}
+
+func TestAnOrphanIsFinishedRatherThanSleptAndWokenAgain(t *testing.T) {
+	// It is already awake, for the right model. Sleeping it and waking it again
+	// inside one plan would cost a drain, a sleep and a wake to reach the state
+	// it was in to begin with -- so the return is dropped and the borrow
+	// finishes the activation the interrupted sequence began.
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "qwen", pool.Waking)},
+		Variants:    []VariantDemand{demand("qwen", 1, 0)},
+		Now:         now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Borrow) != 1 || got.Borrow[0].Pod != pod("a") {
+		t.Fatalf("the orphan must be put to work: %+v", got.Borrow)
+	}
+	if len(got.Return) != 0 {
+		t.Errorf("and not slept on the way: %+v", got.Return)
+	}
+}
+
+func TestAnOrphanNobodyNeedsIsStillPutBackToSleep(t *testing.T) {
+	// The other half. With no shortfall to finish it into, an awake engine
+	// serving nothing is simply burning a GPU, and belongs in the reserve.
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "qwen", pool.Waking)},
+		Variants:    []VariantDemand{demand("qwen", 1, 1)},
+		Now:         now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 1 || got.Return[0].Pod != pod("a") {
+		t.Fatalf("an unwanted orphan must be handed back: %+v", got.Return)
+	}
+	if len(got.Borrow) != 0 {
+		t.Errorf("and not borrowed: %+v", got.Borrow)
+	}
+}
+
+func TestAServingBridgeIsNotMistakenForAnOrphan(t *testing.T) {
+	// Serving means traffic is pointed at it. Returning that would take a live
+	// bridge out from under the requests it is carrying.
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "qwen", pool.Serving)},
+		Variants:    []VariantDemand{demand("qwen", 2, 0)},
+		Now:         now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 0 {
+		t.Fatalf("a serving bridge that is still needed must not be returned: %+v", got.Return)
 	}
 }

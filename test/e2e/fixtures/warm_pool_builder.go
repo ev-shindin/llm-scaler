@@ -420,6 +420,33 @@ func ApplyWarmPoolNetworkPolicy(
 	policy.Namespace = namespace
 	policy.ResourceVersion = ""
 
+	// Point the controller rule at the namespace the suite actually runs in.
+	//
+	// This is not a convenience: it is precisely the edit the manifest tells a
+	// namespace-scoped operator to make, so performing it here keeps the suite
+	// honest about what has to be done and would fail loudly if the rule were
+	// ever removed or renamed. The shipped default names the cluster-scoped
+	// install's namespace, which no test cluster uses.
+	edited := 0
+	for i := range policy.Spec.Ingress {
+		for j := range policy.Spec.Ingress[i].From {
+			peer := &policy.Spec.Ingress[i].From[j]
+			if peer.NamespaceSelector == nil || peer.PodSelector == nil {
+				continue
+			}
+			peer.NamespaceSelector = &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": namespace},
+			}
+			edited++
+		}
+	}
+	if edited == 0 {
+		return "", fmt.Errorf(
+			"%s has no namespaceSelector+podSelector rule to point at the controller; "+
+				"the suite cannot admit the controller and every assertion about the "+
+				"boundary would be meaningless", ShippedNetworkPolicyPath)
+	}
+
 	if _, err := clientset.NetworkingV1().NetworkPolicies(namespace).Create(
 		ctx, &policy, metav1.CreateOptions{}); err != nil {
 		if !errors.IsAlreadyExists(err) {
