@@ -71,11 +71,19 @@ func freshnessRef() *pb.ScaledObjectRef {
 // forever, so the target was woken the moment KEDA asked, was never observed
 // inactive, and no engine could detect demand on it.
 func TestStaleActivationReleasesZeroParkedTarget(t *testing.T) {
-	now := time.Now()
+	// The injected clock is read AFTER the store has been written, not before.
+	// Set stamps the decision with the real time.Now(), so starting the clock
+	// first leaves the test only the one second of slack that the Add below
+	// adds on top of the TTL -- and any pause longer than that between the two
+	// lines (a loaded machine, -race, packages building in parallel) leaves the
+	// decision looking fresh and fails the assertion. Reproduced with a 1.5 s
+	// sleep in that gap; it is why this test flaked in a full -race run.
+	var now time.Time
 	store := decision.NewStore()
 	// The target is parked at zero, but a stale "2" is still in the store.
 	h := freshnessHandler(t, store, 0, &now)
 	store.Set(freshnessNS, freshnessTarget, 2)
+	now = time.Now()
 
 	active, err := h.isActive(context.Background(), freshnessRef())
 	if err != nil {
