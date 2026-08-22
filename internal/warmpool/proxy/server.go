@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -39,12 +40,48 @@ type Config struct {
 	Port uint16
 	// DialTimeout bounds a connection to the awake instance.
 	DialTimeout time.Duration
+	// MinUpstreamPort is the lowest port an engine may listen on, and so the
+	// lowest this proxy will forward to. It exists to keep the supervisor and
+	// this proxy's own control endpoint -- both loopback -- out of reach.
+	MinUpstreamPort int
 }
 
 // DefaultConfig is a usable configuration for a pool Pod.
 var DefaultConfig = Config{
 	Port:        8000,
 	DialTimeout: 10 * time.Second,
+	// Matches pool.BasePort. Not imported from there: this binary ships in the
+	// pool Pod and must not depend on the controller's packages.
+	MinUpstreamPort: 9001,
+}
+
+// Check asks a proxy in this container whether it is ready or alive, and is how
+// the Pod's probes run.
+//
+// An exec probe rather than an httpGet one, because a kubelet probe originates
+// from the NODE and a NetworkPolicy `from:` selector cannot name a node -- so
+// any port this pool restricts is a port the kubelet may not be able to reach,
+// and whether it can is a property of the CNI rather than of the manifest.
+// Running the check inside the container sidesteps the question entirely: the
+// request never leaves the Pod's network namespace.
+func Check(ctx context.Context, port uint16, path string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s answered %d", url, resp.StatusCode)
+	}
+	return nil
 }
 
 // Server forwards HTTP requests to the currently awake instance.
@@ -58,6 +95,14 @@ type Server struct {
 	upstream atomic.Pointer[string]
 	listener atomic.Pointer[net.Listener]
 	proxy    *httputil.ReverseProxy
+
+	// degraded records that a request to the upstream failed. It makes
+	// readiness reflect the engine rather than the pointer at it -- see
+	// ReadyHandler -- and is cleared by the next response that works.
+	degraded atomic.Bool
+	// health is a separate client so a readiness check cannot be starved by
+	// the streaming connections the proxy transport is holding.
+	health *http.Client
 }
 
 // New creates a Server. Nothing listens until Run is called.
@@ -65,7 +110,10 @@ func New(cfg Config) *Server {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = DefaultConfig.DialTimeout
 	}
-	s := &Server{cfg: cfg}
+	if cfg.MinUpstreamPort <= 0 {
+		cfg.MinUpstreamPort = DefaultConfig.MinUpstreamPort
+	}
+	s := &Server{cfg: cfg, health: &http.Client{Timeout: cfg.DialTimeout}}
 	s.proxy = &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
 			// Resolved per request, so a wake takes effect on the next request
@@ -81,7 +129,15 @@ func New(cfg Config) *Server {
 		// output this proxy exists to carry, and buffering it would undo the
 		// latency the pool is built for.
 		FlushInterval: -1,
+		ModifyResponse: func(*http.Response) error {
+			// A response that arrived is proof the engine is there.
+			s.degraded.Store(false)
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// Recorded, not just logged: this is how readiness learns that the
+			// engine behind a perfectly valid upstream has gone.
+			s.degraded.Store(true)
 			klog.FromContext(r.Context()).V(2).Info("warm-pool proxy could not reach the awake instance",
 				"upstream", s.Upstream(), "err", err)
 			http.Error(w, "the awake instance did not answer", http.StatusBadGateway)
@@ -92,6 +148,10 @@ func New(cfg Config) *Server {
 
 // ErrUpstreamNotLocal rejects an upstream outside this Pod.
 var ErrUpstreamNotLocal = errors.New("upstream must be loopback: a pool Pod may only serve its own engines")
+
+// ErrUpstreamNotAnEngine rejects a loopback address that is not an engine --
+// the supervisor and this proxy's own control endpoint are loopback too.
+var ErrUpstreamNotAnEngine = errors.New("upstream must be an engine port")
 
 // SetUpstream points the proxy at addr ("host:port"), which must be loopback.
 //
@@ -107,12 +167,25 @@ func (s *Server) SetUpstream(addr string) error {
 		s.upstream.Store(nil)
 		return nil
 	}
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("address must be host:port: %w", err)
 	}
 	if !isLoopback(host) {
 		return fmt.Errorf("%w: got %q", ErrUpstreamNotLocal, host)
+	}
+	// Loopback alone is not enough. The dangerous ports in a pool Pod are ALSO
+	// loopback: the supervisor spawns processes with caller-supplied argv, and
+	// this proxy's own control endpoint re-points it. An upstream aimed at
+	// either turns this port -- the one every Pod in the namespace may dial --
+	// into a way to reach them, straight through the NetworkPolicy.
+	//
+	// Engines listen in the pool's own range and nothing else legitimately does,
+	// so that is what is accepted.
+	number, err := strconv.Atoi(port)
+	if err != nil || number < s.cfg.MinUpstreamPort {
+		return fmt.Errorf("%w: port %q is not in the pool's engine range (>= %d)",
+			ErrUpstreamNotAnEngine, port, s.cfg.MinUpstreamPort)
 	}
 	s.upstream.Store(&addr)
 	return nil
@@ -180,29 +253,13 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	// The probes are answered HERE, on the port traffic actually arrives on,
-	// and not only on the control port.
-	//
-	// Two reasons, one operational and one about correctness. The control port
-	// is reachable only by the controller under this pool's NetworkPolicy, and
-	// a kubelet probe originates from the NODE, which no `from:` selector can
-	// name -- most CNIs permit it, but relying on that is relying on an
-	// implementation detail to keep Pods from being restart-looped. And a
-	// readiness probe on a different port can pass while the port serving
-	// traffic is wedged, which is the failure readiness exists to catch.
-	//
-	// Intercepting these two paths shadows them on the upstream. vLLM serves
-	// /health, /ping and /version and neither of these, so nothing real is
-	// hidden -- but an engine that did serve them would be unreachable here.
-	switch r.URL.Path {
-	case ReadyPath:
-		s.ReadyHandler(w, r)
-		return
-	case HealthPath:
-		s.HealthHandler(w, r)
-		return
-	}
-
+	// Nothing is intercepted here. An earlier version answered the probes on
+	// this port, on the reasoning that a kubelet probe comes from the node and
+	// the NetworkPolicy admits this port -- but a policy rule carrying ANY
+	// `from:` restricts its sources, and this port's rule carries one, so the
+	// node matches it no better than it matches the control port's. The probes
+	// run `warmpool-proxy --check` inside the container instead, over loopback,
+	// where no policy applies. See Check.
 	if s.Upstream() == "" {
 		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
 		return
@@ -239,13 +296,55 @@ const HealthPath = "/healthz"
 // own readinessProbe, leaving readiness to the kubelet. Doing the same here
 // means the controller needs no `pods/status` permission, and a Pod whose
 // controller has died still stops taking traffic when its model sleeps.
-func (s *Server) ReadyHandler(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	if s.Upstream() == "" {
 		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
 		return
 	}
+	// An upstream that is set is not the same as an engine that answers. A vLLM
+	// process that crashed or was OOM-killed leaves the upstream exactly as it
+	// was, so readiness on the pointer alone keeps the Pod in its InferencePool
+	// and every dispatched request becomes a 502 -- indefinitely, because
+	// nothing else notices. Worse, the controller's eventual Deactivate cannot
+	// put a dead engine to sleep, so the Pod stays lent and its GPU is lost.
+	//
+	// Checked only after a failure, not on every probe: the flag is set by the
+	// proxy's own error handler and cleared by the next response that works, so
+	// the healthy path stays a pointer read.
+	if s.degraded.Load() {
+		if err := s.upstreamAnswers(r.Context()); err != nil {
+			http.Error(w, "the awake instance is not answering: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		s.degraded.Store(false)
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ready"))
+}
+
+// upstreamAnswers asks the engine directly, which is the only thing that
+// settles whether this Pod can serve.
+func (s *Server) upstreamAnswers(ctx context.Context) error {
+	upstream := s.Upstream()
+	if upstream == "" {
+		return errors.New("no model is awake")
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.DialTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+upstream+"/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.health.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("engine answered %d", resp.StatusCode)
+	}
+	return nil
 }
 
 type upstreamBody struct {

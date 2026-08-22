@@ -25,14 +25,14 @@ spec:
   # means authentication inside FMA's launcher, which means forking it.
   #
   # KUBELET PROBES. A probe originates from the NODE, and no `from:` selector can
-  # name a node -- there is no portable way to express it. Most CNIs permit
-  # host-to-local-pod traffic regardless of policy, so probes to :8001 and :8002
-  # normally survive this, but that is an implementation detail and not a
-  # guarantee. The proxy's probes have been moved to :8000 accordingly, where
-  # this policy admits them. The SUPERVISOR's cannot move: its liveness probe
-  # must reach :8001 because FMA's launcher serves only that port, so on a CNI
-  # that blocks node traffic the supervisor container would restart-loop.
-  # Verify probes stay green on the target cluster before relying on this file.
+  # name one -- there is no portable way to express it. Note that an ingress rule
+  # carrying ANY `from:` restricts its sources, so this applies to EVERY port
+  # here, :8000 included: moving a probe between these ports does not help.
+  #
+  # Both containers therefore use `exec` probes, which the kubelet runs INSIDE
+  # the container against loopback. The request never leaves the Pod's network
+  # namespace and no policy applies to it. Nothing here needs relaxing for
+  # probes, and nothing about them depends on which CNI is installed.
   podSelector:
     matchLabels:
       app.kubernetes.io/name: workload-variant-autoscaler
@@ -49,13 +49,32 @@ spec:
         - podSelector: {}
     # Control: the supervisor and the proxy's upstream endpoint, for the
     # controller only.
+    #
+    # The namespaceSelector is REQUIRED, not belt and braces. A `from:` entry
+    # with a bare podSelector matches only pods in this policy's OWN namespace,
+    # and the controller does not run here: the pool is deployed into the
+    # namespace whose models it warms, while WVA installs into
+    # workload-variant-autoscaler-system by default (Makefile WVA_NS) and is
+    # meant to -- WVA_WATCH_NAMESPACE exists precisely so the controller can sit
+    # outside the namespace it manages. Without this selector every call to
+    # :8001 and :8002 is dropped and the pool cannot be driven at all: Activate
+    # fails at the re-point with the engine already awake and the pool labels
+    # already applied, the compensating Deactivate fails at the clear, and the
+    # Pod holds its GPU serving nothing until the hold expires.
+    #
+    # EDIT THIS if WVA is installed into a different namespace. The
+    # kubernetes.io/metadata.name label is applied automatically by the API
+    # server, so no labelling step is needed.
     - ports:
         - protocol: TCP
           port: 8001
         - protocol: TCP
           port: 8002
       from:
-        - podSelector:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: workload-variant-autoscaler-system
+          podSelector:
             matchLabels:
               app.kubernetes.io/name: workload-variant-autoscaler
               control-plane: controller-manager

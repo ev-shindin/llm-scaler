@@ -39,7 +39,12 @@ func run() int {
 		controlPort uint
 		dialTimeout time.Duration
 		upstream    string
+		check       string
 	)
+	flag.StringVar(&check, "check", "",
+		"run as a probe instead of a server: \"ready\" or \"live\". Exits 0 if the "+
+			"proxy in this container answers, 1 otherwise. This is how the Pod's "+
+			"probes run -- see the comment on proxy.Check.")
 	flag.UintVar(&servePort, "port", 8000,
 		"port to serve on; must match the InferencePool's target port")
 	flag.UintVar(&controlPort, "control-port", 8002,
@@ -53,6 +58,11 @@ func run() int {
 
 	logger := klog.NewKlogr().WithName("warmpool-proxy")
 	ctx := klog.NewContext(context.Background(), logger)
+
+	if check != "" {
+		return runCheck(ctx, check, uint16(controlPort))
+	}
+
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -71,11 +81,10 @@ func run() int {
 	// write and so no extra permission for the controller.
 	mux.HandleFunc(proxy.ReadyPath, server.ReadyHandler)
 	mux.HandleFunc(proxy.HealthPath, server.HealthHandler)
-	// Both are also answered on the SERVING port, which is where the Pod's
-	// probes point: the control port is restricted to the controller by this
-	// pool's NetworkPolicy, and a kubelet probe comes from the node, which no
-	// `from:` selector can name. They stay here because a human debugging a
-	// pool Pod reaches the control port, not the tenant's serving port.
+	// The Pod's probes reach these through `--check`, which runs in this
+	// container and dials loopback. They are not exposed on the serving port:
+	// that port is reachable by every Pod in the namespace, and wiring container
+	// restarts to it would let a tenant's traffic restart this proxy.
 
 	control := &http.Server{
 		Addr:              fmt.Sprintf(":%d", controlPort),
@@ -97,6 +106,40 @@ func run() int {
 
 	if err := server.Run(ctx); err != nil {
 		logger.Error(err, "Proxy stopped")
+		return 1
+	}
+	return 0
+}
+
+// runCheck is the probe path: one request to this container's own control
+// endpoint, and an exit code.
+//
+// An exec probe rather than an httpGet one because a kubelet probe originates
+// from the NODE, and a NetworkPolicy `from:` selector cannot name a node. Any
+// port this pool restricts is therefore a port the kubelet may or may not
+// reach depending on the CNI -- a Pod that is permanently NotReady, or a
+// container restart-looping, decided by something no manifest states. Running
+// the check inside the container removes the question: the request never
+// leaves the Pod's network namespace, so no policy applies to it.
+//
+// The image is distroless, so this binary is the only thing available to make
+// the request with. That is why the check lives here rather than being a curl.
+func runCheck(ctx context.Context, check string, controlPort uint16) int {
+	logger := klog.FromContext(ctx)
+
+	var path string
+	switch check {
+	case "ready":
+		path = proxy.ReadyPath
+	case "live":
+		path = proxy.HealthPath
+	default:
+		logger.Error(nil, "unknown check", "check", check, "want", "ready or live")
+		return 2
+	}
+	// Short: a probe that outlives its own period is a probe that has failed.
+	if err := proxy.Check(ctx, controlPort, path, 3*time.Second); err != nil {
+		logger.V(2).Info("check failed", "check", check, "err", err)
 		return 1
 	}
 	return 0

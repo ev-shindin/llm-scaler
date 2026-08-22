@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -158,7 +159,7 @@ func TestRequestsAreRefusedWhenEveryModelIsAsleep(t *testing.T) {
 
 func TestAnUnreachableUpstreamIsABadGatewayNotAHang(t *testing.T) {
 	s, base := startProxy(t)
-	mustSetUpstream(t, s, "127.0.0.1:1") // nothing listens there
+	mustSetUpstream(t, s, deadEngine(t))
 
 	done := make(chan int, 1)
 	go func() {
@@ -326,53 +327,156 @@ func probe(t *testing.T, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
-func TestTheProbesAreAnsweredOnTheServingPort(t *testing.T) {
-	// The Pod's probes point here, not at the control port. A kubelet probe
-	// originates from the node, which no NetworkPolicy `from:` selector can
-	// name, and this pool's policy restricts the control port to the
-	// controller -- so probing it relies on the CNI permitting host traffic,
-	// which is an implementation detail rather than a guarantee. Probing the
-	// serving port also catches the failure readiness exists for: a wedged
-	// serving listener behind a healthy control port.
-	s, base := startProxy(t)
-
-	// Asleep: live, but not ready. Both halves matter -- a liveness probe that
-	// failed while the Pod slept would restart it for doing its job.
-	if code, _ := probe(t, base+HealthPath); code != http.StatusOK {
-		t.Errorf("%s on the serving port = %d, want 200 while asleep", HealthPath, code)
-	}
-	if code, _ := probe(t, base+ReadyPath); code != http.StatusServiceUnavailable {
-		t.Errorf("%s on the serving port = %d, want 503 while asleep", ReadyPath, code)
-	}
-
-	mustSetUpstream(t, s, engine(t, "qwen"))
-	if code, _ := probe(t, base+ReadyPath); code != http.StatusOK {
-		t.Errorf("%s = %d, want 200 once a model is awake", ReadyPath, code)
-	}
-	if code, _ := probe(t, base+HealthPath); code != http.StatusOK {
-		t.Errorf("%s = %d, want 200 once a model is awake", HealthPath, code)
-	}
-}
-
-func TestTheProbePathsAreNotForwardedToTheEngine(t *testing.T) {
-	// Intercepted rather than proxied. An awake Pod would otherwise report
-	// whatever the engine says at those paths, and vLLM serves neither, so
-	// readiness would answer 404 and the Pod would never join its InferencePool.
+func TestTheProbesAreNotReachableOnTheServingPort(t *testing.T) {
+	// The serving port is reachable by every Pod in the namespace. Answering
+	// the probes there would wire container restarts to traffic a tenant
+	// controls: ~30 s of slow responses under a per-token flush is enough to
+	// trip a liveness probe, and this proxy cannot tell a slow client from a
+	// hostile one.
+	//
+	// An earlier version did intercept them here, reasoning that a kubelet
+	// probe comes from the node and this port's NetworkPolicy rule admits it.
+	// That was wrong: a rule carrying ANY `from:` restricts its sources, and
+	// this one carries `podSelector: {}`. The node matches it no better than it
+	// matches the control port's rule.
 	s, base := startProxy(t)
 	mustSetUpstream(t, s, engine(t, "qwen"))
 
 	for _, path := range []string{ReadyPath, HealthPath} {
 		code, body := probe(t, base+path)
-		if code != http.StatusOK {
-			t.Errorf("%s = %d, want 200 from the proxy itself", path, code)
+		if code != http.StatusOK || !strings.Contains(body, "qwen") {
+			t.Errorf("%s on the serving port = %d %q, want it forwarded to the engine",
+				path, code, body)
 		}
-		if strings.Contains(body, "qwen") {
-			t.Errorf("%s was answered by the engine (%q); it must not be forwarded", path, body)
-		}
+	}
+}
+
+func TestCheckIsHowTheProbesRun(t *testing.T) {
+	// Exec rather than httpGet, because the request then never leaves the Pod's
+	// network namespace and no NetworkPolicy applies to it. The image is
+	// distroless, so this binary making the request is the only option.
+	s := New(DefaultConfig)
+	mux := http.NewServeMux()
+	mux.HandleFunc(ReadyPath, s.ReadyHandler)
+	mux.HandleFunc(HealthPath, s.HealthHandler)
+	control := httptest.NewServer(mux)
+	defer control.Close()
+
+	port := portOfURL(t, control.URL)
+	ctx := context.Background()
+
+	// Liveness says the proxy is up; readiness says a model is awake here. The
+	// difference is the whole point: a liveness probe that failed while the Pod
+	// slept would restart it for doing its job.
+	if err := Check(ctx, port, HealthPath, time.Second); err != nil {
+		t.Errorf("live check must pass while asleep: %v", err)
+	}
+	if err := Check(ctx, port, ReadyPath, time.Second); err == nil {
+		t.Error("ready check must fail while asleep")
 	}
 
-	// And every other path still reaches the engine.
-	if code, body := probe(t, base+"/v1/models"); code != http.StatusOK || !strings.Contains(body, "qwen") {
-		t.Errorf("/v1/models = %d %q: ordinary paths must still be forwarded", code, body)
+	mustSetUpstream(t, s, engine(t, "qwen"))
+	if err := Check(ctx, port, ReadyPath, time.Second); err != nil {
+		t.Errorf("ready check must pass once a model is awake: %v", err)
 	}
+}
+
+func TestReadinessFollowsTheEngineAndNotJustThePointer(t *testing.T) {
+	// An upstream that is set is not an engine that answers. A vLLM process
+	// that crashed or was OOM-killed leaves the pointer exactly as it was, so
+	// readiness on the pointer alone keeps the Pod in its InferencePool and
+	// every dispatched request becomes a 502 -- indefinitely, because nothing
+	// else notices. The controller's eventual Deactivate cannot sleep a dead
+	// engine either, so the Pod stays lent and its GPU is lost.
+	s, base := startProxy(t)
+	mustSetUpstream(t, s, engine(t, "qwen"))
+
+	rec := httptest.NewRecorder()
+	s.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, ReadyPath, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a live engine must read as ready, got %d", rec.Code)
+	}
+
+	// The engine dies. Nothing tells the proxy; it finds out by failing.
+	mustSetUpstream(t, s, deadEngine(t))
+	if code, _ := probe(t, base+"/v1/models"); code != http.StatusBadGateway {
+		t.Fatalf("a request to a dead engine = %d, want 502", code)
+	}
+
+	rec = httptest.NewRecorder()
+	s.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, ReadyPath, nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readiness = %d after the engine died, want 503", rec.Code)
+	}
+}
+
+func TestReadinessRecoversWhenTheEngineComesBack(t *testing.T) {
+	// Latching would be worse than not checking at all: a Pod marked NotReady
+	// takes no traffic, so nothing would ever produce the success that clears
+	// the flag. The check has to be able to un-fail.
+	s := New(DefaultConfig)
+	mustSetUpstream(t, s, engine(t, "qwen"))
+
+	s.degraded.Store(true)
+	rec := httptest.NewRecorder()
+	s.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, ReadyPath, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readiness = %d, want the live engine to clear the flag", rec.Code)
+	}
+	if s.degraded.Load() {
+		t.Error("the flag must be cleared once the engine answers again")
+	}
+}
+
+func TestAnUpstreamMustBeAnEngineAndNotJustLoopback(t *testing.T) {
+	// The dangerous ports in a pool Pod are loopback too. The supervisor spawns
+	// processes with caller-supplied argv in a container mounting the shared
+	// model cache read-write, and this proxy's own control endpoint re-points
+	// it. An upstream aimed at either would turn the serving port -- the one
+	// every Pod in the namespace may dial -- into a route to them, straight
+	// through the NetworkPolicy that exists to keep them closed.
+	s := New(DefaultConfig)
+	for _, addr := range []string{
+		"127.0.0.1:8001", // the FMA supervisor: arbitrary execution
+		"127.0.0.1:8002", // this proxy's own control endpoint
+		"127.0.0.1:8000", // its serving port, which would be a loop
+		"127.0.0.1:22",
+	} {
+		if err := s.SetUpstream(addr); !errors.Is(err, ErrUpstreamNotAnEngine) {
+			t.Errorf("SetUpstream(%q) = %v, want it refused as not an engine", addr, err)
+		}
+	}
+	if s.Upstream() != "" {
+		t.Errorf("a refused upstream must not be stored, got %q", s.Upstream())
+	}
+	if err := s.SetUpstream(net.JoinHostPort(loopbackHost, "9001")); err != nil {
+		t.Errorf("SetUpstream on an engine port: %v", err)
+	}
+}
+
+// deadEngine returns an address in the engine range that is proven to have
+// nothing behind it: a server is bound and then closed, so the kernel has told
+// us the port was free rather than us guessing one. Guessing found a port this
+// developer's machine was already using, and the test failed with a 404 from
+// something else entirely.
+func deadEngine(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := strings.TrimPrefix(server.URL, "http://")
+	server.Close()
+	return addr
+}
+
+// portOfURL extracts the port an httptest server bound.
+func portOfURL(t *testing.T, raw string) uint16 {
+	t.Helper()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(raw, "http://"))
+	if err != nil {
+		t.Fatalf("split %q: %v", raw, err)
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("port %q: %v", port, err)
+	}
+	return uint16(number)
 }

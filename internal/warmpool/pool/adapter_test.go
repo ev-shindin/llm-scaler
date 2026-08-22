@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,15 @@ import (
 )
 
 const testNamespace = "pool-ns"
+
+// deadAddr is an address proven to have nothing behind it: bound and closed, so
+// the kernel confirmed it was free rather than the test guessing a port.
+var deadAddr = func() string {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := strings.TrimPrefix(server.URL, "http://")
+	server.Close()
+	return addr
+}()
 
 // journal records what happened, in order, across all three protocols and the
 // Kubernetes client. The orderings are the thing worth asserting: sleeping
@@ -90,6 +100,13 @@ type harness struct {
 	upstream  string
 	asleep    bool
 	wakeFails bool
+	// brokenPods answer as if their supervisor were unreachable. Per Pod
+	// rather than per harness, so a test can put a healthy Pod and a broken one
+	// behind the SAME ListWarm call -- which is the only way to exercise the
+	// loop that must skip one and keep the other.
+	brokenPods map[string]bool
+	// serveSlowly delays /health so an admission can outlive its context.
+	serveSlowly time.Duration
 
 	// Failure knobs. Each names a step that can fail in production and whose
 	// failure must stop the sequence rather than let it run on: the orderings
@@ -108,9 +125,10 @@ func newHarness(t *testing.T, pods ...client.Object) *harness {
 		t.Fatalf("scheme: %v", err)
 	}
 	h := &harness{
-		journal:   &journal{},
-		asleep:    true,
-		instances: []Instance{{ID: "qwen", Status: "running", Options: "--model Qwen/Qwen3-0.6B --port 9001"}},
+		journal:    &journal{},
+		brokenPods: map[string]bool{},
+		asleep:     true,
+		instances:  []Instance{{ID: "qwen", Status: "running", Options: "--model Qwen/Qwen3-0.6B --port 9001"}},
 	}
 	h.k8s = fake.NewClientBuilder().WithScheme(scheme).WithObjects(pods...).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -137,7 +155,11 @@ func newHarness(t *testing.T, pods ...client.Object) *harness {
 
 	a := NewAdapter(h.k8s, testNamespace, Ram)
 	a.DrainWait = 5 * time.Millisecond
-	a.newSupervisor = func(string) *Supervisor {
+	a.newSupervisor = func(podIP string) *Supervisor {
+		if h.brokenPods[podIP] {
+			// A supervisor that is not there at all: the address refuses.
+			return &Supervisor{client: supervisor.Client(), baseURL: "http://" + deadAddr}
+		}
 		return &Supervisor{client: supervisor.Client(), baseURL: supervisor.URL}
 	}
 	a.newEngine = func(Endpoint) *Engine {
@@ -176,11 +198,16 @@ func (h *harness) serveSupervisor(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(inst)
 	case r.Method == http.MethodDelete:
-		h.journal.add("delete " + strings.TrimPrefix(r.URL.Path, instancesPath+"/"))
+		id := strings.TrimPrefix(r.URL.Path, instancesPath+"/")
+		h.journal.add("delete " + id)
 		if h.deleteFails {
 			http.Error(w, "instance is busy", http.StatusConflict)
 			return
 		}
+		// Actually remove it. A fake that journals the call but keeps the
+		// instance lets a test assert the delete happened while the state it
+		// was supposed to change did not.
+		h.instances = slices.DeleteFunc(h.instances, func(inst Instance) bool { return inst.ID == id })
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{}`))
 	default:
@@ -215,6 +242,9 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(`{"is_sleeping":` + strconv.FormatBool(h.asleep) + `}`))
 	case r.URL.Path == "/health":
+		if h.serveSlowly > 0 {
+			time.Sleep(h.serveSlowly)
+		}
 		w.WriteHeader(http.StatusOK)
 	default:
 		http.NotFound(w, r)
@@ -262,6 +292,11 @@ func poolPod(name, ip string, extra map[string]string) *corev1.Pod {
 func podA() types.NamespacedName {
 	return types.NamespacedName{Namespace: testNamespace, Name: "pod-a"}
 }
+
+// admitted is the variant these tests admit, as opposed to the one already
+// resident. Named because several tests now use it and the two must not be
+// confused: admitting a model that is already there is a no-op.
+const admitted = "llama"
 
 func qwen() ModelRef {
 	return ModelRef{
@@ -371,7 +406,7 @@ func TestWarmAdmitsAndLeavesTheModelAsleep(t *testing.T) {
 	h.asleep = false
 
 	model := qwen()
-	model.Variant = "llama"
+	model.Variant = admitted
 	if err := h.adapter.Warm(context.Background(), podA(), model, Ram); err != nil {
 		t.Fatalf("Warm: %v", err)
 	}
@@ -493,24 +528,97 @@ func TestAnInstanceThatWillNotAnswerReadsAsLoading(t *testing.T) {
 	}
 }
 
-func TestASupervisorTalkingNonsenseHidesOnlyItsOwnPod(t *testing.T) {
-	// One Pod answering with a body that does not parse must not empty the warm
-	// set: treating a transient failure as "the pool is empty" admits models
-	// that are already resident, at ~35 s and a reserve slot each.
-	good := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
-	if got, err := good.adapter.ListWarm(context.Background()); err != nil || len(got) != 1 {
-		t.Fatalf("baseline: %+v %v", got, err)
-	}
+func TestAnUnreachablePodHidesOnlyItself(t *testing.T) {
+	// One Pod that will not answer must not empty the warm set. Treating a
+	// transient supervisor failure as "the pool is empty" re-admits models that
+	// are already resident, at ~35 s and a reserve slot each.
+	//
+	// The two Pods must be in the SAME ListWarm call: testing them in separate
+	// harnesses would show "one good Pod alone -> 1" and "one bad Pod alone ->
+	// 0" without ever running the loop that has to skip one and keep the other.
+	h := newHarness(t,
+		poolPod("pod-a", "10.0.0.1", nil),
+		poolPod("pod-b", "10.0.0.2", nil),
+	)
+	h.brokenPods["10.0.0.2"] = true
 
-	bad := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
-	bad.garbageList = true
-	got, err := bad.adapter.ListWarm(context.Background())
+	got, err := h.adapter.ListWarm(context.Background())
 	if err != nil {
-		t.Fatalf("ListWarm must not fail for one bad Pod: %v", err)
+		t.Fatalf("ListWarm must not fail for one unreachable Pod: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("an unreadable Pod contributes nothing, got %+v", got)
+	if len(got) != 1 {
+		t.Fatalf("ListWarm = %+v, want only the reachable Pod", got)
 	}
+	if got[0].Pod.Name != "pod-a" {
+		t.Errorf("kept %s, want the Pod that answered", got[0].Pod.Name)
+	}
+}
+
+func TestAFailedAdmissionDoesNotCostThePodItsPlaceInTheReserve(t *testing.T) {
+	// An instance that was created but never served will not answer, so stateOf
+	// reports it as Loading -- deliberately not part of the reserve, because a
+	// Pod mid-load cannot serve a wake. Nothing revisits it: admission is
+	// idempotent on the instance already existing. Left behind, one failed
+	// admission costs the pool a Pod and its GPU, permanently.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.instances = nil
+	h.sleepFails = true // created and serving, but it will not go to sleep
+
+	model := qwen()
+	model.Variant = admitted
+	err := h.adapter.Warm(context.Background(), podA(), model, Ram)
+	if err == nil {
+		t.Fatal("want the admission failure reported")
+	}
+	h.journal.inOrder(t, "create", "sleep", "delete "+admitted)
+
+	h.mu.Lock()
+	remaining := len(h.instances)
+	h.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("%d instances left behind; the Pod is out of the reserve forever", remaining)
+	}
+}
+
+func TestAnAbandonedInstanceThatCannotBeRemovedSaysSo(t *testing.T) {
+	// The Pod really is out of the pool in this case, and that is worth more to
+	// whoever reads the log than the original failure on its own.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.instances = nil
+	h.sleepFails = true
+	h.deleteFails = true
+
+	model := qwen()
+	model.Variant = admitted
+	err := h.adapter.Warm(context.Background(), podA(), model, Ram)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "out of the reserve") {
+		t.Errorf("the error must say the Pod was lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), admitted) {
+		t.Errorf("and name the model: %v", err)
+	}
+}
+
+func TestCleanupSurvivesTheContextThatFailed(t *testing.T) {
+	// The context that failed is very often the reason it failed, so a cleanup
+	// inheriting its deadline cleans nothing up -- which is exactly the case
+	// where the Pod would be stranded.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.instances = nil
+	h.serveSlowly = 50 * time.Millisecond // WaitServing will outlive the context
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	model := qwen()
+	model.Variant = admitted
+	if err := h.adapter.Warm(ctx, podA(), model, Ram); err == nil {
+		t.Fatal("want the admission to fail on the deadline")
+	}
+	h.journal.at(t, "delete "+admitted)
 }
 
 func TestEvictRemovesTheInstanceItWasAskedTo(t *testing.T) {

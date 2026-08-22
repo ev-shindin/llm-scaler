@@ -26,6 +26,10 @@ const (
 	// NameLabel is the other half of the pool Deployment's own selector.
 	NameLabel = "app.kubernetes.io/name"
 
+	// abandonTimeout bounds the cleanup of a failed admission. Short, because it
+	// is one call and it runs after something has already gone wrong.
+	abandonTimeout = 30 * time.Second
+
 	// BasePort is the first port an instance may listen on inside a Pod.
 	// Instance ports are ours to choose, unlike FMA's, which come from the
 	// InferenceServerConfig and therefore collide between two instances of one
@@ -52,9 +56,15 @@ type Adapter struct {
 	tier      Tier
 
 	// DrainWait is how long to let in-flight work finish after the Pod leaves
-	// service and before the engine sleeps. Measured drain is ~630 ms; the
-	// default leaves margin, because sleeping early is a 503 and sleeping late
-	// costs only milliseconds.
+	// service and before the engine sleeps.
+	//
+	// It has to cover the whole chain, not just the drain: the kubelet must
+	// notice /readyz failing (up to one probe period), the Pod must leave its
+	// EndpointSlice, and the EPP must stop dispatching to it (~630 ms measured).
+	// With the manifest's periodSeconds: 1 and failureThreshold: 1 that is
+	// roughly 1.7 s, so the default leaves margin on top. Sleeping early is a
+	// 503 for every request still arriving; sleeping late costs only the
+	// milliseconds a returned Pod spends out of the reserve.
 	DrainWait time.Duration
 
 	// These exist so the protocol halves can be substituted in tests. Each
@@ -70,7 +80,7 @@ func NewAdapter(c client.Client, namespace string, tier Tier) *Adapter {
 		client:        c,
 		namespace:     namespace,
 		tier:          tier,
-		DrainWait:     2 * time.Second,
+		DrainWait:     4 * time.Second,
 		newSupervisor: func(podIP string) *Supervisor { return NewSupervisor(podIP, 0) },
 		newEngine:     func(ep Endpoint) *Engine { return NewEngine(ep, 0) },
 		newProxy:      func(podIP string) *Proxy { return NewProxy(podIP, 0) },
@@ -203,14 +213,42 @@ func (a *Adapter) Warm(ctx context.Context, pod types.NamespacedName, model Mode
 	ep := Endpoint{PodIP: p.Status.PodIP, Port: port}
 	engine := a.newEngine(ep)
 	if err := engine.WaitServing(ctx); err != nil {
-		return fmt.Errorf("instance for %s in %s never served: %w", model.Variant, pod, err)
+		return a.abandon(ctx, sup, pod, model,
+			fmt.Errorf("instance for %s in %s never served: %w", model.Variant, pod, err))
 	}
 	// Admission ends asleep. A model admitted and left awake would hold the
 	// GPU it was supposed to share.
 	if err := engine.Sleep(ctx, tier); err != nil {
-		return fmt.Errorf("sleep newly admitted %s in %s: %w", model.Variant, pod, err)
+		return a.abandon(ctx, sup, pod, model,
+			fmt.Errorf("sleep newly admitted %s in %s: %w", model.Variant, pod, err))
 	}
 	return nil
+}
+
+// abandon removes an instance whose admission did not finish, and returns the
+// error that caused it to be abandoned.
+//
+// Without this a failed admission is permanent. The instance exists in the
+// supervisor but will not answer, so stateOf reports it as Loading -- which is
+// deliberately NOT part of the reserve, because a Pod mid-load cannot serve a
+// wake. Nothing ever revisits it: admission is idempotent on the instance
+// already being there, so the pool simply loses a Pod, and with it a GPU.
+//
+// The delete gets a context of its own. The one that failed is very likely the
+// reason it failed, and a cleanup that inherits an expired deadline cleans
+// nothing up.
+func (a *Adapter) abandon(ctx context.Context, sup *Supervisor, pod types.NamespacedName, model ModelRef, cause error) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonTimeout)
+	defer cancel()
+
+	if err := sup.Delete(cleanup, InstanceID(model)); err != nil {
+		// Reported together: an instance that can be neither loaded nor removed
+		// has taken the Pod out of the pool, and that is worth more than the
+		// original failure alone.
+		return fmt.Errorf("%w (and it could not be removed, so %s is out of the reserve: %v)",
+			cause, pod, err)
+	}
+	return cause
 }
 
 // Activate puts a resident model into service.

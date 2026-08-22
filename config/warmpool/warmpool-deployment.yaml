@@ -142,18 +142,40 @@ spec:
             # The supervisor being up says nothing about whether a model is
             # awake -- that is the proxy's /readyz. This probe only reports that
             # the Pod can accept instructions.
-            httpGet:
-              path: /health
-              port: supervisor
+            #
+            # exec, not httpGet: :8001 is closed to everything but the
+            # controller, and a kubelet probe comes from the node, which no
+            # NetworkPolicy `from:` selector can name. An httpGet probe here
+            # would depend on whether the CNI happens to permit host traffic.
+            # Run inside the container, it depends on nothing.
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import sys, urllib.request
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=3)
+                  except Exception as err:
+                      print(err); sys.exit(1)
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
+            # exec for the same reason as the readiness probe above.
+            #
             # A wedged supervisor otherwise holds its GPU indefinitely: nothing
             # else in the system can restart it, and the models it holds are
             # unreachable.
-            httpGet:
-              path: /health
-              port: supervisor
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import sys, urllib.request
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=5)
+                  except Exception as err:
+                      print(err); sys.exit(1)
             initialDelaySeconds: 30
             periodSeconds: 30
             failureThreshold: 3
@@ -167,7 +189,7 @@ spec:
           # `make docker-build-warmpool-proxy docker-push-warmpool-proxy
           # WARMPOOL_PROXY_IMG=...` (Dockerfile.warmpool-proxy) and republish
           # under the project's own namespace before this leaves a test cluster.
-          image: ghcr.io/ev-shindin/warmpool-proxy:v4@sha256:0fee87f20324f3be676a15719fb1dbd151ed39b3dae602b93901532b3b598dc8
+          image: ghcr.io/ev-shindin/warmpool-proxy:v5@sha256:e614747c65f7ce02df3571b13fa487b0f4315b21118bfcfd25df38f04981b322
           imagePullPolicy: IfNotPresent
           args:
             - --port=8000
@@ -181,13 +203,17 @@ spec:
               containerPort: 8002
               protocol: TCP
           livenessProbe:
-            # On the SERVING port, not the control port. Two reasons: a kubelet
-            # probe comes from the node and the NetworkPolicy restricts the
-            # control port to the controller, and a probe on a port other than
-            # the one traffic uses can pass while that port is wedged.
-            httpGet:
-              path: /healthz
-              port: serving
+            # exec, through the proxy binary itself: the image is distroless, so
+            # there is no curl and no shell, and the binary is the only thing
+            # available to make the request with. The request goes to loopback
+            # inside this container, so the NetworkPolicy does not apply to it.
+            #
+            # Deliberately NOT on the serving port. That port is reachable by
+            # every Pod in the namespace, and wiring container restarts to it
+            # would let a tenant's traffic restart this proxy: with a per-token
+            # flush and 500m of CPU, ~30 s of slow responses is enough.
+            exec:
+              command: ["/warmpool-proxy", "--check=live", "--control-port=8002"]
             initialDelaySeconds: 3
             periodSeconds: 10
           readinessProbe:
@@ -200,11 +226,21 @@ spec:
             # kubelet. So the controller needs no `pods/status` permission, and
             # a Pod whose controller has died still stops taking traffic when
             # its model sleeps.
-            httpGet:
-              path: /readyz
-              port: serving
+            #
+            # periodSeconds and failureThreshold are load-bearing, not defaults.
+            # Deactivate clears the proxy, waits DrainWait, then sleeps the
+            # engine -- so the kubelet must notice within that wait. With the
+            # defaults (period 5, failureThreshold 3) it takes 5-20 s to mark
+            # the Pod NotReady while the engine sleeps at ~2 s, leaving the Pod
+            # in its InferencePool with nothing awake behind it: every dispatch
+            # 503s for up to 18 s, on EVERY sleep. That is precisely the
+            # Ready-but-asleep window this whole design exists to avoid.
+            exec:
+              command: ["/warmpool-proxy", "--check=ready", "--control-port=8002"]
             initialDelaySeconds: 3
-            periodSeconds: 5
+            periodSeconds: 1
+            failureThreshold: 1
+            timeoutSeconds: 2
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

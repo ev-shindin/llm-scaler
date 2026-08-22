@@ -128,7 +128,16 @@ func Decide(in Input, cfg Config) Plan {
 		}
 		candidates := holding(byPod, free, v.Model.Variant)
 		if len(candidates) == 0 {
-			plan.Missed = append(plan.Missed, v.Model)
+			// Which fault this is decides which knob an operator turns, so the
+			// two must not be conflated. `holding` searches FREE Pods only, so
+			// a variant resident in Pods that are all lent or loading yields no
+			// candidates -- and reporting that as a miss would say "the warm
+			// set was wrong" when the truth is "the reserve was too small".
+			if residentSomewhere(byPod, v.Model.Variant) {
+				plan.Blocked = append(plan.Blocked, v.Model)
+			} else {
+				plan.Missed = append(plan.Missed, v.Model)
+			}
 			continue
 		}
 		borrowed := 0

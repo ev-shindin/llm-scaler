@@ -493,3 +493,59 @@ func TestPreloadIsOffWhenNothingReportsPopularity(t *testing.T) {
 		t.Fatalf("with no popularity signal and no misses, nothing is admitted: %+v", got.Admit)
 	}
 }
+
+func TestAResidentVariantWithNoFreeHolderIsBlockedNotMissed(t *testing.T) {
+	// The two faults tell an operator to turn different knobs: a miss says the
+	// warm set is too small (raise C), a block says the reserve is (raise K).
+	// `holding` searches FREE Pods only, so a variant resident in Pods that are
+	// all lent reads as no candidates -- and calling that a miss sends the
+	// operator after the wrong one.
+	in := Input{
+		Memberships: []pool.Membership{
+			// Both copies of "qwen" are already serving; nothing is free.
+			resident("a", "qwen", pool.Serving),
+			resident("b", "qwen", pool.Serving),
+		},
+		Variants: []VariantDemand{demand("qwen", 5, 0)},
+		Now:      now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Missed) != 0 {
+		t.Errorf("a resident variant did not miss: %+v", got.Missed)
+	}
+	if len(got.Blocked) != 1 || got.Blocked[0].Variant != "qwen" {
+		t.Fatalf("want qwen blocked, got %+v", got.Blocked)
+	}
+}
+
+func TestAVariantResidentNowhereStillMisses(t *testing.T) {
+	// The other half of the same distinction: nothing holds this model, so the
+	// warm set really is the thing that was wrong.
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "other", pool.Asleep)},
+		Variants:    []VariantDemand{demand("stranger", 2, 0)},
+		Now:         now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Blocked) != 0 {
+		t.Errorf("a variant resident nowhere is not blocked: %+v", got.Blocked)
+	}
+	if len(got.Missed) != 1 || got.Missed[0].Variant != "stranger" {
+		t.Fatalf("want stranger missed, got %+v", got.Missed)
+	}
+}
+
+func TestAVariantResidentOnlyInALoadingPodIsBlocked(t *testing.T) {
+	// A Pod mid-admission cannot serve a wake -- that is why Loading is not
+	// reserve -- but the model IS resident, so the shortfall is one of free
+	// Pods and not of coverage.
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "qwen", pool.Loading)},
+		Variants:    []VariantDemand{demand("qwen", 2, 0)},
+		Now:         now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Blocked) != 1 || len(got.Missed) != 0 {
+		t.Fatalf("blocked=%+v missed=%+v, want blocked", got.Blocked, got.Missed)
+	}
+}
