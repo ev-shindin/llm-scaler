@@ -71,24 +71,31 @@ instance). WVA takes that role.
 | spawn / list / delete engines in a Pod | supervisor (this directory) |
 | `/sleep`, `/wake_up`, `/is_sleeping` | **WVA**, over HTTP to the engine's port |
 | which models are warm, which wakes, which is evicted | **WVA** — it is an allocation problem, which is what WVA is for |
-| joining a woken model to its InferencePool | **WVA** — label membership plus a readiness gate |
+| joining a woken model to its InferencePool | **WVA** — label membership; readiness comes from an ordinary probe against the proxy's `/readyz`, not a Pod readiness gate |
 
 No policy lives in the Pod. That is deliberate: the cache policy is the part most
 likely to change, and it must be changeable without touching the data plane.
 
-## What still has to change in the copied code
+## What had to change, and where it changed
 
-1. **The Pod holds the GPUs.** The pool Deployment requests `nvidia.com/gpu`, and
+All four are done. Note where: three of them turned out to be decisions WVA
+makes when CALLING the launcher, not modifications to the launcher itself, which
+is why the copy here runs unmodified.
+
+1. **The Pod holds the GPUs.** Done in the manifest. The pool Deployment requests `nvidia.com/gpu`, and
    the supervisor allocates the container's own devices among instances rather
    than being handed a device by a requester.
-2. **Instance identity keyed by model**, not by a hash over GPU UUIDs. The hash is
+2. **Instance identity keyed by model**, not by a hash over GPU UUIDs. Done in
+   WVA (`pool.InstanceID`): the launcher takes the ID from its caller. The hash is
    correct *for FMA* — `CUDA_VISIBLE_DEVICES` is fixed at process start, so a
    sleeper is not portable between GPUs — but our reuse question is "is this model
    resident in this Pod", which the model name answers.
-3. **Ports assigned from a local range**, not derived from an InferenceServerConfig.
+3. **Ports assigned from a local range**, not derived from an
+   InferenceServerConfig. Done in WVA (`pool.freePort`): the launcher takes the
+   port from its caller too.
    FMA's ISC-derived port is what made two instances of one model collide, and the
    port-conflict fix in `aa072ef` is a workaround for it.
-4. **Drop the launcher-notifier sidecar** (`launcher_pod_notifier.py`, not copied):
+4. **Drop the launcher-notifier sidecar** — never copied, so nothing to do:
    it maintains the `dual-pods.llm-d.ai/sleeping` label for the dual-pods
    controller. WVA reads instance state from the supervisor instead, which the
    measurements showed is the reliable source — the Pod label is per-Pod and flips

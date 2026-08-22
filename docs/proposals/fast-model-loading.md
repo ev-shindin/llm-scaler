@@ -232,10 +232,13 @@ twenty-eight would.
 two of three unbound sleepers dead with `cumem` errors — did not occur, because
 the Pod holds its GPUs for as long as it holds models.
 
-What this does NOT yet show: traffic actually served through an InferencePool
-(the proxy and readiness gate are built but not wired), behaviour under
-concurrent load, more than two models, or anything about how often a real fleet
-would hit rather than miss (§6.1).
+Traffic through an InferencePool HAS since been served: the EPP dispatched to
+the pool Pod as an ordinary peer endpoint, 19 of 30 requests in the run that
+checked it.
+
+What this still does not show: behaviour under concurrent load, more than two
+models, or anything about how often a real fleet would hit rather than miss
+(§6.1).
 
 ## 3. What measurement already forces
 
@@ -321,15 +324,21 @@ Identifying it is a prerequisite, not a detail.
 | Readiness -> EPP propagation | **admit 462 ms, drain 631 ms** — sub-second both ways |
 | Several engine instances on one card? | **Yes** — 1,399 MiB sleeper coexists with a live instance, no leak on delete |
 
-So the Kubernetes plumbing (readiness gates traffic), the correctness question,
+So the Kubernetes plumbing (readiness gates traffic — see §5's note: an ordinary probe, not a Pod readiness gate), the correctness question,
 and multi-tenancy of a single card are all answered. The remaining risk is
 concentrated in the wake mechanism itself.
 
 ### 3.4 Ordering is load-bearing
 
-Gate false -> wait ~1 s -> `/sleep`. Sleeping first leaves a Ready-but-asleep
-window, which *is* the 503 condition. On wake: `/wake_up` -> confirm the engine
-answers -> gate true. This is cheap to get right and expensive to get wrong.
+Clear the proxy (readiness follows it) -> wait for the drain -> unlabel ->
+`/sleep`. Sleeping first leaves a Ready-but-asleep window, which *is* the 503
+condition. On wake the label goes FIRST, then `/wake_up`, then the proxy is
+pointed: labelling early costs nothing and takes the EPP's measured ~462 ms
+admit off the critical path.
+
+This is cheap to get right and expensive to get wrong — and the wait is longer
+than it looks. It has to cover the kubelet noticing the probe fail and the Pod
+leaving its EndpointSlice, not just the ~630 ms the EPP itself takes to drain.
 
 ### 3.5 Large models weaken the technique, whatever the mechanism
 
@@ -387,12 +396,19 @@ which is what the launcher is. Reuse it or write a minimal one, but something
 plays that role. See
 [the implementation design](fast-model-loading-implementation.md).
 
-**A pool is an ordinary Deployment.** One per `(accelerator, TP size, tier)`.
+**A pool is an ordinary Deployment.** One per `(accelerator, TP size, tier)` was
+the intent; what was built is one per NAMESPACE, single tier, with no accelerator
+or TP dimension.
 
 - Each Pod owns its GPUs (§3.1 — non-negotiable) and holds several models, at most
   one awake.
-- **Readiness gates traffic** (§3.3). The gate is declared in the template we
-  author, so no webhook and no CRD.
+- **Readiness gates traffic** (§3.3) — but through an ORDINARY readinessProbe
+  against the proxy, not a Pod readiness GATE. What was built probes the proxy's
+  `/readyz`, which answers 200 only while a model is awake in that Pod. The
+  difference matters: a gate is a status condition someone has to patch, so it
+  would need `pods/status` on the controller and would stop working the moment
+  the controller died. A probe needs neither. Read "gate" throughout §3 as this
+  probe.
 - **WVA drives** wake and sleep from the loop it already runs, through five calls:
   `ListWarm`, `Warm`, `Activate`, `Deactivate`, `Evict`.
 - Tier is expressed as *intent* (`desired-tier: ram|disk|none`), not as mechanism

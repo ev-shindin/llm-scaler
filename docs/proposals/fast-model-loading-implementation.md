@@ -37,7 +37,8 @@ So the honest inventory is:
 | in-Pod supervisor | **reuse FMA's launcher**, or write a minimal one (~300 lines) | a GPU belongs to one container; multiple engines need a parent |
 | dual-pods controller (~3.5k lines) | **not needed** | a pool is an ordinary Deployment |
 | launcher-populator, `LauncherPopulationPolicy` | **not needed** | WVA does the allocation |
-| requester / SPI / probes / proxy | **not needed** | traffic arrives through the InferencePool, not a requester |
+| requester / SPI | **not needed** | traffic arrives through the InferencePool, not a requester |
+| proxy | **NEEDED, and built** | a sleeping engine keeps its socket, so instances cannot take turns binding the pool's target port — see §3 |
 | `pod-helper.go` (`removeGPUResourceLimits`) | **not needed** | our Pods hold their GPUs deliberately (review §3.1) |
 
 Reuse-versus-rewrite of the supervisor is a real decision, deferred to §11: the
@@ -59,13 +60,15 @@ M>1) says the pool may not need building at all:
   is free in every one, membership is ordinary Deployment labelling, and the
   requester's TCP proxy landed upstream in `2c01cf8`. **That deletes item 9 (the
   model-aware local router) from §11 entirely.**
+  *(Superseded: a pool Pod holds several engines, so port 8000 is NOT free in
+  it, and a proxy was needed and written. See §3.)*
 - The shared-pool plan's conclusion was explicit: **"Do not fork FMA"** — the
   mechanism is a flag plus an allocation policy, and the allocation policy is
   WVA's job. Which is the same conclusion §7 of this document reaches from the
   other direction.
 
-**So the recommendation changes.** Do not build a parallel pool. Take FMA's
-launcher-plus-requester as the data plane, raise `--sleeper-limit` to the number
+**So the recommendation changes.** *(NOT WHAT WAS BUILT — see below.)* Do not
+build a parallel pool. Take FMA's launcher-plus-requester as the data plane, raise `--sleeper-limit` to the number
 of models a GPU should cover, and put the allocation policy in WVA — which is
 what it is for. What remains genuinely unresolved is narrower and sharper than
 "should we fork":
@@ -81,25 +84,44 @@ The rest of this document — objects, ports, state machine, policy, RBAC — st
 describes what WVA must do, whether the Pods are ours or FMA's. Read §2-§4 as the
 shape of a pool we build only if reusing FMA's is refused.
 
+**Reusing FMA's data plane WAS refused, on measurement.** FMA's controller
+strips the GPU from the launcher Pod and hands it to a transient requester;
+when that requester goes, the sleepers die with `cumem` errors — measured, twice.
+So the pool owns its Pods: an ordinary Deployment that keeps the GPU, running
+FMA's launcher UNMODIFIED as the in-Pod supervisor, with our own proxy and the
+allocation policy in WVA. §2-§4 are therefore the built design, not a fallback.
+
 ## 2. Objects
 
-One **Deployment per pool**, where a pool is a `(accelerator, TP size, tier)`
-triple. No CRD, no webhook, no operator.
+One **Deployment per pool**. No CRD, no webhook, no operator.
+
+The sketch below is WHAT WAS BUILT (`config/warmpool/`). An earlier draft
+described a pool as an `(accelerator, TP size, tier)` triple with a readiness
+gate and a `wva.llm-d.ai/pool` label; none of that exists. A pool is one
+namespace, one tier, and is identified by the two ordinary
+`app.kubernetes.io/` labels its own Deployment selects on.
 
 ```
-Deployment  wva-pool-h100-tp1-ram        replicas: K
+Deployment  wva-warm-pool                replicas: K
   Pod
-    container "engines"                  requests: nvidia.com/gpu: <TP>
+    container "inference-server"         requests: nvidia.com/gpu: <TP>
                                          requests: memory: <warm-set budget>
-      supervisor (PID 1)                 :8081  control API, cluster-internal
+      supervisor (PID 1)                 :8001  control API, controller-only
       vllm instance, model A (asleep)    :9001
-      vllm instance, model B (serving)   :8000  the InferencePool's target port
-    readinessGates:
-      - conditionType: wva.llm-d.ai/warm-ready
+      vllm instance, model B (awake)     :9002
+    container "proxy"
+      serving                            :8000  the InferencePool's target port
+      control                            :8002  controller-only; re-points it
     labels:
-      wva.llm-d.ai/pool: h100-tp1-ram
-      llm-d.ai/model: <set at wake, removed at sleep>     <- membership
+      app.kubernetes.io/name: workload-variant-autoscaler
+      app.kubernetes.io/component: warm-pool          <- pool capacity
+      llm-d.ai/model: <set at wake, removed at sleep> <- membership
 ```
+
+Both instances bind their own ports for life; the proxy owns 8000 and follows
+whichever is awake. Readiness is an ORDINARY probe against the proxy's
+`/readyz`, not a readiness gate — see §3 — which is what keeps the controller
+out of `pods/status`.
 
 Three properties are fixed at Pod creation and therefore belong to the pool, not
 to a runtime call: **TP size** (GPU count), **tier** (`gpu_memory_utilization` and
@@ -125,6 +147,14 @@ or something else. Membership is therefore "apply exactly the labels in that
 InferencePool's `spec.selector.matchLabels`, and remove exactly those at sleep",
 read from the object. WVA already reconciles InferencePools, so it has them;
 hardcoding `llm-d.ai/model` is a bug waiting for the first tenant who differs.
+
+**With one guard, which the sentence above does not admit.** A selector naming
+`app.kubernetes.io/name` or `app.kubernetes.io/component` with a different value
+is refused outright, and those two keys are never removed at sleep. A tenant's
+selector is theirs to write and generic keys are common, so "exactly the labels"
+taken literally would rewrite the Pod out of its OWN Deployment's selector: the
+ReplicaSet releases it, and what is left is a GPU-holding orphan with no
+controller, invisible to `ListWarm` and recoverable only by hand.
 
 **A Pod carries one value per key, so it belongs to one model's pool at a time.**
 That fits the one-awake invariant — and is an independent reason M>1 does not
@@ -171,11 +201,22 @@ taking traffic when its model sleeps, which a patched gate cannot manage.
 **The port is the constraint that limits M.** The EPP dials the InferencePool's
 `targetPortNumber` — typically 8000 — and only one process in a Pod can bind it.
 
-- **M=1 (phase 1):** the awake instance binds 8000. Nothing else is needed.
-- **M>1 (phase 2):** a **model-aware local router** binds 8000 and forwards by the
-  `model` field of the OpenAI request body to the right local instance. It must
-  stream, and it adds a hop. This is the only new networking code in the design,
-  and it is the price of the 3.3x coverage in review §5.1.
+- **M=1: the awake instance binds 8000 and nothing else is needed.** THIS IS
+  WRONG, and it is the load-bearing error in this section. A sleeping vLLM
+  process KEEPS ITS SOCKET -- `/sleep` frees GPU memory, not the listener -- so
+  the instances cannot take turns binding 8000 even when only one is awake. A
+  proxy is required at M=1, not at M>1.
+- **What was built:** `internal/warmpool/proxy` owns 8000 in every pool Pod and
+  forwards to whichever instance is awake, so waking a different model is a
+  re-point rather than a rebind. It is an HTTP reverse proxy rather than a TCP
+  one for two reasons found in review: the upstream resolves PER REQUEST, so a
+  client holding a keep-alive connection across a wake reaches the model that is
+  awake now; and a byte pump that stops when either side closes truncates a
+  streamed completion the moment the client half-closes its request side, which
+  is the ordinary shape of LLM traffic.
+- **M>1 would additionally need routing by the `model` field** of the request
+  body. That part remains unbuilt, and is the price of the 3.3x coverage in
+  review §5.1.
 
 **Ordering is load-bearing** and is already measured (admit 462 ms, drain 631 ms,
 wake 355 ms, sleep 70 ms):
@@ -218,6 +259,13 @@ policy can change without touching the data plane.
 
 ## 5. WVA side
 
+Every method above takes the POD as its first argument in the code
+(`Warm(ctx, pod, model, tier)` and so on); the sketch omits it. That is
+deliberate rather than an oversight in the implementation: which Pod to use is
+the policy's decision, and an adapter that chose for itself would be making
+allocation decisions inside the data plane. `Membership` also carries the
+`Endpoint` the instance listens on, which the sketch does not show.
+
 Package `internal/warmpool`, running as its own manager Runnable: a 5 s
 housekeeping tick plus a decision-store trigger, so a borrow starts when WVA
 DECIDES rather than when KEDA next polls. `internal/engines/scalefromzero` is
@@ -246,10 +294,12 @@ type Membership struct {
 
 Integration points that already exist:
 
-- **`internal/engines/scalefromzero`** decides a model must wake. Today it
-  publishes an activation; it gains one branch — ask the pool first, fall through
-  to the cold path on a miss. `publishActivation` and `processInactiveModel` are
-  the seams.
+- **`internal/engines/scalefromzero`** decides a model must wake. An earlier
+  draft had it gain a branch here — ask the pool first, fall through to the cold
+  path on a miss. **That was not built and is not needed.** The pool subscribes
+  to the decision store directly (§5's Runnable), so it learns of a scale-up at
+  the moment WVA decides one rather than when this engine acts on it, and
+  scale-from-zero is untouched.
 - **`internal/controller/inferencepool_reconciler.go`** and the pod datastore
   already know pools, pods and `llm-d.ai/model`, so membership bookkeeping has a
   home.
@@ -283,7 +333,9 @@ the reserve.
 `Waking -> fail` is not hypothetical: two of three unbound sleepers could not be
 woken (review §3.1). Our Pods hold their GPUs, which should remove the cause, but
 the transition must exist and must fall back to the cold path rather than retry —
-a sleeper that fails to wake is corrupt and gets evicted.
+a sleeper that fails to wake is corrupt and should be evicted. **NOT BUILT:**
+the reconciler returns the Pod to the reserve and records a miss, leaving the
+instance resident; see the eviction note in §7.
 
 ## 7. Cache policy — where the real work is
 
@@ -417,12 +469,23 @@ on scale_up(variant, N):
     candidates = free pods with `variant` resident
     borrow     = min(N, |candidates|)
     for pod in first `borrow` candidates:       # ~0.44 s each to serve
-        wake(pod, variant)                      # /wake_up, then point the proxy
         label(pod, variant)                     # joins the InferencePool
+        wake(pod, variant)                      # /wake_up, then point the proxy
         pod.hold_until = now + maxHoldSeconds
     record: hits=borrow, blocked=(N - borrow if candidates exhausted)
             misses=(N - borrow if variant not resident anywhere)
 ```
+
+The label goes FIRST, as in §3 and as the code does. Readiness is what admits
+traffic, so labelling early costs nothing and takes the EPP's measured ~462 ms
+admit off the critical path. (An earlier draft of this block had the two
+reversed, which is the same defect that was corrected for the sleep ordering
+in §7a.3.)
+
+Note also that `blocked` here means "candidates exhausted", and candidates are
+drawn from FREE Pods only -- so a variant resident in Pods that are all lent or
+loading is blocked, not missed. The distinction decides which knob an operator
+turns, and the code makes it explicitly.
 
 Both paths run; neither waits for the other. If the pool covers the whole spike
 the user sees capacity in under a second; if it covers none the behaviour is
@@ -436,13 +499,18 @@ warm set was wrong (raise the warm set, or change what is admitted to it).
 ### 7a.3 Handover: return as soon as the ordinary replicas serve
 
 ```
-on ordinary.ready >= ordinary.desired (for the variant):
+on ordinary.ready rising (for the variant), per bridge rather than all at once:
     for pod in lent pods of `variant`:
         clear the proxy upstream      # /readyz -> 503, Pod NotReady
         wait drain (~0.7 s measured)
         unlabel(pod)                  # leaves the InferencePool
         sleep(pod, variant)           # ~70 ms
 ```
+
+Bridges are returned INCREMENTALLY, not at a threshold: the policy hands back
+any lending beyond `desired - ready`, so each ordinary replica that becomes
+ready releases one pool Pod. Waiting for the full count would hold the reserve
+hostage to the slowest replica.
 
 Ordering is load-bearing and already measured. **The proxy is cleared first**,
 because it is the gate: readiness follows the upstream, so clearing it is what
@@ -519,6 +587,11 @@ being counted as a replica of the variant it is covering -- which is exactly the
 self-suppression this section forbids. The collector should filter
 `app.kubernetes.io/component: warm-pool` explicitly.
 
+> **NOT BUILT.** Growth and shrink are reported, not acted on: the policy
+> computes `GrowBy` and the reconciler logs it. Growing costs a full model load
+> per Pod, and a shortfall that lasts one cycle is a borrow doing its job, so
+> the decision is left to an operator.
+
 ### 7a.6 Replenishing the reserve
 
 After a borrow, `free` has dropped. Two ways back, in order of preference:
@@ -581,6 +654,16 @@ scale-ups are failing and the pool is masking it.
 
 ## 8. Configuration
 
+> **NOT BUILT — read this section as a wish list.** The configuration surface is
+> three flags, not a ConfigMap: `--warm-pool-namespace` (empty disables the pool
+> entirely), `--warm-pool-sleep-min-size` (default 1) and `--warm-pool-max-hold`
+> (default 2m). Everything else below has no counterpart: `accelerator`,
+> `tensorParallel`, `tier`, `replicas`, `awakeSlots`, `growDebounceSeconds`,
+> `shrinkSlack`, `minPredictedSaving`, `parkedWithinHours`, `evict` and `pin`
+> are unimplemented, and `warmSetPerPod` is fixed at 16 rather than
+> configurable at 8. The tier is hardcoded to RAM and the reconcile interval to
+> 5 s.
+
 ConfigMap, in the shape the repo already uses for scaling policy:
 
 ```yaml
@@ -607,7 +690,10 @@ sized: K for capacity, C for coverage.
 
 ## 9. RBAC — a real privilege increase
 
-Today the manager ClusterRole has `pods: get, list, watch`. The pool needs:
+Today the manager ClusterRole has `pods: get, list, watch, patch` — the `patch`
+verb described below has since been added, and is in
+`config/base/rbac/manager-clusterrole.yaml`. Before the pool it was
+`get, list, watch`. The pool needs:
 
 | resource | verb | why |
 | --- | --- | --- |
@@ -645,17 +731,20 @@ can be switched off at any moment by scaling the Deployment to zero.
 | 1 | supervisor: reuse FMA launcher vs write minimal | 2-4 d | decision below |
 | 2 | pool Deployment rendering + config | 2 d | — |
 | 3 | `Pool` port + HTTP adapter to the supervisor | 3 d | 1 |
-| 4 | readiness gate + label membership + drain ordering | 3 d | RBAC |
+| 4 | readiness (an ordinary probe, not a gate) + label membership + drain ordering | 3 d | RBAC |
 | 5 | cache policy (admit/evict/place/hold) | 4-5 d | — (pure, testable first) |
 | 6 | scale-from-zero integration + miss fallback | 2 d | 3, 4 |
 | 7 | metrics: hit/miss, slots busy, memberships, evictions | 1 d | — |
 | 8 | e2e with a fake supervisor | 3 d | 3 |
-| 9 | model-aware local router (M>1) | 4 d | **phase 2 only** |
+| 9 | model-aware local router (M>1) | 4 d | **phase 2 only.** The per-Pod proxy itself was needed at M=1 and IS built; only routing by the request body's `model` field remains |
 
 Roughly **three weeks to phase 1** (items 1-8, M=1, tier A, parking only), with
 item 5 the only genuinely hard one.
 
-**Supervisor decision.** Write a minimal one. FMA's launcher is proven and has the
+**Supervisor decision.** *(Superseded: FMA's launcher is used unmodified — see
+`warmpool/README.md`. Instance IDs, ports and GPUs are all caller-supplied, so
+model-keyed identity and a local port range were WVA-side choices needing no
+change to it.)* Write a minimal one. FMA's launcher is proven and has the
 API, but it carries the dual-pods assumptions — instance IDs hashed from GPU UUIDs,
 the ISC-derived port, reclaim behaviour — and we would be forking it to remove
 them. A supervisor that spawns processes, calls three vLLM endpoints and reports a
@@ -663,6 +752,11 @@ list is a few hundred lines with no policy in it. Reuse if the fork proves
 smaller than the rewrite; measure that on day one, not by argument.
 
 ## 12. Testing
+
+> **What exists is not this.** The reconciler, policy, adapter and proxy are
+> covered by ordinary Go tests with hand-written fakes and the controller-runtime
+> fake client (~90% of `internal/warmpool`). There is no envtest suite and no
+> kind e2e spec for the pool. Read the rest of this section as a plan.
 
 - **Policy: unit, no cluster.** Admission, eviction, placement and hold are pure
   functions over memberships and demand. This is where most tests belong.
@@ -680,3 +774,61 @@ smaller than the rewrite; measure that on day one, not by argument.
 Multi-node (LWS) pools; a CRD; a webhook; a scheduler plugin; cross-node model
 migration; CRIU. Each is either out of scope per the review or waiting on a
 measurement that has not been taken.
+
+## 13. Built, and not described above
+
+Decisions taken during implementation that no earlier section anticipated. They
+are listed here rather than folded in, so that the difference between what was
+designed and what was learned stays visible.
+
+**A NetworkPolicy is the pool's only boundary** (`config/warmpool/`). Two of a
+pool Pod's ports are dangerous: `:8001` spawns processes with caller-supplied
+argv AND environment in a container mounting the shared model cache read-write —
+arbitrary execution and a write primitive over other tenants' weights — and
+`:8002` re-points where the Pod sends the traffic it receives. Both are
+restricted to the controller. §9 discusses RBAC as "a real privilege increase"
+and says nothing about this, which is the larger one.
+
+A shared secret on those ports is deliberately NOT built. Authenticating `:8002`
+while `:8001` sits behind the same rule would be theatre: identical reachability,
+and the unauthenticated one is strictly more dangerous. Closing it means
+authentication inside FMA's launcher, which means forking it.
+
+**Probes are `exec`, not `httpGet`.** A kubelet probe originates from the NODE,
+and no NetworkPolicy `from:` selector can name a node — so any restricted port
+is one the kubelet may or may not reach depending on the CNI. Running the check
+inside the container removes the question. The supervisor uses `python3`; the
+proxy image is distroless, so the proxy binary makes the request itself
+(`warmpool-proxy --check=ready|live`).
+
+**The proxy will only forward to an engine.** An upstream must be loopback AND
+in the pool's engine port range. Loopback alone is not a boundary, because the
+dangerous ports are loopback too: an upstream of `127.0.0.1:8001` would turn the
+serving port — the one every Pod in the namespace may dial — into a route to the
+supervisor, straight through the NetworkPolicy.
+
+**Readiness follows the engine, not the pointer.** An upstream that is set is not
+an engine that answers. A vLLM process that crashed leaves the pointer untouched,
+so readiness on the pointer alone keeps the Pod in its InferencePool and turns
+every dispatch into a 502 — and the controller cannot put a dead engine to sleep,
+so the Pod stays lent and its GPU is lost.
+
+**Engine options are derived from the ordinary replicas' pod spec**
+(`Demand.EngineOptionsFrom`), not configured. The two must MATCH: a different
+`--gpu-memory-utilization` is a different torch.compile cache key, and a miss
+costs ~9 s of compile on top of the load. Configuring them separately would make
+that divergence silent and permanent. `--enable-sleep-mode` is added if absent,
+since without it `/sleep` and `/wake_up` do not exist and the pool has no
+mechanism at all.
+
+**Every call the reconcile loop makes is bounded**, by three separate deadlines:
+one observation, one act, one admission. The engine client's default timeout is
+120 s, so one Pod that accepts a connection and never answers would otherwise
+hold a pass for two minutes per instance behind it. An admission runs off-cycle
+under its own budget, single-flighted per variant, because a ~35 s load must not
+be re-issued every 5 s while it is still in progress.
+
+**`DrainWait` is 4 s, not the ~0.7 s the measurements report.** The measurement
+is of the EPP draining; the wait has to cover the whole chain — the kubelet
+noticing `/readyz` fail, the Pod leaving its EndpointSlice, and then that drain.
+
