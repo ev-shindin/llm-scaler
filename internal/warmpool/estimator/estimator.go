@@ -137,7 +137,7 @@ func Run(events []Event, cfg Config) (Result, error) {
 	copy(ordered, events)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].At.Before(ordered[j].At) })
 
-	warm := newLRU(cfg.Memberships)
+	warm := newWarmSet(cfg.Memberships)
 	// releases holds the times at which busy slots come free. It is small (K),
 	// so a linear scan beats a heap and keeps the code obvious.
 	releases := make([]time.Time, 0, cfg.Slots)

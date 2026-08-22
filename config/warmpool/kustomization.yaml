@@ -6,3 +6,4 @@ kind: Kustomization
 # continuously and that is a cost decision rather than a default.
 resources:
   - warmpool-deployment.yaml
+  - warmpool-networkpolicy.yaml

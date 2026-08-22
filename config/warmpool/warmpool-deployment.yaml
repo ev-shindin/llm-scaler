@@ -11,6 +11,11 @@ spec:
   # docs/proposals/fast-model-loading.md turns spike rate and hold time into K,
   # and neither has been measured on a fleet with organic traffic.
   replicas: 1
+  # Recreate, not RollingUpdate: a surge needs a SECOND GPU before the old Pod
+  # releases its own, so on a node with one free GPU the default strategy
+  # deadlocks -- the new Pod Pending, the old one never terminated.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: workload-variant-autoscaler
@@ -24,8 +29,25 @@ spec:
         # wake and sleep. Nothing here claims a model: an idle pool Pod belongs
         # to no InferencePool and receives no traffic.
     spec:
-      # The NVIDIA device plugin hands GPUs to a CONTAINER, so every engine in
-      # this Pod lives in one container under the supervisor.
+      # Nothing in this Pod talks to the Kubernetes API. The supervisor's only
+      # API use is a ConfigMap read reached exclusively in --mock-gpus mode
+      # (gputranslator.py: `if self.mock_mode and ...`), which this Pod never
+      # enables -- so it needs no token, and the container that runs model code
+      # should not be handed one.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # GPU nodes are routinely tainted. Without this the Deployment sits
+      # Pending on exactly the clusters it is meant for.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # CLUSTER-SPECIFIC. Needed where the GPU operator installs a RuntimeClass
+      # (pokprod uses `nvidia-legacy`); on a cluster without it, admission fails
+      # outright, so remove this line rather than guess at a name.
       runtimeClassName: nvidia-legacy
       containers:
         - name: inference-server
@@ -81,6 +103,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           resources:
             limits:
               # THE ONE STRUCTURAL DIFFERENCE FROM FMA. Its controller strips
@@ -91,26 +118,56 @@ spec:
               # it. Measured: two of three unbound sleepers could not be woken
               # at all. The pool keeps its GPUs for as long as it keeps models.
               nvidia.com/gpu: "1"
+              # Memory is a limit as well as a request because the warm set is
+              # the thing worth protecting: an unbounded Pod that gets evicted
+              # loses every resident model at once.
+              memory: 48Gi
             requests:
               nvidia.com/gpu: "1"
+              # THE MEMORY REQUEST IS THE WARM-SET BUDGET, and must be sized as
+              # (models held per Pod) x (weight size), because a level-1 sleeper
+              # keeps its weights in HOST memory -- only ~1.4 GiB stays on the
+              # GPU. Left unset, the scheduler treats a Pod holding sixteen
+              # sleeping models as needing no memory at all, and the kubelet
+              # evicts it: the one outcome the pool exists to prevent.
+              #
+              # 48Gi suits a handful of small models. Raise it before raising
+              # the warm set.
+              memory: 48Gi
+              cpu: "2"
           volumeMounts:
             - name: model-cache
               mountPath: /model-cache
           readinessProbe:
             # The supervisor being up says nothing about whether a model is
-            # awake -- that is what WVA's readiness gate is for. This probe only
-            # reports that the Pod can accept instructions.
+            # awake -- that is the proxy's /readyz. This probe only reports that
+            # the Pod can accept instructions.
             httpGet:
               path: /health
               port: supervisor
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            # A wedged supervisor otherwise holds its GPU indefinitely: nothing
+            # else in the system can restart it, and the models it holds are
+            # unreachable.
+            httpGet:
+              path: /health
+              port: supervisor
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
         # The Pod's serving port. Engines bind their own ports for life and a
         # sleeping process keeps its socket, so they cannot take turns binding
         # the port the InferencePool dials. This owns it and follows whichever
         # model is awake; WVA re-points it through the control endpoint.
         - name: proxy
-          image: ghcr.io/ev-shindin/warmpool-proxy:v2
+          # NOT SHIPPABLE AS-IS: a personal namespace, pinned by digest so at
+          # least the bytes are fixed. Build it from this tree with
+          # `make docker-build-warmpool-proxy docker-push-warmpool-proxy
+          # WARMPOOL_PROXY_IMG=...` (Dockerfile.warmpool-proxy) and republish
+          # under the project's own namespace before this leaves a test cluster.
+          image: ghcr.io/ev-shindin/warmpool-proxy:v3@sha256:d522836752773e8afcdaaaa96a1aaa799f04e5f016ad74489c42660fa39f568e
           imagePullPolicy: IfNotPresent
           args:
             - --port=8000
@@ -144,11 +201,23 @@ spec:
               port: proxy-control
             initialDelaySeconds: 3
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           resources:
             requests:
               cpu: 10m
               memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
       volumes:
+        # PREREQUISITE, not created here: the PVC belongs to whoever owns the
+        # models, and the pool mounts it to reuse a cache that is already warm.
+        # Applying this directory into a namespace without `model-pvc` leaves
+        # the Pod Pending on a missing volume.
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-pvc

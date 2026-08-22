@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // Engine talks to one vLLM instance inside a pool Pod.
@@ -70,19 +72,19 @@ func (e *Engine) Wake(ctx context.Context) error {
 }
 
 // WaitServing blocks until the engine answers /health or ctx ends.
+//
+// Polled with the same helper the rest of this codebase uses for "wait for a
+// condition or give up with the context" (internal/prometheus, internal/engines/
+// executor, internal/resources), rather than a hand-rolled ticker.
 func (e *Engine) WaitServing(ctx context.Context) error {
-	ticker := time.NewTicker(e.pollWait)
-	defer ticker.Stop()
-	for {
-		if _, err := e.do(ctx, http.MethodGet, "/health"); err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("engine at %s did not answer: %w", e.baseURL, ctx.Err())
-		case <-ticker.C:
-		}
+	err := wait.PollUntilContextCancel(ctx, e.pollWait, true, func(ctx context.Context) (bool, error) {
+		_, err := e.do(ctx, http.MethodGet, "/health")
+		return err == nil, nil
+	})
+	if err != nil {
+		return fmt.Errorf("engine at %s did not answer: %w", e.baseURL, err)
 	}
+	return nil
 }
 
 // IsSleeping asks the engine what it is, rather than inferring it.

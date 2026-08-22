@@ -1,0 +1,49 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wva-warm-pool
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  # Two of this Pod's three ports are dangerous to expose, and both were open to
+  # anything that could reach the Pod IP:
+  #
+  #   :8001  the supervisor. It spawns processes with caller-supplied argv AND
+  #          caller-supplied environment, in a container that mounts the shared
+  #          model cache read-write. That is arbitrary execution and a write
+  #          primitive over other tenants' weights, not "start an engine".
+  #   :8002  the proxy's control endpoint. Re-points where the Pod sends the
+  #          traffic it receives. Now loopback-only in the proxy itself, so the
+  #          worst case is denial of service rather than exfiltration -- but
+  #          only WVA has any business calling it.
+  #
+  # This is a boundary, not authentication: anything admitted here is still
+  # trusted completely by the supervisor. A shared secret on both endpoints is
+  # the other half and is not yet built.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: workload-variant-autoscaler
+      app.kubernetes.io/component: warm-pool
+  policyTypes:
+    - Ingress
+  ingress:
+    # Serving traffic: the EPP dispatches to the Pod's InferencePool target port
+    # from within the model's own namespace.
+    - ports:
+        - protocol: TCP
+          port: 8000
+      from:
+        - podSelector: {}
+    # Control: the supervisor and the proxy's upstream endpoint, for the
+    # controller only.
+    - ports:
+        - protocol: TCP
+          port: 8001
+        - protocol: TCP
+          port: 8002
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: workload-variant-autoscaler
+              control-plane: controller-manager
