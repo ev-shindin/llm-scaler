@@ -38,7 +38,6 @@ func run() int {
 		servePort   uint
 		controlPort uint
 		dialTimeout time.Duration
-		upstream    string
 		check       string
 	)
 	flag.StringVar(&check, "check", "",
@@ -51,8 +50,6 @@ func run() int {
 		"port for the upstream control endpoint WVA calls")
 	flag.DurationVar(&dialTimeout, "dial-timeout", 10*time.Second,
 		"timeout for dialing the awake instance")
-	flag.StringVar(&upstream, "upstream", "",
-		"initial upstream host:port; empty means no model is awake yet")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -66,13 +63,12 @@ func run() int {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// No --upstream flag, deliberately. It stored a pointer WITHOUT the engine
+	// check the control endpoint performs, so a proxy started with one went
+	// Ready on the strength of the pointer alone -- the exact bug the check was
+	// added to close, reachable by another door. The controller points this
+	// proxy; there is no other legitimate source.
 	server := proxy.New(proxy.Config{Port: uint16(servePort), DialTimeout: dialTimeout})
-	if upstream != "" {
-		if err := server.SetUpstream(upstream); err != nil {
-			logger.Error(err, "refusing the initial upstream")
-			return 1
-		}
-	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(proxy.UpstreamPath, server.UpstreamHandler)

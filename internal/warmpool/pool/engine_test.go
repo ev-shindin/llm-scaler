@@ -40,7 +40,7 @@ func newFakeEngine(t *testing.T) *fakeEngine {
 			}
 			f.sleeping = false
 			w.WriteHeader(http.StatusOK)
-		case r.URL.Path == "/is_sleeping":
+		case r.URL.Path == sleepStatePath:
 			_, _ = w.Write([]byte(`{"is_sleeping":` + boolText(f.sleeping) + `}`))
 		case r.URL.Path == healthPath:
 			if time.Now().Before(f.servingAt) {
@@ -57,6 +57,10 @@ func newFakeEngine(t *testing.T) *fakeEngine {
 }
 
 const healthPath = "/health"
+
+// sleepStatePath is what the pool asks instead of inferring from /health: a
+// sleeping vLLM answers /health perfectly well, because the process is alive.
+const sleepStatePath = "/is_sleeping"
 
 func queryOf(r *http.Request) string {
 	if r.URL.RawQuery == "" {

@@ -25,6 +25,11 @@ const (
 	ComponentValue = "warm-pool"
 	// NameLabel is the other half of the pool Deployment's own selector.
 	NameLabel = "app.kubernetes.io/name"
+	// ControlPlaneLabel is how the pool's NetworkPolicy recognises the
+	// controller, and therefore who may reach the supervisor and the engines.
+	// It is guarded for that reason rather than for ownership -- see
+	// identityLabels.
+	ControlPlaneLabel = "control-plane"
 
 	// abandonTimeout bounds the cleanup of a failed admission. Short, because it
 	// is one call and it runs after something has already gone wrong.
@@ -410,9 +415,19 @@ func (a *Adapter) setLabels(ctx context.Context, p *corev1.Pod, labels map[strin
 	return a.client.Patch(ctx, p, patch)
 }
 
-// identityLabels are the ones that make a pool Pod part of its own Deployment.
-// They are never written by a join and never removed by a leave.
-var identityLabels = []string{ComponentLabel, NameLabel}
+// identityLabels are the ones a join must never write and a leave must never
+// remove.
+//
+// The first two make a pool Pod part of its own Deployment. The third is
+// different in kind and just as important: `control-plane` is what the pool's
+// NetworkPolicy matches to decide who may reach :8001, :8002 and the engine
+// ports. A pool Pod already carries `app.kubernetes.io/name:
+// workload-variant-autoscaler`, so a tenant whose InferencePool selector also
+// named `control-plane: controller-manager` would have WVA ITSELF label that Pod
+// into the trusted set -- after which the tenant's own model code, running
+// inside it, could reach the supervisor of every other pool Pod in the
+// namespace and spawn processes there with argv of its choosing.
+var identityLabels = []string{ComponentLabel, NameLabel, ControlPlaneLabel}
 
 func (a *Adapter) removeLabels(ctx context.Context, p *corev1.Pod, labels map[string]string) error {
 	patch := client.MergeFrom(p.DeepCopy())

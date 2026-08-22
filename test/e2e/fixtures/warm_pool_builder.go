@@ -1,14 +1,18 @@
 package fixtures
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 )
@@ -304,6 +308,17 @@ func warmPoolSupervisorContainer() corev1.Container {
 			InitialDelaySeconds: 2,
 			PeriodSeconds:       5,
 		},
+		// Production ships a liveness probe here too, and the suite asserts that
+		// an idle pool is not restart-looped. Without one on this container that
+		// assertion would be true by construction for it -- nothing could
+		// restart it -- which is a pass that establishes nothing.
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+				Command: warmPoolPythonCheck(WarmPoolSupervisorPort, "/health"),
+			}},
+			InitialDelaySeconds: 10,
+			PeriodSeconds:       10,
+		},
 	}
 }
 
@@ -369,6 +384,75 @@ func createWarmPoolScript(ctx context.Context, clientset *kubernetes.Clientset, 
 	_, err := clientset.CoreV1().ConfigMaps(spec.Namespace).Create(ctx, cm, metav1.CreateOptions{})
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("create supervisor script configmap: %w", err)
+	}
+	return nil
+}
+
+// ShippedNetworkPolicyPath is the policy the pool actually ships with, relative
+// to the e2e package directory (which is the working directory `go test` uses).
+const ShippedNetworkPolicyPath = "../../config/warmpool/warmpool-networkpolicy.yaml"
+
+// ApplyWarmPoolNetworkPolicy installs the SHIPPED policy, read from the manifest
+// rather than restated here.
+//
+// Read rather than rebuilt on purpose. A copy in Go would drift from the file
+// that actually gets deployed, and the drift would be invisible: the suite would
+// keep passing against a policy nobody applies. It also means the e2e is testing
+// the artefact, which is the only thing worth testing about a manifest.
+//
+// The fixture's pool Pod deliberately carries the same labels as the real one,
+// so the shipped podSelector matches it, and the controller-labelled driver Pod
+// matches the same-namespace `from:` rule.
+func ApplyWarmPoolNetworkPolicy(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	namespace string,
+) (string, error) {
+	raw, err := os.ReadFile(ShippedNetworkPolicyPath)
+	if err != nil {
+		return "", fmt.Errorf("read the shipped policy at %s: %w", ShippedNetworkPolicyPath, err)
+	}
+
+	var policy networkingv1.NetworkPolicy
+	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), 4096).Decode(&policy); err != nil {
+		return "", fmt.Errorf("decode %s: %w", ShippedNetworkPolicyPath, err)
+	}
+	policy.Namespace = namespace
+	policy.ResourceVersion = ""
+
+	if _, err := clientset.NetworkingV1().NetworkPolicies(namespace).Create(
+		ctx, &policy, metav1.CreateOptions{}); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("create network policy %s: %w", policy.Name, err)
+		}
+		// Someone applied it out of band. Take it over rather than test against
+		// a version this run did not choose.
+		existing, getErr := clientset.NetworkingV1().NetworkPolicies(namespace).Get(
+			ctx, policy.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return "", fmt.Errorf("get existing network policy %s: %w", policy.Name, getErr)
+		}
+		policy.ResourceVersion = existing.ResourceVersion
+		if _, err := clientset.NetworkingV1().NetworkPolicies(namespace).Update(
+			ctx, &policy, metav1.UpdateOptions{}); err != nil {
+			return "", fmt.Errorf("update network policy %s: %w", policy.Name, err)
+		}
+	}
+	return policy.Name, nil
+}
+
+// DeleteWarmPoolNetworkPolicy removes it again.
+func DeleteWarmPoolNetworkPolicy(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	namespace, name string,
+) error {
+	if name == "" {
+		return nil
+	}
+	if err := clientset.NetworkingV1().NetworkPolicies(namespace).Delete(
+		ctx, name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete network policy %s: %w", name, err)
 	}
 	return nil
 }

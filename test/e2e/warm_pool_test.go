@@ -31,13 +31,17 @@ import (
 // waking, and how long that takes.
 var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label("warmpool"), Ordered, func() {
 	const (
-		poolName       = "e2e-warm-pool"
-		controlDriver  = "e2e-warm-pool-controller"
-		tenantDriver   = "e2e-warm-pool-tenant"
-		model          = "Qwen/Qwen3-0.6B"
-		instanceID     = "qwen"
-		enginePort     = fixtures.WarmPoolBasePort
-		deadEnginePort = fixtures.WarmPoolBasePort + 900
+		poolName      = "e2e-warm-pool"
+		controlDriver = "e2e-warm-pool-controller"
+		tenantDriver  = "e2e-warm-pool-tenant"
+		model         = "Qwen/Qwen3-0.6B"
+		instanceID    = "qwen"
+		enginePort    = fixtures.WarmPoolBasePort
+		// In the engine range but with nothing behind it. Outside the range
+		// the proxy would refuse it for the WRONG reason -- bad port, not a
+		// dead engine -- and the spec below would pass without testing the
+		// vetting it names.
+		deadEnginePort = fixtures.WarmPoolBasePort + 15
 	)
 
 	var (
@@ -48,6 +52,7 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 		podIP      string
 		podName    string
 		engineAddr string
+		policyName string
 	)
 
 	// call makes a request FROM a driver Pod, which is the only vantage point a
@@ -66,6 +71,19 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 	control := func(method, path string, port int, body string) fixtures.PodProxyResult {
 		GinkgoHelper()
 		return call(controlDriver, method, path, port, body)
+	}
+
+	// controlOK is for the calls that SET UP a scenario. It insists on a real
+	// 2xx, because status 0 -- this suite's signal for "could not connect at
+	// all" -- would otherwise satisfy any `< 300` bound and let a request that
+	// never landed read as success. That is the exact shape of false pass this
+	// suite already had once.
+	controlOK := func(method, path string, port int, body string) fixtures.PodProxyResult {
+		GinkgoHelper()
+		result := control(method, path, port, body)
+		Expect(result.Status).To(And(BeNumerically(">=", 200), BeNumerically("<", 300)),
+			"%s %s on port %d: %s", method, path, port, result.Body)
+		return result
 	}
 
 	// containerReady is the kubelet's view, which is the only view that decides
@@ -96,6 +114,17 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 		asTenant = fixtures.DriverSpec{
 			Name: tenantDriver, Namespace: cfg.LLMDNamespace, Labels: fixtures.TenantDriverLabels(),
 		}
+
+		By("Applying the NetworkPolicy the pool actually ships with")
+		// Read from config/warmpool rather than restated here, and applied by
+		// the suite rather than assumed: without this the boundary spec below
+		// runs against an allow-all namespace, reads the resulting 200 as "this
+		// CNI does not enforce policy", and skips -- so the one spec whose
+		// purpose is catching a policy regression would never run in CI, and
+		// the skip would be invisible in a green summary.
+		var err error
+		policyName, err = fixtures.ApplyWarmPoolNetworkPolicy(ctx, k8sClient, cfg.LLMDNamespace)
+		Expect(err).NotTo(HaveOccurred())
 
 		By("Creating an emulated warm pool with the real proxy, and two drivers")
 		Expect(fixtures.CreateWarmPool(ctx, k8sClient, poolSpec)).To(Succeed())
@@ -141,6 +170,7 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 		Expect(fixtures.DeleteWarmPool(ctx, k8sClient, poolSpec)).To(Succeed())
 		Expect(fixtures.DeleteHTTPDriver(ctx, k8sClient, asControl)).To(Succeed())
 		Expect(fixtures.DeleteHTTPDriver(ctx, k8sClient, asTenant)).To(Succeed())
+		Expect(fixtures.DeleteWarmPoolNetworkPolicy(ctx, k8sClient, cfg.LLMDNamespace, policyName)).To(Succeed())
 	})
 
 	It("keeps the Pod out of service while every model is asleep", func() {
@@ -210,10 +240,9 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 
 	It("admits traffic once a model is awake, and withdraws it as quickly", func() {
 		By("Admitting a model to the pool")
-		created := control("PUT", "/v2/vllm/instances/"+instanceID, fixtures.WarmPoolSupervisorPort,
+		controlOK("PUT", "/v2/vllm/instances/"+instanceID, fixtures.WarmPoolSupervisorPort,
 			fmt.Sprintf(`{"options":%q,"env_vars":{"VLLM_SERVER_DEV_MODE":"1"}}`,
 				fixtures.WarmPoolInstanceOptions(model, enginePort)))
-		Expect(created.Status).To(BeNumerically("<", 300), "creating the instance: %s", created.Body)
 
 		By("Waking it and pointing the proxy, which is the borrow ordering")
 		Expect(control("POST", "/wake_up", enginePort, "").Status).To(Equal(200))
@@ -236,8 +265,7 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 			"the request must reach the engine that is awake")
 
 		By("Returning the bridge: clear the proxy FIRST, which is the gate")
-		Expect(control("DELETE", "/upstream", fixtures.WarmPoolControlPort, "").Status).
-			To(BeNumerically("<", 300))
+		controlOK("DELETE", "/upstream", fixtures.WarmPoolControlPort, "")
 
 		// The measurement that decides whether the controller's drain wait is
 		// long enough. With the probe defaults (period 5, failureThreshold 3)
@@ -251,13 +279,13 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 		GinkgoWriter.Printf("kubelet withdrew the Pod after %s\n", withdrawn)
 		Expect(withdrawn).To(BeNumerically("<", 10*time.Second),
 			"withdrawal must fit inside the controller's drain wait, or every sleep is a 503 window")
-	})
 
-	It("leaves the model resident after the bridge is returned", func() {
-		// Returning a bridge sleeps the model; it does not evict it. That is the
-		// entire point of a warm pool -- the next wake is the fast one.
-		listed := control("GET", "/v2/vllm/instances", fixtures.WarmPoolSupervisorPort, "")
-		Expect(listed.Status).To(Equal(200))
+		By("and the model is still resident, because a return sleeps rather than evicts")
+		// Asserted HERE rather than in a spec of its own: the instance is
+		// created a few lines above, so a separate spec would depend on this
+		// one having run and would fail on its own under -ginkgo.focus, for a
+		// reason that has nothing to do with the invariant.
+		listed := controlOK("GET", "/v2/vllm/instances", fixtures.WarmPoolSupervisorPort, "")
 		Expect(listed.Body).To(ContainSubstring(instanceID),
 			"the instance must survive the return, or the pool is a cold start with extra steps")
 		Expect(strings.Count(listed.Body, `"instance_id"`)).To(Equal(1))
@@ -269,19 +297,34 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 		// this Pod sends the traffic it receives. Neither is any tenant's
 		// business, and the serving port is.
 		//
-		// Skipped where nothing enforces the policy rather than reported as a
-		// pass: kind's default CNI accepts NetworkPolicy objects and ignores
-		// them, and a suite that called that "secure" would be worse than one
-		// that did not look.
-		if control("GET", "/health", fixtures.WarmPoolSupervisorPort, "").Status != 200 {
-			Skip("no NetworkPolicy is admitting the controller here; the pool's policy is not applied")
-		}
+		// The policy is applied by this suite, so "the controller cannot reach
+		// the supervisor" is a FAILURE and not a reason to skip. That
+		// distinction matters: the controller being locked out of these ports
+		// is precisely the regression that made the pool inert, and a guard
+		// that skipped on it would swallow the defect it exists to catch.
+		Expect(control("GET", "/health", fixtures.WarmPoolSupervisorPort, "").Status).To(Equal(200),
+			"the policy must admit the controller to the supervisor, or no instance can ever be "+
+				"listed, woken or slept and the pool is inert")
+
+		// A CNI that ignores NetworkPolicy is a different matter: nothing is
+		// wrong with the manifest, the cluster simply cannot show it. kind's
+		// default CNI accepts policy objects and ignores them, and a suite that
+		// called that "secure" would be worse than one that never looked.
 		if call(tenantDriver, "GET", "/health", fixtures.WarmPoolSupervisorPort, "").Status != 0 {
 			Skip("this cluster's CNI does not enforce NetworkPolicy, so the boundary cannot be observed")
 		}
 
-		By("A tenant workload cannot reach the supervisor or the control endpoint")
-		for _, port := range []int{fixtures.WarmPoolSupervisorPort, fixtures.WarmPoolControlPort} {
+		By("A tenant workload cannot reach the supervisor, the control endpoint, or an engine")
+		// The engine range is in the list because the controller reaches
+		// engines DIRECTLY -- sleeping and waking are vLLM's own API -- so the
+		// policy has to admit it there, and that rule is one careless
+		// `podSelector: {}` away from handing every tenant a sleep switch for
+		// another tenant's model.
+		for _, port := range []int{
+			fixtures.WarmPoolSupervisorPort,
+			fixtures.WarmPoolControlPort,
+			enginePort,
+		} {
 			denied := call(tenantDriver, "GET", "/health", port, "")
 			Expect(denied.Status).To(BeZero(),
 				"port %d must be unreachable for a tenant, got %d: %s", port, denied.Status, denied.Body)

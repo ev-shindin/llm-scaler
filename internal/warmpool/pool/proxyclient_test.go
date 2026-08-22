@@ -24,11 +24,17 @@ import (
 func liveEngine(t *testing.T) int {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == healthPath {
+		switch r.URL.Path {
+		case healthPath:
 			w.WriteHeader(http.StatusOK)
-			return
+		case sleepStatePath:
+			// Awake. The proxy asks BOTH: a sleeping vLLM answers /health
+			// perfectly well, so /health alone does not establish that this
+			// engine can serve.
+			_, _ = w.Write([]byte(`{"is_sleeping":false}`))
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	}))
 	t.Cleanup(server.Close)
 
@@ -62,7 +68,13 @@ func deadEnginePort(t *testing.T) int {
 
 func realProxy(t *testing.T) (*Proxy, *proxy.Server) {
 	t.Helper()
-	server := proxy.New(proxy.DefaultConfig)
+	// A window wide enough for a kernel-chosen port: these tests need a real
+	// listener, and production's 9001-9016 cannot be bound reliably on a shared
+	// machine. The range itself is covered in the proxy package's own tests.
+	server := proxy.New(proxy.Config{
+		MinUpstreamPort:   1024,
+		UpstreamPortCount: 65535 - 1024,
+	})
 	mux := http.NewServeMux()
 	mux.HandleFunc(proxy.UpstreamPath, server.UpstreamHandler)
 	mux.HandleFunc(proxy.ReadyPath, server.ReadyHandler)

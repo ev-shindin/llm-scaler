@@ -271,3 +271,81 @@ func TestWatchRegistryEndsWithItsContext(t *testing.T) {
 		t.Fatal("WatchRegistry did not return when its context ended")
 	}
 }
+
+func TestAPodWhoseReturnFailedIsNotThenBorrowed(t *testing.T) {
+	// policy.Decide folds a RETURNING Pod into the free set, deliberately, so a
+	// handed-back Pod can serve a borrow in the same cycle. When the return
+	// actually fails that assumption is wrong, and acting on it anyway puts a
+	// second engine on a GPU sized for one: the first model is still awake, and
+	// Activate would label, wake and point a second on top of it.
+	p := &fakePool{
+		memberships: []pool.Membership{
+			// One Pod, holding a model it is serving and another asleep.
+			{Model: model("serving"), Pod: podA(), State: pool.Serving},
+			{Model: model("asleep"), Pod: podA(), State: pool.Asleep},
+		},
+		deactivateErr: errors.New("the proxy will not clear"),
+	}
+
+	r := New(p, &staticDemand{variants: []policy.VariantDemand{
+		// "serving" has all the ordinary replicas it needs, so its bridge is
+		// due back...
+		{Model: model("serving"), Desired: 1, Ready: 1},
+		// ...and "asleep" is short, so the freed Pod would be borrowed for it.
+		{Model: model("asleep"), Desired: 1, Ready: 0},
+	}}, testConfig())
+
+	plan, err := r.Once(context.Background())
+	if err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	// The plan itself is right: return, then borrow the same Pod.
+	if len(plan.Return) != 1 || len(plan.Borrow) != 1 {
+		t.Fatalf("expected the plan to return and re-borrow one Pod: %+v", plan)
+	}
+	if plan.Borrow[0].Pod != podA() {
+		t.Fatalf("borrow targeted %s, want the returning Pod", plan.Borrow[0].Pod)
+	}
+
+	// What must NOT happen is the borrow being carried out.
+	if len(p.activated) != 0 {
+		t.Errorf("activated %d times; a Pod whose return failed still holds its "+
+			"first engine, so waking a second is two awake engines on one GPU", len(p.activated))
+	}
+}
+
+func TestAPodWhoseReturnFailedIsNotThenAdmittedInto(t *testing.T) {
+	// Worse than a borrow: admission starts a full model load, and Warm only
+	// checks whether THIS model is resident, never whether the Pod is occupied.
+	p := &fakePool{
+		memberships: []pool.Membership{
+			{Model: model("serving"), Pod: podA(), State: pool.Serving},
+		},
+		deactivateErr: errors.New("the engine will not sleep"),
+	}
+
+	cfg := testConfig()
+	cfg.MinMissesToAdmit = 1
+	r := New(p, &staticDemand{variants: []policy.VariantDemand{
+		{Model: model("serving"), Desired: 1, Ready: 1},
+		// Parked, so it is admitted eagerly into whatever Pod looks free.
+		{Model: model("newcomer"), Desired: 0, Ready: 0, Parked: true},
+	}}, cfg)
+
+	plan, err := r.Once(context.Background())
+	if err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if len(plan.Admit) != 1 || plan.Admit[0].Pod != podA() {
+		t.Fatalf("expected an admission into the returning Pod: %+v", plan.Admit)
+	}
+
+	// Admission runs in a goroutine, so give it a chance to be wrong.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !p.did("warm newcomer") {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.did("warm newcomer") {
+		t.Error("admitted a model into a Pod whose previous engine never slept")
+	}
+}

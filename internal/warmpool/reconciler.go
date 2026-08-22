@@ -77,6 +77,14 @@ type Reconciler struct {
 	// goroutine, so it is generous where the others are tight.
 	AdmitTimeout time.Duration
 
+	// passMu serialises a whole observe-decide-act pass. The finer mu below
+	// guards the bookkeeping maps, which is not the same thing: two passes
+	// could each read the pool, each see the same Pod free, and each spend it,
+	// without either touching a map the other had locked. Once is exported and
+	// its doc invites an operator to call it, so this cannot be left to
+	// convention.
+	passMu sync.Mutex
+
 	mu         sync.Mutex
 	borrowedAt map[policy.Borrow]time.Time
 	missesAt   map[string][]time.Time
@@ -147,6 +155,9 @@ func (r *Reconciler) Start(ctx context.Context) error {
 //
 // which cancels a 35 s admission at 30 s, every time.
 func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
+	r.passMu.Lock()
+	defer r.passMu.Unlock()
+
 	memberships, variants, err := r.observe(ctx)
 	if err != nil {
 		return policy.Plan{}, err
@@ -173,11 +184,21 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 	logger := log.FromContext(ctx).WithName("warmpool")
 
+	// Returns are planned as though they will succeed, and the borrows and
+	// admissions below were chosen from a free set that INCLUDES them -- see
+	// policy.Decide, which folds returning Pods into `free` precisely so a
+	// handed-back Pod can serve a borrow in the same cycle. When a return fails
+	// that assumption is wrong, and acting on it anyway puts a second engine on
+	// a GPU sized for one: the first model is still awake, and Activate would
+	// label, wake and point a second on top of it.
+	stillLent := map[types.NamespacedName]bool{}
+
 	for _, action := range plan.Return {
 		if err := r.act(ctx, func(ctx context.Context) error {
 			return r.Pool.Deactivate(ctx, action.Pod, action.Model)
 		}); err != nil {
 			logger.V(1).Info("could not return a bridge", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
+			stillLent[action.Pod] = true
 			continue
 		}
 		// Observed as the bridge ends, so the distribution answers the question
@@ -191,6 +212,15 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 	}
 
 	for _, action := range plan.Borrow {
+		if stillLent[action.Pod] {
+			// Counted as blocked, which is what it is: the model is resident
+			// and the reserve could not produce a Pod for it.
+			logger.V(1).Info("not borrowing a Pod whose return failed",
+				"pod", action.Pod, "variant", action.Model.Variant)
+			metrics.CountWarmPoolBorrow(action.Model.Namespace, action.Model.Variant, OutcomeBlocked)
+			continue
+		}
+
 		// Recorded BEFORE the attempt, not after. A borrow that fails partway --
 		// labelled and awake but never pointed at -- still reads as lent to the
 		// next cycle, and with no start time its age is recomputed as zero
@@ -230,6 +260,14 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 	// shows as Loading on the following pass, which is what keeps it out of the
 	// reserve, so the state is discovered rather than remembered.
 	for _, action := range plan.Admit {
+		if stillLent[action.Pod] {
+			// Worse here than for a borrow: admission starts a full model load
+			// on a Pod whose previous engine never slept, and Warm only checks
+			// whether THIS model is resident, not whether the Pod is occupied.
+			logger.V(1).Info("not admitting into a Pod whose return failed",
+				"pod", action.Pod, "variant", action.Model.Variant)
+			continue
+		}
 		if !r.beginAdmission(action.Model.Variant) {
 			continue
 		}

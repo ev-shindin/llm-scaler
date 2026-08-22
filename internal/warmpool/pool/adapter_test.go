@@ -235,7 +235,7 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 		}
 		h.asleep = false
 		w.WriteHeader(http.StatusOK)
-	case r.URL.Path == "/is_sleeping":
+	case r.URL.Path == sleepStatePath:
 		if h.garbageState {
 			_, _ = w.Write([]byte(`<html>502 Bad Gateway</html>`))
 			return
@@ -826,5 +826,36 @@ func TestTheDrainIsSkippedWhenTheDeadlineHasAllButPassed(t *testing.T) {
 
 	if wait := h.adapter.drainFor(ctx); wait != 0 {
 		t.Fatalf("drainFor on an expired deadline = %s, want 0", wait)
+	}
+}
+
+func TestASelectorCannotLabelAPoolPodIntoTheControlPlane(t *testing.T) {
+	// A pool Pod already carries app.kubernetes.io/name:
+	// workload-variant-autoscaler, which is half of what the NetworkPolicy
+	// matches to recognise the controller. A tenant whose InferencePool
+	// selector supplied the other half would have WVA label the Pod into the
+	// trusted set for them -- and the tenant's own model code runs inside that
+	// Pod, so it could then reach the supervisor of every other pool Pod in the
+	// namespace and spawn processes there with argv of its choosing.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+
+	model := qwen()
+	model.PoolLabels["control-plane"] = "controller-manager"
+
+	_, err := h.adapter.Activate(context.Background(), podA(), model)
+	if err == nil {
+		t.Fatal("want the join refused")
+	}
+	if !strings.Contains(err.Error(), "control-plane") {
+		t.Errorf("the error must name the label it refused: %v", err)
+	}
+	h.journal.never(t, "wake")
+
+	var got corev1.Pod
+	if err := h.k8s.Get(context.Background(), podA(), &got); err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if _, taken := got.Labels["control-plane"]; taken {
+		t.Error("the label must never have been applied")
 	}
 }
