@@ -328,3 +328,123 @@ func TestDemandFailureDoesNotActOnStaleState(t *testing.T) {
 		t.Fatalf("nothing should have been done: %v", p.seen())
 	}
 }
+
+// hangingPool blocks in whichever call the test selects, until its context ends.
+// A Pod that accepts a connection and never answers is the realistic version:
+// the HTTP clients have their own timeouts, but they are measured in minutes.
+type hangingPool struct {
+	fakePool
+	hangList     bool
+	hangActivate bool
+	listEnded    chan error
+
+	mu           sync.Mutex
+	listDeadline bool
+}
+
+func (h *hangingPool) ListWarm(ctx context.Context) ([]pool.Membership, error) {
+	h.mu.Lock()
+	_, h.listDeadline = ctx.Deadline()
+	h.mu.Unlock()
+
+	if !h.hangList {
+		return h.fakePool.ListWarm(ctx)
+	}
+	<-ctx.Done()
+	if h.listEnded != nil {
+		h.listEnded <- ctx.Err()
+	}
+	return nil, ctx.Err()
+}
+
+func (h *hangingPool) sawDeadline() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.listDeadline
+}
+
+func (h *hangingPool) Activate(ctx context.Context, p types.NamespacedName, m pool.ModelRef) (pool.Endpoint, error) {
+	if !h.hangActivate {
+		return h.fakePool.Activate(ctx, p, m)
+	}
+	<-ctx.Done()
+	return pool.Endpoint{}, ctx.Err()
+}
+
+func TestAPoolPodThatWillNotAnswerDoesNotHoldTheLoop(t *testing.T) {
+	// The reconcile interval is 5 s and the engine client's default timeout is
+	// 120 s. Without a deadline of its own, one Pod that accepts a connection
+	// and never answers holds the pass for two minutes per instance behind it --
+	// and every borrow decided in that window arrives long after the cold start
+	// it was meant to beat.
+	p := &hangingPool{hangList: true, listEnded: make(chan error, 1)}
+	r := New(p, &staticDemand{}, testConfig())
+	r.ObserveTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	if _, err := r.Once(context.Background()); err == nil {
+		t.Fatal("an observation that timed out must be reported, not treated as an empty pool")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Once took %s: the observation is not bounded", elapsed)
+	}
+
+	select {
+	case err := <-p.listEnded:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("the pool saw %v, want a deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the call was abandoned without its context being cancelled")
+	}
+}
+
+func TestABorrowThatHangsCostsOneActionRatherThanThePass(t *testing.T) {
+	// Each act gets its own deadline, so a Pod that will not wake does not stop
+	// the pool from returning bridges or admitting models in the same pass.
+	p := &hangingPool{hangActivate: true}
+	p.memberships = []pool.Membership{{Model: model("qwen"), Pod: podA(), State: pool.Asleep}}
+
+	r := New(p, &staticDemand{variants: []policy.VariantDemand{
+		{Model: model("qwen"), Desired: 2, Ready: 0},
+	}}, testConfig())
+	r.ActTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	if _, err := r.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Once took %s: the borrow is not bounded", elapsed)
+	}
+	// And it is treated as what it is: a warm copy that cannot wake is not warm.
+	r.mu.Lock()
+	misses := len(r.missesAt["qwen"])
+	r.mu.Unlock()
+	if misses != 1 {
+		t.Errorf("misses = %d, want the failed borrow counted as one", misses)
+	}
+}
+
+func TestAnUnsetTimeoutIsBoundedAnyway(t *testing.T) {
+	// A Reconciler built as a struct literal rather than through New must still
+	// be bounded: an unset deadline is a mistake, not a request for none, and a
+	// zero duration passed straight to context.WithTimeout would be worse than
+	// either -- every call would fail immediately.
+	p := &hangingPool{}
+	r := &Reconciler{
+		Pool:       p,
+		Demand:     &staticDemand{},
+		Config:     testConfig(),
+		borrowedAt: map[policy.Borrow]time.Time{},
+		missesAt:   map[string][]time.Time{},
+		admitting:  map[string]bool{},
+		now:        time.Now,
+	}
+	if _, err := r.Once(context.Background()); err != nil {
+		t.Fatalf("a zero ObserveTimeout must not fail the pass: %v", err)
+	}
+	if !p.sawDeadline() {
+		t.Error("an unset ObserveTimeout must fall back to a default, not run unbounded")
+	}
+}

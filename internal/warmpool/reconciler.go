@@ -56,6 +56,25 @@ type Reconciler struct {
 	// Name identifies this pool in its metrics.
 	Name string
 
+	// ObserveTimeout bounds one observation -- the HTTP fan-out across the pool
+	// plus the read of what each variant wants.
+	//
+	// Bounded because the pool talks to Pods over the network and the default
+	// client timeout is 120 s. One Pod that accepts a connection and never
+	// answers would otherwise hold the whole loop for that long, per instance
+	// behind it, and a reconcile that should take milliseconds becomes minutes.
+	// A borrow that arrives after the cold start it was meant to beat is worse
+	// than no pool at all, so giving up early and going round again is the
+	// correct answer.
+	ObserveTimeout time.Duration
+	// ActTimeout bounds one borrow or one return. A return includes the drain
+	// wait, so this must comfortably exceed the adapter's DrainWait.
+	ActTimeout time.Duration
+	// AdmitTimeout bounds one admission, which is a model load: ~33-37 s
+	// measured for 0.6 B, and minutes for anything large. It runs in its own
+	// goroutine, so it is generous where the others are tight.
+	AdmitTimeout time.Duration
+
 	mu         sync.Mutex
 	borrowedAt map[policy.Borrow]time.Time
 	missesAt   map[string][]time.Time
@@ -68,10 +87,14 @@ type Reconciler struct {
 // New returns a Reconciler ready to Start.
 func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 	return &Reconciler{
-		Pool:       p,
-		Demand:     demand,
-		Config:     cfg,
-		Interval:   5 * time.Second,
+		Pool:           p,
+		Demand:         demand,
+		Config:         cfg,
+		Interval:       5 * time.Second,
+		ObserveTimeout: defaultObserveTimeout,
+		ActTimeout:     defaultActTimeout,
+		AdmitTimeout:   defaultAdmitTimeout,
+
 		borrowedAt: map[policy.Borrow]time.Time{},
 		missesAt:   map[string][]time.Time{},
 		admitting:  map[string]bool{},
@@ -108,11 +131,7 @@ func (r *Reconciler) Start(ctx context.Context) error {
 // Once observes, decides and acts a single time. Exported because a single pass
 // is exactly what a test wants, and what an operator debugging a pool wants.
 func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
-	memberships, err := r.Pool.ListWarm(ctx)
-	if err != nil {
-		return policy.Plan{}, err
-	}
-	variants, err := r.Demand.Variants(ctx)
+	memberships, variants, err := r.observe(ctx)
 	if err != nil {
 		return policy.Plan{}, err
 	}
@@ -139,7 +158,9 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 	logger := log.FromContext(ctx).WithName("warmpool")
 
 	for _, action := range plan.Return {
-		if err := r.Pool.Deactivate(ctx, action.Pod, action.Model); err != nil {
+		if err := r.act(ctx, func(ctx context.Context) error {
+			return r.Pool.Deactivate(ctx, action.Pod, action.Model)
+		}); err != nil {
 			logger.V(1).Info("could not return a bridge", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
 			continue
 		}
@@ -161,14 +182,20 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 		// means the timeout applies whatever the attempt does.
 		r.recordBorrow(action)
 
-		if _, err := r.Pool.Activate(ctx, action.Pod, action.Model); err != nil {
+		if err := r.act(ctx, func(ctx context.Context) error {
+			_, err := r.Pool.Activate(ctx, action.Pod, action.Model)
+			return err
+		}); err != nil {
 			logger.V(1).Info("wake failed; returning the Pod and falling through to the cold path",
 				"pod", action.Pod, "variant", action.Model.Variant, "err", err)
 			// Put it back rather than leave it half-borrowed. Without this one
 			// transient failure removes a Pod from the reserve permanently: it
 			// reads as lent, so nothing retries the variant elsewhere, and it
 			// serves no traffic.
-			if back := r.Pool.Deactivate(ctx, action.Pod, action.Model); back != nil {
+			back := r.act(ctx, func(ctx context.Context) error {
+				return r.Pool.Deactivate(ctx, action.Pod, action.Model)
+			})
+			if back != nil {
 				logger.V(1).Info("could not return a Pod after a failed wake; the hold timeout will reclaim it",
 					"pod", action.Pod, "variant", action.Model.Variant, "err", back)
 			} else {
@@ -192,14 +219,21 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 		}
 		go func(action policy.Action) {
 			defer r.endAdmission(action.Model.Variant)
-			if err := r.Pool.Warm(ctx, action.Pod, action.Model, r.tierFor(action.Model)); err != nil {
+			// From the loop's context, not the tick's: an admission outlives
+			// the pass that decided it by design, and cancelling it at the next
+			// tick would restart a ~35 s load every 5 s forever.
+			admitCtx, cancel := context.WithTimeout(ctx, orDefault(r.AdmitTimeout, defaultAdmitTimeout))
+			defer cancel()
+			if err := r.Pool.Warm(admitCtx, action.Pod, action.Model, r.tierFor(action.Model)); err != nil {
 				logger.V(1).Info("admission failed", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
 			}
 		}(action)
 	}
 
 	for _, action := range plan.Evict {
-		if err := r.Pool.Evict(ctx, action.Pod, action.Model); err != nil {
+		if err := r.act(ctx, func(ctx context.Context) error {
+			return r.Pool.Evict(ctx, action.Pod, action.Model)
+		}); err != nil {
 			logger.V(1).Info("eviction failed", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
 		}
 	}
@@ -275,6 +309,51 @@ func (r *Reconciler) recordMiss(variant string) {
 		}
 	}
 	r.missesAt[variant] = kept
+}
+
+// Defaults for the three deadlines. They are separate constants rather than one
+// because they bound different things: a fan-out of small calls, a single wake,
+// and a model load.
+const (
+	defaultObserveTimeout = 15 * time.Second
+	defaultActTimeout     = 60 * time.Second
+	defaultAdmitTimeout   = 10 * time.Minute
+)
+
+// observe reads what is resident and what each variant wants, under one
+// deadline. Both halves are reads, and a pass that cannot complete them has
+// nothing to decide from.
+func (r *Reconciler) observe(ctx context.Context) ([]pool.Membership, []policy.VariantDemand, error) {
+	observeCtx, cancel := context.WithTimeout(ctx, orDefault(r.ObserveTimeout, defaultObserveTimeout))
+	defer cancel()
+
+	memberships, err := r.Pool.ListWarm(observeCtx)
+	if err != nil {
+		return nil, nil, err
+	}
+	variants, err := r.Demand.Variants(observeCtx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return memberships, variants, nil
+}
+
+// act runs one borrow, return or eviction under its own deadline, so that one
+// Pod that will not answer costs a single action rather than the pass.
+func (r *Reconciler) act(ctx context.Context, do func(context.Context) error) error {
+	actCtx, cancel := context.WithTimeout(ctx, orDefault(r.ActTimeout, defaultActTimeout))
+	defer cancel()
+	return do(actCtx)
+}
+
+// orDefault lets a Reconciler built as a struct literal -- which is what tests
+// and any future caller that does not use New will do -- still be bounded.
+// An unset timeout is a mistake, not a request for none.
+func orDefault(d, fallback time.Duration) time.Duration {
+	if d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 // beginAdmission reports whether this variant's admission should start, and
