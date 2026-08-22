@@ -256,10 +256,12 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 	if err := a.newProxy(p.Status.PodIP).Clear(ctx); err != nil {
 		return fmt.Errorf("take %s out of service: %w", pod, err)
 	}
-	select {
-	case <-time.After(a.DrainWait):
-	case <-ctx.Done():
-		return ctx.Err()
+	if wait := a.drainFor(ctx); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	if err := a.removeLabels(ctx, p, model.PoolLabels); err != nil {
 		return fmt.Errorf("leave the InferencePool for %s: %w", model.Variant, err)
@@ -268,6 +270,37 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 		return fmt.Errorf("sleep %s in %s: %w", model.Variant, pod, err)
 	}
 	return nil
+}
+
+// drainFor is how long to let in-flight work finish, bounded by the time the
+// context actually has left.
+//
+// The drain must never be allowed to consume the whole budget, because the two
+// calls AFTER it are the ones that matter. Deactivate clears the proxy first, so
+// a timeout inside the drain leaves the Pod NotReady, still carrying its
+// InferencePool labels, and with its engine still awake holding the GPU. The
+// next pass reads that as Waking, which still counts as lent, and schedules the
+// same Deactivate -- which fails at the same point again. The Pod never returns
+// to the reserve.
+//
+// That is a livelock reachable purely by configuration: DrainWait lives on this
+// Adapter and the deadline comes from the reconciler's ActTimeout, two knobs in
+// two packages with no invariant tying them together. Rather than assert one,
+// this makes the drain yield. Half the remaining budget, so the rule scales with
+// whatever budget it is given and always leaves room for the unlabel and the
+// sleep.
+//
+// Cutting the drain short costs the requests still in flight, which is a real
+// cost -- but a strictly smaller one than losing a GPU-holding Pod permanently.
+func (a *Adapter) drainFor(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return a.DrainWait
+	}
+	if half := time.Until(deadline) / 2; half < a.DrainWait {
+		return max(half, 0)
+	}
+	return a.DrainWait
 }
 
 // Evict removes a model from a Pod, freeing its host memory.

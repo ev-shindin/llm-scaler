@@ -130,6 +130,20 @@ func (r *Reconciler) Start(ctx context.Context) error {
 
 // Once observes, decides and acts a single time. Exported because a single pass
 // is exactly what a test wants, and what an operator debugging a pool wants.
+//
+// Admissions started by this pass OUTLIVE it -- a model load is ~35 s and must
+// not hold the loop -- and they are bound to ctx, not to the pass. Start passes
+// the loop's own context, which is what makes that work: an admission survives
+// every tick and ends only at shutdown or AdmitTimeout. A caller that passes a
+// short-lived context instead gets the other behaviour, and cancelling it
+// cancels the load in flight. That is the right answer for a caller who asked
+// for one pass and then walked away, but it is worth knowing before writing
+//
+//	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+//	defer cancel()
+//	r.Once(ctx)
+//
+// which cancels a 35 s admission at 30 s, every time.
 func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	memberships, variants, err := r.observe(ctx)
 	if err != nil {

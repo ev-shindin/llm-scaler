@@ -652,3 +652,71 @@ func mustList(t *testing.T, c client.Client) []runtime.Object {
 	}
 	return out
 }
+
+func TestTheDrainYieldsToTheDeadlineRatherThanStrandingThePod(t *testing.T) {
+	// Deactivate clears the proxy FIRST, so a timeout inside the drain leaves
+	// the Pod NotReady, still carrying its InferencePool labels, and with its
+	// engine awake holding the GPU. The next pass reads that as Waking, which
+	// still counts as lent, and schedules the same Deactivate -- which fails at
+	// the same point again. The Pod never returns to the reserve.
+	//
+	// That livelock is reachable purely by configuration, because DrainWait
+	// lives on the Adapter and the deadline comes from the reconciler's
+	// ActTimeout: two knobs in two packages with nothing tying them together.
+	// The drain yields instead.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.adapter.DrainWait = time.Hour
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	if err := h.adapter.Deactivate(ctx, podA(), qwen()); err != nil {
+		t.Fatalf("Deactivate must complete under a deadline shorter than the drain: %v", err)
+	}
+	// The whole sequence, in order -- the point is that it REACHES the sleep.
+	h.journal.inOrder(t, "clear", "unlabel", "sleep")
+
+	var got corev1.Pod
+	if err := h.k8s.Get(context.Background(), podA(), &got); err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if _, still := got.Labels["llm-d.ai/model"]; still {
+		t.Error("the Pod must leave its InferencePool, or it is lent forever")
+	}
+	if !h.asleep {
+		t.Error("the engine must sleep, or the Pod holds its GPU forever")
+	}
+}
+
+func TestTheDrainIsUnshortenedWhenThereIsTimeForIt(t *testing.T) {
+	// Yielding is for the cliff, not the common case: cutting the drain short
+	// kills the requests still in flight, so a deadline with room must leave the
+	// full DrainWait alone.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.adapter.DrainWait = 40 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	start := time.Now()
+	if err := h.adapter.Deactivate(ctx, podA(), qwen()); err != nil {
+		t.Fatalf("Deactivate: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+		t.Errorf("drained for %s, want the full DrainWait when the budget allows it", elapsed)
+	}
+}
+
+func TestTheDrainIsSkippedWhenTheDeadlineHasAllButPassed(t *testing.T) {
+	// With nothing left, waiting at all guarantees the stranded Pod. Skipping
+	// the drain costs in-flight requests, which is strictly the smaller loss.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.adapter.DrainWait = time.Hour
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	if wait := h.adapter.drainFor(ctx); wait != 0 {
+		t.Fatalf("drainFor on an expired deadline = %s, want 0", wait)
+	}
+}
