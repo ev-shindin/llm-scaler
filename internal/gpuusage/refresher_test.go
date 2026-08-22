@@ -3,6 +3,7 @@ package gpuusage
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -12,15 +13,22 @@ import (
 )
 
 // fakeDiscovery returns a scripted observation, or an error once armed.
+// fakeDiscovery is read from the test goroutine while the Refresher calls it
+// from its own, so its counter is atomic. Ordinary ints raced under -race:
+// Eventually/Consistently poll from the ginkgo goroutine while Start() is
+// running, which is the whole point of those assertions.
 type fakeDiscovery struct {
 	byType      map[string]int
 	byNamespace map[string]map[string]int
 	err         error
-	calls       int
+	calls       atomic.Int64
 }
 
+// Calls reports how many observations have been made.
+func (f *fakeDiscovery) Calls() int { return int(f.calls.Load()) }
+
 func (f *fakeDiscovery) DiscoverUsageByNamespace(context.Context) (map[string]int, map[string]map[string]int, error) {
-	f.calls++
+	f.calls.Add(1)
 	if f.err != nil {
 		return nil, nil, f.err
 	}
@@ -109,7 +117,7 @@ var _ = Describe("Refresher", func() {
 			done := make(chan error, 1)
 			go func() { done <- r.Start(runCtx) }()
 
-			Consistently(func() int { return disc.calls }, 200*time.Millisecond, 10*time.Millisecond).
+			Consistently(func() int { return disc.Calls() }, 200*time.Millisecond, 10*time.Millisecond).
 				Should(Equal(0), "the cluster was observed for a view nothing consumes")
 
 			cancel()
@@ -119,20 +127,20 @@ var _ = Describe("Refresher", func() {
 		It("follows the predicate without a restart when the configuration changes", func() {
 			// Limiter mode is live-reloadable, so the answer is re-read every tick
 			// rather than latched at startup.
-			wanted := false
+			var wanted atomic.Bool
 			r.Interval = 5 * time.Millisecond
-			r.Periodic = func() bool { return wanted }
+			r.Periodic = func() bool { return wanted.Load() }
 
 			runCtx, cancel := context.WithCancel(ctx)
 			done := make(chan error, 1)
 			go func() { done <- r.Start(runCtx) }()
 			defer cancel()
 
-			Consistently(func() int { return disc.calls }, 100*time.Millisecond, 10*time.Millisecond).
+			Consistently(func() int { return disc.Calls() }, 100*time.Millisecond, 10*time.Millisecond).
 				Should(Equal(0))
 
-			wanted = true
-			Eventually(func() int { return disc.calls }, 2*time.Second, 5*time.Millisecond).
+			wanted.Store(true)
+			Eventually(func() int { return disc.Calls() }, 2*time.Second, 5*time.Millisecond).
 				Should(BeNumerically(">", 0), "a limiter mode change must not need a restart")
 
 			cancel()
@@ -149,7 +157,7 @@ var _ = Describe("Refresher", func() {
 			done := make(chan error, 1)
 			go func() { done <- r.Start(runCtx) }()
 
-			Eventually(func() int { return disc.calls }, time.Second, 5*time.Millisecond).
+			Eventually(func() int { return disc.Calls() }, time.Second, 5*time.Millisecond).
 				Should(BeNumerically(">", 0), "Start never attempted an observation")
 
 			cancel()
@@ -197,12 +205,12 @@ var _ = Describe("Refresher", func() {
 			// nothing.
 			disc.byType = map[string]int{"A100": 1}
 			Expect(r.Refresh(ctx)).To(Succeed())
-			before := disc.calls
+			before := disc.Calls()
 
 			for range 20 {
 				r.EnsureFresh(ctx, time.Minute)
 			}
-			Expect(disc.calls).To(Equal(before), "a current observation must be reused")
+			Expect(disc.Calls()).To(Equal(before), "a current observation must be reused")
 		})
 
 		It("keeps the previous observation when the look fails", func() {
