@@ -8,6 +8,7 @@
 package policy
 
 import (
+	"fmt"
 	"slices"
 	"sort"
 	"time"
@@ -37,6 +38,25 @@ type Config struct {
 	PreloadTop int
 	// MaxInstancesPerPod bounds a Pod's warm set.
 	MaxInstancesPerPod int
+
+	// PodMemoryBytes is how much HOST memory one Pod may commit to sleeping
+	// weights, and it is a hard wall rather than a target.
+	//
+	// A level-1 sleeper keeps its weights in host memory and the container has
+	// a hard limit, so admitting one model too many does not fail that
+	// admission: it OOM-kills the launcher and destroys every model already
+	// resident in the Pod. Zero disables the check, which is what a pool with
+	// no configured budget gets -- the previous behaviour, kept only so that an
+	// unset field is not silently restrictive.
+	PodMemoryBytes int64
+
+	// GPUsPerPod is how many devices a pool Pod holds.
+	//
+	// A warm copy inherits the ordinary replicas' parallelism flags, so a
+	// tensor-parallel workload asks for more GPUs than a Pod has. Without this
+	// the admission is accepted, the engine cannot start, and the ~35 s load is
+	// spent and re-spent every cycle. Zero means one.
+	GPUsPerPod int
 }
 
 // VariantDemand is what WVA has decided about one variant, plus what the pool
@@ -102,6 +122,18 @@ type Plan struct {
 	// recover it from.
 	Blocked []pool.ModelRef
 	Missed  []pool.ModelRef
+
+	// Declined are variants the pool will not warm at all, with the reason.
+	// Distinct from Missed: a miss is a model the pool could have held and did
+	// not, and says raise the warm set. A decline says the warm set could never
+	// have held it, and no amount of raising anything will change that.
+	Declined []Declined
+}
+
+// Declined is one variant the pool refused to warm.
+type Declined struct {
+	Model  pool.ModelRef
+	Reason string
 }
 
 // Decide produces the plan. It never mutates its input.
@@ -189,7 +221,7 @@ func Decide(in Input, cfg Config) Plan {
 	// 3. Admissions, last and most cautiously: never spend the reserve to fill
 	//    the cache, and never during a burst.
 	if len(plan.Blocked) == 0 {
-		plan.Admit = admissions(in, cfg, byPod, free)
+		plan.Admit, plan.Declined = admissions(in, cfg, byPod, free)
 	}
 
 	// 4. What the reserve will be once this plan is carried out.
@@ -235,11 +267,12 @@ func returnsFor(v VariantDemand, lent []pool.Membership, in Input, cfg Config) [
 // admissions chooses what to make resident, in descending order of confidence:
 // parked variants, then the most popular, then anything that has missed often
 // enough to look like a pattern rather than an accident.
-func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool) []Action {
+func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool) ([]Action, []Declined) {
 	var out []Action
+	var declined []Declined
 	budget := len(free) - cfg.SleepMinSize // never take the reserve below its floor
 	if budget <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	for _, v := range candidatesForAdmission(in, cfg) {
@@ -253,11 +286,17 @@ func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Memb
 		if !ok {
 			break
 		}
+		if reason := doesNotFit(v.Model, byPod[target], cfg); reason != "" {
+			// Skipped rather than breaking the loop: this variant does not fit,
+			// but a smaller one further down the list still might.
+			declined = append(declined, Declined{Model: v.Model, Reason: reason})
+			continue
+		}
 		out = append(out, Action{Pod: target, Model: v.Model})
 		delete(free, target)
 		budget--
 	}
-	return out
+	return out, declined
 }
 
 // candidatesForAdmission ranks the variants worth warming.
@@ -324,6 +363,53 @@ func lentByVariant(all []pool.Membership) map[string][]pool.Membership {
 		}
 	}
 	return out
+}
+
+// doesNotFit reports why a model cannot be admitted into this Pod, or "" if it
+// can.
+//
+// Two questions, and the second is the expensive one to get wrong. A Pod holds a
+// fixed number of GPUs, so a tensor-parallel engine simply cannot start in it --
+// that costs a wasted load. And a Pod has a hard memory limit that a level-1
+// sleeper's weights count against, so one model too many does not fail its own
+// admission, it takes the whole Pod down with every model already in it.
+func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) string {
+	shape := pool.ShapeOf(model.EngineOptions)
+
+	gpus := cfg.GPUsPerPod
+	if gpus < 1 {
+		gpus = 1
+	}
+	if shape.GPUs > gpus {
+		return fmt.Sprintf("needs %d GPUs, the pool's Pods hold %d", shape.GPUs, gpus)
+	}
+
+	if cfg.PodMemoryBytes <= 0 {
+		return "" // no budget configured; the check is off
+	}
+	if !shape.Known() {
+		// Declining is the conservative direction and the consistent one: the
+		// engine-flag allowlist already refuses to guess, and a warm copy the
+		// pool declines to make costs a cold start, where a warm copy that
+		// does not fit costs every model in the Pod.
+		return "its size cannot be worked out from its name, so it cannot be shown to fit"
+	}
+
+	committed := int64(0)
+	for _, m := range resident {
+		if held := pool.ShapeOf(m.Model.EngineOptions); held.Known() {
+			committed += held.WeightsBytes
+		}
+	}
+	if committed+shape.WeightsBytes > cfg.PodMemoryBytes {
+		return fmt.Sprintf("needs %s on top of the %s already resident, over the %s budget",
+			gib(shape.WeightsBytes), gib(committed), gib(cfg.PodMemoryBytes))
+	}
+	return ""
+}
+
+func gib(bytes int64) string {
+	return fmt.Sprintf("%.1fGiB", float64(bytes)/(1<<30))
 }
 
 // knownModels indexes what demand knows about each variant.

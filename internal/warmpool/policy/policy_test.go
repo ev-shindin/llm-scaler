@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -638,5 +639,139 @@ func TestAServingBridgeIsNotMistakenForAnOrphan(t *testing.T) {
 	got := Decide(in, cfg())
 	if len(got.Return) != 0 {
 		t.Fatalf("a serving bridge that is still needed must not be returned: %+v", got.Return)
+	}
+}
+
+func TestAModelNeedingMoreGPUsThanAPodHasIsDeclined(t *testing.T) {
+	// A warm copy inherits the ordinary replicas' parallelism flags, so a
+	// tensor-parallel workload asks for more devices than a single-GPU pool Pod
+	// has. Without this the admission is accepted, the engine cannot start, and
+	// the ~35 s load is spent and re-spent every cycle.
+	c := cfg()
+	c.GPUsPerPod = 1
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0 // the reserve floor is not what these cases are about
+
+	big := VariantDemand{
+		Model: pool.ModelRef{
+			Namespace:     "workload",
+			Variant:       "tp2",
+			EngineOptions: "--model meta-llama/Llama-3.1-8B --tensor-parallel-size 2",
+		},
+		Parked: true,
+	}
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Variants:    []VariantDemand{big},
+		Now:         now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 0 {
+		t.Fatalf("a two-GPU engine must not be admitted into a one-GPU Pod: %+v", got.Admit)
+	}
+	if len(got.Declined) != 1 || !strings.Contains(got.Declined[0].Reason, "GPU") {
+		t.Fatalf("and the reason must say so: %+v", got.Declined)
+	}
+}
+
+func TestAModelTooLargeForTheBudgetIsDeclined(t *testing.T) {
+	// The expensive one to get wrong. A level-1 sleeper keeps its weights in
+	// HOST memory against a hard container limit, so one model too many does not
+	// fail its own admission -- it OOM-kills the launcher and takes every model
+	// already resident in that Pod with it.
+	c := cfg()
+	c.GPUsPerPod = 1
+	c.PodMemoryBytes = 20 << 30 // room for one 8B, not two
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{{
+			Pod:   pod("a"),
+			Model: pool.ModelRef{Variant: "first", EngineOptions: "--model meta-llama/Llama-3.1-8B"},
+			State: pool.Asleep,
+		}},
+		Variants: []VariantDemand{{
+			Model: pool.ModelRef{
+				Variant:       "second",
+				EngineOptions: "--model meta-llama/Llama-3.1-8B",
+			},
+			Parked: true,
+		}},
+		Now: now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 0 {
+		t.Fatalf("a second 8B must not be admitted into a 20GiB budget: %+v", got.Admit)
+	}
+	if len(got.Declined) != 1 || !strings.Contains(got.Declined[0].Reason, "budget") {
+		t.Fatalf("and the reason must say so: %+v", got.Declined)
+	}
+}
+
+func TestAModelThatFitsIsStillAdmitted(t *testing.T) {
+	// The check must not become a blanket refusal.
+	c := cfg()
+	c.GPUsPerPod = 1
+	c.PodMemoryBytes = 20 << 30
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Variants: []VariantDemand{{
+			Model: pool.ModelRef{
+				Variant:       "small",
+				EngineOptions: "--model Qwen/Qwen3-0.6B",
+			},
+			Parked: true,
+		}},
+		Now: now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 1 {
+		t.Fatalf("a 0.6B fits a 20GiB budget: admit=%+v declined=%+v", got.Admit, got.Declined)
+	}
+}
+
+func TestAModelWhoseSizeCannotBeWorkedOutIsDeclined(t *testing.T) {
+	// Consistent with the engine-flag allowlist: the pool refuses to guess. A
+	// warm copy it declines to make costs a cold start; one that does not fit
+	// costs every model in the Pod.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Variants: []VariantDemand{{
+			Model:  pool.ModelRef{Variant: "mystery", EngineOptions: "--model BAAI/bge-m3"},
+			Parked: true,
+		}},
+		Now: now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 0 {
+		t.Fatalf("an unsizeable model must not be admitted: %+v", got.Admit)
+	}
+	if len(got.Declined) != 1 {
+		t.Fatalf("and must be reported as declined: %+v", got.Declined)
+	}
+}
+
+func TestTheFitCheckIsOffWhenNoBudgetIsSet(t *testing.T) {
+	// An unset field must not be silently restrictive.
+	c := cfg()
+	c.PodMemoryBytes = 0
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Variants: []VariantDemand{{
+			Model:  pool.ModelRef{Variant: "mystery", EngineOptions: "--model BAAI/bge-m3"},
+			Parked: true,
+		}},
+		Now: now,
+	}
+	if got := Decide(in, c); len(got.Admit) != 1 {
+		t.Fatalf("with no budget the check is off: admit=%+v declined=%+v", got.Admit, got.Declined)
 	}
 }

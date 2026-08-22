@@ -149,6 +149,16 @@ func main() {
 		"How long a borrowed Pod may serve before it is returned regardless. Bounds the case "+
 			"where the ordinary replicas never arrive, which would otherwise turn insurance "+
 			"into permanent capacity for one variant.")
+	warmPoolMemoryBudget := flag.Int64("warm-pool-memory-bytes", 40<<30,
+		"Host memory ONE pool Pod may commit to sleeping weights. A level-1 sleeper keeps its "+
+			"weights in host memory, so admitting one model too many does not fail that "+
+			"admission -- it OOM-kills the launcher and destroys every model already resident "+
+			"in the Pod. Must be comfortably under the container's memory limit. 0 disables "+
+			"the check.")
+	warmPoolGPUsPerPod := flag.Int("warm-pool-gpus-per-pod", 1,
+		"GPUs each pool Pod holds. A warm copy inherits the ordinary replicas' parallelism "+
+			"flags, so a variant wanting more devices than this is declined rather than "+
+			"loaded and failed. Must match the pool Deployment's nvidia.com/gpu request.")
 
 	// Leader election timeout configuration flags
 	// These can be overridden in manager.yaml to tune for different environments
@@ -763,6 +773,8 @@ func main() {
 					AdmissionWindow:    time.Hour,
 					MinMissesToAdmit:   2,
 					MaxInstancesPerPod: warmpoolpool.MaxInstancesPerPod,
+					PodMemoryBytes:     *warmPoolMemoryBudget,
+					GPUsPerPod:         *warmPoolGPUsPerPod,
 				},
 			)
 			reconciler.Name = *warmPoolNamespace
@@ -770,7 +782,9 @@ func main() {
 			setupLog.Info("warm pool enabled",
 				"namespace", *warmPoolNamespace,
 				"sleepMinSize", *warmPoolSleepMinSize,
-				"maxHold", *warmPoolMaxHold)
+				"maxHold", *warmPoolMaxHold,
+				"memoryBudgetBytes", *warmPoolMemoryBudget,
+				"gpusPerPod", *warmPoolGPUsPerPod)
 			return reconciler.Start(ctx)
 		})); err != nil {
 			setupLog.Error(err, "unable to add the warm pool to manager")

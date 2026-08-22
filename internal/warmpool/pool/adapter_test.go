@@ -260,8 +260,19 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(`{"is_sleeping":` + strconv.FormatBool(h.asleep) + `}`))
 	case r.URL.Path == "/health":
-		if h.serveSlowly > 0 {
-			time.Sleep(h.serveSlowly)
+		// The delay is taken OUTSIDE the lock. Sleeping while holding it blocks
+		// every other handler in this harness -- including the supervisor's
+		// DELETE, which is exactly the call the abandonment path has to make,
+		// so the test deadlocked against its own fake and waited out the whole
+		// delay before failing.
+		delay := h.serveSlowly
+		if delay > 0 {
+			h.mu.Unlock()
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+			}
+			h.mu.Lock()
 		}
 		w.WriteHeader(http.StatusOK)
 	default:
