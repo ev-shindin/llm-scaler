@@ -100,7 +100,7 @@ const DecisionMaxAge = 2 * time.Second
 
 // EnsureFresh takes a new observation if the published one is older than maxAge,
 // so a caller about to make a decision is not reasoning about a cluster that has
-// since changed. A nil Refresher is a no-op, which is what makes it safe to leave
+// since changed. A maxAge of zero or less forces an observation outright. A nil Refresher is a no-op, which is what makes it safe to leave
 // uninjected in tests.
 //
 // Concurrent callers collapse onto one observation rather than stampeding: the
@@ -115,15 +115,28 @@ func (r *Refresher) EnsureFresh(ctx context.Context, maxAge time.Duration) {
 	if r == nil {
 		return
 	}
-	if snap, ok := r.store().Get(); ok && time.Since(snap.TakenAt) <= maxAge {
-		return
+	// A maxAge of zero or less means "observe now", and must not be satisfied by
+	// an existing snapshot. Without this guard it usually IS: time.Since can
+	// return exactly zero when the monotonic clock has not ticked between the
+	// observation and the check, and `0 <= 0` then reports a stale view as
+	// fresh. How often that happens is a property of the platform's timer
+	// granularity rather than of anything the caller did -- on Windows, whose
+	// tick is ~15 ms, it is the common case.
+	if maxAge > 0 {
+		if snap, ok := r.store().Get(); ok && time.Since(snap.TakenAt) <= maxAge {
+			return
+		}
 	}
 
 	r.freshMu.Lock()
 	defer r.freshMu.Unlock()
-	// Re-check under the lock: whoever held it may have just refreshed.
-	if snap, ok := r.store().Get(); ok && time.Since(snap.TakenAt) <= maxAge {
-		return
+	// Re-check under the lock: whoever held it may have just refreshed. Skipped
+	// for a forced refresh, which is a caller saying it needs an observation of
+	// its own rather than someone else's.
+	if maxAge > 0 {
+		if snap, ok := r.store().Get(); ok && time.Since(snap.TakenAt) <= maxAge {
+			return
+		}
 	}
 	if err := r.Refresh(ctx); err != nil {
 		log.FromContext(ctx).V(logging.DEBUG).Info(

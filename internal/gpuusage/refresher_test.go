@@ -129,7 +129,7 @@ var _ = Describe("Refresher", func() {
 			// rather than latched at startup.
 			var wanted atomic.Bool
 			r.Interval = 5 * time.Millisecond
-			r.Periodic = func() bool { return wanted.Load() }
+			r.Periodic = wanted.Load
 
 			runCtx, cancel := context.WithCancel(ctx)
 			done := make(chan error, 1)

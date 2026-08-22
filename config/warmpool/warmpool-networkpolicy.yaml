@@ -80,6 +80,20 @@ spec:
           port: 8001
         - protocol: TCP
           port: 8002
+        # The ENGINES, too. Sleeping and waking are vLLM's own API, not the
+        # supervisor's, and the controller calls them directly on the instance
+        # -- at the Pod IP and the instance's port, from outside the Pod. Without
+        # this range every /is_sleeping fails, so ListWarm reads every instance
+        # as Loading, no Pod is ever counted as reserve, and no wake can happen:
+        # the pool is inert. Found by the e2e suite on a policy-enforcing
+        # cluster, having been missed by hand-testing that ran inside the Pod
+        # over loopback.
+        #
+        # The range is pool.BasePort through pool.MaxInstancesPerPod, which is
+        # what the adapter assigns from and therefore all an engine can bind.
+        - protocol: TCP
+          port: 9001
+          endPort: 9016
       from:
         # Namespace-scoped install: the controller is in this namespace.
         - podSelector:

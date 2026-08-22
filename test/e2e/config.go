@@ -29,6 +29,12 @@ type E2EConfig struct {
 	PollIntervalSlowSec     int // Slower polling for long-running conditions
 	PollIntervalVerySlowSec int // e.g. job completion probes
 
+	// WarmPoolProxyImage: env WARMPOOL_PROXY_IMAGE. The warm-pool suite runs the
+	// REAL proxy next to an emulated supervisor, because the proxy is the piece
+	// whose behaviour is subtle -- readiness, the engine-range check, streaming
+	// -- and a stand-in would test the stand-in. Override it to test a build
+	// other than the published one.
+	WarmPoolProxyImage string
 }
 
 // LoadConfigFromEnv reads e2e test configuration from environment variables.
@@ -50,6 +56,9 @@ func LoadConfigFromEnv() E2EConfig {
 		PollIntervalQuickSec:    testconfig.GetEnvInt("E2E_EVENTUALLY_POLL_QUICK", 2),
 		PollIntervalSlowSec:     testconfig.GetEnvInt("E2E_EVENTUALLY_POLL_SLOW", 10),
 		PollIntervalVerySlowSec: testconfig.GetEnvInt("E2E_EVENTUALLY_POLL_VERY_SLOW", 15),
+
+		WarmPoolProxyImage: testconfig.GetEnv("WARMPOOL_PROXY_IMAGE",
+			"ghcr.io/ev-shindin/warmpool-proxy:v6"),
 	}
 
 	// OpenShift clusters typically don't have the HPAScaleToZero feature gate enabled, so native HPAs
