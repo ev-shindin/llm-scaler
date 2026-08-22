@@ -287,6 +287,15 @@ func (s *Server) Run(ctx context.Context) error {
 		ReadHeaderTimeout: 30 * time.Second,
 		// No write timeout: a completion may stream for minutes, and cutting it
 		// off would be the truncation this design exists to avoid.
+		//
+		// Idle connections and header size ARE bounded. This port is open to
+		// every Pod in the namespace, and the container has a hard 128Mi limit,
+		// so a neighbour holding connections open -- deliberately or through a
+		// leak -- is otherwise a way to OOM the proxy. Losing the proxy costs
+		// the bridge: the upstream is in memory, so a restart leaves the engine
+		// awake with nothing pointed at it.
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	go func() {
 		<-ctx.Done()

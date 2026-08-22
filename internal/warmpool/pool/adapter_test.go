@@ -79,6 +79,16 @@ func (j *journal) inOrder(t *testing.T, steps ...string) {
 	}
 }
 
+// has reports whether anything with this prefix has happened yet.
+func (j *journal) has(prefix string) bool {
+	for _, e := range j.list() {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (j *journal) never(t *testing.T, prefix string) {
 	t.Helper()
 	for _, e := range j.list() {
@@ -128,7 +138,15 @@ func newHarness(t *testing.T, pods ...client.Object) *harness {
 		journal:    &journal{},
 		brokenPods: map[string]bool{},
 		asleep:     true,
-		instances:  []Instance{{ID: "qwen", Status: "running", Options: "--model Qwen/Qwen3-0.6B --port 9001"}},
+		// Exactly what the pool would have created: the variant's derived
+		// options, --enable-sleep-mode (without which the copy cannot sleep at
+		// all), and the port the pool assigned. A fixture missing any of those
+		// is not a resident instance, and admission is right to refuse it.
+		instances: []Instance{{
+			ID:      "qwen",
+			Status:  "running",
+			Options: "--model Qwen/Qwen3-0.6B --enable-sleep-mode --port 9001",
+		}},
 	}
 	h.k8s = fake.NewClientBuilder().WithScheme(scheme).WithObjects(pods...).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -608,15 +626,27 @@ func TestCleanupSurvivesTheContextThatFailed(t *testing.T) {
 	// where the Pod would be stranded.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
 	h.instances = nil
-	h.serveSlowly = 50 * time.Millisecond // WaitServing will outlive the context
+	// Long enough that WaitServing cannot finish on its own; the test decides
+	// when the context ends rather than racing it. A deadline short enough to
+	// beat a fast call is a deadline a loaded machine will trip in the wrong
+	// place -- this test did exactly that before it was written this way.
+	h.serveSlowly = time.Minute
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go func() {
+		// Cancel once the instance exists, which is the only state from which
+		// cleanup has anything to do.
+		for !h.journal.has("create") {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
 
 	model := qwen()
 	model.Variant = admitted
 	if err := h.adapter.Warm(ctx, podA(), model, Ram); err == nil {
-		t.Fatal("want the admission to fail on the deadline")
+		t.Fatal("want the admission to fail once its context ends")
 	}
 	h.journal.at(t, "delete "+admitted)
 }

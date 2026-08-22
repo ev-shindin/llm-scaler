@@ -74,8 +74,28 @@ spec:
             # ~2.8 s whether or not this node has served the model before, and
             # the shared torch.compile cache cuts compilation from 12.35 s to
             # 3.08 s.
+            #
+            # KNOWN RISK, kept deliberately for that measurement: the inductor
+            # and Triton caches below hold COMPILED ARTEFACTS, and they live on
+            # a volume shared with whoever else mounts it. An engine that runs
+            # hostile code can poison what another tenant's engine will load and
+            # execute. Splitting them into a per-Pod volume closes it and gives
+            # back the 9 s. That is the trade; make it deliberately rather than
+            # by accident.
+            # HOME is NOT the shared volume, and PYTHONNOUSERSITE is set.
+            #
+            # Python imports `usercustomize` from the user site directory at
+            # interpreter startup, and the user site directory is derived from
+            # HOME. With HOME on a volume the tenant can write, dropping
+            # $HOME/.local/lib/python3.X/site-packages/usercustomize.py is
+            # arbitrary code inside this GPU-holding Pod -- picked up by every
+            # engine vLLM spawns, without touching argv at all. The flag makes
+            # that directory inert; moving HOME means there is nothing there to
+            # find in the first place.
             - name: HOME
-              value: /model-cache
+              value: /pod-home
+            - name: PYTHONNOUSERSITE
+              value: "1"
             - name: HF_HOME
               value: /model-cache
             - name: VLLM_CACHE_ROOT
@@ -136,6 +156,8 @@ spec:
               memory: 48Gi
               cpu: "2"
           volumeMounts:
+            - name: pod-home
+              mountPath: /pod-home
             - name: model-cache
               mountPath: /model-cache
           readinessProbe:
@@ -254,6 +276,11 @@ spec:
               cpu: 500m
               memory: 128Mi
       volumes:
+        # A HOME of its own, per Pod. See the PYTHONNOUSERSITE note above: a
+        # writable HOME on the SHARED volume is an execution channel into this
+        # Pod, and nothing in a home directory needs to outlive it.
+        - name: pod-home
+          emptyDir: {}
         # PREREQUISITE, not created here: the PVC belongs to whoever owns the
         # models, and the pool mounts it to reuse a cache that is already warm.
         # Applying this directory into a namespace without `model-pvc` leaves

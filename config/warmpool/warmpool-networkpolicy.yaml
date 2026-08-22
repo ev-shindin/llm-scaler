@@ -68,9 +68,16 @@ spec:
     # WVA_NS); a namespace-scoped install (WVA_SCOPE=namespace) puts the
     # controller beside the pool, so set it to the pool's own namespace.
     #
-    # Getting it wrong fails LOUDLY and safely: the controller is denied, every
-    # /is_sleeping fails, ListWarm reads every instance as Loading, and the pool
-    # simply never wakes anything. It cannot fail open.
+    # Getting it wrong cannot fail OPEN -- the controller is denied and the pool
+    # simply never wakes anything -- but be clear about what it looks like,
+    # because it is not obvious from the outside. All three port groups share
+    # this one rule, so a wrong namespace denies :8001 first: the supervisor
+    # listing fails before any engine is asked anything, each Pod drops out of
+    # the observation, and the pool reports itself as empty. That is
+    # indistinguishable from "the pool is too small" in the metrics alone, so
+    # the controller logs the reason per Pod at default verbosity. Look for
+    # "warm pool Pod could not be read" before concluding the reserve is
+    # undersized.
     #
     # An earlier version carried a SECOND `from:` entry with a bare podSelector,
     # to make a namespace-scoped install work without editing anything. That was

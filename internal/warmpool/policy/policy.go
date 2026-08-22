@@ -109,13 +109,18 @@ func Decide(in Input, cfg Config) Plan {
 	plan := Plan{}
 	byPod := pool.ByPod(in.Memberships)
 	lent := lentByVariant(in.Memberships)
+	// What each variant's model REALLY looks like, including the InferencePool
+	// selector. An observation cannot supply that: ListWarm learns a variant's
+	// name and options from the supervisor, and the selector comes from the
+	// tenant's InferencePool, which only demand has read.
+	known := knownModels(in.Variants)
 
 	// 1. Returns first: a handed-back Pod is reserve for every model, and may
 	//    serve a borrow decided below.
 	returned := map[types.NamespacedName]bool{}
 	for _, v := range in.Variants {
 		for _, action := range returnsFor(v, lent[v.Model.Variant], in, cfg) {
-			plan.Return = append(plan.Return, action)
+			plan.Return = append(plan.Return, withKnownModel(action, known))
 			returned[action.Pod] = true
 		}
 	}
@@ -123,8 +128,9 @@ func Decide(in Input, cfg Config) Plan {
 	// variant asked for it back. These are not bridges anyone is holding; they
 	// are GPUs being burned by a sequence that did not finish.
 	orphans := orphanReturns(in.Memberships)
-	for _, action := range orphans {
-		plan.Return = append(plan.Return, action)
+	for i, action := range orphans {
+		orphans[i] = withKnownModel(action, known)
+		plan.Return = append(plan.Return, orphans[i])
 		returned[action.Pod] = true
 	}
 
@@ -318,6 +324,38 @@ func lentByVariant(all []pool.Membership) map[string][]pool.Membership {
 		}
 	}
 	return out
+}
+
+// knownModels indexes what demand knows about each variant.
+func knownModels(variants []VariantDemand) map[string]pool.ModelRef {
+	out := make(map[string]pool.ModelRef, len(variants))
+	for _, v := range variants {
+		out[v.Model.Variant] = v.Model
+	}
+	return out
+}
+
+// withKnownModel replaces an action's model with demand's fuller version.
+//
+// This is what makes a return able to UNDO its borrow. An action built from an
+// observation carries no PoolLabels -- there is nowhere for ListWarm to learn
+// them -- and Deactivate removes exactly the labels it is handed, so a return
+// built that way silently removed nothing at all. The Pod kept every
+// InferencePool selector it had ever served, and the next model woken in it
+// went Ready as an endpoint of BOTH pools: the first model's traffic, answered
+// by the second model's engine.
+//
+// A variant that demand no longer knows about keeps the observation's model.
+// Nothing better is available, and the labels are then left behind -- which is
+// worth knowing about, but is confined to variants that have been deregistered
+// while lent.
+func withKnownModel(action Action, known map[string]pool.ModelRef) Action {
+	full, ok := known[action.Model.Variant]
+	if !ok || len(full.PoolLabels) == 0 {
+		return action
+	}
+	action.Model = full
+	return action
 }
 
 // dropOrphanReturnsSupersededByBorrows removes an ORPHAN return whose Pod and

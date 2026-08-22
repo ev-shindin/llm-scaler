@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
 const (
@@ -43,11 +46,6 @@ const (
 	// MaxInstancesPerPod bounds the port range, and with it the warm set.
 	MaxInstancesPerPod = 16
 )
-
-// portFlag finds the port an instance was told to listen on. The options string
-// is the source of truth because it is what the process was actually started
-// with.
-var portFlag = regexp.MustCompile(`--port[= ](\d+)`)
 
 // Adapter implements Pool against the real data plane: the supervisor for
 // instance lifecycle, the engine for sleep and wake, the proxy for the serving
@@ -122,6 +120,15 @@ func (a *Adapter) ListWarm(ctx context.Context) ([]Membership, error) {
 			// the reserve is still countable without it, and treating a
 			// transient supervisor error as "the pool is empty" would trigger
 			// pointless admissions.
+			//
+			// Logged, and at a level that ships. A Pod dropping silently out of
+			// every observation looks exactly like a pool that is too small,
+			// which sends an operator after the wrong thing entirely -- and the
+			// most likely cause is not transient at all but a NetworkPolicy
+			// naming the wrong namespace, which denies every port at once.
+			log.FromContext(ctx).V(logging.DEFAULT).Info(
+				"warm pool Pod could not be read; it is absent from this observation",
+				"pod", p.Name, "err", err.Error())
 			continue
 		}
 		out = append(out, found...)
@@ -136,9 +143,20 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 	}
 	// Where the Pod is currently sending traffic tells us which instance is
 	// serving, as opposed to merely awake.
+	//
+	// A FAILED read is not an empty one, and folding the two together was a
+	// real defect rather than a tidy-up: an empty upstream means "no instance
+	// is in service here", so a Pod that is awake and correctly pointed would
+	// read as Waking the moment one GET to :8002 failed. Since a Waking engine
+	// is treated as an orphan and slept, a single flaky read was enough to
+	// drain and sleep a bridge that was serving live traffic.
+	//
+	// Unknown is its own answer. The Pod drops out of this observation, exactly
+	// as it does when the supervisor will not answer, and the next pass looks
+	// again.
 	upstream, err := a.newProxy(p.Status.PodIP).Upstream(ctx)
 	if err != nil {
-		upstream = ""
+		return nil, fmt.Errorf("read the proxy's upstream in %s: %w", p.Name, err)
 	}
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
@@ -193,9 +211,20 @@ func (a *Adapter) Warm(ctx context.Context, pod types.NamespacedName, model Mode
 		return fmt.Errorf("list instances in %s: %w", pod, err)
 	}
 	for _, inst := range existing {
-		if inst.ID == InstanceID(model) {
-			return nil // already resident; admission is idempotent
+		if inst.ID != InstanceID(model) {
+			continue
 		}
+		// Already resident, and admission is idempotent -- but only if it is
+		// the SAME engine. An instance carrying different options is a
+		// different model, a different shape, or a different compile cache key,
+		// and quietly serving traffic from it would be answering one variant's
+		// requests with another variant's engine.
+		if optionsWithoutPort(inst.Options) != optionsWithoutPort(model.EngineOptions) {
+			return fmt.Errorf(
+				"%s is resident in %s with different options (%q, wanted %q); refusing to reuse it",
+				model.Variant, pod, inst.Options, model.EngineOptions)
+		}
+		return nil
 	}
 	port, err := freePort(existing)
 	if err != nil {
@@ -448,14 +477,58 @@ func isIdentityLabel(key string) bool {
 	return slices.Contains(identityLabels, key)
 }
 
-func portOf(options string) int {
-	m := portFlag.FindStringSubmatch(options)
-	if m == nil {
-		return 0
+// optionsWithoutPort is an instance's options with the pool-assigned port
+// removed, which is what makes two instances comparable: the port is the pool's
+// choice and differs between Pods, everything else is the engine's identity.
+func optionsWithoutPort(options string) string {
+	fields := strings.Fields(options)
+	out := make([]string, 0, len(fields))
+	for i := 0; i < len(fields); i++ {
+		name, _, hasInline := strings.Cut(fields[i], "=")
+		if name != "--port" {
+			out = append(out, fields[i])
+			continue
+		}
+		if !hasInline && i+1 < len(fields) {
+			i++
+		}
 	}
-	port, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0
+	return strings.Join(out, " ")
+}
+
+// portOf finds the port an instance was told to listen on, by tokenising rather
+// than by searching.
+//
+// A regular expression over the whole options string was wrong in a way that
+// mattered: it matched the FIRST `--port=NNNN` anywhere, including inside
+// another flag's VALUE. Since the pool appends the real `--port N` last, a
+// workload naming a model at, say, `/model-cache/w--port=9002/` would have the
+// controller believe the engine listens on 9002 -- so freePort would reserve
+// the wrong port, endpointOf would resolve to a DIFFERENT resident instance,
+// and Activate would wake that one and point the serving port at it while
+// applying the requesting variant's InferencePool labels.
+//
+// Tokenised, and the LAST occurrence wins, which is the one the pool appended.
+func portOf(options string) int {
+	port := 0
+	fields := strings.Fields(options)
+	for i := 0; i < len(fields); i++ {
+		var value string
+		name, inline, hasInline := strings.Cut(fields[i], "=")
+		switch {
+		case name != "--port":
+			continue
+		case hasInline:
+			value = inline
+		case i+1 < len(fields):
+			value = fields[i+1]
+			i++
+		default:
+			continue
+		}
+		if parsed, err := strconv.Atoi(value); err == nil {
+			port = parsed
+		}
 	}
 	return port
 }

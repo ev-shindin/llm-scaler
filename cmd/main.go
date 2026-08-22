@@ -751,6 +751,7 @@ func main() {
 			reconciler := warmpool.New(
 				warmpoolpool.NewAdapter(mgr.GetClient(), *warmPoolNamespace, warmpoolpool.Ram),
 				&warmpool.Demand{
+					Namespace: *warmPoolNamespace,
 					Registry:  registry.Default,
 					Decisions: decision.Default,
 					Client:    mgr.GetClient(),

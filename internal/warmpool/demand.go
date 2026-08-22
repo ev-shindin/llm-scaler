@@ -34,6 +34,15 @@ type Demand struct {
 	Decisions *decision.Store
 	Client    client.Client
 	Datastore datastore.Datastore
+	// Namespace is the pool's, and variants outside it are not its business.
+	//
+	// Load-bearing rather than tidy. The registry spans every namespace WVA
+	// watches, while an Adapter is pinned to one -- and a variant is keyed by
+	// the ScaledObject's NAME, which is only unique within a namespace. Without
+	// this filter a variant called "decode" in one tenant's namespace and
+	// another called "decode" somewhere else are the same key to the warm set,
+	// so one tenant's traffic could be pointed at the other's engine.
+	Namespace string
 }
 
 // Variants reports every registered variant the pool could act on.
@@ -47,6 +56,9 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 
 	var out []policy.VariantDemand
 	for _, entry := range d.Registry.Snapshot() {
+		if d.Namespace != "" && entry.Namespace != d.Namespace {
+			continue // another namespace's variant; not this pool's to warm
+		}
 		if entry.Target.Name == "" {
 			continue // never enriched; nothing to scale and nothing to bridge
 		}
@@ -146,26 +158,93 @@ func EngineOptionsFrom(spec *corev1.PodSpec) (string, error) {
 	return "", errors.New("no container names a --model")
 }
 
-// normaliseOptions strips what the pool assigns itself and adds what a warm copy
-// cannot do without.
+// warmableFlags are the vLLM options a warm copy may inherit from a workload.
+//
+// An ALLOWLIST, and it has to be. These options are copied out of a Deployment
+// the tenant owns, and they become the argv of a process the pool runs on a GPU
+// with the shared model cache mounted -- so the flag set is an execution
+// surface, not a configuration detail. vLLM has several that load and run code
+// the caller names: --trust-remote-code, --tool-parser-plugin,
+// --logits-processors, --model-loader-extra-config, --speculative-config. It
+// has others that read arbitrary local files through the serving port
+// (--allowed-local-media-path) or send data off-cluster
+// (--otlp-traces-endpoint), and the pool's NetworkPolicy governs ingress only.
+//
+// Denying those individually would mean tracking a moving target across vLLM
+// releases that arrive in a third-party image. Naming what may pass does not.
+//
+// The list is what a warm copy must MATCH to be the same engine: anything that
+// changes the model, its shape, or its memory arithmetic. A flag missing from
+// here is not a bug in the tenant's workload, it is a warm copy the pool
+// declines to make -- which costs a cold start and nothing else.
+var warmableFlags = map[string]bool{
+	"--model":                        true,
+	"--served-model-name":            true,
+	"--tokenizer":                    true,
+	"--tokenizer-mode":               true,
+	"--revision":                     true,
+	"--code-revision":                true,
+	"--tokenizer-revision":           true,
+	"--dtype":                        true,
+	"--quantization":                 true,
+	"--kv-cache-dtype":               true,
+	"--max-model-len":                true,
+	"--max-num-seqs":                 true,
+	"--max-num-batched-tokens":       true,
+	"--tensor-parallel-size":         true,
+	"--pipeline-parallel-size":       true,
+	"--data-parallel-size":           true,
+	"--gpu-memory-utilization":       true,
+	"--swap-space":                   true,
+	"--block-size":                   true,
+	"--seed":                         true,
+	"--enable-prefix-caching":        true,
+	"--disable-log-requests":         true,
+	"--disable-log-stats":            true,
+	"--enforce-eager":                true,
+	"--enable-chunked-prefill":       true,
+	"--load-format":                  true,
+	"--config-format":                true,
+	"--max-seq-len-to-capture":       true,
+	"--num-scheduler-steps":          true,
+	"--distributed-executor-backend": true,
+	"--enable-sleep-mode":            true,
+}
+
+// normaliseOptions keeps the flags a warm copy must match, drops everything
+// else, and adds what it cannot do without.
+//
+// Dropping rather than refusing outright is deliberate: a workload carrying an
+// unlisted flag still gets a warm copy of the model, just without that flag.
+// The copy is then not identical to the ordinary replicas, which matters for
+// the torch.compile cache key -- so the flags that DO affect it are exactly the
+// ones on the list.
 func normaliseOptions(options string) string {
 	fields := strings.Fields(options)
 	out := make([]string, 0, len(fields)+1)
 	for i := 0; i < len(fields); i++ {
-		f := fields[i]
-		switch {
-		case f == "--port":
-			// The pool assigns ports from its own range: instances share a Pod,
-			// and a port taken from the workload would collide with the copy
-			// already listening on it.
+		name, inline, hasInline := strings.Cut(fields[i], "=")
+		if !strings.HasPrefix(name, "-") {
+			// A bare word: the launcher, the module, or a value whose flag was
+			// dropped. Either way it is not ours to pass on.
+			continue
+		}
+		if !warmableFlags[name] {
+			// Skip the flag AND its value, or the value becomes a bare word
+			// that a later parse could read as something else.
+			if !hasInline && i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		if hasInline {
+			out = append(out, name+"="+inline)
+			continue
+		}
+		out = append(out, name)
+		if i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
+			out = append(out, fields[i+1])
 			i++
-		case strings.HasPrefix(f, "--port="):
-		case f == "vllm" || f == "serve" || strings.HasSuffix(f, "python") || strings.HasSuffix(f, "python3"):
-			// The supervisor starts the engine itself; only the arguments carry.
-		case strings.HasPrefix(f, "-m") && i+1 < len(fields) && fields[i+1] == "vllm.entrypoints.openai.api_server":
-			i++
-		default:
-			out = append(out, f)
 		}
 	}
 	joined := strings.Join(out, " ")
