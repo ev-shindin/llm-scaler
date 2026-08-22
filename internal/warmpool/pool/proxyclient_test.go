@@ -2,8 +2,10 @@ package pool
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,7 +15,50 @@ import (
 // realProxy runs the actual proxy control handler, so these tests exercise the
 // two halves against each other rather than against a restatement of the
 // protocol.
-const loopback9001 = "127.0.0.1:9001"
+// liveEngine stands up something that answers /health, and returns the port it
+// bound. The proxy vets an engine before it will point at one -- pointing at
+// nothing would leave the Pod READY with no model behind it -- so these tests
+// need a real listener rather than a chosen number.
+//
+// The kernel picks the port, which is always well above the engine range floor.
+func liveEngine(t *testing.T) int {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split %q: %v", server.URL, err)
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("port %q: %v", port, err)
+	}
+	return number
+}
+
+// deadEnginePort returns a port in the engine range with nothing behind it,
+// proven free by binding and closing rather than guessed.
+func deadEnginePort(t *testing.T) int {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split %q: %v", server.URL, err)
+	}
+	server.Close()
+	number, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("port %q: %v", port, err)
+	}
+	return number
+}
 
 func realProxy(t *testing.T) (*Proxy, *proxy.Server) {
 	t.Helper()
@@ -30,13 +75,14 @@ func TestPointAndClearDriveTheRealProxy(t *testing.T) {
 	client, server := realProxy(t)
 	ctx := context.Background()
 
-	if err := client.Point(ctx, Endpoint{PodIP: "10.0.0.5", Port: 9001}); err != nil {
+	port := liveEngine(t)
+	if err := client.Point(ctx, Endpoint{PodIP: "10.0.0.5", Port: port}); err != nil {
 		t.Fatalf("Point: %v", err)
 	}
 	// The address is Pod-LOCAL: the proxy shares a network namespace with the
 	// engines, so it dials 127.0.0.1 whatever the Pod's cluster IP is.
-	if got := server.Upstream(); got != loopback9001 {
-		t.Fatalf("upstream = %q, want the loopback address", got)
+	if got, want := server.Upstream(), net.JoinHostPort("127.0.0.1", strconv.Itoa(port)); got != want {
+		t.Fatalf("upstream = %q, want the loopback address %q", got, want)
 	}
 
 	if err := client.Clear(ctx); err != nil {
@@ -59,7 +105,7 @@ func TestPointingMakesThePodReadyAndClearingUnmakesIt(t *testing.T) {
 		t.Fatalf("a Pod with nothing awake must not be ready: %d", rec.Code)
 	}
 
-	if err := client.Point(ctx, Endpoint{Port: 9002}); err != nil {
+	if err := client.Point(ctx, Endpoint{Port: liveEngine(t)}); err != nil {
 		t.Fatalf("Point: %v", err)
 	}
 	rec = httptest.NewRecorder()
@@ -83,14 +129,38 @@ func TestUpstreamIsReadBackForReconciliation(t *testing.T) {
 	// remembering what it asked for.
 	client, _ := realProxy(t)
 	ctx := context.Background()
-	if err := client.Point(ctx, Endpoint{Port: 9003}); err != nil {
+	port := liveEngine(t)
+	if err := client.Point(ctx, Endpoint{Port: port}); err != nil {
 		t.Fatalf("Point: %v", err)
 	}
 	got, err := client.Upstream(ctx)
 	if err != nil {
 		t.Fatalf("Upstream: %v", err)
 	}
-	if !strings.HasSuffix(got, ":9003") {
+	if !strings.HasSuffix(got, ":"+strconv.Itoa(port)) {
 		t.Fatalf("Upstream = %q", got)
+	}
+}
+
+func TestPointingAtAnEngineThatIsNotThereIsRefused(t *testing.T) {
+	// Measured on a cluster: pointing at an address with nothing behind it left
+	// the Pod READY, because the degraded flag is only raised once a request has
+	// actually failed. Readiness would then admit traffic to nothing until the
+	// first request 502'd. Vetting the engine before storing the pointer makes
+	// "an upstream is set" mean "an engine answered".
+	client, server := realProxy(t)
+
+	err := client.Point(context.Background(), Endpoint{Port: deadEnginePort(t)})
+	if err == nil {
+		t.Fatal("want an error when the engine does not answer")
+	}
+	if server.Upstream() != "" {
+		t.Errorf("a refused point must leave no upstream, got %q", server.Upstream())
+	}
+
+	rec := httptest.NewRecorder()
+	server.ReadyHandler(rec, httptest.NewRequest(http.MethodGet, proxy.ReadyPath, nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("readiness = %d after a refused point, want 503", rec.Code)
 	}
 }

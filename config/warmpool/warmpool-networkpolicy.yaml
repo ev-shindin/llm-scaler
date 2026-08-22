@@ -62,15 +62,31 @@ spec:
     # already applied, the compensating Deactivate fails at the clear, and the
     # Pod holds its GPU serving nothing until the hold expires.
     #
-    # EDIT THIS if WVA is installed into a different namespace. The
-    # kubernetes.io/metadata.name label is applied automatically by the API
-    # server, so no labelling step is needed.
+    # Both install scopes are covered, because `from:` entries are OR-ed while
+    # the selectors WITHIN one entry are AND-ed. WVA_SCOPE=namespace puts the
+    # controller beside the pool; a cluster-scoped install puts it in its own
+    # namespace. Verified against a namespace-scoped install on a real cluster,
+    # where the second rule alone matched nothing.
+    #
+    # EDIT the namespace below if a cluster-scoped WVA is installed somewhere
+    # other than the default. The kubernetes.io/metadata.name label is applied
+    # automatically by the API server, so no labelling step is needed.
+    #
+    # Deliberately NOT `namespaceSelector: {}`: matching the controller's labels
+    # in ANY namespace would let anyone who can create a Pod with two well-known
+    # labels reach :8001, which is arbitrary execution.
     - ports:
         - protocol: TCP
           port: 8001
         - protocol: TCP
           port: 8002
       from:
+        # Namespace-scoped install: the controller is in this namespace.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: workload-variant-autoscaler
+              control-plane: controller-manager
+        # Cluster-scoped install: the controller is in its own namespace.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: workload-variant-autoscaler-system

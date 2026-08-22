@@ -214,8 +214,10 @@ func TestTheControlEndpointRefusesARemoteUpstream(t *testing.T) {
 }
 
 func TestControlEndpointReportsSetsAndClears(t *testing.T) {
+	// Real engines, because the control endpoint now vets one before it will
+	// point at it: an upstream that is set must mean an engine answered.
 	s := New(DefaultConfig)
-	backend := net.JoinHostPort(loopbackHost, "9001")
+	backend := engine(t, "qwen")
 
 	rec := httptest.NewRecorder()
 	s.UpstreamHandler(rec, httptest.NewRequest(http.MethodGet, UpstreamPath, nil))
@@ -230,7 +232,7 @@ func TestControlEndpointReportsSetsAndClears(t *testing.T) {
 	}
 
 	// PUT again: a second wake in the same Pod is normal, not a conflict.
-	other := net.JoinHostPort(loopbackHost, "9002")
+	other := engine(t, "llama")
 	rec = httptest.NewRecorder()
 	s.UpstreamHandler(rec, put(t, other))
 	if rec.Code != http.StatusOK || s.Upstream() != other {

@@ -167,6 +167,17 @@ func (s *Server) SetUpstream(addr string) error {
 		s.upstream.Store(nil)
 		return nil
 	}
+	if err := validUpstream(addr, s.cfg.MinUpstreamPort); err != nil {
+		return err
+	}
+	s.upstream.Store(&addr)
+	return nil
+}
+
+// validUpstream reports whether addr is an engine in this Pod. Separated from
+// SetUpstream so the control endpoint can check the form before spending a
+// request on the engine.
+func validUpstream(addr string, minPort int) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("address must be host:port: %w", err)
@@ -183,11 +194,10 @@ func (s *Server) SetUpstream(addr string) error {
 	// Engines listen in the pool's own range and nothing else legitimately does,
 	// so that is what is accepted.
 	number, err := strconv.Atoi(port)
-	if err != nil || number < s.cfg.MinUpstreamPort {
+	if err != nil || number < minPort {
 		return fmt.Errorf("%w: port %q is not in the pool's engine range (>= %d)",
-			ErrUpstreamNotAnEngine, port, s.cfg.MinUpstreamPort)
+			ErrUpstreamNotAnEngine, port, minPort)
 	}
-	s.upstream.Store(&addr)
 	return nil
 }
 
@@ -312,7 +322,7 @@ func (s *Server) ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	// proxy's own error handler and cleared by the next response that works, so
 	// the healthy path stays a pointer read.
 	if s.degraded.Load() {
-		if err := s.upstreamAnswers(r.Context()); err != nil {
+		if err := s.upstreamAnswers(r.Context(), s.Upstream()); err != nil {
 			http.Error(w, "the awake instance is not answering: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -322,10 +332,9 @@ func (s *Server) ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ready"))
 }
 
-// upstreamAnswers asks the engine directly, which is the only thing that
-// settles whether this Pod can serve.
-func (s *Server) upstreamAnswers(ctx context.Context) error {
-	upstream := s.Upstream()
+// upstreamAnswers asks the engine at addr directly, which is the only thing
+// that settles whether this Pod can serve.
+func (s *Server) upstreamAnswers(ctx context.Context, upstream string) error {
 	if upstream == "" {
 		return errors.New("no model is awake")
 	}
@@ -367,6 +376,26 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, fmt.Sprintf("decode body: %v", err), http.StatusBadRequest)
 			return
+		}
+		if err := validUpstream(body.Address, s.cfg.MinUpstreamPort); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// The engine is vetted BEFORE the pointer is stored, so that "an
+		// upstream is set" means "an engine answered", by construction.
+		//
+		// Found on a cluster: pointing at an address with nothing behind it
+		// left the Pod READY, because degraded is only raised once a request
+		// has actually failed. Readiness would then have admitted traffic to
+		// nothing until the first request 502'd. The wake path already waits
+		// for /health before it points, so this costs the ~8 ms measured
+		// between /wake_up returning and the engine answering.
+		if body.Address != "" {
+			if err := s.upstreamAnswers(r.Context(), body.Address); err != nil {
+				http.Error(w, "refusing to point at an engine that does not answer: "+err.Error(),
+					http.StatusBadGateway)
+				return
+			}
 		}
 		if err := s.SetUpstream(body.Address); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
