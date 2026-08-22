@@ -70,14 +70,12 @@ func run() int {
 	// keeps the Pod out of its InferencePool while it sleeps, with no Pod-status
 	// write and so no extra permission for the controller.
 	mux.HandleFunc(proxy.ReadyPath, server.ReadyHandler)
-	// Liveness for the Pod. It reports that the proxy is up, NOT that a model is
-	// awake -- what decides whether traffic should arrive is the readiness gate,
-	// and conflating the two is how a Pod comes to be Ready while asleep, which
-	// is the 503 condition this design exists to avoid.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	mux.HandleFunc(proxy.HealthPath, server.HealthHandler)
+	// Both are also answered on the SERVING port, which is where the Pod's
+	// probes point: the control port is restricted to the controller by this
+	// pool's NetworkPolicy, and a kubelet probe comes from the node, which no
+	// `from:` selector can name. They stay here because a human debugging a
+	// pool Pod reaches the control port, not the tenant's serving port.
 
 	control := &http.Server{
 		Addr:              fmt.Sprintf(":%d", controlPort),

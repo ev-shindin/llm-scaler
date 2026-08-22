@@ -180,6 +180,29 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	// The probes are answered HERE, on the port traffic actually arrives on,
+	// and not only on the control port.
+	//
+	// Two reasons, one operational and one about correctness. The control port
+	// is reachable only by the controller under this pool's NetworkPolicy, and
+	// a kubelet probe originates from the NODE, which no `from:` selector can
+	// name -- most CNIs permit it, but relying on that is relying on an
+	// implementation detail to keep Pods from being restart-looped. And a
+	// readiness probe on a different port can pass while the port serving
+	// traffic is wedged, which is the failure readiness exists to catch.
+	//
+	// Intercepting these two paths shadows them on the upstream. vLLM serves
+	// /health, /ping and /version and neither of these, so nothing real is
+	// hidden -- but an engine that did serve them would be unreachable here.
+	switch r.URL.Path {
+	case ReadyPath:
+		s.ReadyHandler(w, r)
+		return
+	case HealthPath:
+		s.HealthHandler(w, r)
+		return
+	}
+
 	if s.Upstream() == "" {
 		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
 		return
@@ -187,11 +210,24 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.proxy.ServeHTTP(w, r)
 }
 
+// HealthHandler reports that the proxy process is up. Deliberately says nothing
+// about whether a model is awake: that is ReadyHandler's job, and a liveness
+// probe that failed while a Pod slept would restart it for doing what it is for.
+func (s *Server) HealthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
 // UpstreamPath is where the control endpoint lives.
 const UpstreamPath = "/upstream"
 
 // ReadyPath is the Pod's readiness probe.
 const ReadyPath = "/readyz"
+
+// HealthPath is the Pod's liveness probe. It reports that the proxy is up, NOT
+// that a model is awake -- conflating the two is how a Pod comes to be Ready
+// while asleep, which is the 503 condition this design exists to avoid.
+const HealthPath = "/healthz"
 
 // ReadyHandler reports whether this Pod should receive traffic: it is ready
 // exactly when a model is awake in it.

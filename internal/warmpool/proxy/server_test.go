@@ -310,3 +310,69 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder) upstreamBody {
 	}
 	return body
 }
+
+// probe sends a GET and returns status and body, which is what a kubelet does.
+func probe(t *testing.T, url string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+func TestTheProbesAreAnsweredOnTheServingPort(t *testing.T) {
+	// The Pod's probes point here, not at the control port. A kubelet probe
+	// originates from the node, which no NetworkPolicy `from:` selector can
+	// name, and this pool's policy restricts the control port to the
+	// controller -- so probing it relies on the CNI permitting host traffic,
+	// which is an implementation detail rather than a guarantee. Probing the
+	// serving port also catches the failure readiness exists for: a wedged
+	// serving listener behind a healthy control port.
+	s, base := startProxy(t)
+
+	// Asleep: live, but not ready. Both halves matter -- a liveness probe that
+	// failed while the Pod slept would restart it for doing its job.
+	if code, _ := probe(t, base+HealthPath); code != http.StatusOK {
+		t.Errorf("%s on the serving port = %d, want 200 while asleep", HealthPath, code)
+	}
+	if code, _ := probe(t, base+ReadyPath); code != http.StatusServiceUnavailable {
+		t.Errorf("%s on the serving port = %d, want 503 while asleep", ReadyPath, code)
+	}
+
+	mustSetUpstream(t, s, engine(t, "qwen"))
+	if code, _ := probe(t, base+ReadyPath); code != http.StatusOK {
+		t.Errorf("%s = %d, want 200 once a model is awake", ReadyPath, code)
+	}
+	if code, _ := probe(t, base+HealthPath); code != http.StatusOK {
+		t.Errorf("%s = %d, want 200 once a model is awake", HealthPath, code)
+	}
+}
+
+func TestTheProbePathsAreNotForwardedToTheEngine(t *testing.T) {
+	// Intercepted rather than proxied. An awake Pod would otherwise report
+	// whatever the engine says at those paths, and vLLM serves neither, so
+	// readiness would answer 404 and the Pod would never join its InferencePool.
+	s, base := startProxy(t)
+	mustSetUpstream(t, s, engine(t, "qwen"))
+
+	for _, path := range []string{ReadyPath, HealthPath} {
+		code, body := probe(t, base+path)
+		if code != http.StatusOK {
+			t.Errorf("%s = %d, want 200 from the proxy itself", path, code)
+		}
+		if strings.Contains(body, "qwen") {
+			t.Errorf("%s was answered by the engine (%q); it must not be forwarded", path, body)
+		}
+	}
+
+	// And every other path still reaches the engine.
+	if code, body := probe(t, base+"/v1/models"); code != http.StatusOK || !strings.Contains(body, "qwen") {
+		t.Errorf("/v1/models = %d %q: ordinary paths must still be forwarded", code, body)
+	}
+}

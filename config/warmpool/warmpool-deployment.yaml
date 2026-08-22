@@ -181,9 +181,13 @@ spec:
               containerPort: 8002
               protocol: TCP
           livenessProbe:
+            # On the SERVING port, not the control port. Two reasons: a kubelet
+            # probe comes from the node and the NetworkPolicy restricts the
+            # control port to the controller, and a probe on a port other than
+            # the one traffic uses can pass while that port is wedged.
             httpGet:
               path: /healthz
-              port: proxy-control
+              port: serving
             initialDelaySeconds: 3
             periodSeconds: 10
           readinessProbe:
@@ -198,7 +202,7 @@ spec:
             # its model sleeps.
             httpGet:
               path: /readyz
-              port: proxy-control
+              port: serving
             initialDelaySeconds: 3
             periodSeconds: 5
           securityContext:

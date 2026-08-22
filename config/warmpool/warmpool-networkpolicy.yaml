@@ -19,8 +19,20 @@ spec:
   #          only WVA has any business calling it.
   #
   # This is a boundary, not authentication: anything admitted here is still
-  # trusted completely by the supervisor. A shared secret on both endpoints is
-  # the other half and is not yet built.
+  # trusted completely by the supervisor. A shared secret is the other half, and
+  # is deliberately NOT built -- authenticating :8002 while :8001 sits behind the
+  # same rule and offers arbitrary execution would be theatre. Closing that gap
+  # means authentication inside FMA's launcher, which means forking it.
+  #
+  # KUBELET PROBES. A probe originates from the NODE, and no `from:` selector can
+  # name a node -- there is no portable way to express it. Most CNIs permit
+  # host-to-local-pod traffic regardless of policy, so probes to :8001 and :8002
+  # normally survive this, but that is an implementation detail and not a
+  # guarantee. The proxy's probes have been moved to :8000 accordingly, where
+  # this policy admits them. The SUPERVISOR's cannot move: its liveness probe
+  # must reach :8001 because FMA's launcher serves only that port, so on a CNI
+  # that blocks node traffic the supervisor container would restart-loop.
+  # Verify probes stay green on the target cluster before relying on this file.
   podSelector:
     matchLabels:
       app.kubernetes.io/name: workload-variant-autoscaler
