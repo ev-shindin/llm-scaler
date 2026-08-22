@@ -6,7 +6,11 @@ asleep, so capacity for any of them arrives in seconds instead of ~41 s.
 Design: [`docs/proposals/fast-model-loading.md`](../docs/proposals/fast-model-loading.md)
 and [the implementation design](../docs/proposals/fast-model-loading-implementation.md).
 
-**Status: under construction.** Nothing here is deployed.
+**Status: built, and running on a test cluster.** A pool Pod holding two models
+has served real EPP traffic on pokprod, switching between them in ~437 ms. It is
+off by default in the controller (`--warm-pool-namespace`), and the proxy image
+in `config/warmpool` is still a personal-namespace build -- see the note there
+before deploying anywhere that matters.
 
 ## Why this exists rather than using Fast Model Actuation
 
@@ -44,6 +48,14 @@ commit **`aa072ef`** (upstream `2c01cf8` plus the port-conflict reclaim fix):
 | file | origin | why it earns its place |
 | --- | --- | --- |
 | `supervisor/launcher.py` | `inference_server/launcher/launcher.py` | spawns and supervises vLLM engines inside one container. Proven: every 2-3 s wake measured on pokprod came from an instance it created |
+
+> **Vendored, not maintained here.** These files are a copy taken at fork commit
+> `aa072ef`; edit them upstream and re-copy rather than in place. Note also that
+> the image the pool actually runs
+> (`llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13`) is a DIFFERENT build
+> from this copy -- the copy is here to be read, not to be what executes. The
+> tests under `supervisor/tests/` came with the source and are not wired into any
+> make target or CI job.
 | `supervisor/gputranslator.py` | `inference_server/launcher/gputranslator.py` | GPU UUID ↔ index mapping via pynvml, with a mock mode for tests |
 | `supervisor/tests/` | the same tree | the evidence the above works; kept so adaptation is not blind |
 

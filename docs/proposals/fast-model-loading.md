@@ -6,7 +6,9 @@ mechanism, and the commercial case was never stated in a form that can be
 falsified. This document restates the problem from the beginning, keeps what
 measurement supports, and discards what it does not.
 
-**Status:** design review. Nothing here is built.
+**Status:** design review. The mechanism it argues for has since been built and
+measured (§2.7); the economic case it makes has not been tested, because the
+measurements that would test it are not available on any cluster we have (§6.1).
 
 **Scope decisions taken as input:** one mechanism serves both use cases; pool
 nodes may be required to have local NVMe; host RAM may be assumed available; no
@@ -199,7 +201,7 @@ most of the responsiveness of min=1. Its buyer is anyone who wants to park model
 but cannot accept a 41 s first request — and its coverage ratio is even better
 than burst's, because parked models spike rarely by definition.
 
-## 2.7 The pool was built and measured (2026-08-21)
+### 2.7 The pool was built and measured (2026-08-21)
 
 Not a projection. A GPU-**holding** pool Pod was deployed to pokprod
 (`config/warmpool/`), two models were made resident in it, and every number below

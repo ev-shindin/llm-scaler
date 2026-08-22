@@ -4,7 +4,18 @@ How to build the pool described in
 [the review](fast-model-loading.md). That document argues *whether*; this one is
 *how*, at the level of packages, objects, ports and failure paths.
 
-**Status:** implementation design, not built. Phase 0 measurement still gates it.
+**Status.** The mechanism is BUILT and running: `internal/warmpool` (port,
+adapter, policy, reconciler), `internal/warmpool/proxy` + `cmd/warmpool-proxy`,
+`config/warmpool`, wired into the controller behind `--warm-pool-namespace` and
+off by default. A pool Pod has served real EPP traffic on pokprod with ~437 ms
+model switches.
+
+What is NOT built, and is marked so where it appears below: eviction and pinning,
+spreading a model across Pods, the ConfigMap configuration surface (three flags
+instead), pool growth and shrink (`GrowBy` is reported, not acted on), preloading
+by popularity (inert: request share is always zero), and the admission guard that
+should decline models a pool cannot help. Phase 0 measurement still gates whether
+any of it pays.
 
 ---
 
@@ -192,11 +203,14 @@ FMA's launcher or ours, WVA needs exactly this:
 
 | call | does | cost |
 | --- | --- | --- |
-| `GET /instances` | list: model, state, port, GPU, resident bytes | ms |
-| `POST /instances` | spawn an engine for a model and load it | ~41 s [M] |
-| `POST /instances/{id}/sleep?level=N` | vLLM `/sleep` | sub-second |
-| `POST /instances/{id}/wake` | vLLM `/wake_up`, then confirm it answers | **0.3-3 s** [M] tier A |
-| `DELETE /instances/{id}` | terminate, free RAM and GPU | seconds |
+| `GET /v2/vllm/instances` | list: id, status, the options it was started with | ms |
+| `PUT /v2/vllm/instances/{id}` | spawn an engine for a model and load it | ~33-37 s [M] |
+| `DELETE /v2/vllm/instances/{id}` | terminate, free RAM and GPU | seconds |
+
+**Sleep and wake are NOT supervisor calls.** They are vLLM's own API, and the
+control plane calls the engine directly -- `/sleep`, `/wake_up`, `/is_sleeping`
+on the instance's port -- which is also how FMA's controller does it. An earlier
+draft of this table listed them here, contradicting `warmpool/README.md`.
 
 The supervisor owns process lifecycle and nothing else. **No policy lives in the
 Pod** — which model to hold, wake or evict is WVA's decision, so that the cache
@@ -204,7 +218,11 @@ policy can change without touching the data plane.
 
 ## 5. WVA side
 
-New package `internal/engines/warmpool`, running on the existing optimize loop.
+Package `internal/warmpool`, running as its own manager Runnable: a 5 s
+housekeeping tick plus a decision-store trigger, so a borrow starts when WVA
+DECIDES rather than when KEDA next polls. `internal/engines/scalefromzero` is
+untouched -- an earlier draft proposed adding a branch there, and the trigger
+made it unnecessary.
 
 ```go
 // Port — the mechanism boundary. Tier intent, never mechanism calls, so a
@@ -296,7 +314,7 @@ So residency has three sources, in descending order of confidence:
 | source | policy | why |
 | --- | --- | --- |
 | **parked models** | admit eagerly, bypassing the filter | no ordinary replicas exist, so the pool is their only fast path, and the next wake is near-certain. The alternative is a guaranteed ~41 s |
-| **popular models** | **preload** while the pool is idle, top-C by request share | prefetch beats demand-fill when the distribution is known, and skew is what makes a small warm set work |
+| **popular models** | **preload** while the pool is idle, top-C by request share. **INERT TODAY**: request share is hardcoded to zero and `PreloadTop` is unset, so this source admits nothing until a popularity signal is wired in | prefetch beats demand-fill when the distribution is known, and skew is what makes a small warm set work |
 | **everything else** | admit on the second miss in a window | keeps one-off models out |
 
 Every source is subject to the same two guards:
@@ -305,12 +323,12 @@ Every source is subject to the same two guards:
 admit(model, pod) requires:
     free - 1 >= sleepMinSize          # never spend the reserve to fill the cache
     no borrow blocked recently        # not during a burst
-    predicted_wake(model) << cold_start(model)   # refuse models a pool cannot help
+    predicted_wake(model) << cold_start(model)   # NOT BUILT
 ```
 
-The last guard is review §3.5 made operational: at TP=8 or 70 B, every mechanism
-converges to seconds and the pool should decline rather than underperform
-quietly.
+The first two guards are implemented. The third -- review §3.5 made operational,
+so that at TP=8 or 70 B the pool declines rather than underperforming quietly --
+is **not built**: nothing yet estimates a model's wake against its cold start.
 
 **The parameters are empirical, and the tool to settle them exists.**
 `internal/warmpool/estimator` already carries `FillOnMiss` for exactly this: replay
@@ -320,9 +338,17 @@ where measuring is cheap.
 - **Eviction.** LRU by last-use, with explicit pinning. LRU is right because this
   is a cache and popularity is skewed; pinning exists because the operator knows
   things the recency signal does not.
+  **NOT BUILT.** `Plan.Evict` exists and the reconciler carries it out, but the
+  policy never populates it and `Membership.LastUsed` is never set, so a Pod that
+  reaches `MaxInstancesPerPod` keeps its warm set forever. This is the largest
+  unimplemented piece of the policy.
 - **Placement.** Spread copies of a model across Pods so that expected concurrent
   wakes per Pod stay under M. With M=1 this degenerates to the anti-affinity rule
   the earlier design stated.
+  **NOT BUILT, and currently prevented:** admission skips any model that is
+  resident anywhere, so a model lives in exactly one Pod. Admission does spread
+  DIFFERENT models across Pods (the roomiest Pod takes the next one), which is a
+  weaker property than the one described here.
 - **Hold timeout.** A slot is released when ordinary replicas serve, or at
   `maxHoldSeconds`, whichever comes first. Without the timeout a stuck scale-up
   holds a slot forever and the loss model stops applying.
@@ -339,7 +365,7 @@ pool capacity, and gives it back when the ordinary replicas arrive.
 ### 7a.1 Pod states, and what `sleepMinSize` counts
 
 The invariant is one awake instance per Pod, so a pool Pod is in exactly one of
-two states:
+three states -- two of them serving no traffic:
 
 | state | meaning | can serve a wake? | in its InferencePool? | Ready? |
 | --- | --- | --- | --- | --- |
@@ -412,15 +438,21 @@ warm set was wrong (raise the warm set, or change what is admitted to it).
 ```
 on ordinary.ready >= ordinary.desired (for the variant):
     for pod in lent pods of `variant`:
-        unlabel(pod)                  # leaves the InferencePool
-        wait drain (~0.7 s measured)
         clear the proxy upstream      # /readyz -> 503, Pod NotReady
+        wait drain (~0.7 s measured)
+        unlabel(pod)                  # leaves the InferencePool
         sleep(pod, variant)           # ~70 ms
 ```
 
-Ordering is load-bearing and already measured: unlabel and drain **before**
-sleeping, because sleeping first leaves a Ready-but-asleep window, which is
-exactly the 503 condition.
+Ordering is load-bearing and already measured. **The proxy is cleared first**,
+because it is the gate: readiness follows the upstream, so clearing it is what
+actually stops the EPP dispatching. Unlabelling first would also work eventually
+but propagates more slowly, leaving a window where the Pod is Ready, still a pool
+member, and about to sleep -- which is the Ready-but-asleep 503 condition.
+
+(An earlier draft of this section stated the reverse order, contradicting §3.
+§3 was right, the code follows it, and this is now the same sentence in both
+places.)
 
 `maxHoldSeconds` bounds it. If the ordinary replicas never arrive — quota,
 unschedulable, image pull — the borrowed Pod is returned anyway, with an event
@@ -479,6 +511,14 @@ This is the same shape as the FMA attribution problem already documented in
 ScaledObject owns. The difference is that here we own both sides, so the rule can
 simply be stated and enforced.
 
+**Not yet enforced in the collector.** Today it holds by accident: the
+modelserver PodMonitor selects `llm-d.ai/role In (decode,prefill)` and a pool Pod
+declares no `modelserver` port, so it is not scraped. A lent Pod carrying a
+tenant selector that includes that role label is one manifest edit away from
+being counted as a replica of the variant it is covering -- which is exactly the
+self-suppression this section forbids. The collector should filter
+`app.kubernetes.io/component: warm-pool` explicitly.
+
 ### 7a.6 Replenishing the reserve
 
 After a borrow, `free` has dropped. Two ways back, in order of preference:
@@ -529,8 +569,11 @@ knob is wrong:
 wva_warmpool_free_pods                 vs sleepMinSize  -- is the reserve holding?
 wva_warmpool_borrow_total{outcome}     hit | blocked | miss
 wva_warmpool_bridge_seconds            borrow -> handover: how long a bridge lasts
-wva_warmpool_hold_expired_total        bridges returned because ordinary never came
 ```
+
+`wva_warmpool_hold_expired_total` was listed here in an earlier draft and is not
+implemented; an expired hold is currently visible only as a long
+`bridge_seconds` observation.
 
 `bridge_seconds` is the honest measure of what the pool is worth: it should track
 the ordinary start time (~33-37 s). If it sits at `maxHoldSeconds`, ordinary
@@ -569,7 +612,10 @@ Today the manager ClusterRole has `pods: get, list, watch`. The pool needs:
 | resource | verb | why |
 | --- | --- | --- |
 | `pods` | `patch` | add/remove the model label (membership) |
-| `deployments` | `create, update, patch` | own the pool Deployments |
+
+`deployments: create, update, patch` was claimed by an earlier draft and is **not
+needed**: the controller never writes a Deployment. Pool growth is reported, not
+acted on, so the pool Deployment is an operator's object. Do not grant it.
 
 **`pods/status` is NOT needed**, which is the second thing the readiness probe
 buys (§3). An earlier draft asked for it to satisfy a readiness gate and called
