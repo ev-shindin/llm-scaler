@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 )
@@ -190,3 +191,83 @@ func indexOf(events []string, want string) int {
 }
 
 func name(i int) string { return string(rune('a'+i%26)) + "-decode" }
+
+func TestTheTriggerPicksUpVariantsDiscoveredAfterItStarted(t *testing.T) {
+	// Discovery is call-driven: a workload becomes known when KEDA first asks
+	// about it. A trigger built once at startup would therefore never fire for
+	// anything registered later -- every variant, on a fresh controller -- and
+	// each of those bridges would wait for KEDA's next poll instead of starting
+	// at decision time.
+	store := decision.NewStore()
+	reg := registry.New(0)
+	trigger := NewDecisionTrigger(store, nil)
+	defer trigger.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go trigger.WatchRegistry(ctx, reg, time.Millisecond)
+
+	// Registered only now, after WatchRegistry is already running.
+	reg.Observe("tenant", "qwen", nil)
+	reg.SetTarget("tenant", "qwen", registry.Target{Kind: "Deployment", Name: "qwen-decode"})
+
+	// The subscription lands on a tick, so keep writing until it does rather
+	// than sleeping for a guessed interval.
+	deadline := time.After(5 * time.Second)
+	for {
+		store.Set("tenant", "qwen-decode", 3)
+		select {
+		case <-trigger.Notify():
+			return
+		case <-deadline:
+			t.Fatal("a decision for a later-discovered variant never woke the loop")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func TestTheTriggerIgnoresEntriesWhoseScaleTargetIsNotKnownYet(t *testing.T) {
+	// The decision store is keyed by the SCALE TARGET's name, which is only
+	// known after a ScaledObject read. Subscribing on the ScaledObject's name
+	// would silently watch a key nothing ever writes.
+	store := decision.NewStore()
+	reg := registry.New(0)
+	reg.Observe("tenant", "qwen", nil) // observed, never enriched
+
+	trigger := NewDecisionTrigger(store, nil)
+	defer trigger.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go trigger.WatchRegistry(ctx, reg, time.Millisecond)
+
+	time.Sleep(20 * time.Millisecond)
+	store.Set("tenant", "qwen", 3) // the ScaledObject's name, not a scale target
+
+	select {
+	case <-trigger.Notify():
+		t.Fatal("an unenriched entry must not be watched under the wrong key")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestWatchRegistryEndsWithItsContext(t *testing.T) {
+	// It runs for the life of the manager; on shutdown it must return rather
+	// than hold the run group open.
+	trigger := NewDecisionTrigger(decision.NewStore(), nil)
+	defer trigger.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		trigger.WatchRegistry(ctx, registry.New(0), time.Hour)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WatchRegistry did not return when its context ended")
+	}
+}

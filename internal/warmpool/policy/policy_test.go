@@ -403,3 +403,93 @@ func TestDecideDoesNotMutateItsInput(t *testing.T) {
 		t.Fatal("Decide mutated the memberships it was given")
 	}
 }
+
+func TestPreloadingAdmitsThePopularModelsWithoutWaitingForAMiss(t *testing.T) {
+	// Prefetch beats demand-fill when the distribution is known, and skew is
+	// what makes a small warm set work at all: with PreloadTop=2 the two
+	// busiest variants are warmed before either has missed once.
+	//
+	// Nothing feeds Share today -- Demand hardcodes it to zero -- so this
+	// branch is inert in production. It is tested because the day a popularity
+	// source is wired in is the day it starts spending the reserve, and the
+	// ordering it spends it in is the whole point.
+	c := cfg()
+	c.PreloadTop = 2
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{
+			resident("a", "", pool.Absent),
+			resident("b", "", pool.Absent),
+			resident("c", "", pool.Absent),
+		},
+		Variants: []VariantDemand{
+			{Model: model("rare"), Desired: 1, Ready: 1, Share: 0.05},
+			{Model: model("busiest"), Desired: 1, Ready: 1, Share: 0.60},
+			{Model: model("second"), Desired: 1, Ready: 1, Share: 0.30},
+		},
+		Now: now,
+	}
+
+	got := variantsIn(Decide(in, c).Admit)
+	if len(got) != 2 {
+		t.Fatalf("PreloadTop=2 should admit exactly the top two, got %v", got)
+	}
+	if got[0] != "busiest" || got[1] != "second" {
+		t.Errorf("admitted %v, want the busiest first: a small budget is spent where it buys most", got)
+	}
+	for _, v := range got {
+		if v == "rare" {
+			t.Error("a variant outside the top C must wait for the frequency filter")
+		}
+	}
+}
+
+func TestPreloadingStillRespectsTheReserve(t *testing.T) {
+	// The reserve exists for the next spike. Filling the cache is worth less
+	// than being able to answer, so popularity must not be a way around
+	// sleepMinSize -- which is exactly what a preload that ignored the budget
+	// would be.
+	c := cfg()
+	c.PreloadTop = 3
+	c.SleepMinSize = 2
+
+	in := Input{
+		Memberships: []pool.Membership{
+			resident("a", "", pool.Absent),
+			resident("b", "", pool.Absent),
+			resident("c", "", pool.Absent),
+		},
+		Variants: []VariantDemand{
+			{Model: model("busiest"), Desired: 1, Ready: 1, Share: 0.60},
+			{Model: model("second"), Desired: 1, Ready: 1, Share: 0.30},
+			{Model: model("third"), Desired: 1, Ready: 1, Share: 0.10},
+		},
+		Now: now,
+	}
+
+	got := variantsIn(Decide(in, c).Admit)
+	if len(got) != 1 || got[0] != "busiest" {
+		t.Fatalf("three free Pods and a floor of two leaves room for one: %v", got)
+	}
+}
+
+func TestPreloadIsOffWhenNothingReportsPopularity(t *testing.T) {
+	// The production configuration: PreloadTop unset. Every Share is zero, and
+	// admission must fall through to parking and the frequency filter rather
+	// than warming whichever variant happened to sort first.
+	in := Input{
+		Memberships: []pool.Membership{
+			resident("a", "", pool.Absent),
+			resident("b", "", pool.Absent),
+		},
+		Variants: []VariantDemand{
+			{Model: model("one"), Desired: 1, Ready: 1},
+			{Model: model("two"), Desired: 1, Ready: 1},
+		},
+		Now: now,
+	}
+	if got := Decide(in, cfg()); len(got.Admit) != 0 {
+		t.Fatalf("with no popularity signal and no misses, nothing is admitted: %+v", got.Admit)
+	}
+}

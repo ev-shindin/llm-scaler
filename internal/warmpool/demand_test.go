@@ -1,10 +1,22 @@
 package warmpool
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
+	poolutil "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/pool"
 )
 
 func specWith(command, args []string) *corev1.PodSpec {
@@ -99,5 +111,220 @@ func TestAWorkloadWithNoModelIsNotWarmable(t *testing.T) {
 		{Name: "proxy", Args: []string{"--listen", ":8080"}},
 	}}); err == nil {
 		t.Fatal("want an error when no container names a --model")
+	}
+}
+
+// fakeDatastore answers only the one question Demand asks of a datastore. The
+// interface is embedded rather than implemented so that any other call panics
+// loudly: Demand reading more of the datastore than this would be a change
+// worth noticing.
+type fakeDatastore struct {
+	datastore.Datastore
+	pool *poolutil.EndpointPool
+	err  error
+}
+
+func (f *fakeDatastore) PoolGetFromLabels(string, map[string]string) (*poolutil.EndpointPool, error) {
+	return f.pool, f.err
+}
+
+// scaleTarget is the one workload these tests register; the variant is named
+// separately because they are different identities and conflating them is how
+// the decision store gets read under the wrong key.
+const scaleTarget = "qwen-decode"
+
+func deployment(ready int32, container corev1.Container) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: scaleTarget, Namespace: "tenant"},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": scaleTarget}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{container}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: ready},
+	}
+}
+
+func vllmContainer() corev1.Container {
+	return corev1.Container{
+		Name:  "vllm",
+		Args:  []string{"--model", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", "0.95"},
+		Image: "vllm",
+	}
+}
+
+// demandFor wires a Demand over the given objects and datastore.
+func demandFor(t *testing.T, objects []client.Object, ds datastore.Datastore) (*Demand, *registry.Registry, *decision.Store) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	reg := registry.New(0)
+	decisions := decision.NewStore()
+	return &Demand{
+		Registry:  reg,
+		Decisions: decisions,
+		Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build(),
+		Datastore: ds,
+	}, reg, decisions
+}
+
+func registerVariant(reg *registry.Registry, target string) {
+	reg.Observe("tenant", "qwen", nil)
+	reg.SetTarget("tenant", "qwen", registry.Target{Kind: "Deployment", Name: target})
+}
+
+func inferencePool() *poolutil.EndpointPool {
+	return &poolutil.EndpointPool{
+		Name:      "qwen-pool",
+		Namespace: "tenant",
+		Selector: map[string]string{
+			"llm-d.ai/model":            "qwen",
+			"llm-d.ai/inferenceServing": "true",
+		},
+	}
+}
+
+func TestVariantsReadDesireFromTheDecisionStoreAndReadinessFromTheWorkload(t *testing.T) {
+	// The accounting rule made structural: the pool must never be able to
+	// influence how much a variant scales, only how quickly that capacity
+	// arrives. A demand source that recomputed desire is how it would start to.
+	d, reg, decisions := demandFor(t,
+		[]client.Object{deployment(1, vllmContainer())},
+		&fakeDatastore{pool: inferencePool()})
+	registerVariant(reg, scaleTarget)
+	decisions.Set("tenant", scaleTarget, 3)
+
+	got, err := d.Variants(context.Background())
+	if err != nil {
+		t.Fatalf("Variants: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Variants = %+v, want one", got)
+	}
+	v := got[0]
+	if v.Desired != 3 || v.Ready != 1 {
+		t.Errorf("desired/ready = %d/%d, want 3/1", v.Desired, v.Ready)
+	}
+	if v.Parked {
+		t.Error("a variant WVA wants three of is not parked")
+	}
+	if v.Share != 0 {
+		t.Errorf("share = %v: preloading is inert until a popularity source exists", v.Share)
+	}
+	if !strings.Contains(v.Model.EngineOptions, "--gpu-memory-utilization 0.95") {
+		t.Errorf("options must be derived from the ordinary replicas: %q", v.Model.EngineOptions)
+	}
+	if !strings.Contains(v.Model.EngineOptions, "--enable-sleep-mode") {
+		t.Errorf("a warm copy that cannot sleep is not a warm copy: %q", v.Model.EngineOptions)
+	}
+}
+
+func TestPoolLabelsComeFromTheInferencePoolsOwnSelector(t *testing.T) {
+	// Read rather than assumed. A selector belongs to the tenant, and one that
+	// requires something other than llm-d.ai/model is not hypothetical -- a pool
+	// Pod that guesses joins nothing, and its wake then serves no traffic.
+	d, reg, _ := demandFor(t,
+		[]client.Object{deployment(1, vllmContainer())},
+		&fakeDatastore{pool: inferencePool()})
+	registerVariant(reg, scaleTarget)
+
+	got, err := d.Variants(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	labels := got[0].Model.PoolLabels
+	if labels["llm-d.ai/inferenceServing"] != "true" || labels["llm-d.ai/model"] != "qwen" {
+		t.Errorf("labels = %v, want the InferencePool's whole selector", labels)
+	}
+	if _, copied := labels["app"]; copied {
+		t.Error("the workload's own labels are not the pool's selector")
+	}
+}
+
+func TestParkedNeedsADecisionAndNotJustTwoZeroes(t *testing.T) {
+	// Before WVA has decided anything -- every variant, on every restart --
+	// desired reads 0, and a workload that has not started reads 0 ready.
+	// Calling that parked would admit models nobody asked for, at ~35 s and a
+	// reserve slot each, on every restart.
+	d, reg, decisions := demandFor(t,
+		[]client.Object{deployment(0, vllmContainer())},
+		&fakeDatastore{pool: inferencePool()})
+	registerVariant(reg, scaleTarget)
+
+	got, err := d.Variants(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	if got[0].Parked {
+		t.Fatal("no decision yet is not the same as a decision to park")
+	}
+
+	decisions.Set("tenant", scaleTarget, 0)
+	if got, err = d.Variants(context.Background()); err != nil || len(got) != 1 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	if !got[0].Parked {
+		t.Error("a decided zero with nothing ready is parked, which is the case with no alternative")
+	}
+}
+
+func TestVariantsSkipWhatItCannotWarmRatherThanGuessing(t *testing.T) {
+	// A warm copy started with different options than the ordinary replicas is
+	// a different torch.compile cache key: ~9 s of extra compile, and silently
+	// so. Skipping is the only safe answer.
+	sidecarOnly := corev1.Container{Name: "proxy", Args: []string{"--listen", ":8080"}}
+
+	for _, tc := range []struct {
+		name    string
+		objects []client.Object
+		ds      datastore.Datastore
+		target  string
+	}{
+		{
+			name:    "no scale target has been resolved yet",
+			objects: []client.Object{deployment(1, vllmContainer())},
+			ds:      &fakeDatastore{pool: inferencePool()},
+			target:  "",
+		},
+		{
+			name:    "the scale target cannot be read",
+			objects: nil,
+			ds:      &fakeDatastore{pool: inferencePool()},
+			target:  scaleTarget,
+		},
+		{
+			name:    "no container names a --model",
+			objects: []client.Object{deployment(1, sidecarOnly)},
+			ds:      &fakeDatastore{pool: inferencePool()},
+			target:  scaleTarget,
+		},
+		{
+			name:    "the workload belongs to no InferencePool",
+			objects: []client.Object{deployment(1, vllmContainer())},
+			ds:      &fakeDatastore{err: errors.New("no pool matches")},
+			target:  scaleTarget,
+		},
+		{
+			name:    "its InferencePool has an empty selector",
+			objects: []client.Object{deployment(1, vllmContainer())},
+			ds:      &fakeDatastore{pool: &poolutil.EndpointPool{Name: "empty", Namespace: "tenant"}},
+			target:  scaleTarget,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, reg, _ := demandFor(t, tc.objects, tc.ds)
+			registerVariant(reg, tc.target)
+
+			got, err := d.Variants(context.Background())
+			if err != nil {
+				t.Fatalf("one unwarmable variant must not fail the read: %v", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("Variants = %+v, want none", got)
+			}
+		})
 	}
 }

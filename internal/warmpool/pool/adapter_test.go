@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -89,6 +90,15 @@ type harness struct {
 	upstream  string
 	asleep    bool
 	wakeFails bool
+
+	// Failure knobs. Each names a step that can fail in production and whose
+	// failure must stop the sequence rather than let it run on: the orderings
+	// this adapter exists to enforce are only enforced if a failed step aborts.
+	deleteFails  bool
+	clearFails   bool
+	sleepFails   bool
+	garbageList  bool
+	garbageState bool
 }
 
 func newHarness(t *testing.T, pods ...client.Object) *harness {
@@ -147,6 +157,10 @@ func (h *harness) serveSupervisor(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/health":
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodGet && r.URL.Path == instancesPath:
+		if h.garbageList {
+			_, _ = w.Write([]byte(`{"qwen": "this is not an instance"}`))
+			return
+		}
 		byID := map[string]Instance{}
 		for _, inst := range h.instances {
 			byID[inst.ID] = inst
@@ -163,6 +177,10 @@ func (h *harness) serveSupervisor(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(inst)
 	case r.Method == http.MethodDelete:
 		h.journal.add("delete " + strings.TrimPrefix(r.URL.Path, instancesPath+"/"))
+		if h.deleteFails {
+			http.Error(w, "instance is busy", http.StatusConflict)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{}`))
 	default:
@@ -176,6 +194,10 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/sleep"):
 		h.journal.add("sleep")
+		if h.sleepFails {
+			http.Error(w, "cumem: invalid argument", http.StatusInternalServerError)
+			return
+		}
 		h.asleep = true
 		w.WriteHeader(http.StatusOK)
 	case r.URL.Path == "/wake_up":
@@ -187,6 +209,10 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 		h.asleep = false
 		w.WriteHeader(http.StatusOK)
 	case r.URL.Path == "/is_sleeping":
+		if h.garbageState {
+			_, _ = w.Write([]byte(`<html>502 Bad Gateway</html>`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"is_sleeping":` + strconv.FormatBool(h.asleep) + `}`))
 	case r.URL.Path == "/health":
 		w.WriteHeader(http.StatusOK)
@@ -209,6 +235,10 @@ func (h *harness) serveProxy(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"address":"` + body.Address + `"}`))
 	case http.MethodDelete:
 		h.journal.add("clear")
+		if h.clearFails {
+			http.Error(w, "proxy is not listening", http.StatusServiceUnavailable)
+			return
+		}
 		h.upstream = ""
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -443,4 +473,182 @@ func TestPortOfReadsWhatTheProcessWasStartedWith(t *testing.T) {
 			t.Errorf("portOf(%q) = %d, want %d", tc.options, got, tc.want)
 		}
 	}
+}
+
+func TestAnInstanceThatWillNotAnswerReadsAsLoading(t *testing.T) {
+	// An instance exists in the supervisor's list long before it can serve: a
+	// load is ~33-37 s measured. What the caller needs to know is not "is it
+	// asleep" but "can it serve a wake", and during a load the answer is no.
+	// Reading an unanswerable engine as Asleep would offer it as reserve and
+	// blow the borrow.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.garbageState = true
+
+	got, err := h.adapter.ListWarm(context.Background())
+	if err != nil {
+		t.Fatalf("ListWarm: %v", err)
+	}
+	if len(got) != 1 || got[0].State != Loading {
+		t.Fatalf("state = %+v, want loading", got)
+	}
+}
+
+func TestASupervisorTalkingNonsenseHidesOnlyItsOwnPod(t *testing.T) {
+	// One Pod answering with a body that does not parse must not empty the warm
+	// set: treating a transient failure as "the pool is empty" admits models
+	// that are already resident, at ~35 s and a reserve slot each.
+	good := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	if got, err := good.adapter.ListWarm(context.Background()); err != nil || len(got) != 1 {
+		t.Fatalf("baseline: %+v %v", got, err)
+	}
+
+	bad := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	bad.garbageList = true
+	got, err := bad.adapter.ListWarm(context.Background())
+	if err != nil {
+		t.Fatalf("ListWarm must not fail for one bad Pod: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("an unreadable Pod contributes nothing, got %+v", got)
+	}
+}
+
+func TestEvictRemovesTheInstanceItWasAskedTo(t *testing.T) {
+	// Eviction is what frees host memory. It is keyed on the variant, not on a
+	// hash over GPU UUIDs, because a pool Pod owns its GPUs for as long as it
+	// owns the model.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+
+	if err := h.adapter.Evict(context.Background(), podA(), qwen()); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	deleted := h.journal.list()[h.journal.at(t, "delete")]
+	if deleted != "delete qwen" {
+		t.Errorf("evicted %q, want the variant's own instance", deleted)
+	}
+}
+
+func TestAFailedEvictionIsReportedRatherThanAssumed(t *testing.T) {
+	// A caller that believes it freed memory it did not free will admit the
+	// next model into a Pod with no room for it.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.deleteFails = true
+
+	err := h.adapter.Evict(context.Background(), podA(), qwen())
+	if err == nil {
+		t.Fatal("want an error when the supervisor refuses")
+	}
+	if !strings.Contains(err.Error(), "qwen") || !strings.Contains(err.Error(), "pod-a") {
+		t.Errorf("the error must name what could not be evicted from where: %v", err)
+	}
+}
+
+func TestDeactivateDoesNotSleepAModelStillTakingTraffic(t *testing.T) {
+	// The whole reason the proxy is cleared first. If clearing fails the Pod is
+	// still Ready and still in its InferencePool, so sleeping anyway is the
+	// Ready-but-asleep window -- every request routed there 503s.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.clearFails = true
+
+	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err == nil {
+		t.Fatal("a proxy that will not clear must be reported")
+	}
+	h.journal.never(t, "sleep")
+	h.journal.never(t, "unlabel")
+
+	var got corev1.Pod
+	if err := h.k8s.Get(context.Background(), podA(), &got); err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if _, member := got.Labels["llm-d.ai/model"]; !member {
+		t.Error("membership must survive a failed deactivation, so a retry has something to undo")
+	}
+}
+
+func TestDeactivateDoesNotSleepAModelStillInItsInferencePool(t *testing.T) {
+	// Same window, one step later: unlabelling is what removes the Pod from the
+	// EPP's endpoint set. Sleeping while it is still listed is a 503 for as long
+	// as the EPP takes to notice.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.k8s = refusePatches(t, h.k8s)
+	h.adapter.client = h.k8s
+
+	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err == nil {
+		t.Fatal("a Pod that cannot leave its pool must be reported")
+	}
+	h.journal.inOrder(t, "clear")
+	h.journal.never(t, "sleep")
+}
+
+func TestDeactivateReportsAnEngineThatWillNotSleep(t *testing.T) {
+	// Measured on the cluster: sleep and wake both fail on real engines, with
+	// cumem errors. A Pod whose engine refused to sleep is still holding its
+	// GPU, and must not silently be counted back into the reserve.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.sleepFails = true
+
+	err := h.adapter.Deactivate(context.Background(), podA(), qwen())
+	if err == nil {
+		t.Fatal("want an error when the engine will not sleep")
+	}
+	if !strings.Contains(err.Error(), "qwen") {
+		t.Errorf("the error must name the model still holding the GPU: %v", err)
+	}
+}
+
+func TestDeactivateGivesUpTheDrainWithTheContext(t *testing.T) {
+	// The drain is a sleep in the middle of a sequence. On shutdown it must end
+	// with the context rather than hold the loop open, and it must not go on to
+	// sleep an engine whose Pod it can no longer observe.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.adapter.DrainWait = time.Minute
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Let the clear land first, so the test covers the drain and not the
+		// call before it.
+		for len(h.journal.list()) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+
+	start := time.Now()
+	if err := h.adapter.Deactivate(ctx, podA(), qwen()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Deactivate = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("waited %s: the drain must end with the context", elapsed)
+	}
+	h.journal.never(t, "sleep")
+}
+
+// refusePatches wraps a client so every Patch fails, which is how a Pod that
+// cannot leave its InferencePool behaves.
+func refusePatches(t *testing.T, inner client.Client) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).
+		WithRuntimeObjects(mustList(t, inner)...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+				return errors.New("apiserver said no")
+			},
+		}).Build()
+}
+
+func mustList(t *testing.T, c client.Client) []runtime.Object {
+	t.Helper()
+	var pods corev1.PodList
+	if err := c.List(context.Background(), &pods); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	out := make([]runtime.Object, 0, len(pods.Items))
+	for i := range pods.Items {
+		out = append(out, &pods.Items[i])
+	}
+	return out
 }
