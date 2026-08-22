@@ -56,6 +56,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/controller"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/allocation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/throughput"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/scalefromzero"
@@ -69,6 +70,9 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/scaler"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/crd"
 	poolutil "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/pool"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool"
+	warmpoolpolicy "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
+	warmpoolpool "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
@@ -133,6 +137,18 @@ func main() {
 	externalScalerBindAddress := flag.String("external-scaler-bind-address", ":9090",
 		"The address the KEDA external scaler gRPC service binds to. "+
 			"KEDA ScaledObjects reference this via an external trigger's scalerAddress.")
+
+	// The warm pool is OFF unless a namespace is named, because it holds GPUs
+	// continuously: that is a cost decision an operator makes, never a default.
+	warmPoolNamespace := flag.String("warm-pool-namespace", "",
+		"Namespace holding warm-pool Pods. Empty disables the pool entirely.")
+	warmPoolSleepMinSize := flag.Int("warm-pool-sleep-min-size", 1,
+		"Floor on FREE pool Pods -- ones with every instance asleep. This is the reserve "+
+			"the pool keeps for the next spike, per pool rather than per model.")
+	warmPoolMaxHold := flag.Duration("warm-pool-max-hold", 2*time.Minute,
+		"How long a borrowed Pod may serve before it is returned regardless. Bounds the case "+
+			"where the ordinary replicas never arrive, which would otherwise turn insurance "+
+			"into permanent capacity for one variant.")
 
 	// Leader election timeout configuration flags
 	// These can be overridden in manager.yaml to tune for different environments
@@ -712,6 +728,53 @@ func main() {
 	}); err != nil {
 		setupLog.Error(err, "unable to add KEDA external scaler to manager")
 		os.Exit(1)
+	}
+
+	// The warm pool: GPU-holding Pods that keep models resident but asleep, so a
+	// scale-up can be covered in ~0.4 s while the ordinary replicas take ~35 s.
+	//
+	// Leader-gated with everything else, and driven off the decision store rather
+	// than off KEDA: a decision is known here before KEDA is told about it, so a
+	// bridge starts at decision time instead of a poll interval later. The pool
+	// never touches the metric KEDA reads -- it borrows underneath the same
+	// decision KEDA is about to act on, which is what keeps lent capacity out of
+	// the scaling arithmetic.
+	if *warmPoolNamespace != "" {
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			trigger := warmpool.NewDecisionTrigger(decision.Default, nil)
+			defer trigger.Close()
+			// Discovery is call-driven, so the set of scale targets grows during
+			// a run; a trigger built once at startup would never fire for a
+			// workload registered later.
+			go trigger.WatchRegistry(ctx, registry.Default, 30*time.Second)
+
+			reconciler := warmpool.New(
+				warmpoolpool.NewAdapter(mgr.GetClient(), *warmPoolNamespace, warmpoolpool.Ram),
+				&warmpool.Demand{
+					Registry:  registry.Default,
+					Decisions: decision.Default,
+					Client:    mgr.GetClient(),
+					Datastore: ds,
+				},
+				warmpoolpolicy.Config{
+					SleepMinSize:       *warmPoolSleepMinSize,
+					MaxHold:            *warmPoolMaxHold,
+					AdmissionWindow:    time.Hour,
+					MinMissesToAdmit:   2,
+					MaxInstancesPerPod: warmpoolpool.MaxInstancesPerPod,
+				},
+			)
+			reconciler.Name = *warmPoolNamespace
+			reconciler.Trigger = trigger
+			setupLog.Info("warm pool enabled",
+				"namespace", *warmPoolNamespace,
+				"sleepMinSize", *warmPoolSleepMinSize,
+				"maxHold", *warmPoolMaxHold)
+			return reconciler.Start(ctx)
+		})); err != nil {
+			setupLog.Error(err, "unable to add the warm pool to manager")
+			os.Exit(1)
+		}
 	}
 
 	// +kubebuilder:scaffold:builder

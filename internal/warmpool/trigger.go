@@ -1,11 +1,14 @@
 package warmpool
 
 import (
+	"context"
 	"sync"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 )
 
 // DecisionTrigger fires the reconciler when WVA writes a scale decision.
@@ -21,12 +24,14 @@ type DecisionTrigger struct {
 	mu          sync.Mutex
 	fired       chan struct{}
 	unsubscribe []func()
+	watched     map[types.NamespacedName]bool
 }
 
 // NewDecisionTrigger watches the given scale targets.
 func NewDecisionTrigger(store *decision.Store, targets []types.NamespacedName) *DecisionTrigger {
 	t := &DecisionTrigger{
-		store: store,
+		store:   store,
+		watched: map[types.NamespacedName]bool{},
 		// Depth one, and never blocking: several decisions landing together
 		// need one reconcile, not one each. A full buffer already means "go
 		// round again", which is exactly what a second signal would say.
@@ -42,9 +47,19 @@ func NewDecisionTrigger(store *decision.Store, targets []types.NamespacedName) *
 func (t *DecisionTrigger) Notify() <-chan struct{} { return t.fired }
 
 // Watch adds a target after construction, for variants discovered later.
+// Watching one twice is a no-op: WVA discovers workloads from KEDA calls, so the
+// same target is offered on every sync.
 func (t *DecisionTrigger) Watch(target types.NamespacedName) { t.watch(target) }
 
 func (t *DecisionTrigger) watch(target types.NamespacedName) {
+	t.mu.Lock()
+	if t.watched[target] {
+		t.mu.Unlock()
+		return
+	}
+	t.watched[target] = true
+	t.mu.Unlock()
+
 	updates, cancel := t.store.Subscribe(target.Namespace, target.Name)
 
 	t.mu.Lock()
@@ -61,6 +76,34 @@ func (t *DecisionTrigger) watch(target types.NamespacedName) {
 	}()
 }
 
+// WatchRegistry keeps the trigger's subscriptions in step with what WVA has
+// discovered, until ctx ends.
+//
+// Necessary because discovery is call-driven: a workload becomes known when KEDA
+// first asks about it, so the set of scale targets grows during a run and a
+// trigger built once at startup would never fire for anything registered later.
+func (t *DecisionTrigger) WatchRegistry(ctx context.Context, reg *registry.Registry, every time.Duration) {
+	if every <= 0 {
+		every = 30 * time.Second
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		for _, entry := range reg.Snapshot() {
+			if entry.Target.Name == "" {
+				continue // not enriched yet; the decision store is keyed by the
+				// scale target's name, which is only known after a read
+			}
+			t.Watch(types.NamespacedName{Namespace: entry.Namespace, Name: entry.Target.Name})
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // Close releases every subscription.
 func (t *DecisionTrigger) Close() {
 	t.mu.Lock()
@@ -69,4 +112,5 @@ func (t *DecisionTrigger) Close() {
 		cancel()
 	}
 	t.unsubscribe = nil
+	t.watched = map[types.NamespacedName]bool{}
 }

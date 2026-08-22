@@ -92,11 +92,15 @@ type Plan struct {
 	// act on -- growth costs a full model load, so it must not chase a
 	// transient borrow.
 	GrowBy int
-	// Blocked and Missed name the variants the pool could not help, and why.
+	// Blocked and Missed are the variants the pool could not help, and why.
 	// They are different faults: blocked means the reserve was too small,
 	// missed means the warm set was wrong.
-	Blocked []string
-	Missed  []string
+	//
+	// Carried as models rather than names because a caller reporting them needs
+	// the namespace too, and a variant that missed appears in no action list to
+	// recover it from.
+	Blocked []pool.ModelRef
+	Missed  []pool.ModelRef
 }
 
 // Decide produces the plan. It never mutates its input.
@@ -124,7 +128,7 @@ func Decide(in Input, cfg Config) Plan {
 		}
 		candidates := holding(byPod, free, v.Model.Variant)
 		if len(candidates) == 0 {
-			plan.Missed = append(plan.Missed, v.Model.Variant)
+			plan.Missed = append(plan.Missed, v.Model)
 			continue
 		}
 		borrowed := 0
@@ -139,7 +143,7 @@ func Decide(in Input, cfg Config) Plan {
 		if borrowed < shortfall {
 			// The reserve ran out with the model resident: more Pods would have
 			// helped, unlike a miss.
-			plan.Blocked = append(plan.Blocked, v.Model.Variant)
+			plan.Blocked = append(plan.Blocked, v.Model)
 		}
 	}
 

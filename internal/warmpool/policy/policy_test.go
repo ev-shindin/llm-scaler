@@ -76,7 +76,7 @@ func TestAMissIsNotABlock(t *testing.T) {
 		Now:         now,
 	}
 	got := Decide(byModelAbsent, cfg())
-	if len(got.Missed) != 1 || got.Missed[0] != "qwen" {
+	if len(got.Missed) != 1 || got.Missed[0].Variant != "qwen" {
 		t.Fatalf("a model resident nowhere is a MISS: %+v", got)
 	}
 	if len(got.Blocked) != 0 {

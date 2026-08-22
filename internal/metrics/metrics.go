@@ -54,6 +54,9 @@ var (
 
 	optimizationDuration *prometheus.HistogramVec
 	wakeDuration         *prometheus.HistogramVec
+	warmPoolFreePods     *prometheus.GaugeVec
+	warmPoolBorrows      *prometheus.CounterVec
+	warmPoolBridge       *prometheus.HistogramVec
 	modelsProcessedGauge *prometheus.GaugeVec
 
 	// pipeline stage visibility metrics
@@ -278,6 +281,31 @@ func InitMetrics(registry prometheus.Registerer) error {
 			// lands near 2s and a cold model load near 50-80s, so buckets bunched at
 			// either end would collapse the distinction this metric exists to show.
 			Buckets: []float64{1, 2, 3, 5, 8, 15, 30, 45, 60, 90, 120, 300},
+		},
+		[]string{constants.LabelNamespace, constants.LabelModelName},
+	)
+	warmPoolFreePods = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVAWarmPoolFreePods,
+			Help: "Warm-pool Pods that can serve a wake now (every instance asleep, none loading)",
+		},
+		[]string{constants.LabelPool},
+	)
+	warmPoolBorrows = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: constants.WVAWarmPoolBorrowTotal,
+			Help: "Attempts to cover a scale-up from the warm pool, by outcome: hit, blocked or miss",
+		},
+		[]string{constants.LabelNamespace, constants.LabelModelName, constants.LabelOutcome},
+	)
+	warmPoolBridge = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: constants.WVAWarmPoolBridgeSeconds,
+			Help: "How long a borrowed Pod served before the ordinary replicas took over",
+			// Spread around the ordinary start time this bridges, measured at
+			// 33-37s here, with room above it: a bridge sitting near the hold
+			// timeout means the scale-up it covers is failing.
+			Buckets: []float64{1, 5, 15, 30, 45, 60, 90, 120, 300},
 		},
 		[]string{constants.LabelNamespace, constants.LabelModelName},
 	)
@@ -551,6 +579,15 @@ func InitMetrics(registry prometheus.Registerer) error {
 		return fmt.Errorf("failed to register errorsTotal metric: %w", err)
 	}
 	if err := registry.Register(wakeDuration); err != nil {
+		return err
+	}
+	if err := registry.Register(warmPoolFreePods); err != nil {
+		return err
+	}
+	if err := registry.Register(warmPoolBorrows); err != nil {
+		return err
+	}
+	if err := registry.Register(warmPoolBridge); err != nil {
 		return err
 	}
 	if err := registry.Register(optimizationDuration); err != nil {
@@ -841,6 +878,43 @@ func ObserveWakeDuration(namespace, modelName string, seconds float64) {
 		return
 	}
 	wakeDuration.With(modelSeriesLabels(namespace, modelName)).Observe(seconds)
+}
+
+// SetWarmPoolFreePods records the reserve: Pods that could serve a wake at the
+// moment of observation.
+func SetWarmPoolFreePods(poolName string, free int) {
+	if warmPoolFreePods == nil {
+		return
+	}
+	warmPoolFreePods.With(prometheus.Labels{constants.LabelPool: poolName}).Set(float64(free))
+}
+
+// CountWarmPoolBorrow records one attempt to cover a scale-up from the pool.
+//
+// Outcome is deliberately a label rather than three metrics: hit, blocked and
+// miss partition the same event, and separating them into gauges would let a
+// reader add up a number that is not a total.
+func CountWarmPoolBorrow(namespace, modelName, outcome string) {
+	if warmPoolBorrows == nil {
+		return
+	}
+	warmPoolBorrows.With(prometheus.Labels{
+		constants.LabelNamespace: namespace,
+		constants.LabelModelName: modelName,
+		constants.LabelOutcome:   outcome,
+	}).Inc()
+}
+
+// ObserveWarmPoolBridge records how long a borrowed Pod served before handing
+// back. Observed once per bridge, when it ends.
+func ObserveWarmPoolBridge(namespace, modelName string, seconds float64) {
+	if warmPoolBridge == nil {
+		return
+	}
+	warmPoolBridge.With(prometheus.Labels{
+		constants.LabelNamespace: namespace,
+		constants.LabelModelName: modelName,
+	}).Observe(seconds)
 }
 
 // ClearModelReplicas drops a model's replica series, for a model that has gone

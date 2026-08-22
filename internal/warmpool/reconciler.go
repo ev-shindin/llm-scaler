@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 )
@@ -52,6 +53,8 @@ type Reconciler struct {
 	Trigger Trigger
 	// Interval is the housekeeping cadence: returns, admissions, growth.
 	Interval time.Duration
+	// Name identifies this pool in its metrics.
+	Name string
 
 	mu         sync.Mutex
 	borrowedAt map[policy.Borrow]time.Time
@@ -125,6 +128,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	r.mu.Unlock()
 
 	plan := policy.Decide(in, r.Config)
+	metrics.SetWarmPoolFreePods(r.Name, pool.FreePods(memberships))
 	r.apply(ctx, plan)
 	return plan, nil
 }
@@ -139,6 +143,13 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 			logger.V(1).Info("could not return a bridge", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
 			continue
 		}
+		// Observed as the bridge ends, so the distribution answers the question
+		// the pool exists for: a bridge should last about as long as an ordinary
+		// replica takes to start, and one sitting at the hold timeout means the
+		// scale-up it covers is failing while the pool hides it.
+		if held, ok := r.heldFor(action); ok {
+			metrics.ObserveWarmPoolBridge(action.Model.Namespace, action.Model.Variant, held.Seconds())
+		}
 		r.forget(action)
 	}
 
@@ -151,9 +162,11 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 			logger.V(1).Info("wake failed; falling through to the cold path",
 				"pod", action.Pod, "variant", action.Model.Variant, "err", err)
 			r.recordMiss(action.Model.Variant)
+			metrics.CountWarmPoolBorrow(action.Model.Namespace, action.Model.Variant, OutcomeMiss)
 			continue
 		}
 		r.recordBorrow(action)
+		metrics.CountWarmPoolBorrow(action.Model.Namespace, action.Model.Variant, OutcomeHit)
 	}
 
 	// Admission takes ~35 s, so it must not hold up the next cycle. The Pod
@@ -177,14 +190,41 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 		}
 	}
 
-	for _, variant := range plan.Missed {
-		r.recordMiss(variant)
+	for _, model := range plan.Missed {
+		r.recordMiss(model.Variant)
+		metrics.CountWarmPoolBorrow(model.Namespace, model.Variant, OutcomeMiss)
+	}
+	for _, model := range plan.Blocked {
+		// Counted apart from a miss on purpose: this one says the reserve was
+		// too small, not that the warm set was wrong.
+		metrics.CountWarmPoolBorrow(model.Namespace, model.Variant, OutcomeBlocked)
 	}
 	if plan.GrowBy > 0 {
 		// Reported, not acted on: growing costs a model load per Pod, and a
 		// shortfall that lasts one cycle is a borrow doing its job.
 		logger.V(2).Info("warm pool is below its reserve", "short", plan.GrowBy)
 	}
+}
+
+// Outcomes of an attempt to cover a scale-up from the pool. They partition the
+// same event, which is why they are one metric with a label rather than three.
+const (
+	OutcomeHit     = "hit"
+	OutcomeBlocked = "blocked"
+	OutcomeMiss    = "miss"
+)
+
+// heldFor reports how long a bridge lasted, or false if this process never saw
+// it begin -- after a restart the pool discovers lent Pods it did not lend, and
+// reporting a made-up duration would be worse than reporting none.
+func (r *Reconciler) heldFor(action policy.Action) (time.Duration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	at, ok := r.borrowedAt[policy.Borrow{Pod: action.Pod, Variant: action.Model.Variant}]
+	if !ok {
+		return 0, false
+	}
+	return r.now().Sub(at), true
 }
 
 func (r *Reconciler) tierFor(pool.ModelRef) pool.Tier {

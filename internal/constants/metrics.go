@@ -410,6 +410,39 @@ const (
 	// looks like and a shift toward the slow mode is how its regression shows up.
 	// Nothing else would report that: the wake still succeeds, just slowly.
 	WVAScaleFromZeroWakeSeconds = "wva_scale_from_zero_wake_seconds"
+
+	// WVAWarmPoolFreePods is how many warm-pool Pods can serve a wake right
+	// now: every instance asleep, none loading. Read against the pool's
+	// sleepMinSize, which is a floor on THIS number -- a Pod holding eight
+	// sleeping models is one unit of reserve, not eight, because it can serve
+	// one wake.
+	//
+	// Labels: pool
+	WVAWarmPoolFreePods = "wva_warmpool_free_pods"
+
+	// WVAWarmPoolBorrowTotal counts attempts to cover a scale-up from the pool,
+	// by outcome: hit, blocked or miss.
+	//
+	// The outcomes name different faults and a hit rate alone shows neither. A
+	// MISS means the model was resident nowhere, so the warm set is wrong. A
+	// BLOCK means it was resident but every holding Pod was already serving, so
+	// the reserve is too small. One says raise the warm set, the other says
+	// raise sleepMinSize.
+	//
+	// Labels: exported_namespace, model_name, outcome
+	WVAWarmPoolBorrowTotal = "wva_warmpool_borrow_total"
+
+	// WVAWarmPoolBridgeSeconds is how long a borrowed Pod served before the
+	// ordinary replicas took over.
+	//
+	// This is the honest measure of what the pool is worth: it should track the
+	// ordinary start time, measured at ~33-37s on this cluster. Sitting at
+	// maxHoldSeconds instead means ordinary scale-ups are failing and the pool
+	// is masking it -- which nothing else would report, because the requests
+	// are being served.
+	//
+	// Labels: exported_namespace, model_name
+	WVAWarmPoolBridgeSeconds = "wva_warmpool_bridge_seconds"
 )
 
 // Reasons a model cannot reach the scaling state its configuration implies
@@ -580,6 +613,10 @@ const (
 	LabelLimiterName        = "limiter_name"
 	LabelPolicyType         = "policy_type"
 	LabelOptimizerName      = "optimizer_name"
+	LabelPool               = "pool"
+	// LabelOutcome distinguishes a borrow that hit, one blocked by an exhausted
+	// reserve, and one that missed because the model was resident nowhere.
+	LabelOutcome            = "outcome"
 	LabelErrorType          = "error_type"
 	LabelAnalyzerName       = "analyzer_name"
 	LabelLimiterEnabled     = "limiter_enabled"
