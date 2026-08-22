@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -123,11 +124,7 @@ func (d *Demand) poolLabels(namespace string, workloadLabels map[string]string) 
 	if found == nil || len(found.Selector) == 0 {
 		return nil, fmt.Errorf("InferencePool for %s has no selector", namespace)
 	}
-	labels := make(map[string]string, len(found.Selector))
-	for k, v := range found.Selector {
-		labels[k] = v
-	}
-	return labels, nil
+	return maps.Clone(found.Selector), nil
 }
 
 // EngineOptionsFrom derives the vLLM command line for a warm copy from the

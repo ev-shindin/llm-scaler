@@ -16,6 +16,8 @@ package warmpool
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -390,13 +392,12 @@ func (r *Reconciler) endAdmission(variant string) {
 }
 
 func copyBorrows(in map[policy.Borrow]time.Time) map[policy.Borrow]time.Time {
-	out := make(map[policy.Borrow]time.Time, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
+	return maps.Clone(in)
 }
 
+// copyMisses is NOT maps.Clone: the values are slices, and a shallow copy would
+// alias their backing arrays between the live map and the snapshot handed to the
+// policy.
 func copyMisses(in map[string][]time.Time) map[string][]time.Time {
 	out := make(map[string][]time.Time, len(in))
 	for k, v := range in {
@@ -410,11 +411,7 @@ func copyMisses(in map[string][]time.Time) map[string][]time.Time {
 func (r *Reconciler) Lent() []policy.Borrow {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]policy.Borrow, 0, len(r.borrowedAt))
-	for b := range r.borrowedAt {
-		out = append(out, b)
-	}
-	return out
+	return slices.Collect(maps.Keys(r.borrowedAt))
 }
 
 // PodOf is a small convenience for callers assembling actions by hand.

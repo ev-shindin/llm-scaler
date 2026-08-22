@@ -15,6 +15,7 @@ package estimator
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -197,11 +198,5 @@ func Run(events []Event, cfg Config) (Result, error) {
 
 // free drops slots whose hold has expired by now.
 func free(releases []time.Time, now time.Time) []time.Time {
-	kept := releases[:0]
-	for _, r := range releases {
-		if r.After(now) {
-			kept = append(kept, r)
-		}
-	}
-	return kept
+	return slices.DeleteFunc(releases, func(r time.Time) bool { return !r.After(now) })
 }

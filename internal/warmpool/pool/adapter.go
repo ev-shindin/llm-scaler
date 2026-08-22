@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 
@@ -391,12 +392,7 @@ func (a *Adapter) removeLabels(ctx context.Context, p *corev1.Pod, labels map[st
 }
 
 func isIdentityLabel(key string) bool {
-	for _, guarded := range identityLabels {
-		if key == guarded {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(identityLabels, key)
 }
 
 func portOf(options string) int {
