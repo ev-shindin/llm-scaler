@@ -1,0 +1,246 @@
+package e2e
+
+import (
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/test/e2e/fixtures"
+)
+
+// Supply must never describe a fleet larger than the scale target is committed
+// to. When it does, the optimizer is credited with spare capacity that an
+// in-flight scale-down has already claimed and removes the same replicas twice,
+// which is how a variant under sustained load lands on one replica. See
+// steadystate.clampReplicaCountToScaleTarget.
+//
+// Reproducing that from a real scale-down would mean racing a termination
+// window: a Deployment's status.replicas drops the moment a pod is marked for
+// deletion, while the pod keeps serving and keeps being scraped until its grace
+// period expires. The race is the bug's natural habitat and a bad test.
+//
+// This stages the same INPUT without the timing: an extra serving replica that
+// the Deployment does not own. The collector attributes it to the variant (same
+// pod-template labels, same Service, same ServiceMonitor) and it reports real
+// capacity, but it is invisible to the Deployment's replica count — exactly the
+// state a condemned-but-still-scraping pod produces, held still.
+const concededFakeMetricsJSON = `{"kv-cache-usage":0.3,"running-requests":1,"waiting-requests":0}`
+
+// Production-shaped thresholds, because the arithmetic this guards is only
+// wrong in a particular band and the run that exposed it used these.
+//
+// With kv-cache-usage 0.3 and a two-replica target, a third reporting replica
+// takes spare capacity from 2×P − 3×0.3×P/0.7 = 0.71×P (no replica to give up)
+// to 3×P − 3×0.3×P/0.7 = 1.71×P — one whole replica of slack, on top of the one
+// the target has already conceded. Unclamped that recommends 1; clamped it holds
+// at 2.
+const (
+	concededKvCacheThreshold     = 0.80
+	concededQueueLengthThreshold = 50
+	concededScaleUpThreshold     = 0.85
+	concededScaleDownBoundary    = 0.70
+)
+
+var _ = Describe("Scale-down with supply beyond the scale target", Label("full"), Ordered, func() {
+	const (
+		poolName              = "conceded-pool"
+		modelSvcName          = "conceded-ms"
+		modelDecodeDeployment = modelSvcName + "-decode"
+		serviceName           = modelSvcName + "-service"
+		scalerBaseName        = "conceded"
+		extraPodName          = modelSvcName + "-unowned-replica"
+		targetReplicas        = 2
+	)
+
+	var (
+		modelID         string
+		cmName          string
+		cmNamespace     string
+		cmKey           string
+		cmOriginal      *corev1.ConfigMap
+		cmExistedBefore bool
+		variantName     string
+	)
+
+	BeforeAll(func() {
+		if !cfg.UseSimulator {
+			Skip("This suite needs the simulator runtime: set USE_SIMULATOR=true. " +
+				"It uses llm-d-inference-sim's --fake-metrics flag, which real vLLM rejects.")
+		}
+
+		modelID = cfg.ModelID
+		cmName = scalingPolicyConfigMapName()
+		cmNamespace = cfg.WVANamespace
+		cmKey = defaultConfigKey
+		variantName = scalerBaseName + "-so"
+
+		By("Snapshotting existing saturation ConfigMap for restore in AfterAll")
+		cm, err := k8sClient.CoreV1().ConfigMaps(cmNamespace).Get(ctx, cmName, metav1.GetOptions{})
+		if err == nil {
+			cmExistedBefore = true
+			cmOriginal = cm.DeepCopy()
+		} else if !errors.IsNotFound(err) {
+			Expect(err).NotTo(HaveOccurred(), "failed reading existing saturation configmap")
+		}
+
+		By("Creating model service + service + ServiceMonitor")
+		_ = fixtures.DeleteModelService(ctx, k8sClient, cfg.LLMDNamespace, modelSvcName)
+		Expect(fixtures.CreateModelServiceWithExtraArgs(
+			ctx, k8sClient, cfg.LLMDNamespace, modelSvcName, poolName, modelID,
+			cfg.UseSimulator, cfg.MaxNumSeqs,
+			[]string{"--fake-metrics", concededFakeMetricsJSON})).To(Succeed())
+		Expect(fixtures.EnsureService(
+			ctx, k8sClient, cfg.LLMDNamespace, modelSvcName, modelDecodeDeployment, 8000,
+		)).To(Succeed())
+		Expect(fixtures.EnsureServiceMonitor(
+			ctx, crClient, cfg.MonitoringNS, cfg.LLMDNamespace, modelSvcName, modelDecodeDeployment,
+		)).To(Succeed())
+
+		By("Installing saturation config with production-shaped thresholds")
+		cfgYAML := buildSaturationConfigYAMLWithThresholds(
+			"saturation",
+			concededKvCacheThreshold, concededQueueLengthThreshold,
+			concededScaleUpThreshold, concededScaleDownBoundary,
+		)
+		Expect(upsertSaturationConfigEntry(ctx, cmNamespace, cmName, cmKey, cfgYAML)).To(Succeed())
+
+		By("Registering the deployment with WVA via an annotated ScaledObject")
+		// minReplicaCount is 1 on purpose: the assertion is that the fleet does
+		// NOT fall to it. A floor of 2 would pass whether or not the bug is fixed.
+		Expect(fixtures.EnsureScaledObject(ctx, crClient, cfg.LLMDNamespace, scalerBaseName, modelDecodeDeployment, variantName, 1, 10, cfg.MonitoringNS,
+			fixtures.WithWVATriggerMetadata(modelID, "30.0"),
+			fixtures.WithScaledObjectScaleDownStabilizationWindow(30))).To(Succeed())
+		DeferCleanup(func() { _ = fixtures.DeleteScaledObject(ctx, crClient, cfg.LLMDNamespace, scalerBaseName) })
+	})
+
+	AfterAll(func() {
+		By("Restoring saturation ConfigMap state")
+		if cmExistedBefore && cmOriginal != nil {
+			propagation := metav1.DeletePropagationBackground
+			if err := k8sClient.CoreV1().ConfigMaps(cmNamespace).Delete(ctx, cmName, metav1.DeleteOptions{
+				PropagationPolicy: &propagation,
+			}); err != nil && !errors.IsNotFound(err) {
+				GinkgoWriter.Printf("Warning: failed to delete saturation configmap %s before restore: %v\n", cmName, err)
+			}
+			toCreate := saturationConfigMapForRecreate(cmOriginal)
+			_, err := k8sClient.CoreV1().ConfigMaps(cmNamespace).Create(ctx, toCreate, metav1.CreateOptions{})
+			if err != nil && !errors.IsAlreadyExists(err) {
+				GinkgoWriter.Printf("Warning: failed to restore saturation configmap %s: %v\n", cmName, err)
+			}
+		}
+		_ = fixtures.DeleteModelService(ctx, k8sClient, cfg.LLMDNamespace, modelSvcName)
+	})
+
+	It("holds the fleet at its target when an unowned replica also reports capacity", func() {
+		By("Bringing the deployment to its target replica count")
+		Eventually(func(g Gomega) {
+			dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).Get(ctx, modelDecodeDeployment, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(dep.Status.ReadyReplicas).To(BeNumerically(">=", 1))
+		}, time.Duration(cfg.PodReadyTimeout)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
+
+		scaleDeployment(cfg.LLMDNamespace, modelDecodeDeployment, targetReplicas)
+		Eventually(func(g Gomega) {
+			dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).Get(ctx, modelDecodeDeployment, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(dep.Status.ReadyReplicas).To(BeNumerically("==", targetReplicas))
+		}, time.Duration(cfg.PodReadyTimeout)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
+
+		By("Adding a serving replica the Deployment does not own")
+		createUnownedReplica(cfg.LLMDNamespace, modelDecodeDeployment, serviceName, extraPodName)
+		DeferCleanup(func() {
+			propagation := metav1.DeletePropagationBackground
+			_ = k8sClient.CoreV1().Pods(cfg.LLMDNamespace).Delete(ctx, extraPodName, metav1.DeleteOptions{
+				PropagationPolicy: &propagation,
+			})
+		})
+		Eventually(func(g Gomega) {
+			pod, err := k8sClient.CoreV1().Pods(cfg.LLMDNamespace).Get(ctx, extraPodName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(pod.Status.Phase).To(Equal(corev1.PodRunning))
+		}, time.Duration(cfg.PodReadyTimeout)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
+
+		By("Confirming the Deployment still reports only the replicas it owns")
+		// If the ReplicaSet adopted the extra pod, the premise is gone and the
+		// assertion below would pass for the wrong reason.
+		Consistently(func(g Gomega) {
+			dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).Get(ctx, modelDecodeDeployment, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(dep.Status.Replicas).To(BeNumerically("==", targetReplicas),
+				"the extra pod must stay unowned, or this test is not staging the condition it claims")
+		}, 30*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).Should(Succeed())
+
+		By("Asserting the extra replica's capacity is never treated as removable")
+		// The regression: supply over three reporting replicas yields a full
+		// replica of spare on top of the one the target already conceded, and the
+		// recommendation drops to minReplicaCount.
+		Consistently(func(g Gomega) {
+			dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).Get(ctx, modelDecodeDeployment, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(*dep.Spec.Replicas).To(BeNumerically(">=", targetReplicas),
+				"WVA scaled below the target while an unowned replica was reporting: its capacity was counted as spare")
+		}, time.Duration(cfg.EventuallyExtendedSec)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
+	})
+})
+
+// scaleDeployment sets spec.replicas directly.
+func scaleDeployment(namespace, name string, replicas int32) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		dep, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		g.Expect(err).NotTo(HaveOccurred())
+		dep.Spec.Replicas = &replicas
+		_, err = k8sClient.AppsV1().Deployments(namespace).Update(ctx, dep, metav1.UpdateOptions{})
+		g.Expect(err).NotTo(HaveOccurred())
+	}, 60*time.Second, 2*time.Second).Should(Succeed())
+}
+
+// createUnownedReplica clones the Deployment's pod template into a standalone
+// Pod that serves and is scraped like any other replica but is not counted by
+// the Deployment.
+//
+// The owner reference is what keeps it unowned: a ReplicaSet adopts any matching
+// pod that has no CONTROLLER owner, and an adopted pod would be counted — and
+// then deleted to satisfy the replica count, destroying the premise. Pointing the
+// controller reference at the Service both blocks adoption and makes the pod
+// garbage-collected with the fixture, so a failed run cannot strand a GPU-less
+// simulator pod in the namespace.
+func createUnownedReplica(namespace, deploymentName, serviceName, podName string) {
+	GinkgoHelper()
+	dep, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+
+	svc, err := k8sClient.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred(), "the fixture Service must exist: it owns the unowned replica")
+
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        podName,
+			Namespace:   namespace,
+			Labels:      dep.Spec.Template.Labels,
+			Annotations: dep.Spec.Template.Annotations,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Service",
+				Name:       svc.Name,
+				UID:        svc.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: *dep.Spec.Template.Spec.DeepCopy(),
+	}
+	_, err = k8sClient.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) {
+		return
+	}
+	Expect(err).NotTo(HaveOccurred())
+}
