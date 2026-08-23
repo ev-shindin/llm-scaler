@@ -1,0 +1,58 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# A warm pool whose Pods hold several GPUs, for models whose engines span more
+# than one of them.
+#
+#   kubectl apply -k config/warmpool-multi-gpu -n <the models' namespace>
+#
+# and start the controller with a matching --warm-pool-gpus-per-pod. The two
+# numbers are independent and both real: the Deployment decides what the Pod
+# gets, the flag decides what the policy believes it has, and a mismatch either
+# declines admissions that would fit or accepts ones that cannot start.
+#
+# WHAT THIS SUPPORTS, and what remains untested, because the difference matters
+# more than the list:
+#
+#   - tensor parallelism within the Pod. The engine sees every GPU the Pod
+#     holds, so a --tensor-parallel-size equal to that count works with no
+#     placement logic at all. The one-awake invariant carries over unchanged:
+#     one engine spanning every device, its sleepers holding residue on all of
+#     them.
+#   - pipeline parallelism within the Pod, on the same footing.
+#   - expert parallelism, which asks for no GPUs of its own -- it shards a
+#     mixture-of-experts model's experts across the ranks tensor and data
+#     parallelism already provide. The flags are copied so the warm copy is laid
+#     out like the replicas it stands in for.
+#   - data parallelism is COUNTED (each rank is an engine replica with its own
+#     devices) but is the least certain of these: a DP engine is several engine
+#     cores, and whether sleep and wake reach all of them has not been shown.
+#
+# NOT supported, and not a gap this overlay could close:
+#
+#   - anything spanning NODES. A LeaderWorkerSet engine is several Pods; a pool
+#     Pod is one Pod holding several engines. Warming that means holding an
+#     entire group warm and coordinating sleep across it -- a warm group, not a
+#     warm Pod -- and it rests on multi-node sleep, which has been claimed and
+#     never demonstrated here. Such variants are filtered out before the pool
+#     ever sees them, because their scale target is not a Deployment.
+#
+# UNMEASURED, and worth knowing before relying on this: every sleep and wake
+# timing in these documents was taken on a single-GPU engine. vLLM propagates
+# /sleep to its workers by collective RPC, so tensor parallelism should behave;
+# "should" is doing real work in that sentence.
+#
+# One thing this deliberately does NOT do: place instances on particular GPUs.
+# The supervisor can (InstanceSpec carries gpu_uuids), and the pool never sets
+# it, so every instance sees every device. With one engine awake at a time that
+# costs nothing for the awake model -- but sleepers all settle on the same
+# devices, so their residue accumulates there rather than spreading. It shows up
+# as a smaller warm set than the arithmetic suggests, not as a failure.
+resources:
+  - ../warmpool
+
+patches:
+  - path: warmpool-deployment.yaml
+    target:
+      kind: Deployment
+      name: wva-warm-pool

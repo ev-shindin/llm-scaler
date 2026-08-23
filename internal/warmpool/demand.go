@@ -235,22 +235,34 @@ func EngineOptionsFrom(spec *corev1.PodSpec) (string, error) {
 // here is not a bug in the tenant's workload, it is a warm copy the pool
 // declines to make -- which costs a cold start and nothing else.
 var warmableFlags = map[string]bool{
-	"--model":                        true,
-	"--served-model-name":            true,
-	"--tokenizer":                    true,
-	"--tokenizer-mode":               true,
-	"--revision":                     true,
-	"--code-revision":                true,
-	"--tokenizer-revision":           true,
-	"--dtype":                        true,
-	"--quantization":                 true,
-	"--kv-cache-dtype":               true,
-	"--max-model-len":                true,
-	"--max-num-seqs":                 true,
-	"--max-num-batched-tokens":       true,
-	"--tensor-parallel-size":         true,
-	"--pipeline-parallel-size":       true,
-	"--data-parallel-size":           true,
+	"--model":                    true,
+	"--served-model-name":        true,
+	"--tokenizer":                true,
+	"--tokenizer-mode":           true,
+	"--revision":                 true,
+	"--code-revision":            true,
+	"--tokenizer-revision":       true,
+	"--dtype":                    true,
+	"--quantization":             true,
+	"--kv-cache-dtype":           true,
+	"--max-model-len":            true,
+	"--max-num-seqs":             true,
+	"--max-num-batched-tokens":   true,
+	"--tensor-parallel-size":     true,
+	"--pipeline-parallel-size":   true,
+	"--data-parallel-size":       true,
+	"--data-parallel-size-local": true,
+	"--data-parallel-backend":    true,
+	// Expert parallelism does not ask for GPUs of its own -- it shards a
+	// mixture-of-experts model's experts across the ranks tensor and data
+	// parallelism already provide. It still has to be copied: a warm copy
+	// without it lays the same model out differently from the replicas it
+	// exists to match, which is a different torch.compile cache key and a
+	// different memory profile, so the copy is neither as fast nor as large as
+	// the thing it stands in for.
+	"--enable-expert-parallel":       true,
+	"--enable-eplb":                  true,
+	"--num-redundant-experts":        true,
 	"--gpu-memory-utilization":       true,
 	"--swap-space":                   true,
 	"--block-size":                   true,

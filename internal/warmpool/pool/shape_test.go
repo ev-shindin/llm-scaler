@@ -98,3 +98,27 @@ func TestAFlagValueCannotImpersonateAFlag(t *testing.T) {
 			got.WeightsBytes)
 	}
 }
+
+func TestExpertParallelismDoesNotAskForGPUsOfItsOwn(t *testing.T) {
+	// --enable-expert-parallel shards a mixture-of-experts model's experts
+	// across the ranks tensor and data parallelism already provide. Counting it
+	// as another multiplier would refuse admissions that fit perfectly well.
+	plain := ShapeOf("--model mistralai/Mixtral-8x7B --tensor-parallel-size 2")
+	withEP := ShapeOf("--model mistralai/Mixtral-8x7B --tensor-parallel-size 2 --enable-expert-parallel")
+
+	if withEP.GPUs != plain.GPUs {
+		t.Errorf("expert parallelism changed the GPU count: %d vs %d", withEP.GPUs, plain.GPUs)
+	}
+	if withEP.GPUs != 2 {
+		t.Errorf("GPUs = %d, want the tensor-parallel size", withEP.GPUs)
+	}
+}
+
+func TestDataParallelismMultipliesBecauseEachRankIsAnEngine(t *testing.T) {
+	// Unlike expert parallelism: a DP rank is its own engine replica with its
+	// own devices, so it really does need more of them.
+	got := ShapeOf("--model m --tensor-parallel-size 2 --data-parallel-size 2")
+	if got.GPUs != 4 {
+		t.Errorf("GPUs = %d, want 4", got.GPUs)
+	}
+}

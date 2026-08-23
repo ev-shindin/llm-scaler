@@ -515,3 +515,32 @@ func TestWithoutAnOverrideTheWorkloadsUtilisationIsKept(t *testing.T) {
 		t.Errorf("the workload's own value must survive: %q", got[0].Model.EngineOptions)
 	}
 }
+
+func TestParallelismAndExpertLayoutSurviveIntoTheWarmCopy(t *testing.T) {
+	// A warm copy has to be laid out like the replicas it stands in for. Drop
+	// --enable-expert-parallel and the same model is arranged differently: a
+	// different torch.compile cache key, a different memory profile, and a copy
+	// that is neither as fast nor as large as the thing it replaces.
+	got, err := EngineOptionsFrom(specWith(nil, []string{
+		"--model", "mistralai/Mixtral-8x7B",
+		"--tensor-parallel-size", "4",
+		"--pipeline-parallel-size", "2",
+		"--data-parallel-size", "2",
+		"--enable-expert-parallel",
+		"--enable-eplb",
+	}))
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+	for _, want := range []string{
+		"--tensor-parallel-size 4",
+		"--pipeline-parallel-size 2",
+		"--data-parallel-size 2",
+		"--enable-expert-parallel",
+		"--enable-eplb",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q must survive into the warm copy: %q", want, got)
+		}
+	}
+}

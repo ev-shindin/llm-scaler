@@ -1,0 +1,33 @@
+# A pool Pod holding FOUR GPUs, for models whose engines span more than one.
+#
+# The base holds one GPU, which is the common case and the cheap one. A model
+# with --tensor-parallel-size 4 cannot be warmed there at all: its engine has
+# nowhere to put three of its ranks, so the admission is declined outright
+# rather than loaded and failed. This overlay is what makes such a model
+# warmable.
+#
+# Four is an example, not a recommendation. Set it to the parallelism of the
+# models this pool is for, and pass the SAME number as
+# --warm-pool-gpus-per-pod, or the controller will decline exactly the
+# admissions this overlay exists to allow.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wva-warm-pool
+spec:
+  template:
+    spec:
+      containers:
+        - name: inference-server
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+              # Scaled with the GPU count for the same reason the base sets it
+              # at all: a level-1 sleeper keeps its weights in HOST memory, and
+              # a Pod sized for larger models holds larger weights. This is the
+              # warm-set budget, and --warm-pool-memory-bytes must stay under it.
+              memory: 192Gi
+            requests:
+              nvidia.com/gpu: "4"
+              memory: 192Gi
+              cpu: "8"

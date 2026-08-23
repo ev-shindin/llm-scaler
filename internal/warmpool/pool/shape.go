@@ -109,6 +109,17 @@ func bytesPerParam(options string) int {
 }
 
 // parallelism is how many GPUs the engine would want.
+//
+// The product of the three sizes. Expert parallelism is deliberately absent:
+// --enable-expert-parallel shards a mixture-of-experts model's experts across
+// the ranks tensor and data parallelism already provide, so it changes how the
+// GPUs are used and not how many are needed. Counting it would refuse
+// admissions that fit.
+//
+// Data parallelism is counted because each rank is its own engine replica with
+// its own devices -- but note that a DP engine is several engine cores, and
+// whether sleeping and waking work across all of them is not something this has
+// been shown to do.
 func parallelism(options string) int {
 	gpus := 1
 	for _, flag := range []string{

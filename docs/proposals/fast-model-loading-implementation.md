@@ -958,3 +958,46 @@ The Pods also spread across nodes by preference. A pool concentrated on one node
 is not insurance: losing that node loses every warm model at once, and the next
 spike pays a full cold start for each of them.
 
+### 13c. Parallelism: what a pool Pod can and cannot warm
+
+A pool Pod holds a fixed number of GPUs, and a warm copy inherits the ordinary
+replicas' parallelism flags. Those two facts decide the whole answer, and
+getting them wrong used to be expensive rather than loud: the admission was
+accepted, the engine could not start, and the ~35 s load was spent and re-spent
+every cycle.
+
+| | GPUs it asks for | in the pool |
+|---|---|---|
+| tensor parallel, TP=N | N | **yes**, in a Pod holding N. The engine sees every device the Pod has, so no placement logic is needed |
+| pipeline parallel, PP=N | N | **yes**, same footing, within one Pod |
+| expert parallel | **none of its own** | **yes**. It shards a mixture-of-experts model's experts across the ranks TP and DP already provide, so it changes how GPUs are used, not how many. Counted as a multiplier it would refuse admissions that fit |
+| data parallel, DP=N | N (each rank is an engine replica) | **counted, least certain**. A DP engine is several engine cores, and whether sleep and wake reach all of them has not been shown here |
+| anything spanning NODES (LWS) | — | **no**, and not a gap this could close — see below |
+
+The base manifest holds one GPU, which is the common case and the cheap one.
+`config/warmpool-multi-gpu` is the same pool with four, for models whose engines
+span more. Two numbers have to agree: the Deployment decides what the Pod gets,
+`--warm-pool-gpus-per-pod` decides what the policy believes it has, and a
+mismatch either declines admissions that would fit or accepts ones that cannot
+start.
+
+**Why LWS is a different design rather than a missing feature.** A LeaderWorkerSet
+engine is several Pods; a pool Pod is one Pod holding several engines. Warming
+one would mean holding an entire GROUP warm and coordinating sleep across every
+member of it — and it rests on multi-node sleep, which has been claimed and
+never demonstrated here. Such variants never reach the pool anyway: `Demand`
+reads a scale target as a Deployment, so a non-Deployment target is skipped
+before any of this applies.
+
+**What has not been measured.** Every sleep and wake figure in these documents
+was taken on a SINGLE-GPU engine. vLLM propagates `/sleep` to its workers by
+collective RPC, so tensor parallelism should behave — but "should" is carrying
+weight in that sentence, and the multi-GPU path has never been run.
+
+**One optimisation deliberately not taken.** The supervisor can place an
+instance on particular devices (`InstanceSpec` carries `gpu_uuids`) and the pool
+never sets it, so every instance sees every GPU. With one engine awake at a time
+that costs the awake model nothing, but sleepers all settle on the same devices
+and their residue accumulates there instead of spreading. It shows up as a warm
+set smaller than the arithmetic suggests, not as a failure.
+
