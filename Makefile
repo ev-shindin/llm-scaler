@@ -1617,6 +1617,12 @@ benchmark-restart-controller: ## Restart WVA controller to flush in-memory state
 	kubectl rollout status -n $(BENCHMARK_NAMESPACE) $(WVA_CONTROLLER_DEPLOY) --timeout=$(WVA_ROLLOUT_TIMEOUT)
 
 BURSTY_WORKLOAD    ?= bursty.yaml
+# How long to wait for the harness pod to COMPLETE. Must exceed the profile's own
+# duration plus tokenizer download, warmup and drain -- the CLI default is 3600s,
+# which a multi-stage profile can equal on load alone (burst_4k1000_6_14_6_14_6 is
+# 5 x 720s = exactly 3600s). At the default such a run is killed mid-drain and
+# writes no results, having consumed its full hour: measured 4599s against a
+# 3600s wait. Raise this, not the profile, when adding longer workloads.
 BENCHMARK_WAIT_TIMEOUT ?= 7200
 BENCHMARK_HARNESS_MEMORY ?= 40Gi
 
@@ -1639,7 +1645,8 @@ benchmark-run-bursty: ## Run bursty traffic benchmark using inference-perf multi
 		-w $(BURSTY_WORKLOAD) \
 		-U $(BENCHMARK_GATEWAY_URL) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
-		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,); \
+		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,) \
+		--wait-timeout $(BENCHMARK_WAIT_TIMEOUT); \
 	rc=$$?; \
 	mv $(BENCHMARK_REPO_DIR)/config/templates/values/defaults.yaml.bak \
 	   $(BENCHMARK_REPO_DIR)/config/templates/values/defaults.yaml; \
