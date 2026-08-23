@@ -40,14 +40,16 @@ type Config struct {
 	MaxInstancesPerPod int
 
 	// PodMemoryBytes is how much HOST memory one Pod may commit to sleeping
-	// weights, and it is a hard wall rather than a target.
+	// models, and it is a hard wall rather than a target.
 	//
-	// A level-1 sleeper keeps its weights in host memory and the container has
-	// a hard limit, so admitting one model too many does not fail that
-	// admission: it OOM-kills the launcher and destroys every model already
-	// resident in the Pod. Zero disables the check, which is what a pool with
-	// no configured budget gets -- the previous behaviour, kept only so that an
-	// unset field is not silently restrictive.
+	// A level-1 sleeper's weights go to SHARED memory, which the container's
+	// cgroup is charged for -- measured at 2.6 GiB + 1.4x the weights. So
+	// admitting one model too many does not fail that admission: it OOM-kills
+	// the launcher and destroys every model already resident in the Pod.
+	//
+	// Clamped to the container's own limit at the point of use, so a budget
+	// larger than the limit cannot pretend to be a wall. Zero means "use the
+	// container's limit", which is the honest default.
 	PodMemoryBytes int64
 
 	// GPUsPerPod is how many devices a pool Pod holds.
@@ -426,12 +428,12 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 	committed := int64(0)
 	for _, m := range resident {
 		if held := pool.ShapeOf(m.Model.EngineOptions); held.Known() {
-			committed += held.WeightsBytes
+			committed += held.HostBytes
 		}
 	}
-	if committed+shape.WeightsBytes > budget {
+	if committed+shape.HostBytes > budget {
 		return fmt.Sprintf("needs %s on top of the %s already resident, over the %s budget",
-			gib(shape.WeightsBytes), gib(committed), gib(budget))
+			gib(shape.HostBytes), gib(committed), gib(budget))
 	}
 	return ""
 }

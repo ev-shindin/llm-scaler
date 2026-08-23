@@ -23,16 +23,44 @@ import (
 
 // Shape is what one engine would occupy.
 type Shape struct {
-	// WeightsBytes is what the weights alone would take in host memory when the
-	// instance sleeps. Zero means it could not be worked out.
-	WeightsBytes int64
+	// HostBytes is what a SLEEPING instance charges to its container's memory
+	// cgroup. Zero means it could not be worked out.
+	//
+	// Not the weights. Measured on an H100, level-1 sleep moves the weights
+	// into SHARED memory -- shmem, not anonymous -- and the container is
+	// charged for all of it:
+	//
+	//	model   weights   cgroup delta when asleep
+	//	0.6B     1.1 GiB   4.1 GiB
+	//	8B      14.9 GiB  23.4 GiB
+	//
+	// which is 2.6 GiB + 1.4x weights across those two points. Estimating raw
+	// weights instead understates an 8B by 57%, and it understates in the
+	// direction that OOM-kills the Pod and takes every model resident in it.
+	HostBytes int64
 	// GPUs is how many devices the engine needs: the product of the
 	// parallelism sizes, and at least one.
 	GPUs int
 }
 
 // Known reports whether the memory estimate means anything.
-func (s Shape) Known() bool { return s.WeightsBytes > 0 }
+func (s Shape) Known() bool { return s.HostBytes > 0 }
+
+// What a sleeper costs its container, fitted to the two measurements above.
+//
+// A linear fit on two points is exactly as good as it sounds, and it is what
+// there is. Both terms err UPWARD relative to the weights, which is the safe
+// direction: too high declines an admission that would have fitted and costs a
+// cold start, too low kills the Pod.
+const (
+	// sleeperOverheadBytes is the part that does not scale: the engine process,
+	// its CUDA context, and the allocator's own structures.
+	sleeperOverheadBytes = 2609 << 20
+	// sleeperWeightFactorNum/Den is how much more than the weights a sleeper
+	// holds -- 1.4x, kept as a ratio so the arithmetic stays in integers.
+	sleeperWeightFactorNum = 14
+	sleeperWeightFactorDen = 10
+)
 
 // paramCount finds a parameter count in a model reference.
 //
@@ -55,7 +83,19 @@ func ShapeOf(options string) Shape {
 	if !ok {
 		return shape
 	}
-	shape.WeightsBytes = int64(params * float64(bytesPerParam(options)))
+	weights := int64(params * float64(bytesPerParam(options)))
+
+	// DATA parallelism multiplies the host cost; tensor parallelism does not.
+	// Measured: a DP=2 sleeper held twice the shmem of a TP=1 one, while a TP=2
+	// sleeper held about the same. Each DP rank is its own engine with its own
+	// copy of the weights, where TP shards one copy across devices.
+	copies := int64(1)
+	if dp, err := strconv.Atoi(flagValue(options, "--data-parallel-size")); err == nil && dp > 1 {
+		copies = int64(dp)
+	}
+
+	shape.HostBytes = sleeperOverheadBytes*copies +
+		weights*copies*sleeperWeightFactorNum/sleeperWeightFactorDen
 	return shape
 }
 

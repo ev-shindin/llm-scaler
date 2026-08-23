@@ -2,52 +2,112 @@ package pool
 
 import "testing"
 
+// The two points this estimate is fitted to, measured on an H100 with vLLM
+// level-1 sleep. They are what the arithmetic must reproduce; the formula is
+// only how it gets there.
+const (
+	gib = 1 << 30
+	// A 0.6B asleep charged its container 4.1 GiB over baseline.
+	measuredSleeper06B = 4.1 * gib
+	// An 8B charged 23.4 GiB -- against 14.9 GiB of weights, which is why
+	// estimating weights alone was wrong by 57% in the direction that OOMs.
+	measuredSleeper8B = 23.4 * gib
+)
+
+func TestTheEstimateReproducesWhatWasMeasured(t *testing.T) {
+	// Level-1 sleep moves the weights into SHARED memory and the container's
+	// cgroup is charged for all of it. Anonymous memory barely moves, which is
+	// what made this easy to get wrong: measuring `anon` alone shows a sleeper
+	// costing nothing at all.
+	for _, tc := range []struct {
+		options string
+		want    float64
+	}{
+		{options: "--model Qwen/Qwen3-0.6B", want: measuredSleeper06B},
+		{options: "--model Qwen/Qwen3-8B", want: measuredSleeper8B},
+	} {
+		got := ShapeOf(tc.options)
+		if !got.Known() {
+			t.Errorf("ShapeOf(%q) could not size it", tc.options)
+			continue
+		}
+		// Within 15%: this is a two-point fit over a name-derived parameter
+		// count, and an assertion tighter than the estimate would be theatre.
+		if diff := float64(got.HostBytes) - tc.want; diff > tc.want*0.15 || diff < -tc.want*0.15 {
+			t.Errorf("ShapeOf(%q).HostBytes = %.1f GiB, measured %.1f GiB",
+				tc.options, float64(got.HostBytes)/gib, tc.want/gib)
+		}
+	}
+}
+
+func TestTheEstimateIsNeverBelowTheWeights(t *testing.T) {
+	// The failure that matters is an estimate UNDER the truth: it admits a
+	// model that does not fit and OOM-kills the Pod, taking every model already
+	// resident with it. A sleeper always costs more than its weights.
+	for _, tc := range []struct {
+		options string
+		weights float64
+	}{
+		{options: "--model Qwen/Qwen3-0.6B", weights: 1.2e9},
+		{options: "--model meta-llama/Llama-3.1-8B", weights: 16e9},
+		{options: "--model mistralai/Mixtral-8x7B", weights: 112e9},
+	} {
+		if got := ShapeOf(tc.options); float64(got.HostBytes) <= tc.weights {
+			t.Errorf("ShapeOf(%q).HostBytes = %d, not above its %.0f bytes of weights",
+				tc.options, got.HostBytes, tc.weights)
+		}
+	}
+}
+
 func TestParameterCountsComeFromTheModelName(t *testing.T) {
 	// The only source available: the controller does not mount the weights, so
 	// it cannot read a config.json, and asking the tenant would put the number
 	// under the control of whoever benefits from understating it.
-	const gb = 1 << 30
-	for _, tc := range []struct {
-		options string
-		want    int64 // in bytes, bf16 unless stated
-		known   bool
-	}{
-		{options: "--model Qwen/Qwen3-0.6B", want: int64(0.6 * 2e9), known: true},
-		{options: "--model meta-llama/Llama-3.1-8B-Instruct", want: 16e9, known: true},
-		{options: "--model Qwen/Qwen2.5-0.5B-Instruct", want: 1e9, known: true},
-		{options: "--model openai/gpt-oss-120b", want: 240e9, known: true},
-
-		// A mixture of experts holds ALL its experts resident. Reading 8x7B as
-		// 7B would understate the weights eightfold, which is exactly the
-		// direction that OOMs a Pod.
-		{options: "--model mistralai/Mixtral-8x7B-Instruct-v0.1", want: 112e9, known: true},
-
-		// fp8 halves it; float32 doubles it.
-		{options: "--model meta-llama/Llama-3.1-8B --quantization fp8", want: 8e9, known: true},
-		{options: "--model meta-llama/Llama-3.1-8B --dtype float32", want: 32e9, known: true},
-
-		// A 4-bit scheme really weighs about half a byte per parameter, and is
-		// deliberately counted at two: a wrong guess should refuse an admission,
-		// not kill a Pod.
-		{options: "--model meta-llama/Llama-3.1-8B --quantization awq", want: 16e9, known: true},
-
-		// No parameter count to find.
-		{options: "--model BAAI/bge-m3", known: false},
-		{options: "--dtype bfloat16", known: false},
-	} {
-		got := ShapeOf(tc.options)
-		if got.Known() != tc.known {
-			t.Errorf("ShapeOf(%q).Known() = %v, want %v", tc.options, got.Known(), tc.known)
-			continue
+	//
+	// Asserted through the ORDERING these produce rather than through exact
+	// byte counts, so the cases stay about the parsing they are named for.
+	bigger := func(a, b string) {
+		t.Helper()
+		if x, y := ShapeOf(a), ShapeOf(b); x.HostBytes <= y.HostBytes {
+			t.Errorf("%q (%d) should size larger than %q (%d)", a, x.HostBytes, b, y.HostBytes)
 		}
-		if !tc.known {
-			continue
+	}
+	bigger("--model meta-llama/Llama-3.1-8B-Instruct", "--model Qwen/Qwen3-0.6B")
+	bigger("--model openai/gpt-oss-120b", "--model meta-llama/Llama-3.1-8B")
+	// A mixture of experts holds ALL its experts resident, so 8x7B is 56B and
+	// not 7B. Reading it as 7B understates the weights eightfold.
+	bigger("--model mistralai/Mixtral-8x7B", "--model meta-llama/Llama-3.1-8B")
+	// float32 doubles it; fp8 halves it.
+	bigger("--model meta-llama/Llama-3.1-8B --dtype float32", "--model meta-llama/Llama-3.1-8B")
+	bigger("--model meta-llama/Llama-3.1-8B", "--model meta-llama/Llama-3.1-8B --quantization fp8")
+	// A 4-bit scheme really weighs about half a byte per parameter and is
+	// deliberately counted at two: a wrong guess should refuse an admission,
+	// not kill a Pod.
+	if awq, plain := ShapeOf("--model meta-llama/Llama-3.1-8B --quantization awq"),
+		ShapeOf("--model meta-llama/Llama-3.1-8B"); awq.HostBytes != plain.HostBytes {
+		t.Errorf("4-bit is not credited: %d vs %d", awq.HostBytes, plain.HostBytes)
+	}
+
+	for _, unsizeable := range []string{"--model BAAI/bge-m3", "--dtype bfloat16"} {
+		if got := ShapeOf(unsizeable); got.Known() {
+			t.Errorf("ShapeOf(%q) claimed to size it: %d", unsizeable, got.HostBytes)
 		}
-		// Within a GiB: the estimate is an estimate, and the assertion should
-		// not be more precise than the thing it measures.
-		if diff := got.WeightsBytes - tc.want; diff > gb || diff < -gb {
-			t.Errorf("ShapeOf(%q).WeightsBytes = %d, want about %d", tc.options, got.WeightsBytes, tc.want)
-		}
+	}
+}
+
+func TestDataParallelismMultipliesTheHostCost(t *testing.T) {
+	// Measured: a DP=2 sleeper held twice the shmem of a TP=1 one, while a TP=2
+	// sleeper held about the same. Each DP rank is its own engine with its own
+	// copy of the weights; tensor parallelism shards ONE copy across devices.
+	one := ShapeOf("--model Qwen/Qwen3-8B")
+	dp := ShapeOf("--model Qwen/Qwen3-8B --data-parallel-size 2")
+	tp := ShapeOf("--model Qwen/Qwen3-8B --tensor-parallel-size 2")
+
+	if dp.HostBytes != 2*one.HostBytes {
+		t.Errorf("DP=2 costs %d, want twice the %d of one rank", dp.HostBytes, one.HostBytes)
+	}
+	if tp.HostBytes != one.HostBytes {
+		t.Errorf("TP=2 costs %d, want the same %d: it shards one copy", tp.HostBytes, one.HostBytes)
 	}
 }
 
@@ -59,9 +119,11 @@ func TestAVersionNumberIsNotAParameterCount(t *testing.T) {
 	if !got.Known() {
 		t.Fatal("want a known size")
 	}
-	if got.WeightsBytes < 15e9 {
-		t.Errorf("WeightsBytes = %d; the version number was read as the parameter count",
-			got.WeightsBytes)
+	// Reading "3.1" as the count would size this at well under a tenth of an
+	// 8B, so anything near the real figure proves the delimiters did their job.
+	if got.HostBytes < 15e9 {
+		t.Errorf("HostBytes = %d; the version number was read as the parameter count",
+			got.HostBytes)
 	}
 }
 
@@ -93,9 +155,9 @@ func TestAFlagValueCannotImpersonateAFlag(t *testing.T) {
 	if !got.Known() {
 		t.Fatal("want a known size")
 	}
-	if got.WeightsBytes < 15e9 {
-		t.Errorf("WeightsBytes = %d; a dtype inside the model path was read as the dtype",
-			got.WeightsBytes)
+	if got.HostBytes < 15e9 {
+		t.Errorf("HostBytes = %d; a dtype inside the model path was read as the dtype",
+			got.HostBytes)
 	}
 }
 

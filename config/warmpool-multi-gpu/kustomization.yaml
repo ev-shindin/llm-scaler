@@ -37,10 +37,14 @@ kind: Kustomization
 #     never demonstrated here. Such variants are filtered out before the pool
 #     ever sees them, because their scale target is not a Deployment.
 #
-# UNMEASURED, and worth knowing before relying on this: every sleep and wake
-# timing in these documents was taken on a single-GPU engine. vLLM propagates
-# /sleep to its workers by collective RPC, so tensor parallelism should behave;
-# "should" is doing real work in that sentence.
+# MEASURED, on two H100s in one Pod: TP=2 sleeps in 966 ms and wakes to a first
+# token in 208 ms; DP=2 in 1,225 ms and 229 ms. Both answer correctly after
+# waking, and both drop each GPU to residue while asleep. A single-GPU engine
+# wakes in 247 ms, so parallelism costs the pool nothing in speed.
+#
+# One asymmetry to size for: a DP=2 sleeper holds TWICE the host memory of a
+# TP=1 one, because each data-parallel rank keeps its own copy of the weights.
+# Tensor parallelism shards a single copy and holds about the same.
 #
 # One thing this deliberately does NOT do: place instances on particular GPUs.
 # The supervisor can (InstanceSpec carries gpu_uuids), and the pool never sets

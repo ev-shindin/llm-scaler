@@ -162,15 +162,24 @@ spec:
               memory: 48Gi
             requests:
               nvidia.com/gpu: "1"
-              # THE MEMORY REQUEST IS THE WARM-SET BUDGET, and must be sized as
-              # (models held per Pod) x (weight size), because a level-1 sleeper
-              # keeps its weights in HOST memory -- only ~1.4 GiB stays on the
-              # GPU. Left unset, the scheduler treats a Pod holding sixteen
-              # sleeping models as needing no memory at all, and the kubelet
-              # evicts it: the one outcome the pool exists to prevent.
+              # THE MEMORY REQUEST IS THE WARM-SET BUDGET. Measured on an
+              # H100: level-1 sleep moves the weights into SHARED memory, and
+              # the container's cgroup is charged for all of it --
               #
-              # 48Gi suits a handful of small models. Raise it before raising
-              # the warm set.
+              #   0.6B   1.1 GiB of weights ->  4.1 GiB charged while asleep
+              #   8B    14.9 GiB of weights -> 23.4 GiB charged while asleep
+              #
+              # i.e. about 2.6 GiB + 1.4x the weights, per resident model. Note
+              # ANONYMOUS memory barely moves, so anything watching `anon` will
+              # report a sleeper as costing nothing; watch memory.current.
+              #
+              # Left unset, the scheduler treats a Pod holding sixteen sleeping
+              # models as needing no memory at all, and the kubelet evicts it:
+              # the one outcome the pool exists to prevent.
+              #
+              # 48Gi holds ONE 8B with room to spare, or two at a squeeze. A
+              # 32B sleeper needs ~86 GiB and does not fit here at all -- see
+              # config/warmpool-multi-gpu, which raises both together.
               memory: 48Gi
               cpu: "2"
           volumeMounts:

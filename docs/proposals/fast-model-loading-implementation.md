@@ -938,10 +938,7 @@ uses a different one from the ordinary replicas misses the cache they populated,
 measured at 12.35 s against 3.08 s. That cost is paid once per model per value
 rather than per load, which is what makes the trade worth having at all.
 
-Two numbers that would firm this up and have not been measured: how much HOST
-memory a level-1 sleeper actually takes (the weights-in-host-RAM behaviour is
-vLLM's documented one, not something confirmed here), and whether the ~1.4 GiB
-residue holds for a model much larger than 0.6 B.
+Both of those are now measured. See §14d.
 
 ### 14b. A Pod on a new node must not start cold
 
@@ -1011,10 +1008,11 @@ never demonstrated here. Such variants never reach the pool anyway: `Demand`
 reads a scale target as a Deployment, so a non-Deployment target is skipped
 before any of this applies.
 
-**What has not been measured.** Every sleep and wake figure in these documents
-was taken on a SINGLE-GPU engine. vLLM propagates `/sleep` to its workers by
-collective RPC, so tensor parallelism should behave — but "should" is carrying
-weight in that sentence, and the multi-GPU path has never been run.
+**Since measured.** Both TP=2 and DP=2 sleep and wake correctly on two H100s in
+one Pod, waking to a first token in 208 ms and 229 ms against 247 ms for a
+single GPU — see §14d. The earlier "should behave, never run" caveat is retired.
+The DP asymmetry is the part to size for: a DP=2 sleeper holds twice the host
+memory of a TP=1 one, because each rank keeps its own copy of the weights.
 
 **One optimisation deliberately not taken.** The supervisor can place an
 instance on particular devices (`InstanceSpec` carries `gpu_uuids`) and the pool
@@ -1022,4 +1020,70 @@ never sets it, so every instance sees every GPU. With one engine awake at a time
 that costs the awake model nothing, but sleepers all settle on the same devices
 and their residue accumulates there instead of spreading. It shows up as a warm
 set smaller than the arithmetic suggests, not as a failure.
+
+### 14d. What a sleeper actually costs, measured
+
+The sizing arithmetic rested on two assumptions, both taken from vLLM's
+documentation rather than from this cluster, and both wrong in ways that
+mattered.
+
+**Level-1 sleep offloads to SHARED memory, not anonymous memory.** Measured on
+an H100, an 8B model asleep:
+
+| | awake | asleep |
+|---|---|---|
+| `anon` | 2,922 MiB | 2,922 MiB |
+| `shmem` | 100 MiB | **21,494 MiB** |
+| `memory.current` | 18,769 MiB | **40,250 MiB** |
+| GPU | 78,161 MiB | 2,021 MiB |
+
+Anonymous memory does not move at all. Anything watching `anon` -- which is the
+obvious thing to watch, and what the first measurement here did -- reports a
+sleeper as costing nothing whatsoever. The cost is real, it is shmem, and the
+container's cgroup is charged for every byte of it.
+
+**The cost is not the weights.** Two points:
+
+| model | weights | charged while asleep |
+|---|---|---|
+| 0.6B | 1.1 GiB | 4.1 GiB |
+| 8B | 14.9 GiB | 23.4 GiB |
+
+which fits **2.6 GiB + 1.4x weights**. Estimating raw weights, which is what the
+admission check did when it first shipped, understates an 8B by 57% -- in the
+direction that admits a model which does not fit and OOM-kills the Pod, taking
+every model already resident in it. `pool.ShapeOf` returns the fitted figure now.
+
+A linear fit on two points is exactly as good as it sounds. It is enough to
+decide admissions because both terms err upward relative to the weights, and the
+consequences are asymmetric: too high declines an admission and costs a cold
+start, too low costs the Pod.
+
+**What this means for a 48 GiB Pod:** one 8B with room to spare, or two at a
+squeeze. A 32B sleeper needs ~86 GiB and does not fit at all.
+
+**GPU residue does not scale with the model, but is not constant either.**
+1,399 MiB for a 0.6B, 2,021-2,843 MiB for an 8B across runs, and 4,319 MiB per
+GPU at TP=2. So the "~1.4 GiB per sleeper" used earlier to reason about warm-set
+size is a floor, not a figure.
+
+**Tensor and data parallelism both sleep and wake correctly.** This was the
+caveat carried through every earlier document -- vLLM propagates `/sleep` by
+collective RPC, so it *should* work -- and it is now run, on two H100s in one
+Pod:
+
+| | load | sleep | wake + first token | after waking |
+|---|---|---|---|---|
+| TP=2 | 71.6 s | 966 ms | **208 ms** | answers correctly |
+| DP=2 | 73.6 s | 1,225 ms | **229 ms** | answers correctly |
+
+Both dropped each GPU to residue on sleep and restored it on wake. The wake
+times are in the same band as the single-GPU case, which is the result that
+matters: parallelism does not cost the pool its speed.
+
+One asymmetry worth carrying: a DP=2 sleeper held **twice** the shmem of a TP=1
+one, while a TP=2 sleeper held about the same. Each data-parallel rank is its
+own engine with its own copy of the weights; tensor parallelism shards a single
+copy across devices. The estimate multiplies by the DP size for that reason and
+deliberately does not multiply by TP.
 
