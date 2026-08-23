@@ -58,30 +58,6 @@ func TestFreePodsCountsPodsNotInstances(t *testing.T) {
 	}
 }
 
-func TestPodsHoldingFindsWhereASpikeCanBeServed(t *testing.T) {
-	all := []Membership{
-		member("a", "llama", Asleep),
-		member("b", "qwen", Asleep),
-		member("c", "llama", Asleep), member("c", "qwen", Serving), // c is lent
-		member("d", "llama", Loading), // not wakeable yet
-	}
-
-	holding := PodsHolding(all, "llama")
-	if len(holding) != 1 || holding[0] != pod("a") {
-		t.Fatalf("want only Pod a: got %v", holding)
-	}
-	// A lent Pod holds a sleeping copy of llama, but cannot wake it: it is
-	// already serving qwen, and a Pod serves one model at a time.
-	for _, p := range holding {
-		if p == pod("c") {
-			t.Error("a lent Pod must not be offered for a wake")
-		}
-	}
-	if got := PodsHolding(all, "absent-model"); len(got) != 0 {
-		t.Errorf("a model resident nowhere is a miss: got %v", got)
-	}
-}
-
 func TestByPodGroupsWhatPolicyNeeds(t *testing.T) {
 	all := []Membership{
 		member("a", "x", Asleep), member("a", "y", Asleep),

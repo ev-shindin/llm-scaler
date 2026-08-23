@@ -28,6 +28,9 @@ const (
 	ComponentValue = "warm-pool"
 	// NameLabel is the other half of the pool Deployment's own selector.
 	NameLabel = "app.kubernetes.io/name"
+	// gpuResource is what a pool Pod asks for, and what identifies the
+	// container running engines among the Pod's containers.
+	gpuResource = "nvidia.com/gpu"
 	// ControlPlaneLabel is how the pool's NetworkPolicy recognises the
 	// controller, and therefore who may reach the supervisor and the engines.
 	// It is guarded for that reason rather than for ownership -- see
@@ -160,9 +163,10 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 	}
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
+	capacity := capacityOf(p)
 	if len(instances) == 0 {
 		// An idle Pod is reserve, and must be visible as such. See Membership.
-		return []Membership{{Pod: podRef, State: Absent, Tier: a.tier}}, nil
+		return []Membership{{Pod: podRef, State: Absent, Tier: a.tier, Capacity: capacity}}, nil
 	}
 	out := make([]Membership, 0, len(instances))
 	for _, inst := range instances {
@@ -174,6 +178,7 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 			State:    a.stateOf(ctx, ep, upstream),
 			Tier:     a.tier,
 			Endpoint: ep,
+			Capacity: capacity,
 		})
 	}
 	return out, nil
@@ -386,6 +391,32 @@ func (a *Adapter) Evict(ctx context.Context, pod types.NamespacedName, model Mod
 		return fmt.Errorf("evict %s from %s: %w", model.Variant, pod, err)
 	}
 	return nil
+}
+
+// capacityOf reads what a Pod actually has from its own spec.
+//
+// The ENGINE container's resources, not the Pod's total: the proxy sidecar has
+// a small limit of its own that has nothing to do with how many models can
+// sleep here, and summing the two would overstate the budget by exactly that
+// much.
+func capacityOf(p *corev1.Pod) PodCapacity {
+	var capacity PodCapacity
+	for i := range p.Spec.Containers {
+		c := &p.Spec.Containers[i]
+		gpus, hasGPUs := c.Resources.Limits[gpuResource]
+		if !hasGPUs {
+			gpus, hasGPUs = c.Resources.Requests[gpuResource]
+		}
+		if !hasGPUs {
+			continue // not the container running engines
+		}
+		capacity.GPUs = int(gpus.Value())
+		if limit, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			capacity.MemoryLimitBytes = limit.Value()
+		}
+		break
+	}
+	return capacity
 }
 
 func (a *Adapter) pod(ctx context.Context, ref types.NamespacedName) (*corev1.Pod, error) {

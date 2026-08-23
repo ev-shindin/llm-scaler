@@ -89,6 +89,11 @@ type Reconciler struct {
 	borrowedAt map[policy.Borrow]time.Time
 	missesAt   map[string][]time.Time
 	admitting  map[string]bool
+	// admittingPods is the same claim keyed by POD. Keying only by variant is
+	// not enough: two DIFFERENT variants can be sent to the same Pod on
+	// consecutive passes, because the first one's instance is not visible to
+	// the supervisor's listing until its create call has landed.
+	admittingPods map[types.NamespacedName]bool
 
 	// now exists so tests do not sleep.
 	now func() time.Time
@@ -105,10 +110,11 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		ActTimeout:     defaultActTimeout,
 		AdmitTimeout:   defaultAdmitTimeout,
 
-		borrowedAt: map[policy.Borrow]time.Time{},
-		missesAt:   map[string][]time.Time{},
-		admitting:  map[string]bool{},
-		now:        time.Now,
+		borrowedAt:    map[policy.Borrow]time.Time{},
+		missesAt:      map[string][]time.Time{},
+		admitting:     map[string]bool{},
+		admittingPods: map[types.NamespacedName]bool{},
+		now:           time.Now,
 	}
 }
 
@@ -169,6 +175,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		Variants:    variants,
 		BorrowedAt:  copyBorrows(r.borrowedAt),
 		MissesAt:    copyMisses(r.missesAt),
+		Admitting:   maps.Clone(r.admittingPods),
 		Now:         r.now(),
 	}
 	r.mu.Unlock()
@@ -268,11 +275,11 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 				"pod", action.Pod, "variant", action.Model.Variant)
 			continue
 		}
-		if !r.beginAdmission(action.Model.Variant) {
+		if !r.beginAdmission(action.Model.Variant, action.Pod) {
 			continue
 		}
 		go func(action policy.Action) {
-			defer r.endAdmission(action.Model.Variant)
+			defer r.endAdmission(action.Model.Variant, action.Pod)
 			// From the loop's context, not the tick's: an admission outlives
 			// the pass that decided it by design, and cancelling it at the next
 			// tick would restart a ~35 s load every 5 s forever.
@@ -413,20 +420,22 @@ func orDefault(d, fallback time.Duration) time.Duration {
 // beginAdmission reports whether this variant's admission should start, and
 // claims it if so. Without this the same admission would be re-issued every
 // cycle for the ~35 s it takes, since the model is not resident yet.
-func (r *Reconciler) beginAdmission(variant string) bool {
+func (r *Reconciler) beginAdmission(variant string, pod types.NamespacedName) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.admitting[variant] {
+	if r.admitting[variant] || r.admittingPods[pod] {
 		return false
 	}
 	r.admitting[variant] = true
+	r.admittingPods[pod] = true
 	return true
 }
 
-func (r *Reconciler) endAdmission(variant string) {
+func (r *Reconciler) endAdmission(variant string, pod types.NamespacedName) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.admitting, variant)
+	delete(r.admittingPods, pod)
 }
 
 func copyBorrows(in map[policy.Borrow]time.Time) map[policy.Borrow]time.Time {
@@ -450,9 +459,4 @@ func (r *Reconciler) Lent() []policy.Borrow {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Collect(maps.Keys(r.borrowedAt))
-}
-
-// PodOf is a small convenience for callers assembling actions by hand.
-func PodOf(namespace, name string) types.NamespacedName {
-	return types.NamespacedName{Namespace: namespace, Name: name}
 }

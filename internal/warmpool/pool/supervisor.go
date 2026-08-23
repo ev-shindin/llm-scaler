@@ -57,9 +57,14 @@ type Instance struct {
 // the InferenceServerConfig -- and the second is what made two instances of one
 // model collide.
 type InstanceSpec struct {
-	Options  string            `json:"options"`
-	EnvVars  map[string]string `json:"env_vars,omitempty"`
-	GPUUUIDs []string          `json:"gpu_uuids,omitempty"`
+	Options string            `json:"options"`
+	EnvVars map[string]string `json:"env_vars,omitempty"`
+	// GPUUUIDs places an instance on particular devices. The pool NEVER sets
+	// it, so every instance in a Pod sees every GPU the Pod holds -- which is
+	// what lets a tensor-parallel engine run there with no placement logic at
+	// all. The cost is that sleepers settle on the same devices rather than
+	// spreading, so their residue accumulates; see config/warmpool-multi-gpu.
+	GPUUUIDs []string `json:"gpu_uuids,omitempty"`
 }
 
 // List reports the instances in this Pod.
@@ -123,13 +128,6 @@ func (s *Supervisor) Delete(ctx context.Context, id string) error {
 		return nil
 	}
 	return err
-}
-
-// Healthy reports whether the supervisor is accepting instructions. It says
-// nothing about any model.
-func (s *Supervisor) Healthy(ctx context.Context) bool {
-	_, err := s.do(ctx, http.MethodGet, "/health", nil)
-	return err == nil
 }
 
 func (s *Supervisor) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {

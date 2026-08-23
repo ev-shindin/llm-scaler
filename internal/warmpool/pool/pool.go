@@ -96,6 +96,29 @@ type Membership struct {
 	// LastUsed is when this model last served from this Pod, and is what
 	// eviction ranks on.
 	LastUsed time.Time
+
+	// Capacity is what the Pod holding this instance actually has, read from
+	// its own spec rather than configured.
+	//
+	// Two numbers used to have to agree by hand: how many GPUs the Deployment
+	// asks for and what the controller was told to believe, and likewise the
+	// container's memory limit against the admission budget. Nothing checked
+	// either pair, and both mismatches are silent in the direction that hurts
+	// -- a flag saying four GPUs against a one-GPU Pod admits engines that
+	// cannot start, and a budget above the container limit is not a wall at
+	// all. Observing the Pod removes the question.
+	Capacity PodCapacity
+}
+
+// PodCapacity is what a pool Pod has, as its own spec declares it.
+type PodCapacity struct {
+	// GPUs the Pod requests. Zero when it declares none, which is how an
+	// emulated or misconfigured Pod reads.
+	GPUs int
+	// MemoryLimitBytes is the container's hard limit. Zero when unset, which is
+	// a Pod the kubelet may evict at any size and therefore one whose warm set
+	// cannot be bounded by observation.
+	MemoryLimitBytes int64
 }
 
 // Endpoint is an instance's address inside its Pod.
@@ -183,27 +206,6 @@ func FreePods(all []Membership) int {
 		}
 	}
 	return free
-}
-
-// PodsHolding returns the Pods where a variant is resident and wakeable, which
-// is what decides whether a spike hits or misses.
-func PodsHolding(all []Membership, variant string) []types.NamespacedName {
-	if variant == "" {
-		return nil // the empty variant marks an idle Pod, not a model
-	}
-	var out []types.NamespacedName
-	for pod, inPod := range ByPod(all) {
-		if !Free(inPod) {
-			continue
-		}
-		for _, m := range inPod {
-			if m.Model.Variant == variant && m.State == Asleep {
-				out = append(out, pod)
-				break
-			}
-		}
-	}
-	return out
 }
 
 // Resident counts the models actually held in a Pod, ignoring the placeholder

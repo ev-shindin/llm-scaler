@@ -466,8 +466,21 @@ func TestAnEntirelyParkedFleetHasNoPopularitySignal(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("Variants = %+v, %v", got, err)
 	}
+	// Asserting Share == 0 alone would prove nothing: zero is its zero value,
+	// so deleting withShares entirely would pass. Pin that shares ARE computed
+	// for a running fleet and are absent only for a parked one, which is the
+	// distinction this case is about.
 	if got[0].Share != 0 {
 		t.Errorf("share = %v, want 0 when nothing is running", got[0].Share)
+	}
+	decisions.Set("tenant", scaleTarget, 2)
+	running, err := d.Variants(context.Background())
+	if err != nil || len(running) != 1 {
+		t.Fatalf("Variants = %+v, %v", running, err)
+	}
+	if running[0].Share == 0 {
+		t.Error("the same variant must have a share once it is running; " +
+			"a zero here means nothing computes shares at all")
 	}
 }
 

@@ -131,18 +131,6 @@ func TestErrorsCarryTheSupervisorsOwnWords(t *testing.T) {
 	}
 }
 
-func TestHealthySaysNothingAboutModels(t *testing.T) {
-	f := newFakeSupervisor(t)
-	f.respond = func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"OK"}`)) }
-	if !f.client().Healthy(context.Background()) {
-		t.Error("want healthy")
-	}
-	f.respond = func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "down", http.StatusInternalServerError) }
-	if f.client().Healthy(context.Background()) {
-		t.Error("want unhealthy")
-	}
-}
-
 func TestRequestsHonourContextCancellation(t *testing.T) {
 	f := newFakeSupervisor(t)
 	f.respond = func(w http.ResponseWriter, _ *http.Request) { time.Sleep(2 * time.Second) }

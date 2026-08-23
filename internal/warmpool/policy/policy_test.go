@@ -413,10 +413,9 @@ func TestPreloadingAdmitsThePopularModelsWithoutWaitingForAMiss(t *testing.T) {
 	// what makes a small warm set work at all: with PreloadTop=2 the two
 	// busiest variants are warmed before either has missed once.
 	//
-	// Nothing feeds Share today -- Demand hardcodes it to zero -- so this
-	// branch is inert in production. It is tested because the day a popularity
-	// source is wired in is the day it starts spending the reserve, and the
-	// ordering it spends it in is the whole point.
+	// Share is real now -- a variant's portion of the fleet's desired replicas
+	// -- so this branch spends reserve slots in production. The ordering it
+	// spends them in is the whole point, which is what these cases pin.
 	c := cfg()
 	c.PreloadTop = 2
 	c.SleepMinSize = 0
@@ -848,5 +847,74 @@ func TestAVariantDemandNoLongerKnowsAboutKeepsTheObservation(t *testing.T) {
 	got := Decide(in, cfg())
 	if len(got.Return) != 1 || got.Return[0].Model.Variant != "forgotten" {
 		t.Fatalf("want the orphan still returned: %+v", got.Return)
+	}
+}
+
+func TestTheHoldExpiresExactlyAtMaxHold(t *testing.T) {
+	// The comparison is >=, and the tests around it use five minutes against a
+	// two-minute hold and ten seconds against the same -- both so far from the
+	// edge that flipping >= to > survives them. A bridge exactly at its limit
+	// is the case the operator asked for when they set the number.
+	at := func(age time.Duration) Input {
+		return Input{
+			Memberships: []pool.Membership{resident("a", qwenVariant, pool.Serving)},
+			Variants:    []VariantDemand{demand(qwenVariant, 3, 0)}, // still short
+			BorrowedAt:  map[Borrow]time.Time{{Pod: pod("a"), Variant: qwenVariant}: now.Add(-age)},
+			Now:         now,
+		}
+	}
+	c := cfg()
+	if got := Decide(at(c.MaxHold), c); len(got.Return) != 1 {
+		t.Errorf("a bridge exactly at the hold must be returned: %+v", got.Return)
+	}
+	if got := Decide(at(c.MaxHold-time.Nanosecond), c); len(got.Return) != 0 {
+		t.Errorf("and one a nanosecond short must not: %+v", got.Return)
+	}
+}
+
+func TestAMissExactlyAtTheWindowEdgeStillCounts(t *testing.T) {
+	// Same shape as the hold: the comparison is <=, and the cases around it use
+	// misses two and three hours old against a one-hour window, which an
+	// off-by-one survives untouched.
+	c := cfg()
+	at := func(age time.Duration) Input {
+		return Input{
+			Memberships: []pool.Membership{resident("a", "other", pool.Asleep), resident("b", "other", pool.Asleep)},
+			Variants:    []VariantDemand{demand("rare", 1, 0)},
+			MissesAt:    map[string][]time.Time{"rare": {now.Add(-age), now.Add(-age)}},
+			Now:         now,
+		}
+	}
+	if got := Decide(at(c.AdmissionWindow), c); len(got.Admit) != 1 {
+		t.Errorf("a miss exactly at the window edge still counts: %+v", got.Admit)
+	}
+	if got := Decide(at(c.AdmissionWindow+time.Nanosecond), c); len(got.Admit) != 0 {
+		t.Errorf("and one a nanosecond past it does not: %+v", got.Admit)
+	}
+}
+
+func TestReturnsHandBackTheOldestBridgeFirst(t *testing.T) {
+	// With more lent Pods than excess, WHICH one comes back decides whether the
+	// pool notices a scale-up that is failing. Returning the freshest would
+	// leave a stuck bridge lent indefinitely while its hold clock is repeatedly
+	// reset -- and nothing else in the suite sets up partial excess at all.
+	in := Input{
+		Memberships: []pool.Membership{
+			resident("new", qwenVariant, pool.Serving),
+			resident("old", qwenVariant, pool.Serving),
+		},
+		Variants: []VariantDemand{demand(qwenVariant, 3, 2)}, // room to give one back
+		BorrowedAt: map[Borrow]time.Time{
+			{Pod: pod("new"), Variant: qwenVariant}: now.Add(-10 * time.Second),
+			{Pod: pod("old"), Variant: qwenVariant}: now.Add(-90 * time.Second),
+		},
+		Now: now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 1 {
+		t.Fatalf("exactly one bridge is spare: %+v", got.Return)
+	}
+	if got.Return[0].Pod != pod("old") {
+		t.Errorf("returned %s, want the oldest bridge", got.Return[0].Pod)
 	}
 }

@@ -35,9 +35,11 @@ func TestAnIdlePodIsStillReserve(t *testing.T) {
 	if Resident(got) != 0 {
 		t.Fatalf("and holds no models: Resident = %d", Resident(got))
 	}
-	// It must not be offered as holding anything.
-	if pods := PodsHolding(got, ""); len(pods) != 0 {
-		t.Fatalf("the placeholder is not a model: %v", pods)
+	// And its ModelRef names no model, which is what stops the placeholder
+	// being offered as a candidate anywhere: the policy's own search skips the
+	// empty variant explicitly.
+	if got[0].Model.Variant != "" {
+		t.Fatalf("the placeholder is not a model: %+v", got[0].Model)
 	}
 }
 

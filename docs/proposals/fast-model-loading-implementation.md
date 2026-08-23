@@ -10,11 +10,17 @@ adapter, policy, reconciler), `internal/warmpool/proxy` + `cmd/warmpool-proxy`,
 off by default. A pool Pod has served real EPP traffic on pokprod with ~437 ms
 model switches.
 
-What is NOT built, and is marked so where it appears below: eviction and pinning,
-spreading a model across Pods, the ConfigMap configuration surface (three flags
-instead), pool growth and shrink (`GrowBy` is reported, not acted on), preloading
-and the admission guard that should decline models a pool cannot help. Phase 0 measurement still gates whether
-any of it pays.
+What is NOT built, and is marked so where it appears below: eviction and
+pinning, spreading a model across Pods, the ConfigMap configuration surface
+(flags instead — see §8), and pool growth and shrink (`GrowBy` is reported, not
+acted on). Phase 0 measurement still gates whether any of it pays.
+
+Preloading and the admission guard WERE on that list and are now built. Naming
+them here after they landed was not a small slip: the list is what a reader
+trusts to know where to look, so anything on it is a thing nobody examines.
+Preloading ranks by a variant's share of the fleet (§14a); the guard declines a
+model that cannot fit the Pod it would go into, by GPU count or by weight
+(§14c).
 
 ---
 
@@ -654,10 +660,20 @@ scale-ups are failing and the pool is masking it.
 
 ## 8. Configuration
 
-> **NOT BUILT — read this section as a wish list.** The configuration surface is
-> three flags, not a ConfigMap: `--warm-pool-namespace` (empty disables the pool
-> entirely), `--warm-pool-sleep-min-size` (default 1) and `--warm-pool-max-hold`
-> (default 2m). Everything else below has no counterpart: `accelerator`,
+> **NOT BUILT AS A ConfigMap — read this section as a wish list.** The
+> configuration surface is seven flags:
+>
+> | flag | default | what it decides |
+> | --- | --- | --- |
+> | `--warm-pool-namespace` | "" | which namespace's models to warm; empty disables the pool entirely |
+> | `--warm-pool-sleep-min-size` | 1 | the floor on FREE Pods — the reserve kept for the next spike |
+> | `--warm-pool-max-hold` | 2m | how long a bridge may serve before it is returned regardless |
+> | `--warm-pool-memory-bytes` | 40Gi | host memory one Pod may commit to sleeping weights, clamped to the container's own limit |
+> | `--warm-pool-gpus-per-pod` | 1 | a fallback only; what the POD declares wins (§14c) |
+> | `--warm-pool-gpu-memory-utilization` | 0 | the pool's own value, overriding the workload's; 0 inherits (§14a) |
+> | `--warm-pool-preload-top` | 2 | how many of the busiest variants to preload; 0 disables |
+>
+> Everything else below has no counterpart: `accelerator`,
 > `tensorParallel`, `tier`, `replicas`, `awakeSlots`, `growDebounceSeconds`,
 > `shrinkSlack`, `minPredictedSaving`, `parkedWithinHours`, `evict` and `pin`
 > are unimplemented, and `warmSetPerPod` is fixed at 16 rather than
@@ -796,8 +812,14 @@ smaller than the rewrite; measure that on day one, not by argument.
 
 > **What exists is not this.** The reconciler, policy, adapter and proxy are
 > covered by ordinary Go tests with hand-written fakes and the controller-runtime
-> fake client (~90% of `internal/warmpool`). There is no envtest suite and no
-> kind e2e spec for the pool. Read the rest of this section as a plan.
+> fake client (~90% of `internal/warmpool`). There is no envtest suite. There IS
+> an e2e suite — `test/e2e/warm_pool_test.go`, six specs, green on a real
+> OpenShift cluster — which runs the REAL proxy image next to an emulated
+> supervisor and engines, and applies the shipped NetworkPolicy rather than a
+> copy of it. What it covers is what a unit test cannot reach: kubelet probe
+> timing, policy enforcement, and real traffic through the proxy. What it cannot
+> cover is a real vLLM sleeping and waking, which needs a GPU. Read the rest of
+> this section as a plan for the envtest half.
 
 - **Policy: unit, no cluster.** Admission, eviction, placement and hold are pure
   functions over memberships and demand. This is where most tests belong.
@@ -810,13 +832,13 @@ smaller than the rewrite; measure that on day one, not by argument.
   a real GPU. That stays a manual measurement on pokprod, reported through
   `wva_scale_from_zero_wake_seconds`.
 
-## 13. Not built
+## 13. Out of scope
 
 Multi-node (LWS) pools; a CRD; a webhook; a scheduler plugin; cross-node model
 migration; CRIU. Each is either out of scope per the review or waiting on a
 measurement that has not been taken.
 
-## 13. Built, and not described above
+## 14. Built, and not described above
 
 Decisions taken during implementation that no earlier section anticipated. They
 are listed here rather than folded in, so that the difference between what was
@@ -892,7 +914,7 @@ noticing `/readyz` fail, the Pod leaving its EndpointSlice, and then that drain.
 
 
 
-### 13a. Sizing the warm set is a GPU question, not a host-memory one
+### 14a. Sizing the warm set is a GPU question, not a host-memory one
 
 `MaxInstancesPerPod` is 16, and reading that as "sixteen models per Pod" is
 wrong in a way that only shows up on a cluster. It bounds the PORT RANGE. The
@@ -921,7 +943,7 @@ memory a level-1 sleeper actually takes (the weights-in-host-RAM behaviour is
 vLLM's documented one, not something confirmed here), and whether the ~1.4 GiB
 residue holds for a model much larger than 0.6 B.
 
-### 13b. A Pod on a new node must not start cold
+### 14b. A Pod on a new node must not start cold
 
 Growing the pool means a Pod on a node that has never served these models, and
 whether that is cheap or ruinous is decided entirely by where the weights live.
@@ -958,7 +980,7 @@ The Pods also spread across nodes by preference. A pool concentrated on one node
 is not insurance: losing that node loses every warm model at once, and the next
 spike pays a full cold start for each of them.
 
-### 13c. Parallelism: what a pool Pod can and cannot warm
+### 14c. Parallelism: what a pool Pod can and cannot warm
 
 A pool Pod holds a fixed number of GPUs, and a warm copy inherits the ordinary
 replicas' parallelism flags. Those two facts decide the whole answer, and

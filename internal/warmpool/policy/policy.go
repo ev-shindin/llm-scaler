@@ -89,6 +89,18 @@ type Input struct {
 	// are treated as starting now, which is the safe direction after a restart:
 	// a bridge is held a little too long rather than cut mid-flight.
 	BorrowedAt map[Borrow]time.Time
+	// Admitting are Pods with an admission already in flight, which the caller
+	// knows about and an observation cannot.
+	//
+	// An admission is asynchronous and takes ~35 s, and the instance it creates
+	// does not appear in the supervisor's listing until its create call has
+	// landed. So a Pod chosen for one variant still reads as EMPTY to the next
+	// pass, which picks the roomiest empty Pod, finds the same one, and admits
+	// a second model into it against a budget that counts nothing yet. Two
+	// loads then run in a Pod sized for the arithmetic of one, which is the OOM
+	// that budget exists to prevent.
+	Admitting map[types.NamespacedName]bool
+
 	// MissesAt records recent misses per variant, for the frequency filter.
 	MissesAt map[string][]time.Time
 	Now      time.Time
@@ -167,7 +179,7 @@ func Decide(in Input, cfg Config) Plan {
 	}
 
 	// 2. Borrows: cover what the ordinary replicas cannot yet.
-	free := freePods(byPod, returned)
+	free := freePods(byPod, returned, in.Admitting)
 	for _, v := range in.Variants {
 		shortfall := v.Desired - v.Ready - len(lent[v.Model.Variant])
 		if shortfall <= 0 {
@@ -375,17 +387,33 @@ func lentByVariant(all []pool.Membership) map[string][]pool.Membership {
 // admission, it takes the whole Pod down with every model already in it.
 func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) string {
 	shape := pool.ShapeOf(model.EngineOptions)
+	capacity := capacityOf(resident)
 
-	gpus := cfg.GPUsPerPod
+	// What the POD says it has beats what the controller was told to believe.
+	// The flag is a fallback for a Pod declaring nothing, not an override: a
+	// flag claiming four GPUs against a one-GPU Pod would admit engines that
+	// cannot start, which is the failure this check exists to prevent.
+	gpus := capacity.GPUs
+	if gpus < 1 {
+		gpus = cfg.GPUsPerPod
+	}
 	if gpus < 1 {
 		gpus = 1
 	}
 	if shape.GPUs > gpus {
-		return fmt.Sprintf("needs %d GPUs, the pool's Pods hold %d", shape.GPUs, gpus)
+		return fmt.Sprintf("needs %d GPUs, this Pod holds %d", shape.GPUs, gpus)
 	}
 
-	if cfg.PodMemoryBytes <= 0 {
-		return "" // no budget configured; the check is off
+	budget := cfg.PodMemoryBytes
+	// Clamped to the container's own limit, never above it. A budget larger
+	// than the limit is not a wall -- the kubelet enforces the limit whatever
+	// the flag says -- so admitting against it would OOM the Pod and take every
+	// model resident in it with it.
+	if capacity.MemoryLimitBytes > 0 && (budget <= 0 || budget > capacity.MemoryLimitBytes) {
+		budget = capacity.MemoryLimitBytes
+	}
+	if budget <= 0 {
+		return "" // nothing to check against; the check is off
 	}
 	if !shape.Known() {
 		// Declining is the conservative direction and the consistent one: the
@@ -401,11 +429,22 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 			committed += held.WeightsBytes
 		}
 	}
-	if committed+shape.WeightsBytes > cfg.PodMemoryBytes {
+	if committed+shape.WeightsBytes > budget {
 		return fmt.Sprintf("needs %s on top of the %s already resident, over the %s budget",
-			gib(shape.WeightsBytes), gib(committed), gib(cfg.PodMemoryBytes))
+			gib(shape.WeightsBytes), gib(committed), gib(budget))
 	}
 	return ""
+}
+
+// capacityOf is what the Pod these memberships belong to declares. Every
+// membership from one Pod carries the same value, so the first is enough.
+func capacityOf(resident []pool.Membership) pool.PodCapacity {
+	for _, m := range resident {
+		if m.Capacity.GPUs > 0 || m.Capacity.MemoryLimitBytes > 0 {
+			return m.Capacity
+		}
+	}
+	return pool.PodCapacity{}
 }
 
 func gib(bytes int64) string {
@@ -511,10 +550,14 @@ func borrowedAt(in Input, m pool.Membership) time.Time {
 }
 
 // freePods is the reserve: Pods that can serve a wake now, plus those this plan
-// is about to hand back.
-func freePods(byPod map[types.NamespacedName][]pool.Membership, returning map[types.NamespacedName]bool) map[types.NamespacedName]bool {
+// is about to hand back, minus any with an admission still in flight.
+func freePods(byPod map[types.NamespacedName][]pool.Membership, returning, admitting map[types.NamespacedName]bool) map[types.NamespacedName]bool {
 	free := map[types.NamespacedName]bool{}
 	for p, inPod := range byPod {
+		if admitting[p] {
+			// Loading, even though the listing does not show it yet.
+			continue
+		}
 		if pool.Free(inPod) || returning[p] {
 			free[p] = true
 		}

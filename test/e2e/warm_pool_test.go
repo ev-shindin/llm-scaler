@@ -302,9 +302,17 @@ var _ = Describe("Warm pool - the pool Pod's traffic gate", Label("full"), Label
 		// distinction matters: the controller being locked out of these ports
 		// is precisely the regression that made the pool inert, and a guard
 		// that skipped on it would swallow the defect it exists to catch.
+		// EVERY guarded port, not just the supervisor. The three are in one
+		// ingress rule, so trimming the rule to drop :8002 or the engine range
+		// would leave the pool just as inert -- and a tenant-denial loop reads
+		// "cannot connect" on a port nobody can reach, so it would stay green
+		// while the controller was locked out too.
 		Expect(control("GET", "/health", fixtures.WarmPoolSupervisorPort, "").Status).To(Equal(200),
-			"the policy must admit the controller to the supervisor, or no instance can ever be "+
-				"listed, woken or slept and the pool is inert")
+			"the policy must admit the controller to the supervisor, or nothing can be listed")
+		Expect(control("GET", "/upstream", fixtures.WarmPoolControlPort, "").Status).To(Equal(200),
+			"and to the proxy's control endpoint, or no bridge can ever be pointed")
+		Expect(control("GET", "/health", enginePort, "").Status).To(Equal(200),
+			"and to the engine ports, or every /is_sleeping fails and the pool never wakes anything")
 
 		// A CNI that ignores NetworkPolicy is a different matter: nothing is
 		// wrong with the manifest, the cluster simply cannot show it. kind's
