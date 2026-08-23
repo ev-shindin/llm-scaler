@@ -155,6 +155,18 @@ func main() {
 			"admission -- it OOM-kills the launcher and destroys every model already resident "+
 			"in the Pod. Must be comfortably under the container's memory limit. 0 disables "+
 			"the check.")
+	warmPoolGPUUtil := flag.Float64("warm-pool-gpu-memory-utilization", 0,
+		"Override --gpu-memory-utilization for warm copies. A workload's value is sized for a "+
+			"Pod running ONE engine and typically claims ~95% of the card, which leaves room "+
+			"for about three sleepers on an 80GiB GPU rather than the sixteen the warm set "+
+			"allows. Lowering it trades KV cache for warm-set size, and costs one extra "+
+			"compile (~9s) per model because the value is part of the torch.compile cache key. "+
+			"0 inherits the workload's value.")
+	warmPoolPreloadTop := flag.Int("warm-pool-preload-top", 2,
+		"Preload this many of the busiest variants while the pool has spare reserve, instead "+
+			"of waiting for each to miss. Popularity is share of desired replicas, which "+
+			"tracks share of requests. 0 disables preloading, leaving admission to parking "+
+			"and the frequency filter.")
 	warmPoolGPUsPerPod := flag.Int("warm-pool-gpus-per-pod", 1,
 		"GPUs each pool Pod holds. A warm copy inherits the ordinary replicas' parallelism "+
 			"flags, so a variant wanting more devices than this is declined rather than "+
@@ -761,17 +773,19 @@ func main() {
 			reconciler := warmpool.New(
 				warmpoolpool.NewAdapter(mgr.GetClient(), *warmPoolNamespace, warmpoolpool.Ram),
 				&warmpool.Demand{
-					Namespace: *warmPoolNamespace,
-					Registry:  registry.Default,
-					Decisions: decision.Default,
-					Client:    mgr.GetClient(),
-					Datastore: ds,
+					Namespace:            *warmPoolNamespace,
+					GPUMemoryUtilization: *warmPoolGPUUtil,
+					Registry:             registry.Default,
+					Decisions:            decision.Default,
+					Client:               mgr.GetClient(),
+					Datastore:            ds,
 				},
 				warmpoolpolicy.Config{
 					SleepMinSize:       *warmPoolSleepMinSize,
 					MaxHold:            *warmPoolMaxHold,
 					AdmissionWindow:    time.Hour,
 					MinMissesToAdmit:   2,
+					PreloadTop:         *warmPoolPreloadTop,
 					MaxInstancesPerPod: warmpoolpool.MaxInstancesPerPod,
 					PodMemoryBytes:     *warmPoolMemoryBudget,
 					GPUsPerPod:         *warmPoolGPUsPerPod,
@@ -784,7 +798,9 @@ func main() {
 				"sleepMinSize", *warmPoolSleepMinSize,
 				"maxHold", *warmPoolMaxHold,
 				"memoryBudgetBytes", *warmPoolMemoryBudget,
-				"gpusPerPod", *warmPoolGPUsPerPod)
+				"gpusPerPod", *warmPoolGPUsPerPod,
+				"gpuMemoryUtilization", *warmPoolGPUUtil,
+				"preloadTop", *warmPoolPreloadTop)
 			return reconciler.Start(ctx)
 		})); err != nil {
 			setupLog.Error(err, "unable to add the warm pool to manager")

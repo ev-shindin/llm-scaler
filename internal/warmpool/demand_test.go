@@ -211,8 +211,9 @@ func TestVariantsReadDesireFromTheDecisionStoreAndReadinessFromTheWorkload(t *te
 	if v.Parked {
 		t.Error("a variant WVA wants three of is not parked")
 	}
-	if v.Share != 0 {
-		t.Errorf("share = %v: preloading is inert until a popularity source exists", v.Share)
+	// The only variant, so it is all of the fleet.
+	if v.Share != 1 {
+		t.Errorf("share = %v, want 1 for the only variant with any desire", v.Share)
 	}
 	if !strings.Contains(v.Model.EngineOptions, "--gpu-memory-utilization 0.95") {
 		t.Errorf("options must be derived from the ordinary replicas: %q", v.Model.EngineOptions)
@@ -410,5 +411,107 @@ func TestADroppedFlagTakesItsValueWithIt(t *testing.T) {
 	}
 	if !strings.Contains(got, "--dtype bfloat16") {
 		t.Errorf("and the flag after it must be unaffected: %q", got)
+	}
+}
+
+func TestShareIsAVariantsPortionOfTheFleet(t *testing.T) {
+	// What the design asks for is share of REQUESTS; what exists in this
+	// process is share of desired replicas. They are the same quantity scaled
+	// by per-replica capacity, because holding utilisation roughly constant is
+	// what an autoscaler does -- so a variant WVA wants three replicas of is
+	// serving about three times the traffic of one it wants one of.
+	busy := deployment(1, vllmContainer())
+	quiet := deployment(1, vllmContainer())
+	quiet.Name = "quiet-decode"
+
+	d, reg, decisions := demandFor(t,
+		[]client.Object{busy, quiet},
+		&fakeDatastore{pool: inferencePool()})
+
+	registerVariant(reg, scaleTarget)
+	reg.Observe("tenant", "quiet", nil)
+	reg.SetTarget("tenant", "quiet", registry.Target{Kind: "Deployment", Name: "quiet-decode"})
+
+	decisions.Set("tenant", scaleTarget, 3)
+	decisions.Set("tenant", "quiet-decode", 1)
+
+	got, err := d.Variants(context.Background())
+	if err != nil || len(got) != 2 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	shares := map[string]float64{}
+	for _, v := range got {
+		shares[v.Model.Variant] = v.Share
+	}
+	if shares["qwen"] <= shares["quiet"] {
+		t.Errorf("the busier variant must rank higher: %v", shares)
+	}
+	if total := shares["qwen"] + shares["quiet"]; total < 0.99 || total > 1.01 {
+		t.Errorf("shares must sum to one, got %v", total)
+	}
+}
+
+func TestAnEntirelyParkedFleetHasNoPopularitySignal(t *testing.T) {
+	// Nothing is running, so nothing is busier than anything else. Preloading
+	// falls back to what it was before: inert, with admission driven by parking
+	// and the frequency filter, which is exactly right when every variant is
+	// parked and therefore already admitted eagerly.
+	d, reg, decisions := demandFor(t,
+		[]client.Object{deployment(0, vllmContainer())},
+		&fakeDatastore{pool: inferencePool()})
+	registerVariant(reg, scaleTarget)
+	decisions.Set("tenant", scaleTarget, 0)
+
+	got, err := d.Variants(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	if got[0].Share != 0 {
+		t.Errorf("share = %v, want 0 when nothing is running", got[0].Share)
+	}
+}
+
+func TestThePoolCanSizeItsOwnGPUUtilisation(t *testing.T) {
+	// A workload's value is chosen for a Pod running ONE engine and claims most
+	// of the card; a pool Pod has to leave room for its sleepers' residue.
+	d, reg, _ := demandFor(t,
+		[]client.Object{deployment(1, vllmContainer())},
+		&fakeDatastore{pool: inferencePool()})
+	d.GPUMemoryUtilization = 0.6
+	registerVariant(reg, scaleTarget)
+
+	got, err := d.Variants(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	options := got[0].Model.EngineOptions
+	if !strings.Contains(options, "--gpu-memory-utilization 0.6") {
+		t.Errorf("the pool's value must be applied: %q", options)
+	}
+	// Replaced, not appended: two occurrences would leave the engine's
+	// behaviour to argparse's last-wins rule and the intent to a reader's guess.
+	if strings.Count(options, "--gpu-memory-utilization") != 1 {
+		t.Errorf("the workload's value must be replaced, not duplicated: %q", options)
+	}
+	if strings.Contains(options, "0.95") {
+		t.Errorf("the workload's value survived: %q", options)
+	}
+}
+
+func TestWithoutAnOverrideTheWorkloadsUtilisationIsKept(t *testing.T) {
+	// Zero inherits, which is the previous behaviour and the right default: the
+	// value is part of the torch.compile cache key, so matching the ordinary
+	// replicas is what makes the pool hit the cache they populated.
+	d, reg, _ := demandFor(t,
+		[]client.Object{deployment(1, vllmContainer())},
+		&fakeDatastore{pool: inferencePool()})
+	registerVariant(reg, scaleTarget)
+
+	got, err := d.Variants(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Variants = %+v, %v", got, err)
+	}
+	if !strings.Contains(got[0].Model.EngineOptions, "--gpu-memory-utilization 0.95") {
+		t.Errorf("the workload's own value must survive: %q", got[0].Model.EngineOptions)
 	}
 }

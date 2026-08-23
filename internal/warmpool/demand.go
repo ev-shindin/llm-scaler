@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -34,6 +35,27 @@ type Demand struct {
 	Decisions *decision.Store
 	Client    client.Client
 	Datastore datastore.Datastore
+	// GPUMemoryUtilization overrides what the ordinary replicas ask for, and
+	// exists because the two are sizing different things.
+	//
+	// A workload's value is chosen for a Pod running ONE engine, so it is
+	// usually near 0.95 -- vLLM then CLAIMS that share of the card and fills
+	// the remainder with KV cache. A pool Pod runs one awake engine plus its
+	// sleepers, and each sleeper keeps ~1.4 GiB of GPU residue. Measured: at
+	// 0.95 an 80 GiB card had 4.4 GiB left, which is room for about three
+	// sleepers, not the sixteen MaxInstancesPerPod allows. That limit is a port
+	// range and was never a memory bound; THIS is the memory bound.
+	//
+	// It is not free. The value is part of the torch.compile cache key, so a
+	// pool that uses a different one misses the cache the ordinary replicas
+	// populated -- measured at 12.35 s against 3.08 s. That cost is paid once
+	// per model per value, not per load, which is what makes the trade worth
+	// having: nine seconds on a model's first admission buys a warm set several
+	// times larger.
+	//
+	// Zero inherits the workload's value, which is the previous behaviour.
+	GPUMemoryUtilization float64
+
 	// Namespace is the pool's, and variants outside it are not its business.
 	//
 	// Load-bearing rather than tidy. The registry spans every namespace WVA
@@ -77,6 +99,7 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 				"variant", entry.Name, "err", err)
 			continue
 		}
+		options = withGPUMemoryUtilization(options, d.GPUMemoryUtilization)
 
 		labels, err := d.poolLabels(entry.Namespace, workload.Spec.Template.Labels)
 		if err != nil {
@@ -101,6 +124,8 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			},
 			Desired: desired,
 			Ready:   ready,
+			// Share is filled in below, once every variant's desire is known.
+			// It cannot be computed one variant at a time.
 			// Parked is the case with no alternative: at zero replicas a cold
 			// start is the whole of the first request's latency.
 			//
@@ -110,13 +135,45 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			// Treating that as parked would eagerly admit models nobody asked
 			// for, at ~35 s and a reserve slot each, on every restart.
 			Parked: haveDecision && desired == 0 && ready == 0,
-			// Share stays zero until a popularity source is wired in. Preloading
-			// is therefore inert rather than wrong -- admission still works from
-			// parking and from the frequency filter.
-			Share: 0,
 		})
 	}
+	withShares(out)
 	return out, nil
+}
+
+// withShares fills in each variant's share of the fleet, in place.
+//
+// What the design asks for is share of REQUESTS, and what is available in this
+// process is share of desired replicas. They are the same quantity scaled by
+// per-replica capacity: an autoscaler's whole job is to hold utilisation
+// roughly constant, so a variant WVA wants ten replicas of is serving about ten
+// times the traffic of one it wants one of.
+//
+// The approximation breaks where per-replica capacity differs -- a variant on
+// a smaller accelerator, or one whose model is heavy enough that a replica
+// serves fewer requests, reads as more popular than it is. That is a
+// distortion, not a hazard: the consequence of over-ranking a variant is that
+// the pool preloads it, which costs a reserve slot it would otherwise have
+// spent reactively. Nothing about correctness depends on this number.
+//
+// Zero desire contributes nothing, so a fleet that is entirely parked leaves
+// every share at zero and preloading falls back to what it was before: inert,
+// with admission driven by parking and the frequency filter.
+func withShares(variants []policy.VariantDemand) {
+	total := 0
+	for _, v := range variants {
+		if v.Desired > 0 {
+			total += v.Desired
+		}
+	}
+	if total == 0 {
+		return
+	}
+	for i := range variants {
+		if variants[i].Desired > 0 {
+			variants[i].Share = float64(variants[i].Desired) / float64(total)
+		}
+	}
 }
 
 // poolLabels resolves the InferencePool a workload belongs to and returns that
@@ -209,6 +266,33 @@ var warmableFlags = map[string]bool{
 	"--num-scheduler-steps":          true,
 	"--distributed-executor-backend": true,
 	"--enable-sleep-mode":            true,
+}
+
+// withGPUMemoryUtilization applies the pool's own value, if it has one.
+//
+// Replaces rather than appends when the workload already names it: two
+// occurrences would leave the engine's behaviour up to argparse's last-wins
+// rule, and the pool's intent up to a reader's guess.
+func withGPUMemoryUtilization(options string, value float64) string {
+	if value <= 0 {
+		return options
+	}
+	const flag = "--gpu-memory-utilization"
+
+	fields := strings.Fields(options)
+	out := make([]string, 0, len(fields)+2)
+	for i := 0; i < len(fields); i++ {
+		name, _, hasInline := strings.Cut(fields[i], "=")
+		if name != flag {
+			out = append(out, fields[i])
+			continue
+		}
+		if !hasInline && i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
+			i++
+		}
+	}
+	out = append(out, flag, strconv.FormatFloat(value, 'g', -1, 64))
+	return strings.Join(out, " ")
 }
 
 // normaliseOptions keeps the flags a warm copy must match, drops everything

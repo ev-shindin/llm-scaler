@@ -39,6 +39,24 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      # Spread across nodes, by preference rather than by requirement.
+      #
+      # The pool is insurance, and insurance concentrated on one node is not
+      # insurance: losing that node loses every warm model at once, and the
+      # first spike afterwards pays a full cold start for each. Preferred and
+      # not required, because a pool larger than the cluster's GPU node count
+      # must still schedule -- a Pod that will not start is worse than one
+      # sharing a node.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: workload-variant-autoscaler
+                    app.kubernetes.io/component: warm-pool
       # GPU nodes are routinely tainted. Without this the Deployment sits
       # Pending on exactly the clusters it is meant for.
       tolerations:
@@ -285,6 +303,20 @@ spec:
         # models, and the pool mounts it to reuse a cache that is already warm.
         # Applying this directory into a namespace without `model-pvc` leaves
         # the Pod Pending on a missing volume.
+        #
+        # IT MUST BE ReadWriteMany, and that is what makes the pool scalable at
+        # all. Every Pod mounts it, and Pods land on different nodes -- so with
+        # an RWO claim the FIRST replica runs and the second is stuck Pending on
+        # a multi-attach error, forever. Nothing else in the system reports that
+        # as anything other than a pool which never grew.
+        #
+        # It is also what makes a Pod on a node that has never served a model
+        # cheap: the weights are read from shared storage rather than fetched,
+        # and the torch.compile cache another Pod populated is already there.
+        # Measured on Spectrum Scale, the read costs about the same whether or
+        # not that node has served the model before. A node-local volume would
+        # be faster still and would give this up entirely -- every new node
+        # would start cold.
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-pvc

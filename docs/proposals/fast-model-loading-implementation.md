@@ -13,8 +13,7 @@ model switches.
 What is NOT built, and is marked so where it appears below: eviction and pinning,
 spreading a model across Pods, the ConfigMap configuration surface (three flags
 instead), pool growth and shrink (`GrowBy` is reported, not acted on), preloading
-by popularity (inert: request share is always zero), and the admission guard that
-should decline models a pool cannot help. Phase 0 measurement still gates whether
+and the admission guard that should decline models a pool cannot help. Phase 0 measurement still gates whether
 any of it pays.
 
 ---
@@ -366,7 +365,7 @@ So residency has three sources, in descending order of confidence:
 | source | policy | why |
 | --- | --- | --- |
 | **parked models** | admit eagerly, bypassing the filter | no ordinary replicas exist, so the pool is their only fast path, and the next wake is near-certain. The alternative is a guaranteed ~41 s |
-| **popular models** | **preload** while the pool is idle, top-C by request share. **INERT TODAY**: request share is hardcoded to zero and `PreloadTop` is unset, so this source admits nothing until a popularity signal is wired in | prefetch beats demand-fill when the distribution is known, and skew is what makes a small warm set work |
+| **popular models** | **preload** while the pool is idle, top-C by share. BUILT: share is a variant's portion of desired replicas across the fleet, which tracks share of requests because holding utilisation roughly constant is what an autoscaler does. `--warm-pool-preload-top` selects how many; an entirely parked fleet has no signal and falls back to the other two sources | prefetch beats demand-fill when the distribution is known, and skew is what makes a small warm set work |
 | **everything else** | admit on the second miss in a window | keeps one-off models out |
 
 Every source is subject to the same two guards:
@@ -890,4 +889,72 @@ be re-issued every 5 s while it is still in progress.
 **`DrainWait` is 4 s, not the ~0.7 s the measurements report.** The measurement
 is of the EPP draining; the wait has to cover the whole chain — the kubelet
 noticing `/readyz` fail, the Pod leaving its EndpointSlice, and then that drain.
+
+
+
+### 13a. Sizing the warm set is a GPU question, not a host-memory one
+
+`MaxInstancesPerPod` is 16, and reading that as "sixteen models per Pod" is
+wrong in a way that only shows up on a cluster. It bounds the PORT RANGE. The
+memory bound is elsewhere and much tighter.
+
+Measured on an 80 GiB H100: one awake model at `--gpu-memory-utilization 0.95`
+plus one sleeper left **4.4 GiB free**. The awake figure is not the model's
+size — vLLM CLAIMS that share of the card and fills the remainder with KV cache
+— and each sleeper holds ~1.4 GiB of GPU residue whatever its size. So at 0.95
+a Pod has room for about three sleepers.
+
+Host memory is not the constraint. The GPU nodes measured here carry ~2 TiB
+each across 8 GPUs, so ~250 GiB per GPU, against a 48 GiB Pod limit. There is
+an order of magnitude of headroom there and none at all on the card.
+
+The dial is therefore `--gpu-memory-utilization`, now exposed as
+`--warm-pool-gpu-memory-utilization`. Lowering it trades the awake model's KV
+cache — and so its throughput — for warm-set breadth. It is not free in a second
+way either: the value is part of the torch.compile cache key, so a pool that
+uses a different one from the ordinary replicas misses the cache they populated,
+measured at 12.35 s against 3.08 s. That cost is paid once per model per value
+rather than per load, which is what makes the trade worth having at all.
+
+Two numbers that would firm this up and have not been measured: how much HOST
+memory a level-1 sleeper actually takes (the weights-in-host-RAM behaviour is
+vLLM's documented one, not something confirmed here), and whether the ~1.4 GiB
+residue holds for a model much larger than 0.6 B.
+
+### 13b. A Pod on a new node must not start cold
+
+Growing the pool means a Pod on a node that has never served these models, and
+whether that is cheap or ruinous is decided entirely by where the weights live.
+
+They live on the shared claim the ordinary replicas already use, mounted at
+`/model-cache` with `HF_HOME` pointing at it. So a new Pod READS the weights
+rather than fetching them, and finds the torch.compile cache another Pod
+populated already there. Measured on Spectrum Scale, that read costs about the
+same whether or not the node has served the model before.
+
+Two consequences worth stating plainly, because both are load-bearing and
+neither is enforced by anything:
+
+**The claim must be ReadWriteMany.** Every Pod mounts it and Pods land on
+different nodes, so an RWO claim means the first replica runs and the second is
+stuck Pending on a multi-attach error. Nothing reports that as anything other
+than a pool which never grew. The claim is the tenant's, not the pool's, so this
+is a prerequisite rather than something the manifest can guarantee.
+
+**A node-local cache would be faster and would give this up.** Weights on local
+NVMe read faster than over a network filesystem, and would cut what remains of
+the ~35 s load. It would also mean every new node starts cold, and every model
+is fetched once per node. That is a real trade with a real upside; it is not the
+one this design makes.
+
+What growth still costs, unavoidably, is the LOAD: a new Pod must read each
+model it admits into its own host memory and GPU, at ~35 s each, serially, each
+holding a reserve slot while it happens. Nothing transfers resident state
+between Pods -- different processes, different cgroups -- and vLLM loads weights
+from a file rather than from another process's memory. That is why `GrowBy` is
+reported and never acted on: the cost is real enough to be a person's decision.
+
+The Pods also spread across nodes by preference. A pool concentrated on one node
+is not insurance: losing that node loses every warm model at once, and the next
+spike pays a full cold start for each of them.
 
