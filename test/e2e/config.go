@@ -58,7 +58,7 @@ func LoadConfigFromEnv() E2EConfig {
 		PollIntervalVerySlowSec: testconfig.GetEnvInt("E2E_EVENTUALLY_POLL_VERY_SLOW", 15),
 
 		WarmPoolProxyImage: testconfig.GetEnv("WARMPOOL_PROXY_IMAGE",
-			"ghcr.io/ev-shindin/warmpool-proxy:v7"),
+			"ghcr.io/ev-shindin/warmpool-proxy:v8"),
 	}
 
 	// OpenShift clusters typically don't have the HPAScaleToZero feature gate enabled, so native HPAs

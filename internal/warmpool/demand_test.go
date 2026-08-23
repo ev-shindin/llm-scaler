@@ -328,3 +328,87 @@ func TestVariantsSkipWhatItCannotWarmRatherThanGuessing(t *testing.T) {
 		})
 	}
 }
+
+func TestOnlyThePoolsOwnNamespaceIsWarmed(t *testing.T) {
+	// The registry spans every namespace WVA watches, while an Adapter is
+	// pinned to one -- and a variant is keyed by the ScaledObject's NAME, which
+	// is unique only within a namespace. Without this filter, two tenants can
+	// collide on a single warm-set entry, and one tenant's traffic could be
+	// pointed at the other's engine.
+	// The other namespace needs a REAL scale target, or it would be skipped for
+	// having none and the filter would look effective without being exercised.
+	elsewhere := deployment(1, vllmContainer())
+	elsewhere.Namespace = "other-tenant"
+
+	d, reg, _ := demandFor(t,
+		[]client.Object{deployment(1, vllmContainer()), elsewhere},
+		&fakeDatastore{pool: inferencePool()})
+	d.Namespace = "tenant"
+
+	registerVariant(reg, scaleTarget)
+	// The same variant name, in someone else's namespace.
+	reg.Observe("other-tenant", "qwen", nil)
+	reg.SetTarget("other-tenant", "qwen", registry.Target{Kind: "Deployment", Name: scaleTarget})
+
+	got, err := d.Variants(context.Background())
+	if err != nil {
+		t.Fatalf("Variants: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Variants = %+v, want only this pool's namespace", got)
+	}
+	if got[0].Model.Namespace != "tenant" {
+		t.Errorf("warmed %s, want tenant", got[0].Model.Namespace)
+	}
+}
+
+func TestOnlyTheFlagsAWarmCopyMustMatchAreCopied(t *testing.T) {
+	// These options become the argv of a process the pool runs on a GPU with
+	// the shared model cache mounted, and they are copied from a Deployment the
+	// tenant owns. Several vLLM flags load and run code the caller names; one
+	// turns the namespace-open serving port into an arbitrary file read.
+	spec := specWith(nil, []string{
+		"--model", "Qwen/Qwen3-0.6B",
+		"--gpu-memory-utilization", "0.95",
+		"--trust-remote-code",
+		"--tool-parser-plugin", "/model-cache/evil.py",
+		"--allowed-local-media-path", "/",
+		"--otlp-traces-endpoint", "http://elsewhere/",
+		"--logits-processors", "attacker.Module",
+	})
+	got, err := EngineOptionsFrom(spec)
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+
+	for _, kept := range []string{"--model Qwen/Qwen3-0.6B", "--gpu-memory-utilization 0.95"} {
+		if !strings.Contains(got, kept) {
+			t.Errorf("%q must survive -- it is part of what makes the copy the same engine: %q", kept, got)
+		}
+	}
+	for _, dropped := range []string{
+		"trust-remote-code", "tool-parser-plugin", "allowed-local-media-path",
+		"otlp-traces-endpoint", "logits-processors", "evil.py", "attacker.Module",
+	} {
+		if strings.Contains(got, dropped) {
+			t.Errorf("%q must not reach the pool's argv: %q", dropped, got)
+		}
+	}
+}
+
+func TestADroppedFlagTakesItsValueWithIt(t *testing.T) {
+	// Otherwise the value is left as a bare word, which a later parse could
+	// read as something else entirely.
+	got, err := EngineOptionsFrom(specWith(nil, []string{
+		"--model", "m", "--tool-parser-plugin", "/model-cache/evil.py", "--dtype", "bfloat16",
+	}))
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+	if strings.Contains(got, "evil.py") {
+		t.Fatalf("the dropped flag's value survived: %q", got)
+	}
+	if !strings.Contains(got, "--dtype bfloat16") {
+		t.Errorf("and the flag after it must be unaffected: %q", got)
+	}
+}

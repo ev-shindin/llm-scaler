@@ -900,3 +900,57 @@ func TestASelectorCannotLabelAPoolPodIntoTheControlPlane(t *testing.T) {
 		t.Error("the label must never have been applied")
 	}
 }
+
+func TestThePortIsReadAsATokenNotASubstring(t *testing.T) {
+	// A regular expression over the whole options string matched the FIRST
+	// --port=NNNN anywhere, including inside another flag's value -- while the
+	// pool appends the real one last. Believing the wrong port makes freePort
+	// reserve one already bound, and makes endpointOf resolve to a DIFFERENT
+	// resident instance, which Activate would then wake and serve under the
+	// requesting variant's labels.
+	for _, tc := range []struct {
+		options string
+		want    int
+	}{
+		{options: "--model m --port 9001", want: 9001},
+		{options: "--model m --port=9001", want: 9001},
+		{options: "--model /model-cache/w--port=9002/ --port 9001", want: 9001},
+		{options: "--served-model-name --port=9002 --port 9001", want: 9001},
+		{options: "--model m", want: 0},
+	} {
+		if got := portOf(tc.options); got != tc.want {
+			t.Errorf("portOf(%q) = %d, want %d", tc.options, got, tc.want)
+		}
+	}
+}
+
+func TestAResidentInstanceWithDifferentOptionsIsNotReused(t *testing.T) {
+	// Admission is idempotent on the instance already being there -- but only
+	// if it is the SAME engine. A different model, shape or compile cache key
+	// under the same name would answer one variant's requests with another
+	// variant's engine.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+
+	model := qwen()
+	model.EngineOptions = "--model SomeoneElse/Model-7B --enable-sleep-mode"
+
+	err := h.adapter.Warm(context.Background(), podA(), model, Ram)
+	if err == nil {
+		t.Fatal("want the reuse refused")
+	}
+	if !strings.Contains(err.Error(), "different options") {
+		t.Errorf("the error must say why: %v", err)
+	}
+	h.journal.never(t, "create")
+}
+
+func TestThePortIsNotPartOfWhatMakesTwoInstancesTheSame(t *testing.T) {
+	// The port is the pool's own choice and differs between Pods; everything
+	// else is the engine's identity. Comparing it would refuse every legitimate
+	// reuse.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	if err := h.adapter.Warm(context.Background(), podA(), qwen(), Ram); err != nil {
+		t.Fatalf("a resident instance differing only by port must be reused: %v", err)
+	}
+	h.journal.never(t, "create")
+}

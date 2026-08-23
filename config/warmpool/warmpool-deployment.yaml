@@ -211,7 +211,7 @@ spec:
           # `make docker-build-warmpool-proxy docker-push-warmpool-proxy
           # WARMPOOL_PROXY_IMG=...` (Dockerfile.warmpool-proxy) and republish
           # under the project's own namespace before this leaves a test cluster.
-          image: ghcr.io/ev-shindin/warmpool-proxy:v7@sha256:4612e260d78a22851ec730895975ceb7a07c3bc96086402b32ba089970a93a09
+          image: ghcr.io/ev-shindin/warmpool-proxy:v8@sha256:66e8bb63b985c87db81716b2047f07a5deba2f1729e5397f4476d2415af72093
           imagePullPolicy: IfNotPresent
           args:
             - --port=8000

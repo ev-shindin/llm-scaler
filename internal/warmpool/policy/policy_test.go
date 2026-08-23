@@ -775,3 +775,78 @@ func TestTheFitCheckIsOffWhenNoBudgetIsSet(t *testing.T) {
 		t.Fatalf("with no budget the check is off: admit=%+v declined=%+v", got.Admit, got.Declined)
 	}
 }
+
+func TestAReturnCarriesTheLabelsItHasToRemove(t *testing.T) {
+	// An action built from an OBSERVATION carries no PoolLabels -- ListWarm
+	// learns a variant's name and options from the supervisor, and the selector
+	// comes from the tenant's InferencePool, which only demand has read. Since
+	// Deactivate removes exactly the labels it is handed, a return built that
+	// way removed nothing at all: the Pod kept every InferencePool selector it
+	// had ever served, and the next model woken in it went Ready as an endpoint
+	// of BOTH pools.
+	withLabels := pool.ModelRef{
+		Namespace:  "workload",
+		Variant:    qwenVariant,
+		PoolLabels: map[string]string{"llm-d.ai/model": "qwen", "llm-d.ai/inferenceServing": "true"},
+	}
+	in := Input{
+		// The membership is what an observation produces: no labels on it.
+		Memberships: []pool.Membership{{
+			Pod:   pod("a"),
+			Model: pool.ModelRef{Namespace: "workload", Variant: qwenVariant},
+			State: pool.Serving,
+		}},
+		Variants: []VariantDemand{{Model: withLabels, Desired: 1, Ready: 1}},
+		Now:      now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 1 {
+		t.Fatalf("the bridge is no longer needed and must be returned: %+v", got.Return)
+	}
+	if len(got.Return[0].Model.PoolLabels) != 2 {
+		t.Fatalf("the return carries %v; without the selector it removes nothing",
+			got.Return[0].Model.PoolLabels)
+	}
+}
+
+func TestAnOrphanReturnAlsoCarriesTheLabels(t *testing.T) {
+	// Same requirement on the other return path. An orphan is an engine left
+	// awake by a sequence that did not finish -- it may well have been labelled
+	// before it was abandoned.
+	withLabels := pool.ModelRef{
+		Namespace:  "workload",
+		Variant:    qwenVariant,
+		PoolLabels: map[string]string{"llm-d.ai/model": "qwen"},
+	}
+	in := Input{
+		Memberships: []pool.Membership{{
+			Pod:   pod("a"),
+			Model: pool.ModelRef{Namespace: "workload", Variant: qwenVariant},
+			State: pool.Waking,
+		}},
+		Variants: []VariantDemand{{Model: withLabels, Desired: 1, Ready: 1}},
+		Now:      now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 1 || len(got.Return[0].Model.PoolLabels) != 1 {
+		t.Fatalf("an orphan return must carry the selector too: %+v", got.Return)
+	}
+}
+
+func TestAVariantDemandNoLongerKnowsAboutKeepsTheObservation(t *testing.T) {
+	// Deregistered while lent. Nothing better is available than what the
+	// observation saw, and the plan must still be produced -- leaving the Pod
+	// lent forever would be worse than leaving a label behind.
+	in := Input{
+		Memberships: []pool.Membership{{
+			Pod:   pod("a"),
+			Model: pool.ModelRef{Namespace: "workload", Variant: "forgotten"},
+			State: pool.Waking,
+		}},
+		Now: now,
+	}
+	got := Decide(in, cfg())
+	if len(got.Return) != 1 || got.Return[0].Model.Variant != "forgotten" {
+		t.Fatalf("want the orphan still returned: %+v", got.Return)
+	}
+}
