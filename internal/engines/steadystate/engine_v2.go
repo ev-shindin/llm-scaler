@@ -904,14 +904,32 @@ func buildCapacities(ctx context.Context, nr *allocation.NamedAnalyzerResult, me
 // Counting capacity that has not arrived yet is how a fleet gets scaled down
 // onto replicas that cannot take the load.
 //
-// A CurrentReplicas of zero is not treated as a clamp to zero: discovery reports
-// zero both for a genuinely parked variant and for a scale target it could not
-// read, and the two must not be conflated (see internal/engines/variantmeta).
-// Nothing is lost by skipping it — a decision based at zero replicas cannot
-// remove any.
+// The two signals it feeds are NOT conservative in the same direction, and the
+// scale-up side is the one to watch. SC shrinks, which can only hold replicas.
+// RC is sized against TotalAnticipatedSupply, which shrinks too, while demand is
+// still summed over the larger pod set — including resident KV on the condemned
+// replicas that is about to drain. Since a scale-up rounds up
+// (analyzer_helpers.go), a fractional shortfall orders a whole replica. Replaying
+// the benchmark: of the 45 passes where the clamp fires, 5 turn RC positive, each
+// anticipating by 15-30s a scale-up that pass made anyway. Excluding condemned
+// demand symmetrically would settle it, and needs a signal Kubernetes does not
+// publish (see below).
+//
+// A CurrentReplicas of zero is skipped rather than clamped to zero. Zero reaches
+// here only for a variant whose scale target IS readable and reports no replicas
+// — a parked one — because discovery drops a variant whose scale target it could
+// not resolve before any metadata exists (variantmeta.discovery, `continue` on an
+// unresolved target), so that case never arrives at all. Clamping a parked
+// variant to zero would erase supply for replicas still draining, and nothing is
+// gained: a decision based at zero replicas cannot remove any.
+//
+// Kubernetes publishes no terminating-replica count on a scale target's status,
+// so the symmetric fix — a departing counterpart to PendingReplicas — would mean
+// listing pods, which is the cluster-wide watch this design removed. Clamping to
+// a count the scale target already publishes is what makes this cheap.
 func clampReplicaCountToScaleTarget(vc *domain.VariantCapacity, m domain.VariantMetadata) {
-	if m.CurrentReplicas > 0 && vc.ReplicaCount > m.CurrentReplicas {
-		vc.ReplicaCount = m.CurrentReplicas
+	if m.CurrentReplicas > 0 {
+		vc.ReplicaCount = min(vc.ReplicaCount, m.CurrentReplicas)
 	}
 }
 

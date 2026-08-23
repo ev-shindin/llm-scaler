@@ -151,6 +151,12 @@ type VariantCapacity struct {
 	// hosts several engine instances, but the collector merges their metrics
 	// into one replica before an analyzer sees them, so there is one unit here
 	// and no DP factor for a consumer to reconcile.
+	//
+	// ReplicaCount is analyzer-measured but not analyzer-final: like Role above,
+	// the capacity-build step overlays it from discovery, capping it at
+	// VariantMetadata.CurrentReplicas so supply cannot describe a larger fleet
+	// than the scale target is committed to. The cap only ever lowers it. See
+	// steadystate.clampReplicaCountToScaleTarget for why.
 	ReplicaCount    int
 	PendingReplicas int
 

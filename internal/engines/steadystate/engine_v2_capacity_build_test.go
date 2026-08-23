@@ -347,3 +347,85 @@ var _ = Describe("clampReplicaCountToScaleTarget", func() {
 		Expect(int(r.RoleCapacities["decode"].SpareCapacity / prc)).To(BeZero())
 	})
 })
+
+// The clamp runs per variant inside the metadata-join loop, and per-role supply
+// is summed across variants afterwards. These pin the composition: that it does
+// not leak between variants, and what it does to the OTHER signal built from the
+// same supply.
+var _ = Describe("clampReplicaCountToScaleTarget composition", func() {
+	const prc = 487065.0
+
+	It("clamps only the variant that is over its own target", func() {
+		// Role must be set on the metadata as well as the capacity: the join
+		// overwrites Role from discovery, so metadata without one would blank it
+		// and collapse both variants into the same role bucket.
+		r := &allocation.NamedAnalyzerResult{
+			Result: &domain.AnalyzerResult{
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "prefill", Role: "prefill", ReplicaCount: 4, PerReplicaCapacity: prc},
+					{VariantName: "decode", Role: "decode", ReplicaCount: 6, PerReplicaCapacity: prc},
+				},
+				RoleDemand: map[string]float64{"prefill": 100, "decode": 100},
+			},
+		}
+		meta := map[string]domain.VariantMetadata{
+			"prefill": {VariantName: "prefill", Role: "prefill", CurrentReplicas: 4},
+			"decode":  {VariantName: "decode", Role: "decode", CurrentReplicas: 3},
+		}
+		buildCapacities(ctx, r, meta, 1.0, 1.0)
+
+		Expect(r.RoleCapacities["prefill"].TotalSupply).To(Equal(4*prc), "prefill was at its target and must be untouched")
+		Expect(r.RoleCapacities["decode"].TotalSupply).To(Equal(3*prc), "decode was over its target and must be clamped")
+		Expect(r.TotalSupply).To(Equal(7 * prc))
+	})
+
+	It("counts pending replicas against the clamped count", func() {
+		// Benign in practice: pending describes replicas ARRIVING and the clamp
+		// only fires while replicas are LEAVING, so the two do not normally
+		// coincide. Pinned so that if they ever do, the behaviour is a decision
+		// rather than an accident.
+		r := &allocation.NamedAnalyzerResult{
+			Result: &domain.AnalyzerResult{
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "decode", ReplicaCount: 5, PendingReplicas: 1, PerReplicaCapacity: prc},
+				},
+			},
+		}
+		meta := map[string]domain.VariantMetadata{
+			"decode": {VariantName: "decode", CurrentReplicas: 3},
+		}
+		buildCapacities(ctx, r, meta, 1.0, 1.0)
+
+		Expect(r.TotalSupply).To(Equal(3 * prc))
+		Expect(r.TotalAnticipatedSupply).To(Equal(4 * prc)) // (3 clamped + 1 pending)
+	})
+
+	It("can turn the scale-up signal positive, and that is not suppressed", func() {
+		// The asymmetry worth knowing about. SC shrinking can only hold replicas,
+		// but RC is sized against anticipated supply, which shrinks too, while
+		// demand is still summed over the larger pod set. So the same clamp that
+		// makes scale-down safer makes scale-up EAGERER. Unclamped this demand
+		// leaves RC at zero; clamped it asks for capacity.
+		newResult := func() *allocation.NamedAnalyzerResult {
+			return &allocation.NamedAnalyzerResult{
+				Result: &domain.AnalyzerResult{
+					TotalDemand: 900000,
+					VariantCapacities: []domain.VariantCapacity{
+						{VariantName: "decode", ReplicaCount: 3, PerReplicaCapacity: prc},
+					},
+				},
+			}
+		}
+
+		unclamped := newResult()
+		buildCapacities(ctx, unclamped, nil, 0.85, 0.70)
+		Expect(unclamped.RequiredCapacity).To(BeZero(), "three replicas of supply already cover this demand")
+
+		clamped := newResult()
+		buildCapacities(ctx, clamped, map[string]domain.VariantMetadata{
+			"decode": {VariantName: "decode", CurrentReplicas: 2},
+		}, 0.85, 0.70)
+		Expect(clamped.RequiredCapacity).To(BeNumerically(">", 0),
+			"with only two replicas committed, the same demand is a shortfall")
+	})
+})

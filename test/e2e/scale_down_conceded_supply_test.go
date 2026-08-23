@@ -24,10 +24,14 @@ import (
 // period expires. The race is the bug's natural habitat and a bad test.
 //
 // This stages the same INPUT without the timing: an extra serving replica that
-// the Deployment does not own. The collector attributes it to the variant (same
-// pod-template labels, same Service, same ServiceMonitor) and it reports real
-// capacity, but it is invisible to the Deployment's replica count — exactly the
-// state a condemned-but-still-scraping pod produces, held still.
+// no ReplicaSet owns. The collector still attributes it to the variant — it
+// resolves a pod's variant by walking ownerReferences up to a Deployment, and
+// this pod carries one — so it reports real capacity. But Status.Replicas is
+// summed from the ReplicaSets' pod counts, and none of them owns it, so the
+// scale target does not count it. Measured supply therefore exceeds the
+// committed count, which is exactly the state a condemned-but-still-scraping
+// replica produces, held still. See createUnownedReplica for why the owner has
+// to be the Deployment and nothing else.
 const concededFakeMetricsJSON = `{"kv-cache-usage":0.3,"running-requests":1,"waiting-requests":0}`
 
 // Production-shaped thresholds, because the arithmetic this guards is only
@@ -50,7 +54,6 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 		poolName              = "conceded-pool"
 		modelSvcName          = "conceded-ms"
 		modelDecodeDeployment = modelSvcName + "-decode"
-		serviceName           = modelSvcName + "-service"
 		scalerBaseName        = "conceded"
 		extraPodName          = modelSvcName + "-unowned-replica"
 		targetReplicas        = 2
@@ -152,8 +155,20 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 		}, time.Duration(cfg.PodReadyTimeout)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
 			Should(Succeed())
 
+		By("Proving WVA is actually driving this ScaledObject before relying on a negative")
+		// Everything below is a Consistently on a value NOT changing. That holds
+		// just as well when nothing is running: a miswired trigger, an unreachable
+		// controller or a wrong modelID would leave spec.replicas parked at the 2
+		// set above and the spec would pass while testing nothing. KEDA only
+		// populates the HPA's external CurrentMetrics after it has read the metric
+		// from WVA, so this pins the pipeline as live first.
+		Eventually(func(g Gomega) {
+			expectWVADesiredReplicasConsumed(g, cfg.LLMDNamespace, modelDecodeDeployment)
+		}, time.Duration(cfg.EventuallyExtendedSec)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
+
 		By("Adding a serving replica the Deployment does not own")
-		createUnownedReplica(cfg.LLMDNamespace, modelDecodeDeployment, serviceName, extraPodName)
+		createUnownedReplica(cfg.LLMDNamespace, modelDecodeDeployment, extraPodName)
 		DeferCleanup(func() {
 			propagation := metav1.DeletePropagationBackground
 			_ = k8sClient.CoreV1().Pods(cfg.LLMDNamespace).Delete(ctx, extraPodName, metav1.DeleteOptions{
@@ -204,22 +219,34 @@ func scaleDeployment(namespace, name string, replicas int32) {
 }
 
 // createUnownedReplica clones the Deployment's pod template into a standalone
-// Pod that serves and is scraped like any other replica but is not counted by
-// the Deployment.
+// Pod that serves and is scraped like any other replica, but that the Deployment
+// does not count.
 //
-// The owner reference is what keeps it unowned: a ReplicaSet adopts any matching
-// pod that has no CONTROLLER owner, and an adopted pod would be counted — and
-// then deleted to satisfy the replica count, destroying the premise. Pointing the
-// controller reference at the Service both blocks adoption and makes the pod
-// garbage-collected with the fixture, so a failed run cannot strand a GPU-less
-// simulator pod in the namespace.
-func createUnownedReplica(namespace, deploymentName, serviceName, podName string) {
+// The owner reference has to satisfy three constraints at once, and getting it
+// wrong makes this spec pass while proving nothing:
+//
+//   - The COLLECTOR must attribute the pod to the variant. It walks
+//     ownerReferences for a supported ancestor and accepts only Deployment or
+//     LeaderWorkerSet (collector/locator/walk.go); anything else resolves to no
+//     scale target and the pod is dropped as unattributed. A reference to the
+//     Service reads naturally and is exactly wrong: the pod then contributes no
+//     capacity, the measured count never exceeds the target, the clamp never
+//     fires, and the assertion below holds whether or not the fix is present.
+//   - The REPLICASET must not adopt it. Adoption applies to matching pods with no
+//     CONTROLLER owner; an adopted pod would be counted and then deleted to
+//     satisfy the replica count, destroying the premise. Any controller owner
+//     blocks it, including this one.
+//   - The DEPLOYMENT must still not count it. Status.Replicas is summed from the
+//     ReplicaSets' own pod counts, and no ReplicaSet owns this pod, so pointing
+//     the reference at the Deployment does not inflate the count it is being
+//     compared against.
+//
+// Owning it by the Deployment satisfies all three, and garbage-collects the pod
+// with the fixture so a failed run cannot strand a simulator pod holding a GPU.
+func createUnownedReplica(namespace, deploymentName, podName string) {
 	GinkgoHelper()
 	dep, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
-
-	svc, err := k8sClient.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred(), "the fixture Service must exist: it owns the unowned replica")
 
 	controller := true
 	pod := &corev1.Pod{
@@ -229,10 +256,10 @@ func createUnownedReplica(namespace, deploymentName, serviceName, podName string
 			Labels:      dep.Spec.Template.Labels,
 			Annotations: dep.Spec.Template.Annotations,
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "v1",
-				Kind:       "Service",
-				Name:       svc.Name,
-				UID:        svc.UID,
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       dep.Name,
+				UID:        dep.UID,
 				Controller: &controller,
 			}},
 		},
