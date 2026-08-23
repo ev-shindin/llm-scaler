@@ -185,11 +185,17 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 		By("Confirming the Deployment still reports only the replicas it owns")
 		// If the ReplicaSet adopted the extra pod, the premise is gone and the
 		// assertion below would pass for the wrong reason.
+		//
+		// Bounded on ONE side only. Adoption is the failure this guard exists for
+		// and it shows up as a count ABOVE the target. A count BELOW it is the
+		// regression itself, and that belongs to the assertion after this one:
+		// an equality check here would fire first and report a staging problem
+		// for what is actually the bug under test.
 		Consistently(func(g Gomega) {
 			dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).Get(ctx, modelDecodeDeployment, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(dep.Status.Replicas).To(BeNumerically("==", targetReplicas),
-				"the extra pod must stay unowned, or this test is not staging the condition it claims")
+			g.Expect(dep.Status.Replicas).To(BeNumerically("<=", targetReplicas),
+				"the ReplicaSet adopted the extra pod, so this test is not staging the condition it claims")
 		}, 30*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).Should(Succeed())
 
 		By("Asserting the extra replica's capacity is never treated as removable")
