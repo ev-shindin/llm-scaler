@@ -149,19 +149,23 @@ func main() {
 		"How long a borrowed Pod may serve before it is returned regardless. Bounds the case "+
 			"where the ordinary replicas never arrive, which would otherwise turn insurance "+
 			"into permanent capacity for one variant.")
-	warmPoolMemoryBudget := flag.Int64("warm-pool-memory-bytes", 40<<30,
+	warmPoolMemoryBudget := flag.Int64("warm-pool-memory-bytes", 120<<30,
 		"Host memory ONE pool Pod may commit to sleeping weights. A level-1 sleeper keeps its "+
 			"weights in host memory, so admitting one model too many does not fail that "+
 			"admission -- it OOM-kills the launcher and destroys every model already resident "+
-			"in the Pod. Must be comfortably under the container's memory limit. 0 disables "+
-			"the check.")
-	warmPoolGPUUtil := flag.Float64("warm-pool-gpu-memory-utilization", 0,
+			"in the Pod. Clamped to the container's own limit, so it cannot pretend to be a "+
+			"wall it is not; 0 means use that limit. A sleeper costs 2.6GiB + 1.4x its weights, "+
+			"measured -- so 120Gi is four 8B models, which is where the break-even sits.")
+	warmPoolGPUUtil := flag.Float64("warm-pool-gpu-memory-utilization", 0.90,
 		"Override --gpu-memory-utilization for warm copies. A workload's value is sized for a "+
 			"Pod running ONE engine and typically claims ~95% of the card, which leaves room "+
 			"for about three sleepers on an 80GiB GPU rather than the sixteen the warm set "+
 			"allows. Lowering it trades KV cache for warm-set size, and costs one extra "+
 			"compile (~9s) per model because the value is part of the torch.compile cache key. "+
-			"0 inherits the workload's value.")
+			"0 inherits the workload's value. Defaults to 0.90, which leaves room for three 8B "+
+			"sleepers' GPU residue beside an awake one at a cost of ~6% of KV cache -- the pool "+
+			"only pays when it holds several models per GPU, and an inherited 0.95 leaves room "+
+			"for none.")
 	warmPoolPreloadTop := flag.Int("warm-pool-preload-top", 2,
 		"Preload this many of the busiest variants while the pool has spare reserve, instead "+
 			"of waiting for each to miss. Popularity is share of desired replicas, which "+

@@ -267,6 +267,14 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 		// delay before failing.
 		delay := h.serveSlowly
 		if delay > 0 {
+			// Journalled ONLY on the slow path, so no other test sees an extra
+			// entry. It is the signal that Create has RETURNED to its caller:
+			// the "create" entry is written by the supervisor handler, which
+			// runs while the client is still reading the response, so
+			// cancelling on that can abort Create itself -- and a Create that
+			// fails leaves nothing to clean up, which is not what the test is
+			// about.
+			h.journal.add("serving-check")
 			h.mu.Unlock()
 			select {
 			case <-time.After(delay):
@@ -648,7 +656,7 @@ func TestCleanupSurvivesTheContextThatFailed(t *testing.T) {
 	go func() {
 		// Cancel once the instance exists, which is the only state from which
 		// cleanup has anything to do.
-		for !h.journal.has("create") {
+		for !h.journal.has("serving-check") {
 			time.Sleep(time.Millisecond)
 		}
 		cancel()

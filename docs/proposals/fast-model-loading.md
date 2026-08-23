@@ -240,6 +240,91 @@ What this still does not show: behaviour under concurrent load, more than two
 models, or anything about how often a real fleet would hit rather than miss
 (§6.1).
 
+### 2.8 Break-even, now that the costs are measured (2026-08-23)
+
+Everything above argues the pool *can* pay. This works out when, using the
+figures measured on an H100 rather than assumed ones. The conclusion is sharper
+than expected, and it is not entirely comfortable.
+
+**The saving is a factor of C, and nothing else.**
+
+Take the honest competitor from §2.1: to avoid a cold start for a model, you
+keep a spare replica of it warm. For M models that is M GPUs of insurance. A
+warm pool replaces that with K Pods, so it frees `(1 - K/M)` of the insurance —
+and K is set by whichever of two constraints binds:
+
+- **capacity**, so a spike finds a free Pod. This is the loss system of §2.2.
+- **coverage**, so a spike finds its model resident. `K >= M/C`, where C is how
+  many models fit in one Pod.
+
+Capacity is not the binding one, and it is not close. With M models each spiking
+once an hour and a bridge held for 60 s:
+
+| models | offered load | K for <1% blocking | K for coverage at C=4 |
+|---|---|---|---|
+| 10 | 0.17 erl | 3 | 3 |
+| 20 | 0.33 erl | 3 | 5 |
+| 50 | 0.83 erl | 4 | 13 |
+| 100 | 1.67 erl | 6 | 25 |
+
+So `K = M/C`, the saving is `1 - 1/C`, and **the entire economic case reduces to
+how many models fit on one GPU**. That is exactly the quantity §14d of the
+implementation document just measured.
+
+**At C=1 the pool is not merely break-even, it is worse than the thing it
+replaces.** A spare replica and a pool Pod both hold one GPU and keep one model
+warm — but the spare replica SERVES, and a sleeper cannot until it is woken. One
+model per Pod means paying the same GPU for strictly less. Any argument for the
+pool has to start by establishing C > 1.
+
+**What C costs, for an 8B model.** A sleeper charges its container
+`2.6 GiB + 1.4x weights` (measured), and holds ~2.5 GiB of GPU that the awake
+engine therefore cannot claim:
+
+| C | host limit needed | max `--gpu-memory-utilization` | KV cache left | vs 0.95 |
+|---|---|---|---|---|
+| 1 | 23 GiB | 1.00 | 65 GiB | +6.5% |
+| 2 | 47 GiB | 0.97 | 63 GiB | +2.5% |
+| 4 | 94 GiB | 0.91 | 58 GiB | **-5.7%** |
+| 6 | 141 GiB | 0.84 | 53 GiB | -13.9% |
+| 8 | 188 GiB | 0.78 | 48 GiB | -22.1% |
+
+The host figures are affordable: the GPU nodes measured here carry ~2 TiB across
+8 GPUs, about 250 GiB per GPU, so even C=8 fits with room. **The price of C is
+paid in KV cache**, and therefore in the awake model's concurrency.
+
+C=4 costs under 6% of KV cache and frees three quarters of the insurance GPUs.
+That is a good trade and it is the configuration this design should be argued
+for. C=6 is defensible. C=8 starts to cost real throughput to buy insurance.
+
+**THE SHIPPED DEFAULTS DO NOT CLEAR THE BAR.** 48 GiB and an inherited
+`--gpu-memory-utilization` of 0.95 give C = 1, or 2 with nothing to spare — the
+regime where the pool loses to a spare replica. The defaults were chosen before
+any of this was measured, against a 0.6 B model where they are generous. For any
+model anyone would actually pool they are wrong, and the pool as shipped would
+be an expensive way to do worse than nothing.
+
+Sizing the defaults for C=4 at 8B means `memory: 128Gi` and
+`--warm-pool-gpu-memory-utilization=0.90`. That is a manifest change and a flag
+default, not a design change.
+
+**What this analysis does not include**, and would need a trace to settle:
+
+- Whether spikes are actually independent. Erlang assumes they are; correlated
+  demand (a shared upstream, a batch window) collapses the capacity argument,
+  and capacity is the constraint with all the headroom.
+- Whether the M models are equally likely to spike. Skew HELPS — it is what
+  makes a small warm set cover most spikes, per §2.3 — so ignoring it makes
+  this estimate conservative.
+- The 0.25 s wake against a spare replica's zero. Immaterial next to a 35 s cold
+  start, mentioned so it is not mistaken for an oversight.
+- The operational cost of a component that holds GPUs and can strand them. Six
+  review rounds found several ways it could; they are fixed, but a spare replica
+  has none of that surface.
+
+**So: the pool pays when C >= 4 and there are more models than pool Pods.** Both
+are configuration, both are now quantified, and neither is what ships today.
+
 ## 3. What measurement already forces
 
 These are settled by experiment and constrain any design, whatever mechanism it

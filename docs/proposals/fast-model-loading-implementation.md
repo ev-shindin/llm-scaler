@@ -668,9 +668,9 @@ scale-ups are failing and the pool is masking it.
 > | `--warm-pool-namespace` | "" | which namespace's models to warm; empty disables the pool entirely |
 > | `--warm-pool-sleep-min-size` | 1 | the floor on FREE Pods — the reserve kept for the next spike |
 > | `--warm-pool-max-hold` | 2m | how long a bridge may serve before it is returned regardless |
-> | `--warm-pool-memory-bytes` | 40Gi | host memory one Pod may commit to sleeping weights, clamped to the container's own limit |
+> | `--warm-pool-memory-bytes` | 120Gi | host memory one Pod may commit to sleeping models, clamped to the container's own limit. Four 8B sleepers, which is where the break-even sits |
 > | `--warm-pool-gpus-per-pod` | 1 | a fallback only; what the POD declares wins (§14c) |
-> | `--warm-pool-gpu-memory-utilization` | 0 | the pool's own value, overriding the workload's; 0 inherits (§14a) |
+> | `--warm-pool-gpu-memory-utilization` | 0.90 | the pool's own value, overriding the workload's; 0 inherits (§14a). 0.90 leaves room for three 8B sleepers beside an awake one |
 > | `--warm-pool-preload-top` | 2 | how many of the busiest variants to preload; 0 disables |
 >
 > Everything else below has no counterpart: `accelerator`,
@@ -1059,8 +1059,11 @@ decide admissions because both terms err upward relative to the weights, and the
 consequences are asymmetric: too high declines an admission and costs a cold
 start, too low costs the Pod.
 
-**What this means for a 48 GiB Pod:** one 8B with room to spare, or two at a
-squeeze. A 32B sleeper needs ~86 GiB and does not fit at all.
+**What this means for a Pod's memory limit:** at the 48 GiB this shipped with,
+one 8B with room to spare, or two at a squeeze. That is the regime where the
+pool loses to a spare replica -- see §2.8 of the review document, where the
+saving works out to a factor of C, the models held per Pod. The base manifest is
+128 GiB now, which is four. A 32B sleeper needs ~86 GiB, so even there C=1.
 
 **GPU residue does not scale with the model, but is not constant either.**
 1,399 MiB for a 0.6B, 2,021-2,843 MiB for an 8B across runs, and 4,319 MiB per

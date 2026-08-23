@@ -159,7 +159,7 @@ spec:
               # Memory is a limit as well as a request because the warm set is
               # the thing worth protecting: an unbounded Pod that gets evicted
               # loses every resident model at once.
-              memory: 48Gi
+              memory: 128Gi
             requests:
               nvidia.com/gpu: "1"
               # THE MEMORY REQUEST IS THE WARM-SET BUDGET. Measured on an
@@ -177,10 +177,21 @@ spec:
               # models as needing no memory at all, and the kubelet evicts it:
               # the one outcome the pool exists to prevent.
               #
-              # 48Gi holds ONE 8B with room to spare, or two at a squeeze. A
-              # 32B sleeper needs ~86 GiB and does not fit here at all -- see
-              # config/warmpool-multi-gpu, which raises both together.
-              memory: 48Gi
+              # 128Gi holds FOUR 8B models (4 x 23.4 GiB, with margin), which
+              # is the number the break-even works out at: see §2.8 of
+              # docs/proposals/fast-model-loading.md. The saving over keeping a
+              # spare replica per model is a factor of C, the models held per
+              # Pod, so C=1 is not break-even -- it is strictly worse than the
+              # spare replica, which holds the same GPU and can actually serve.
+              #
+              # This was 48Gi, chosen before any of it was measured and against
+              # a 0.6B model. For anything anyone would really pool, 48Gi gives
+              # C=1 or 2: the regime where the pool loses.
+              #
+              # A 32B sleeper needs ~86 GiB, so C=1 even here; see
+              # config/warmpool-multi-gpu, which raises the GPUs and the memory
+              # together.
+              memory: 128Gi
               cpu: "2"
           volumeMounts:
             - name: pod-home
