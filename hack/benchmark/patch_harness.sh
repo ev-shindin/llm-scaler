@@ -437,3 +437,62 @@ io.open(path, "w", encoding="utf-8", newline="\n").write(src.replace(old, new, 1
 print("  fix 5 (duplicate podmonitor): template guarded on the chart's monitor")
 PYEOF
 fi
+
+# ---------------------------------------------------------------------------
+# Fix 6 -- defaults.yaml: pin the modelservice chart, which floats.
+#
+# The chart version is resolved at PLAN time while the sidecar image beside it
+# is pinned, so the two halves of a matched pair drift apart on their own:
+#
+#   config/templates/values/defaults.yaml:117  llm-d-routing-sidecar_version: v0.9.0
+#   config/templates/values/defaults.yaml:485  llmDModelservice: auto
+#
+# llm-d-modelservice v0.4.16 (published 2026-08-21) added, in _helpers.tpl:
+#
+#   - --model-server-port={{ default 8200 .proxy.targetPort }}
+#
+# which the pinned v0.9.0 sidecar rejects outright: "unknown flag:
+# --model-server-port". The routing-proxy init container CrashLoopBackOffs, the
+# decode pod never leaves PodInitializing, and benchmark-standup fails after its
+# full 25-minute wait with "Decode pods not ready". Nothing in the clone changed
+# and nothing we did changed -- the chart moved underneath a pinned image, which
+# is what `auto` promises to do eventually.
+#
+# Pinned to v0.4.15, the last release compatible with the sidecar tag this
+# harness pins. Both halves of a matched pair get pinned or neither does: a
+# floating dependency is not a property a BENCHMARK can afford, because it makes
+# two runs silently incomparable while both report success.
+#
+# Delete this block when the sidecar tag is bumped to a release accepting the
+# flag, and pin the chart to whatever that release pairs with.
+# ---------------------------------------------------------------------------
+DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
+[ -f "$DEFAULTS" ] || fail "expected file missing: $DEFAULTS"
+
+"$PY" - "$DEFAULTS" <<'PYEOF' || fail "fix 6 (modelservice chart pin) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8").read()
+
+PINNED = "  llmDModelservice: v0.4.15"
+if PINNED in src:
+    print("  fix 6 (modelservice chart pin): already applied")
+    sys.exit(0)
+
+ANCHOR = "  llmDModelservice: auto"
+if ANCHOR not in src:
+    sys.exit("anchor missing (upstream shape changed): %r" % ANCHOR)
+
+# Comment carried into the clone so anyone reading the rendered values sees why
+# it is not "auto" like its neighbours.
+REPLACEMENT = (
+    "  # wva-patch: pinned. v0.4.16 emits --model-server-port, which the\n"
+    "  # llm-d-routing-sidecar version pinned above does not accept.\n"
+    + PINNED
+)
+
+src = src.replace(ANCHOR, REPLACEMENT, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 6 (modelservice chart pin): applied")
+PYEOF
