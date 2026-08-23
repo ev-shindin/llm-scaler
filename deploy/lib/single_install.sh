@@ -68,7 +68,16 @@ wva_installations() {
 # cluster that already had one and be told nothing.
 wva_installations_raw() {
     local out rc
-    out=$(kubectl get deployments -A -l app.kubernetes.io/name=workload-variant-autoscaler         -o go-template="$WVA_INSTALLS_TEMPLATE" 2>&1); rc=$?
+    # control-plane=controller-manager is what makes it a CONTROLLER, and the
+    # name label alone is not. Every WVA component carries the name label --
+    # notably the warm-pool Deployment, which is a data-plane workload with no
+    # reconcile loop at all. Matching on the name alone found one and, because
+    # its args carry no --watch-namespace, classified it cluster-scoped by the
+    # rule below. The install then refused with "A cluster-scoped WVA is already
+    # installed: evgensh-wva-test/wva-warm-pool", naming a Deployment that
+    # manages nothing, and there was no way to proceed except to disable a check
+    # that was right in principle.
+    out=$(kubectl get deployments -A -l app.kubernetes.io/name=workload-variant-autoscaler,control-plane=controller-manager -o go-template="$WVA_INSTALLS_TEMPLATE" 2>&1); rc=$?
     if [ $rc -ne 0 ]; then
         if printf '%s' "$out" | grep -qi 'forbidden'; then
             log_warning "Cannot check whether another WVA is already installed (listing Deployments cluster-wide is not permitted for you)."
