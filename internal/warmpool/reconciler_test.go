@@ -1,8 +1,13 @@
 package warmpool
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"github.com/go-logr/stdr"
+	stdlog "log"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -132,6 +137,86 @@ func podA() types.NamespacedName {
 
 func model(variant string) pool.ModelRef {
 	return pool.ModelRef{Namespace: "workload", Variant: variant, PoolLabels: map[string]string{"llm-d.ai/model": variant}}
+}
+
+// logTo returns a context whose logger writes into buf at a verbosity that
+// includes V(1). stdr defaults to 0, which silently drops the state line these
+// tests exist to assert on -- a test that passes because nothing was logged
+// would agree with the bug.
+func logTo(t *testing.T, buf *bytes.Buffer) context.Context {
+	t.Helper()
+	old := stdr.SetVerbosity(1)
+	t.Cleanup(func() { stdr.SetVerbosity(old) })
+	return log.IntoContext(context.Background(), stdr.New(stdlog.New(buf, "", 0)))
+}
+
+func TestAPoolWhoseEveryPodIsReserveSaysSo(t *testing.T) {
+	// The state the obvious first deployment lands in: one Pod, the default
+	// reserve of one. policy.Decide computes free-minus-reserve, so the budget is
+	// zero forever and nothing is ever admitted -- silently, while the Pod holds
+	// a GPU. Confirmed on a cluster: adding a second Pod made admission fire on
+	// the next pass, with no other change.
+	p := &fakePool{memberships: []pool.Membership{
+		{Model: pool.ModelRef{}, Pod: podA(), State: pool.Asleep},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("qwen"), Desired: 1, Ready: 1}}}
+	cfg := testConfig()
+	cfg.SleepMinSize = 1
+	r := New(p, d, cfg)
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if !strings.Contains(buf.String(), "every Pod is reserve") {
+		t.Fatalf("an inert pool must say so; got %q", buf.String())
+	}
+}
+
+func TestASteadyPoolDoesNotRepeatItself(t *testing.T) {
+	// The state line is deduplicated, not periodic: a pool that is not changing
+	// should be quiet, or the log becomes something operators filter out and
+	// then miss the one line that mattered.
+	p := &fakePool{memberships: []pool.Membership{
+		{Model: model("qwen"), Pod: podA(), State: pool.Asleep},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("qwen"), Desired: 1, Ready: 1}}}
+	r := New(p, d, testConfig())
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	for i := 0; i < 3; i++ {
+		if _, err := r.Once(ctx); err != nil {
+			t.Fatalf("Once: %v", err)
+		}
+	}
+	if got := strings.Count(buf.String(), "warm pool state"); got != 1 {
+		t.Fatalf("an unchanging pool must log its state once, got %d:\n%s", got, buf.String())
+	}
+}
+
+func TestAChangedPoolReportsAgain(t *testing.T) {
+	// The other half: dedup must not swallow a real change, or the feature
+	// trades one silence for another.
+	p := &fakePool{memberships: []pool.Membership{
+		{Model: model("qwen"), Pod: podA(), State: pool.Asleep},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("qwen"), Desired: 1, Ready: 1}}}
+	r := New(p, d, testConfig())
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	p.memberships = nil // every Pod went away
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if got := strings.Count(buf.String(), "warm pool state"); got != 2 {
+		t.Fatalf("a changed pool must report again, got %d:\n%s", got, buf.String())
+	}
 }
 
 func TestABorrowIsCarriedOutWhenAVariantIsShort(t *testing.T) {
