@@ -26,6 +26,72 @@ func specWith(command, args []string) *corev1.PodSpec {
 	}}
 }
 
+func TestEngineOptionsExpandTheContainersOwnEnv(t *testing.T) {
+	// Copied from a live llm-d decode Deployment. The chart writes a SHELL
+	// SCRIPT and relies on the shell expanding these from the container env at
+	// runtime; the launcher expands nothing, so an unexpanded token reached vLLM
+	// and the admitted instance went straight to `stopped`. Seen on a real
+	// admission, after the controller had done everything else right.
+	spec := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name:    "vllm",
+		Command: []string{"/bin/bash", "-c"},
+		Args: []string{"/bin/true ; vllm serve /model-cache/models/Qwen/Qwen3-0.6B \\\n" +
+			"  --block-size $VLLM_BLOCK_SIZE \\\n" +
+			"  --max-model-len ${VLLM_MAX_MODEL_LEN} \\\n" +
+			"  --tensor-parallel-size $VLLM_TENSOR_PARALLELISM"},
+		Env: []corev1.EnvVar{
+			{Name: "VLLM_BLOCK_SIZE", Value: "64"},
+			{Name: "VLLM_MAX_MODEL_LEN", Value: "16000"},
+			{Name: "VLLM_TENSOR_PARALLELISM", Value: "1"},
+		},
+	}}}
+	got, err := EngineOptionsFrom(spec)
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+	for _, want := range []string{"--block-size 64", "--max-model-len 16000", "--tensor-parallel-size 1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want %q in %q", want, got)
+		}
+	}
+	if strings.Contains(got, "$") {
+		t.Errorf("an unexpanded variable reached the warm copy: %q", got)
+	}
+	// The shell's line continuations must not survive as bare words, or the one
+	// before a flag is read as that flag's value.
+	for _, f := range strings.Fields(got) {
+		if f == "\\" {
+			t.Errorf("a line-continuation backslash survived: %q", got)
+		}
+	}
+}
+
+func TestEngineOptionsDropAFlagWhoseValueCannotBeResolved(t *testing.T) {
+	// A valueFrom cannot be read from a PodSpec. Leaving the token in place lets
+	// normaliseOptions drop the flag AND its value, which is safer than
+	// expanding it to empty -- that would leave `--max-model-len` sitting next to
+	// the following flag and read as a valid command line with the wrong shape.
+	spec := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name:    "vllm",
+		Command: []string{"/bin/bash", "-c"},
+		Args:    []string{"vllm serve Qwen/Qwen3-0.6B --max-model-len $FROM_A_SECRET --dtype bfloat16"},
+		Env: []corev1.EnvVar{{
+			Name:      "FROM_A_SECRET",
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+		}},
+	}}}
+	got, err := EngineOptionsFrom(spec)
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+	if strings.Contains(got, "max-model-len") {
+		t.Errorf("an unresolvable flag must be dropped, not guessed: %q", got)
+	}
+	if !strings.Contains(got, "--dtype bfloat16") {
+		t.Errorf("the resolvable flags must survive: %q", got)
+	}
+}
+
 func TestEngineOptionsReadTheLlmdChartsPositionalForm(t *testing.T) {
 	// The argv of a real llm-d decode Deployment, copied from a live cluster:
 	// a shell wrapper, and the model given POSITIONALLY to `vllm serve` with no

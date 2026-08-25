@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"strconv"
 	"strings"
 
@@ -207,6 +208,7 @@ func EngineOptionsFrom(spec *corev1.PodSpec) (string, error) {
 	for i := range spec.Containers {
 		container := &spec.Containers[i]
 		joined := strings.TrimSpace(strings.Join(append(append([]string{}, container.Command...), container.Args...), " "))
+		joined = expandEnv(joined, container.Env)
 		joined, ok := withExplicitModel(joined)
 		if !ok {
 			continue
@@ -214,6 +216,61 @@ func EngineOptionsFrom(spec *corev1.PodSpec) (string, error) {
 		return normaliseOptions(joined), nil
 	}
 	return "", errors.New("no container names a model")
+}
+
+// expandEnv substitutes $NAME and ${NAME} from the container's own env, and
+// drops the line-continuation backslashes a shell would have eaten.
+//
+// The argv this is copied from is usually a SHELL SCRIPT, not an exec form.
+// llm-d's chart renders
+//
+//	/bin/bash -c "... vllm serve $MODEL --block-size $VLLM_BLOCK_SIZE \
+//	  --max-model-len $VLLM_MAX_MODEL_LEN ..."
+//
+// and the shell expands those at runtime from the container's env. The pool
+// hands its argv to the launcher, where nothing expands anything, so vLLM was
+// given the literal text "$VLLM_BLOCK_SIZE" and the instance went straight to
+// `stopped`. Observed on a real admission: the controller admitted the model,
+// created the instance, and the engine could never start.
+//
+// Only literal env values can be resolved. A valueFrom -- a Secret, a
+// ConfigMap, the downward API -- is not readable from a PodSpec, and a warm copy
+// carrying an unresolved reference would fail exactly as before. Those are left
+// as they are so the flag is dropped below rather than silently mis-set: an
+// unexpanded token is not a flag name, so normaliseOptions removes it along with
+// its value.
+func expandEnv(argv string, env []corev1.EnvVar) string {
+	if argv == "" {
+		return argv
+	}
+	values := make(map[string]string, len(env))
+	for _, e := range env {
+		if e.ValueFrom != nil {
+			continue
+		}
+		values[e.Name] = e.Value
+	}
+	expanded := os.Expand(argv, func(name string) string {
+		if v, ok := values[name]; ok {
+			return v
+		}
+		// Unknown: put it back verbatim. Expanding it to "" would turn
+		// `--max-model-len $X` into `--max-model-len` followed by the next flag,
+		// which reads as a valid command line with the wrong shape.
+		return "$" + name
+	})
+	// A trailing backslash is the shell's line continuation. It survives into a
+	// joined block scalar as a bare word, and a bare word next to a flag is read
+	// as that flag's value.
+	fields := strings.Fields(expanded)
+	out := fields[:0]
+	for _, f := range fields {
+		if f == "\\" {
+			continue
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
 }
 
 // withExplicitModel rewrites the POSITIONAL form of a vLLM command line into the
@@ -373,15 +430,27 @@ func normaliseOptions(options string) string {
 			}
 			continue
 		}
+		// A value still carrying a \$ is one expandEnv could not resolve -- a
+		// valueFrom, which is not readable from a PodSpec. Drop the flag WITH
+		// its value: passed on, vLLM receives the literal token and the instance
+		// dies at startup, which is the same failure as before by a longer road.
+		if hasInline && strings.Contains(inline, "$") {
+			continue
+		}
 		if hasInline {
 			out = append(out, name+"="+inline)
 			continue
 		}
-		out = append(out, name)
 		if i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
-			out = append(out, fields[i+1])
+			if strings.Contains(fields[i+1], "$") {
+				i++
+				continue
+			}
+			out = append(out, name, fields[i+1])
 			i++
+			continue
 		}
+		out = append(out, name)
 	}
 	joined := strings.Join(out, " ")
 	if !strings.Contains(joined, "--enable-sleep-mode") {
