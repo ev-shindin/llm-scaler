@@ -97,6 +97,11 @@ type Membership struct {
 	// eviction ranks on.
 	LastUsed time.Time
 
+	// Pool is the name of the pool this Pod belongs to, from its
+	// llm-d.ai/warm-pool label. Empty when the install has one unnamed pool,
+	// which is the shape every existing deployment has.
+	Pool string
+
 	// Capacity is what the Pod holding this instance actually has, read from
 	// its own spec rather than configured.
 	//

@@ -342,10 +342,10 @@ func TestAPodWhoseReturnFailedIsNotThenAdmittedInto(t *testing.T) {
 
 	// Admission runs in a goroutine, so give it a chance to be wrong.
 	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && !p.did("warm newcomer") {
+	for time.Now().Before(deadline) && !p.didPrefix("warm newcomer@") {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if p.did("warm newcomer") {
+	if p.didPrefix("warm newcomer@") {
 		t.Error("admitted a model into a Pod whose previous engine never slept")
 	}
 }

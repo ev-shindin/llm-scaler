@@ -809,6 +809,15 @@ func main() {
 			)
 			reconciler.Name = warmPoolNS
 			reconciler.Trigger = trigger
+			// Pools are DISCOVERED from the Deployments that declare them, so a
+			// second pool is a manifest rather than a manifest plus a controller
+			// restart. The flags above become the base every pool's annotations
+			// are layered onto, and are used whole when nothing declares a pool.
+			reconciler.Pools = &warmpool.DeploymentPools{
+				Client:    mgr.GetClient(),
+				Namespace: warmPoolNS,
+				Fallback:  reconciler.Config,
+			}
 			setupLog.Info("warm pool enabled",
 				"namespace", warmPoolNS,
 				"sleepMinSize", *warmPoolSleepMinSize,

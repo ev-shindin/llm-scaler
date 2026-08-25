@@ -26,6 +26,12 @@ const (
 	ComponentLabel = "app.kubernetes.io/component"
 	// ComponentValue is the value ComponentLabel carries on pool Pods.
 	ComponentValue = "warm-pool"
+	// PoolLabel names the pool a Pod belongs to. A namespace may hold more than
+	// one -- a cluster with two accelerator types needs one pool per type,
+	// because a warm copy is only reusable on the GPU it was loaded on, and a
+	// tensor-parallel variant needs Pods holding that many devices. Absent means
+	// the single unnamed pool.
+	PoolLabel = "llm-d.ai/warm-pool"
 	// NameLabel is the other half of the pool Deployment's own selector.
 	NameLabel = "app.kubernetes.io/name"
 	// gpuResource is what a pool Pod asks for, and what identifies the
@@ -164,9 +170,10 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
 	capacity := capacityOf(p)
+	poolName := p.Labels[PoolLabel]
 	if len(instances) == 0 {
 		// An idle Pod is reserve, and must be visible as such. See Membership.
-		return []Membership{{Pod: podRef, State: Absent, Tier: a.tier, Capacity: capacity}}, nil
+		return []Membership{{Pod: podRef, State: Absent, Tier: a.tier, Capacity: capacity, Pool: poolName}}, nil
 	}
 	out := make([]Membership, 0, len(instances))
 	for _, inst := range instances {
@@ -179,6 +186,7 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 			Tier:     a.tier,
 			Endpoint: ep,
 			Capacity: capacity,
+			Pool:     poolName,
 		})
 	}
 	return out, nil

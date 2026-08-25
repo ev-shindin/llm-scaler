@@ -99,10 +99,14 @@ type Reconciler struct {
 	// now exists so tests do not sleep.
 	now func() time.Time
 
-	// lastSummary is the previous pass's one-line state, so a steady pool logs
-	// once rather than every Interval. Guarded by passMu, which already
-	// serialises the whole pass.
-	lastSummary string
+	// Pools reports the pools that exist. Nil means one unnamed pool running
+	// under Config, which is what every install had before pools were named.
+	Pools PoolSource
+
+	// lastSummary is the previous pass's one-line state PER POOL, so a steady
+	// pool logs once rather than every Interval. Guarded by passMu, which
+	// already serialises the whole pass.
+	lastSummary map[string]string
 }
 
 // New returns a Reconciler ready to Start.
@@ -120,6 +124,7 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		missesAt:      map[string][]time.Time{},
 		admitting:     map[string]bool{},
 		admittingPods: map[types.NamespacedName]bool{},
+		lastSummary:   map[string]string{},
 		now:           time.Now,
 	}
 }
@@ -175,23 +180,77 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		return policy.Plan{}, err
 	}
 
-	r.mu.Lock()
-	in := policy.Input{
-		Memberships: memberships,
-		Variants:    variants,
-		BorrowedAt:  copyBorrows(r.borrowedAt),
-		MissesAt:    copyMisses(r.missesAt),
-		Admitting:   maps.Clone(r.admittingPods),
-		Now:         r.now(),
+	pools, err := r.poolSpecs(ctx)
+	if err != nil {
+		return policy.Plan{}, err
 	}
-	r.mu.Unlock()
+	if orphans := Orphaned(memberships, pools); len(orphans) > 0 {
+		// A Pod labelled for a pool nothing declares holds a GPU that no pool
+		// will ever lend. Silence here reads as a pool that is simply small.
+		log.FromContext(ctx).WithName("warmpool").Info(
+			"warm pool Pods belong to no declared pool and are holding GPUs unusably; "+
+				"check their llm-d.ai/warm-pool label against the pool Deployments",
+			"pods", orphans)
+	}
 
-	plan := policy.Decide(in, r.Config)
-	free := pool.FreePods(memberships)
-	metrics.SetWarmPoolFreePods(r.Name, free)
-	r.report(ctx, memberships, variants, plan, free)
-	r.apply(ctx, plan)
-	return plan, nil
+	// One decision per pool. The per-variant state below -- borrows, misses,
+	// admissions in flight -- is keyed by Pod and variant, both already unique
+	// across pools, so it needs no splitting.
+	var merged policy.Plan
+	for _, spec := range pools {
+		mine := MembershipsIn(memberships, spec.Name)
+
+		r.mu.Lock()
+		in := policy.Input{
+			Memberships: mine,
+			Variants:    variants,
+			BorrowedAt:  copyBorrows(r.borrowedAt),
+			MissesAt:    copyMisses(r.missesAt),
+			Admitting:   maps.Clone(r.admittingPods),
+			Now:         r.now(),
+		}
+		r.mu.Unlock()
+
+		plan := policy.Decide(in, spec.Config)
+		free := pool.FreePods(mine)
+		metrics.SetWarmPoolFreePods(r.metricName(spec), free)
+		r.report(ctx, spec, mine, variants, free)
+		r.apply(ctx, plan)
+		merged = mergePlans(merged, plan)
+	}
+	return merged, nil
+}
+
+// poolSpecs is the declared pools, or the single unnamed one when nothing
+// declares any.
+func (r *Reconciler) poolSpecs(ctx context.Context) ([]PoolSpec, error) {
+	if r.Pools == nil {
+		return []PoolSpec{{Name: "", Config: r.Config}}, nil
+	}
+	return r.Pools.Pools(ctx)
+}
+
+// metricName keeps the pool label stable for the single unnamed pool, which
+// reported under the namespace before pools had names. Renaming a live series
+// loses its history for no gain.
+func (r *Reconciler) metricName(spec PoolSpec) string {
+	if spec.Name == "" {
+		return r.Name
+	}
+	return spec.Name
+}
+
+// mergePlans concatenates two pools' plans so one pass still reports one Plan.
+func mergePlans(a, b policy.Plan) policy.Plan {
+	a.Return = append(a.Return, b.Return...)
+	a.Borrow = append(a.Borrow, b.Borrow...)
+	a.Admit = append(a.Admit, b.Admit...)
+	a.Evict = append(a.Evict, b.Evict...)
+	a.Blocked = append(a.Blocked, b.Blocked...)
+	a.Missed = append(a.Missed, b.Missed...)
+	a.Declined = append(a.Declined, b.Declined...)
+	a.GrowBy += b.GrowBy
+	return a
 }
 
 // report logs what the pass saw, but only when it differs from the last one.
@@ -205,14 +264,30 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 //
 // Deduplicated rather than rate-limited so a steady pool is quiet and a change
 // is visible immediately, which is the opposite of what a periodic dump gives.
-func (r *Reconciler) report(ctx context.Context, memberships []pool.Membership, variants []policy.VariantDemand, plan policy.Plan, free int) {
+func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []pool.Membership, variants []policy.VariantDemand, free int) {
 	logger := log.FromContext(ctx).WithName("warmpool")
+	if r.lastSummary == nil {
+		// A Reconciler built as a struct literal rather than through New has no
+		// map here, and writing to a nil one panics. An unset field is a
+		// mistake, not a request to crash the pass.
+		r.lastSummary = map[string]string{}
+	}
+	name := r.metricName(spec)
 	pods := len(pool.ByPod(memberships))
 	summary := fmt.Sprintf("pods=%d free=%d resident=%d variants=%d lent=%d",
 		pods, free, len(memberships), len(variants), len(r.Lent()))
-	if summary != r.lastSummary {
-		logger.V(1).Info("warm pool state", "pool", r.Name, "state", summary)
-		r.lastSummary = summary
+	if summary != r.lastSummary[name] {
+		logger.V(1).Info("warm pool state", "pool", name, "state", summary)
+		r.lastSummary[name] = summary
+	}
+
+	// The reserve cannot fit inside the pool. Read from the Deployment, so it is
+	// reported whether or not any model has asked for anything yet -- the check
+	// below only fires once there is demand, which is exactly when it is too
+	// late to be useful.
+	if why, inert := spec.Inert(); inert {
+		logger.Info("warm pool is configured so that it can never admit a model",
+			"pool", name, "reason", why)
 	}
 
 	// A pool whose every Pod is reserve can never admit anything: the budget in
@@ -222,10 +297,10 @@ func (r *Reconciler) report(ctx context.Context, memberships []pool.Membership, 
 	// the outside, and it is the state the obvious first deployment lands in:
 	// one Pod, the default reserve of one. Proven on a cluster by adding a
 	// second Pod, after which admission fired on the next pass.
-	if pods > 0 && pods <= r.Config.SleepMinSize && len(variants) > 0 {
+	if pods > 0 && pods <= spec.Config.SleepMinSize && len(variants) > 0 {
 		logger.Info("warm pool cannot admit any model: every Pod is reserve. "+
 			"Add Pods or lower the reserve, or the pool will hold GPUs and never warm anything",
-			"pool", r.Name, "pods", pods, "sleepMinSize", r.Config.SleepMinSize)
+			"pool", name, "pods", pods, "sleepMinSize", spec.Config.SleepMinSize)
 	}
 }
 

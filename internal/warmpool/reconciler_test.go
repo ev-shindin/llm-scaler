@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/go-logr/stdr"
 	stdlog "log"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/stdr"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
@@ -44,7 +44,11 @@ func (f *fakePool) ListWarm(context.Context) ([]pool.Membership, error) {
 }
 
 func (f *fakePool) Warm(ctx context.Context, p types.NamespacedName, m pool.ModelRef, _ pool.Tier) error {
-	f.record("warm " + m.Variant)
+	// The POD is part of the record, as it is for activate and deactivate. It
+	// was dropped here, so no test could say which Pod a model was admitted
+	// into -- which is exactly the question once a namespace holds more than
+	// one pool.
+	f.record("warm " + m.Variant + "@" + p.Name)
 	if f.warmStarted != nil {
 		f.warmStarted <- struct{}{}
 	}
@@ -89,6 +93,16 @@ func (f *fakePool) seen() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+// didPrefix is did for a call whose Pod half is not the point of the assertion.
+func (f *fakePool) didPrefix(prefix string) bool {
+	for _, c := range f.seen() {
+		if strings.HasPrefix(c, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakePool) did(call string) bool {
@@ -148,6 +162,86 @@ func logTo(t *testing.T, buf *bytes.Buffer) context.Context {
 	old := stdr.SetVerbosity(1)
 	t.Cleanup(func() { stdr.SetVerbosity(old) })
 	return log.IntoContext(context.Background(), stdr.New(stdlog.New(buf, "", 0)))
+}
+
+// fakePools is a fixed set of declared pools.
+type fakePools []PoolSpec
+
+func (f fakePools) Pools(context.Context) ([]PoolSpec, error) { return []PoolSpec(f), nil }
+
+func TestEachPoolKeepsItsOwnReserve(t *testing.T) {
+	// The point of naming pools: the reserve is per pool, so a pool with room
+	// admits while one whose every Pod is reserve does not -- on the SAME pass,
+	// for the SAME model. Before the split both Pods were one flat pool under
+	// one config, so the reserve was a single number spanning accelerators that
+	// cannot substitute for each other.
+	//
+	// The reserve gates ADMISSION, not borrowing: lending a Pod that already
+	// holds the model warm is what the pool is for.
+	podRoomy := types.NamespacedName{Namespace: "pool", Name: "roomy-0"}
+	podStrict := types.NamespacedName{Namespace: "pool", Name: "strict-0"}
+	p := &fakePool{
+		memberships: []pool.Membership{
+			{Pod: podRoomy, State: pool.Absent, Pool: "zzz-roomy"},
+			{Pod: podStrict, State: pool.Absent, Pool: "aaa-strict"},
+		},
+		warmStarted: make(chan struct{}, 2),
+	}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("parked"), Parked: true}}}
+
+	roomy, strict := testConfig(), testConfig()
+	roomy.SleepMinSize = 0
+	strict.SleepMinSize = 1
+
+	r := New(p, d, testConfig())
+	// The STRICT pool is named so it sorts FIRST. With the roomy one first, a
+	// bug that ignores per-pool config still produces the right Pod: the roomy
+	// pool admits, and the variant-level dedup then suppresses the strict pool's
+	// attempt, so the outcome is identical either way. Ordering the strict pool
+	// first makes the two cases diverge.
+	r.Pools = fakePools{
+		{Name: "aaa-strict", Config: strict, Replicas: 1},
+		{Name: "zzz-roomy", Config: roomy, Replicas: 1},
+	}
+
+	if _, err := r.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	// Admission runs in its own goroutine so a ~35 s load cannot hold the loop.
+	select {
+	case <-p.warmStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no admission was started at all")
+	}
+	if !p.did("warm parked@roomy-0") {
+		t.Fatalf("the pool with room must admit: %v", p.seen())
+	}
+	if p.did("warm parked@strict-0") {
+		t.Fatalf("a pool whose every Pod is reserve must not: %v", p.seen())
+	}
+}
+
+func TestAPodInNoDeclaredPoolIsNeverLent(t *testing.T) {
+	// A Pod whose label matches no pool holds a GPU nothing will lend. Folding
+	// it into the first pool would be worse than ignoring it: that pool would
+	// admit models into a Pod sized for something else.
+	stray := types.NamespacedName{Namespace: "pool", Name: "stray-0"}
+	p := &fakePool{memberships: []pool.Membership{
+		{Model: model("qwen"), Pod: stray, State: pool.Asleep, Pool: "typo"},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("qwen"), Desired: 2, Ready: 1}}}
+
+	open := testConfig()
+	open.SleepMinSize = 0
+	r := New(p, d, testConfig())
+	r.Pools = fakePools{{Name: "declared", Config: open, Replicas: 2}}
+
+	if _, err := r.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if len(r.Lent()) != 0 {
+		t.Fatalf("a Pod in no declared pool must not be lent: %v", r.Lent())
+	}
 }
 
 func TestAPoolWhoseEveryPodIsReserveSaysSo(t *testing.T) {
@@ -328,7 +422,7 @@ func TestTheSameAdmissionIsNotIssuedTwice(t *testing.T) {
 
 	warms := 0
 	for _, c := range p.seen() {
-		if c == "warm parked" {
+		if strings.HasPrefix(c, "warm parked@") {
 			warms++
 		}
 	}
