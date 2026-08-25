@@ -6,10 +6,16 @@ kind: Kustomization
 #
 #   kubectl apply -k config/warmpool-multi-gpu -n <the models' namespace>
 #
-# and start the controller with a matching --warm-pool-gpus-per-pod. The two
-# numbers are independent and both real: the Deployment decides what the Pod
-# gets, the flag decides what the policy believes it has, and a mismatch either
-# declines admissions that would fit or accepts ones that cannot start.
+# There is nothing to configure on the controller to match it. WVA reads the GPU
+# count from this Pod's own spec, so the Deployment is the only place the number
+# lives and there is no second copy to disagree with it.
+#
+# This overlay REPLACES the base pool rather than adding a second one: it patches
+# the same Deployment, so the namespace ends up with one pool whose Pods hold
+# four GPUs. If you want both shapes at once -- a cheap single-GPU pool for most
+# models and a wide one for tensor-parallel models -- deploy two pools with
+# different llm-d.ai/warm-pool names, and have each model name the one it wants
+# with the warmPool trigger metadata key. See docs/guides/warm-pool/.
 #
 # WHAT THIS SUPPORTS, and what remains untested, because the difference matters
 # more than the list:

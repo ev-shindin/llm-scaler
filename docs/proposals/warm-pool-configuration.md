@@ -243,6 +243,68 @@ Pod serves while the variant has zero ordinary replicas.
 - **Silent success** — done: a deduplicated state line, so a working pool and a
   dead one are no longer indistinguishable.
 
+## Part 5: what stays warm, and how big the pool is
+
+Two questions the automatic policy cannot answer, added after the first four
+steps landed.
+
+### Which models, and how many copies
+
+Automatic admission ranks parked variants, then the busiest, then anything that
+has missed twice. It cannot express two things:
+
+- a **low-traffic but latency-critical** model, which popularity ranking will
+  never warm and which no amount of tuning `preload-top` will reach;
+- **two simultaneous scale-ups of one model**, because a single warm copy
+  bridges a single scale-up and the second goes cold with free Pods beside it.
+
+One trigger-metadata key covers both, and the opt-out as well:
+
+| `warmPoolCopies` | means |
+| --- | --- |
+| *absent* | automatic — at most one copy, ranked by the pool |
+| `"0"` | never warm this model |
+| `"1"` | pin one copy |
+| `"N"` | N copies, so N scale-ups bridge at once |
+
+`"1"` is deliberately not the same as absent: absent lets a quiet model lose its
+slot to a busier one. Copies land in different Pods, since a second copy beside
+the first shares its accelerators and could never serve a second bridge.
+
+This is also the only way to weight a shared pool. Automatic mode holds one copy
+of each model and no more, so "two of A, one of B" is otherwise inexpressible.
+
+### The pool's own size
+
+The pool gets **its own ScaledObject**, and is scaled the way every other
+workload here is: WVA publishes a size, KEDA writes it.
+
+The first attempt did not. It patched `spec.replicas` directly, which needed a
+permission `internal/controller/rbac.go` explicitly warns against — *"the single
+permission a cluster admin is most right to refuse"* — with an instruction not
+to re-add it without first answering "why is WVA writing when KEDA actuates?".
+Answered honestly, it should not be. Scaling through KEDA means the controller
+needs no write permission at all, not even one scoped by `resourceNames` to a
+single object.
+
+Three things fell out of that, which is how you know it was the right shape:
+
+- **The hysteresis went away.** Counting consecutive short and idle passes was a
+  hand-rolled stabilization window. An HPA has those, so the asymmetry a warm
+  pool needs — grow promptly, shrink slowly, because too small costs latency on
+  every spike while too large only costs money — now lives in the ScaledObject's
+  `behavior` block where it can be seen and tuned.
+- **The min/max annotations went away**, because `minReplicaCount` and
+  `maxReplicaCount` already say it. Two ways to bound one number is exactly the
+  duplicated-fact problem this document exists to remove; it had crept back in.
+- **What remains is one stateless formula:** `lent + reserve + 1`. Lent Pods
+  cannot count toward the reserve because they are serving; the `+1` is what
+  makes admission possible at all.
+
+A pool's trigger carries `warmPoolName` instead of `modelID` — a pool serves no
+model — and both consumers that build variants skip those entries, so the pool
+does not become a phantom variant every engine has to special-case.
+
 ## Order, and what is done
 
 1. **Done.** Derived `gpusPerPod`, memory and namespace; deleted the flags.
@@ -255,7 +317,9 @@ Pod serves while the variant has zero ordinary replicas.
 4. **Done.** RBAC preflight (`SelfSubjectAccessReview` for pods `patch`, the pool
    refuses to start without it) and a distinct diagnosis when EVERY Pod is
    unreadable at once.
-5. **Deferred.** Cross-namespace pools, only if a real deployment needs them.
+5. **Done.** `warmPoolCopies` for pinning, opting out and non-even
+   distribution; the pool's own ScaledObject for its size.
+6. **Deferred.** Cross-namespace pools, only if a real deployment needs them.
 
 The user guide is written: [Bridge a scale-up with a warm
 pool](../guides/warm-pool/).
@@ -297,6 +361,10 @@ identity with no such grant. The DENIAL branch was not exercised end to end: on
 pokprod the controller's ServiceAccount draws `patch` from a ClusterRole shared
 with other namespaces' installs, so revoking it to observe one log line would
 have broken other tenants. That branch is unit-tested and mutation-checked.
+
+**Not verified on a cluster:** everything in Part 5 — `warmPoolCopies` and the
+pool ScaledObject are unit-tested only, and the second changes how the pool's
+size reaches Kubernetes at all.
 
 **Not verified on a cluster:** the accelerator MISMATCH path. Every GPU node on
 pokprod is an H100, so there is no second type to be declined against, and the

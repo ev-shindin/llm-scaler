@@ -663,19 +663,31 @@ scale-ups are failing and the pool is masking it.
 > **NOT BUILT AS A ConfigMap — read this section as a wish list.** The
 > configuration surface is seven flags:
 >
-> | flag | default | what it decides |
-> | --- | --- | --- |
-> | `--warm-pool-namespace` | "" | which namespace's models to warm; empty disables the pool entirely |
-> | `--warm-pool-sleep-min-size` | 1 | the floor on FREE Pods — the reserve kept for the next spike |
-> | `--warm-pool-max-hold` | 2m | how long a bridge may serve before it is returned regardless |
-> | `--warm-pool-memory-bytes` | 120Gi | host memory one Pod may commit to sleeping models, clamped to the container's own limit. Four 8B sleepers, which is where the break-even sits |
-> | `--warm-pool-gpus-per-pod` | 1 | a fallback only; what the POD declares wins (§14c) |
-> | `--warm-pool-gpu-memory-utilization` | 0.90 | the pool's own value, overriding the workload's; 0 inherits (§14a). 0.90 leaves room for three 8B sleepers beside an awake one |
-> | `--warm-pool-preload-top` | 2 | how many of the busiest variants to preload; 0 disables |
+> **Superseded.** The flag table below described the surface before
+> `docs/proposals/warm-pool-configuration.md`. What is true now:
 >
-> Everything else below has no counterpart: `accelerator`,
-> `tensorParallel`, `tier`, `replicas`, `awakeSlots`, `growDebounceSeconds`,
-> `shrinkSlack`, `minPredictedSaving`, `parkedWithinHours`, `evict` and `pin`
+> | where | what it decides |
+> | --- | --- |
+> | pool **Deployment** annotations | `sleep-min-size`, `max-hold`, `preload-top`, `gpu-memory-utilization` — per pool, layered over the flags below |
+> | pool **Deployment** labels | `llm-d.ai/warm-pool` names the pool; a namespace may hold several |
+> | pool **Deployment** pod spec | GPUs per Pod and the memory limit, READ rather than configured |
+> | the Pod's **node** | the accelerator a warm copy is reusable on |
+> | pool **ScaledObject** | the pool's own size, via KEDA; `minReplicaCount` must exceed the reserve |
+> | model **trigger metadata** | `warmPool` selects a pool, `warmPoolCopies` pins / opts out / asks for N copies |
+> | remaining **flags** | `--warm-pool-namespace` (derived from the watched namespace when empty), plus the four knobs above as defaults |
+>
+> `--warm-pool-gpus-per-pod` is DELETED: its own help said it had to match the
+> Deployment's GPU request, and a value that must equal another object's field
+> is a second copy that can only agree or fail silently.
+> `--warm-pool-memory-bytes` defaults to 0, meaning take the container's limit.
+>
+> Of the unimplemented list below, `accelerator`, `replicas`, `pin` and
+> per-model copy counts now exist; `growDebounceSeconds` and `shrinkSlack` were
+> implemented and then deleted, because an HPA's stabilization windows do the
+> same job in an object operators already read.
+>
+> Everything else below has no counterpart: `tensorParallel`, `tier`,
+> `awakeSlots`, `minPredictedSaving`, `parkedWithinHours` and `evict`
 > are unimplemented, and `warmSetPerPod` is fixed at 16 rather than
 > configurable at 8. The tier is hardcoded to RAM and the reconcile interval to
 > 5 s.
@@ -995,10 +1007,11 @@ every cycle.
 
 The base manifest holds one GPU, which is the common case and the cheap one.
 `config/warmpool-multi-gpu` is the same pool with four, for models whose engines
-span more. Two numbers have to agree: the Deployment decides what the Pod gets,
-`--warm-pool-gpus-per-pod` decides what the policy believes it has, and a
-mismatch either declines admissions that would fit or accepts ones that cannot
-start.
+span more. Only one number is involved now: the Deployment decides what the Pod
+gets and WVA reads it from the Pod, so there is nothing to keep in step. A model
+asking for more devices than a Pod holds is declined with a reason naming both
+figures. Running both shapes at once means two pools with different
+`llm-d.ai/warm-pool` names, each selected by the models that want it.
 
 **Why LWS is a different design rather than a missing feature.** A LeaderWorkerSet
 engine is several Pods; a pool Pod is one Pod holding several engines. Warming

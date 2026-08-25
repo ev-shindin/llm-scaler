@@ -7,9 +7,9 @@
 # warmable.
 #
 # Four is an example, not a recommendation. Set it to the parallelism of the
-# models this pool is for, and pass the SAME number as
-# --warm-pool-gpus-per-pod, or the controller will decline exactly the
-# admissions this overlay exists to allow.
+# models this pool is for; nothing else needs telling. WVA reads the count from
+# this Pod, so the number cannot disagree with a flag, and a model asking for
+# more devices than a Pod holds is declined with a reason naming both figures.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
