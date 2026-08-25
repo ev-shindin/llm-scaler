@@ -48,8 +48,9 @@ scaleDownBoundary: 0.70
 analyzerName: "saturation"
 `
 	got := buildSaturationConfigYAMLWithModel(
-		saturationQueueLengthThreshold, saturationScaleUpThreshold,
-		saturationScaleDownBoundary, "meta/llama", "llm-d",
+		saturationKVCacheThreshold, saturationQueueLengthThreshold,
+		saturationScaleUpThreshold, saturationScaleDownBoundary,
+		"meta/llama", "llm-d",
 	)
 	if got != want {
 		t.Errorf("buildSaturationConfigYAMLWithModel() =\n%q\nwant\n%q", got, want)
