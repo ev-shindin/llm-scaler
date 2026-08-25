@@ -1,8 +1,18 @@
 # Warm pool: configuration surface
 
-Status: proposal. Follows the cluster run of 2026-08-25, which took the pool
-through a full borrow -> bridge -> return cycle and produced the requirements
-below.
+Status: steps 1-3 implemented; cross-namespace pools (step 5) deferred. Follows
+the cluster run of 2026-08-25, which took the pool through a full borrow ->
+bridge -> return cycle and produced the requirements below.
+
+One thing changed shape during implementation. Step 1 turned out to be mostly
+DONE already: `doesNotFit` preferred the Pod's declared capacity over the flag,
+and every pool Pod carries that capacity including an empty one. So the work was
+deleting flags that could only ever agree or silently disagree, not building a
+derivation.
+
+And one requirement was missing from this document entirely -- accelerator
+matching, added as Part 3a below. It is what makes multiple pools necessary
+rather than merely possible.
 
 ## What exists today
 
@@ -146,6 +156,49 @@ the scaling-policy resolver already sets: the silent fallback is the right
 behaviour and the wrong silence. Per project convention this is a `reason` on
 `wva_model_scaling_blocked`, not a new gauge.
 
+## Part 3a: matching the GPU model, not just the count
+
+The fit check compared GPU COUNT and stopped, so a pool of A100 Pods would warm
+a model pinned to H100: the right number of the wrong GPU. The load is spent for
+nothing, because the workload's own affinity refuses the node the warm copy sits
+on, so no bridge from it can serve.
+
+**Reading `nodeSelector` alone would have been useless.** A live llm-d decode
+Deployment pins its accelerator entirely through
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: nvidia.com/gpu.product
+          operator: In
+          values: [NVIDIA-H100-80GB-HBM3]
+```
+
+and writes **no `nodeSelector` at all** -- checked on the cluster before writing
+the check. A `nodeSelector`-only version would find nothing, conclude every
+workload is portable, and never fire on the layout it exists to protect. Both
+forms are read, plus the provider label aliases, without which a CoreWeave fleet
+demonstrably on H200s reads as having no accelerator.
+
+Deliberately NOT treated as a requirement: a *preferred* affinity (the scheduler
+may ignore it); a `NotIn` term (says what a workload refuses, not what it needs);
+a multi-valued `In` (says the workload is portable between those models); and any
+key that is not a GPU-model label, or a workload pinned to a zone would appear to
+demand an accelerator called `us-east-1a`.
+
+Only a PROVEN mismatch blocks. Nodes are cluster-scoped, so a namespace-scoped
+install may legitimately not read them; declining every admission there would
+silently disable the pool, which is the failure this whole document exists to
+remove. An unknown accelerator therefore allows, and appears in the pool state
+line so its absence is visible rather than assumed.
+
+This is also what settles Part 2: multiple pools are **necessary**, not a
+convenience. One pool cannot serve two accelerator types, because a warm copy is
+only reusable on the GPU it was loaded on.
+
 ## Part 3: GPU accounting
 
 Warm pool GPUs **are** already counted, and the accounting is correct. Verified
@@ -190,15 +243,54 @@ Pod serves while the variant has zero ordinary replicas.
 - **Silent success** — done: a deduplicated state line, so a working pool and a
   dead one are no longer indistinguishable.
 
-## Suggested order
+## Order, and what is done
 
-1. Derive `gpusPerPod`, memory and namespace; delete the flags. Removes a whole
-   class of silent mismatch and shrinks the surface before it is documented.
-2. Name pools (`llm-d.ai/warm-pool` label) and read knobs from annotations,
-   keeping flags as the fallback for a single unnamed pool.
-3. Honour `warmPool` in trigger metadata; decline-and-report on ambiguity.
-4. RBAC preflight and the NetworkPolicy diagnosis.
-5. Cross-namespace pools, only if a real deployment needs them.
+1. **Done.** Derived `gpusPerPod`, memory and namespace; deleted the flags.
+2. **Done.** Pools are named by the `llm-d.ai/warm-pool` label and discovered
+   from the Deployments that declare them; knobs are annotations on the
+   Deployment, layered over the flags; each pool keeps its own reserve.
+3. **Done.** `warmPool` in trigger metadata, needed only to disambiguate;
+   unresolvable selection is declined and reported per variant.
+3a. **Done.** Accelerator matching, from nodeAffinity as well as nodeSelector.
+4. **Not started.** RBAC preflight (`SelfSubjectAccessReview` for pods `patch`)
+   and a distinct diagnosis for the NetworkPolicy case.
+5. **Deferred.** Cross-namespace pools, only if a real deployment needs them.
 
-Steps 1-2 are worth doing before any user-facing guide is written: documenting
-the current surface means documenting three duplicated facts and a footgun.
+### Verified on the cluster, 2026-08-25
+
+Steps 1, 2, 3 and 3a were run on pokprod. One log line covers three of them:
+
+```
+warm pool enabled  {"namespace":"evgensh-wva-test","sleepMinSize":1,"maxHold":"2m0s",
+                    "memoryBudgetBytes":0,"gpuMemoryUtilization":0.9,"preloadTop":2}
+warm pool state    {"pool":"default","state":"pods=2 free=2 resident=2 variants=1
+                    lent=0 accelerator=NVIDIA-H100-80GB-HBM3"}
+```
+
+`memoryBudgetBytes: 0` is the derived default and `gpusPerPod` is gone entirely
+(step 1); `pool: default` is discovered from the Deployment label rather than
+configured (step 2); the accelerator was read from the node the Pod runs on
+(step 3a). A model was then admitted and reached `running`.
+
+Step 3 was exercised by adding a second pool Deployment at `replicas: 0`, which
+costs no GPU but makes the namespace ambiguous:
+
+```
+variant will get no warm copy  {"variant":"qwen-...-decode-wva",
+  "reason":"names no warm pool and this namespace has 2 (default, second);
+            set the \"warmPool\" trigger metadata key"}
+```
+
+Setting `warmPool: default` in the trigger metadata restored it on the next KEDA
+call, and both pools reported their own state independently. The warm copy was
+NOT destroyed while the variant was unassignable, which is the right behaviour:
+eviction answers pressure, not a variant that stopped asking.
+
+**Not verified on a cluster:** the accelerator MISMATCH path. Every GPU node on
+pokprod is an H100, so there is no second type to be declined against, and the
+alternatives -- repinning the live workload to a fake accelerator -- would take
+the tenant's own deployment down to test a log line. The reading of both sides is
+verified above; the decline itself rests on mutation-checked unit tests.
+
+A user-facing guide is now worth writing, which it was not before: the surface no
+longer contains three duplicated facts and a footgun.
