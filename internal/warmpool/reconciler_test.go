@@ -277,6 +277,55 @@ func TestAPoolWhoseEveryPodIsReserveSaysSo(t *testing.T) {
 	}
 }
 
+func TestAnInertPoolIsReportedOnceNotTwice(t *testing.T) {
+	// Two checks describe this condition from different evidence: the declared
+	// replica count, and the Pods that exist. Both firing reads as two separate
+	// faults, and the reader has to work out they are one. Seen on a cluster --
+	// raising the reserve to equal replicas produced two lines, one after the
+	// other, saying the same thing.
+	p := &fakePool{memberships: []pool.Membership{
+		{Pod: podA(), State: pool.Absent, Pool: "sized"},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("qwen"), Desired: 1, Ready: 1}}}
+	cfg := testConfig()
+	cfg.SleepMinSize = 1
+	r := New(p, d, cfg)
+	r.Pools = fakePools{{Name: "sized", Config: cfg, Replicas: 1}}
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if got := strings.Count(buf.String(), "can never admit"); got != 1 {
+		t.Fatalf("the Deployment-based reason must be the only one, got %d:\n%s", got, buf.String())
+	}
+	if strings.Contains(buf.String(), "every Pod is reserve") {
+		t.Errorf("the Pod-count check must stand down where the Deployment answered: %s", buf.String())
+	}
+}
+
+func TestAPoolWithNoDeploymentStillReportsBeingInert(t *testing.T) {
+	// The other half: with no Deployment to read, Replicas is unknown and Inert
+	// cannot answer, so the Pod-count check is the only thing that can say it.
+	p := &fakePool{memberships: []pool.Membership{
+		{Pod: podA(), State: pool.Absent},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("qwen"), Desired: 1, Ready: 1}}}
+	cfg := testConfig()
+	cfg.SleepMinSize = 1
+	r := New(p, d, cfg) // no r.Pools: the single unnamed pool, Replicas unknown
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if !strings.Contains(buf.String(), "every Pod is reserve") {
+		t.Fatalf("an inert pool with no Deployment must still say so: %s", buf.String())
+	}
+}
+
 func TestASteadyPoolDoesNotRepeatItself(t *testing.T) {
 	// The state line is deduplicated, not periodic: a pool that is not changing
 	// should be quiet, or the log becomes something operators filter out and

@@ -335,7 +335,8 @@ func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []po
 	// reported whether or not any model has asked for anything yet -- the check
 	// below only fires once there is demand, which is exactly when it is too
 	// late to be useful.
-	if why, inert := spec.Inert(); inert {
+	why, inert := spec.Inert()
+	if inert {
 		logger.Info("warm pool is configured so that it can never admit a model",
 			"pool", name, "reason", why)
 	}
@@ -347,7 +348,13 @@ func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []po
 	// the outside, and it is the state the obvious first deployment lands in:
 	// one Pod, the default reserve of one. Proven on a cluster by adding a
 	// second Pod, after which admission fired on the next pass.
-	if pods > 0 && pods <= spec.Config.SleepMinSize && len(variants) > 0 {
+	// Only when the Deployment could not answer it. Both checks describe the
+	// same condition from different evidence -- Inert reads the declared replica
+	// count, this one counts Pods that exist -- and saying it twice reads as two
+	// faults. Inert is preferred where it applies because it names the
+	// annotation to change; this one is the answer for a pool with no Deployment
+	// to read, where Replicas is unknown.
+	if !inert && pods > 0 && pods <= spec.Config.SleepMinSize && len(variants) > 0 {
 		logger.Info("warm pool cannot admit any model: every Pod is reserve. "+
 			"Add Pods or lower the reserve, or the pool will hold GPUs and never warm anything",
 			"pool", name, "pods", pods, "sleepMinSize", spec.Config.SleepMinSize)
