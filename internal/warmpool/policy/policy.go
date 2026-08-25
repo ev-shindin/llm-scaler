@@ -397,6 +397,15 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 		return fmt.Sprintf("needs %d GPUs, this Pod holds %d", shape.GPUs, gpus)
 	}
 
+	// The right NUMBER of the wrong GPU is still the wrong GPU. A warm copy is
+	// only reusable on the accelerator it was loaded on, so a pool of one type
+	// cannot serve a model pinned to another: the bridge would place traffic on
+	// hardware the workload's own affinity refuses, and the load that produced
+	// it is spent for nothing.
+	if why, bad := pool.AcceleratorMismatch(model.Accelerator, capacity.Accelerator); bad {
+		return why
+	}
+
 	budget := cfg.PodMemoryBytes
 	// Clamped to the container's own limit, never above it. A budget larger
 	// than the limit is not a wall -- the kubelet enforces the limit whatever

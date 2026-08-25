@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -253,6 +255,27 @@ func mergePlans(a, b policy.Plan) policy.Plan {
 	return a
 }
 
+// acceleratorsIn summarises the GPU models a pool's Pods sit on.
+func acceleratorsIn(memberships []pool.Membership) string {
+	seen := map[string]bool{}
+	var models []string
+	for _, m := range memberships {
+		name := m.Capacity.Accelerator
+		if name == "" {
+			name = "unknown"
+		}
+		if !seen[name] {
+			seen[name] = true
+			models = append(models, name)
+		}
+	}
+	if len(models) == 0 {
+		return "none"
+	}
+	sort.Strings(models)
+	return strings.Join(models, ",")
+}
+
 // report logs what the pass saw, but only when it differs from the last one.
 //
 // Everything else in this file logs on FAILURE only, which means a pool that is
@@ -274,8 +297,12 @@ func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []po
 	}
 	name := r.metricName(spec)
 	pods := len(pool.ByPod(memberships))
-	summary := fmt.Sprintf("pods=%d free=%d resident=%d variants=%d lent=%d",
-		pods, free, len(memberships), len(variants), len(r.Lent()))
+	// The accelerator is in the summary because its ABSENCE is the interesting
+	// case: an install that cannot read nodes matches nothing, and the fit check
+	// then treats every model as portable. That is the right failure direction,
+	// but a silent one, and this line is deduplicated so saying it costs nothing.
+	summary := fmt.Sprintf("pods=%d free=%d resident=%d variants=%d lent=%d accelerator=%s",
+		pods, free, len(memberships), len(variants), len(r.Lent()), acceleratorsIn(memberships))
 	if summary != r.lastSummary[name] {
 		logger.V(1).Info("warm pool state", "pool", name, "state", summary)
 		r.lastSummary[name] = summary

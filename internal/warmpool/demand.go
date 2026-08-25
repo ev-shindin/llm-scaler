@@ -122,6 +122,9 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 				Variant:       entry.Name,
 				EngineOptions: options,
 				PoolLabels:    labels,
+				// From the workload's OWN pod template, so the pool matches what
+				// the scheduler will actually enforce for the ordinary replicas.
+				Accelerator: pool.AcceleratorRequiredBy(&workload.Spec.Template.Spec),
 			},
 			Desired: desired,
 			Ready:   ready,

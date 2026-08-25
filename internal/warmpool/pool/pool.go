@@ -69,6 +69,11 @@ type ModelRef struct {
 	// replicas' -- a different --gpu-memory-utilization is a different
 	// torch.compile cache key, and a cache miss costs ~9 s of extra compile.
 	EngineOptions string
+	// Accelerator is the GPU model the workload requires, from its own pod
+	// template, or "" if it requires none in particular. A warm copy is only
+	// reusable on the accelerator it was loaded on, so this is what keeps a pool
+	// of one GPU type from warming a model pinned to another.
+	Accelerator string
 	// PoolLabels are the labels that make a Pod a member of this model's
 	// InferencePool: the target pool's own `spec.selector.matchLabels`, resolved
 	// by the caller from the InferencePool rather than assumed here. Selectors
@@ -124,6 +129,10 @@ type PodCapacity struct {
 	// a Pod the kubelet may evict at any size and therefore one whose warm set
 	// cannot be bounded by observation.
 	MemoryLimitBytes int64
+	// Accelerator is the GPU model of the node this Pod runs on, or "" when it
+	// could not be read -- which is the ordinary case for an install without
+	// cluster-scoped node access, not an error.
+	Accelerator string
 }
 
 // Endpoint is an instance's address inside its Pod.

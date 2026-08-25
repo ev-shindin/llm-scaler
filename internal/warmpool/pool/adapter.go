@@ -145,6 +145,28 @@ func (a *Adapter) ListWarm(ctx context.Context) ([]Membership, error) {
 	return out, nil
 }
 
+// acceleratorOfPod reports the GPU model of the node a pool Pod runs on.
+//
+// Unreadable is "" rather than an error: nodes are cluster-scoped, so a
+// namespace-scoped install may legitimately have no access to them, and the fit
+// check treats an unknown accelerator as no constraint. Failing the whole
+// observation here would take the pool down over a check that is only ever
+// advisory.
+func (a *Adapter) acceleratorOfPod(ctx context.Context, p *corev1.Pod) string {
+	if p.Spec.NodeName == "" {
+		return ""
+	}
+	var node corev1.Node
+	if err := a.client.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, &node); err != nil {
+		log.FromContext(ctx).V(logging.TRACE).Info(
+			"could not read the node a pool Pod runs on; its accelerator is unknown "+
+				"and will not be matched against a model's",
+			"pod", p.Name, "node", p.Spec.NodeName, "err", err.Error())
+		return ""
+	}
+	return AcceleratorOf(&node)
+}
+
 func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membership, error) {
 	instances, err := a.newSupervisor(p.Status.PodIP).List(ctx)
 	if err != nil {
@@ -170,6 +192,7 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
 	capacity := capacityOf(p)
+	capacity.Accelerator = a.acceleratorOfPod(ctx, p)
 	poolName := p.Labels[PoolLabel]
 	if len(instances) == 0 {
 		// An idle Pod is reserve, and must be visible as such. See Membership.

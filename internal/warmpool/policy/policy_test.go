@@ -713,6 +713,52 @@ func TestThePodsOwnGPUCountDecidesWhatFits(t *testing.T) {
 	}
 }
 
+func TestAModelPinnedToAnotherAcceleratorIsDeclined(t *testing.T) {
+	// The right NUMBER of the wrong GPU is still the wrong GPU. A warm copy is
+	// only reusable on the accelerator it was loaded on, and the workload's own
+	// affinity would refuse the node this Pod is on, so a bridge from here could
+	// not serve it at all -- the load is spent for nothing.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	onA100 := withGPUs(resident("a", "", pool.Absent), 1)
+	onA100.Capacity.Accelerator = "NVIDIA-A100-SXM4-80GB"
+
+	wantsH100 := VariantDemand{
+		Model: pool.ModelRef{
+			Namespace:     "workload",
+			Variant:       "pinned",
+			EngineOptions: "--model Qwen/Qwen3-0.6B",
+			Accelerator:   "NVIDIA-H100-80GB-HBM3",
+		},
+		Parked: true,
+	}
+	got := Decide(Input{
+		Memberships: []pool.Membership{onA100},
+		Variants:    []VariantDemand{wantsH100},
+		Now:         now,
+	}, c)
+	if len(got.Admit) != 0 {
+		t.Fatalf("an H100 model must not be warmed on an A100 Pod: %+v", got.Admit)
+	}
+	if len(got.Declined) != 1 || !strings.Contains(got.Declined[0].Reason, "A100") {
+		t.Fatalf("and the reason must name what the Pod actually holds: %+v", got.Declined)
+	}
+
+	// Same Pod, same model, matching accelerator: admitted.
+	onH100 := withGPUs(resident("a", "", pool.Absent), 1)
+	onH100.Capacity.Accelerator = "NVIDIA-H100-80GB-HBM3"
+	ok := Decide(Input{
+		Memberships: []pool.Membership{onH100},
+		Variants:    []VariantDemand{wantsH100},
+		Now:         now,
+	}, c)
+	if len(ok.Admit) != 1 {
+		t.Fatalf("a matching accelerator must be admitted: admit=%+v declined=%+v", ok.Admit, ok.Declined)
+	}
+}
+
 func TestAModelTooLargeForTheBudgetIsDeclined(t *testing.T) {
 	// The expensive one to get wrong. A level-1 sleeper keeps its weights in
 	// HOST memory against a hard container limit, so one model too many does not
