@@ -26,6 +26,71 @@ func specWith(command, args []string) *corev1.PodSpec {
 	}}
 }
 
+func TestEngineOptionsReadTheLlmdChartsPositionalForm(t *testing.T) {
+	// The argv of a real llm-d decode Deployment, copied from a live cluster:
+	// a shell wrapper, and the model given POSITIONALLY to `vllm serve` with no
+	// --model anywhere. This was skipped as "no engine options", so the pool saw
+	// zero demand and would never have warmed anything on the layout llm-d's own
+	// chart produces.
+	spec := specWith(
+		[]string{"/bin/bash", "-c"},
+		[]string{"/bin/true ; vllm serve /model-cache/models/Qwen/Qwen3-0.6B " +
+			"--served-model-name Qwen/Qwen3-0.6B --gpu-memory-utilization 0.95 " +
+			"--max-model-len 16000 --port 8000"},
+	)
+	got, err := EngineOptionsFrom(spec)
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+	if !strings.Contains(got, "--model /model-cache/models/Qwen/Qwen3-0.6B") {
+		t.Fatalf("the positional model must become an explicit --model: %q", got)
+	}
+	if strings.Count(got, "--model ") != 1 {
+		t.Errorf("exactly one --model expected, got %q", got)
+	}
+	// The bare wrapper words must not survive into argv the pool will run.
+	// Compared as TOKENS, not substrings: --served-model-name contains "serve".
+	junk := map[string]bool{"/bin/bash": true, "/bin/true": true, "vllm": true, "serve": true, ";": true}
+	for _, f := range strings.Fields(got) {
+		if junk[f] {
+			t.Errorf("%q leaked into the warm copy argv: %q", f, got)
+		}
+	}
+	// And the shape flags still come across, because a warm copy that differs
+	// misses the torch.compile cache.
+	if !strings.Contains(got, "--gpu-memory-utilization 0.95") {
+		t.Errorf("shape flags lost: %q", got)
+	}
+}
+
+func TestEngineOptionsPreferTheSourceOverTheAdvertisedName(t *testing.T) {
+	// --served-model-name is a repository id while the weights are already a
+	// local path. Warming the advertised name would download a second copy of a
+	// model that is on the shared cache already.
+	spec := specWith(nil, []string{
+		"vllm", "serve", "/model-cache/models/Qwen/Qwen3-0.6B",
+		"--served-model-name", "Qwen/Qwen3-0.6B",
+	})
+	got, err := EngineOptionsFrom(spec)
+	if err != nil {
+		t.Fatalf("EngineOptionsFrom: %v", err)
+	}
+	if !strings.Contains(got, "--model /model-cache/models/Qwen/Qwen3-0.6B") {
+		t.Fatalf("the SOURCE must win: %q", got)
+	}
+}
+
+func TestEngineOptionsStillRefuseAContainerThatNamesNoModel(t *testing.T) {
+	// `serve` alone is not a model, and a sidecar must not be mistaken for the
+	// engine just because the word appears.
+	if _, err := EngineOptionsFrom(specWith(nil, []string{"--not-a-model-server"})); err == nil {
+		t.Fatal("a container naming no model must be refused")
+	}
+	if _, err := EngineOptionsFrom(specWith(nil, []string{"vllm", "serve"})); err == nil {
+		t.Fatal("a bare `serve` with no model must be refused")
+	}
+}
+
 func TestEngineOptionsComeFromTheOrdinaryReplicas(t *testing.T) {
 	// Derived rather than configured, because the two must match: a different
 	// --gpu-memory-utilization is a different torch.compile cache key.

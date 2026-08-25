@@ -41,6 +41,45 @@ func (f *fakeSupervisor) client() *Supervisor {
 	return &Supervisor{client: f.server.Client(), baseURL: f.server.URL}
 }
 
+func TestListAcceptsTheLauncherEnvelopeShape(t *testing.T) {
+	// The shape the pinned launcher actually returns, copied from a live Pod.
+	// Without this case the parser passed its tests and could not read a single
+	// real Pod: the pool reported itself empty on every reconcile.
+	f := newFakeSupervisor(t)
+	f.respond = func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"revision":1,"total_instances":1,"running_instances":1,` +
+			`"instances":[{"instance_id":"qwen-a","status":"running",` +
+			`"options":"--model /model-cache/models/Qwen/Qwen3-0.6B --port 9001"}]}`))
+	}
+	got, err := f.client().List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "qwen-a" {
+		t.Fatalf("envelope not unwrapped: %+v", got)
+	}
+	if got[0].Status != "running" || !strings.Contains(got[0].Options, "Qwen3-0.6B") {
+		t.Errorf("fields lost: %+v", got[0])
+	}
+}
+
+func TestListReportsAnEmptyPoolRatherThanFailing(t *testing.T) {
+	// An empty pool is the ordinary state of a Pod that holds nothing yet, and
+	// it must not read as an error -- "could not be read" makes the reconciler
+	// drop the Pod from the observation entirely.
+	f := newFakeSupervisor(t)
+	f.respond = func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"revision":0,"total_instances":0,"running_instances":0,"instances":[]}`))
+	}
+	got, err := f.client().List(context.Background())
+	if err != nil {
+		t.Fatalf("an empty pool must not be an error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want no instances, got %+v", got)
+	}
+}
+
 func TestListAcceptsTheLauncherMapShape(t *testing.T) {
 	f := newFakeSupervisor(t)
 	f.respond = func(w http.ResponseWriter, _ *http.Request) {

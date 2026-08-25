@@ -73,8 +73,30 @@ func (s *Supervisor) List(ctx context.Context) ([]Instance, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The launcher answers with a map keyed by instance id at the collection
-	// root; tolerate a bare list too, so a future shape does not break reads.
+	// The launcher this pool pins (v0.6.0-alpha.13) answers with an ENVELOPE:
+	//
+	//   {"revision":1,"total_instances":1,"running_instances":1,"instances":[...]}
+	//
+	// Tried first because it is the shape actually on the wire. It was missing
+	// entirely, and the two shapes below could not stand in for it: `revision`
+	// is a number where the map form wants an Instance, so the map decode fails,
+	// and the list decode then fails on the object. The result was that every
+	// Pod reported "could not be read" and the pool observed itself as EMPTY --
+	// silently, because an unreadable Pod is indistinguishable in the metrics
+	// from a Pod that is simply not there.
+	//
+	// It survived review and unit tests because both fixtures were written from
+	// the two shapes the code already handled, and every cluster measurement so
+	// far drove the supervisor API by hand rather than through this client.
+	var envelope struct {
+		Instances []Instance `json:"instances"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil && envelope.Instances != nil {
+		return envelope.Instances, nil
+	}
+	// The map keyed by instance id at the collection root, and a bare list, are
+	// both tolerated: the launcher is copied code that may change shape, and a
+	// read that breaks on it takes the whole pool down.
 	var asMap map[string]Instance
 	if err := json.Unmarshal(body, &asMap); err == nil {
 		out := make([]Instance, 0, len(asMap))

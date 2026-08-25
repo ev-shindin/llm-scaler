@@ -207,12 +207,52 @@ func EngineOptionsFrom(spec *corev1.PodSpec) (string, error) {
 	for i := range spec.Containers {
 		container := &spec.Containers[i]
 		joined := strings.TrimSpace(strings.Join(append(append([]string{}, container.Command...), container.Args...), " "))
-		if !strings.Contains(joined, "--model") {
+		joined, ok := withExplicitModel(joined)
+		if !ok {
 			continue
 		}
 		return normaliseOptions(joined), nil
 	}
-	return "", errors.New("no container names a --model")
+	return "", errors.New("no container names a model")
+}
+
+// withExplicitModel rewrites the POSITIONAL form of a vLLM command line into the
+// flag form, and reports whether the argv names a model at all.
+//
+// llm-d's modelservice chart does not pass --model. It renders
+//
+//	/bin/bash -c "... ; vllm serve /model-cache/models/Qwen/Qwen3-0.6B --served-model-name Qwen/Qwen3-0.6B ..."
+//
+// so a check for the literal "--model" finds nothing and the variant is skipped
+// as having no engine options. Measured on a real llm-d deployment: the pool saw
+// ZERO demand and would never have warmed anything, on the most common layout
+// there is. normaliseOptions cannot rescue it either -- it drops bare words,
+// which is exactly what the positional model is.
+//
+// Anchored on the `serve` token rather than "first non-flag word", for the same
+// reason the ScaledObject planner is: a bare first-word rule answers `python`
+// for `python -m sglang.launch_server`, `/bin/sh` for an entrypoint wrapper, and
+// `ray` for a ray head -- all of them confidently wrong.
+//
+// --served-model-name is an advertised NAME, never a source, so it is not
+// consulted here: on the chart above it is a repository id while the weights are
+// a local path, and warming the wrong one loads a second copy of a model that is
+// already on disk.
+func withExplicitModel(joined string) (string, bool) {
+	fields := strings.Fields(joined)
+	for i, f := range fields {
+		name, _, _ := strings.Cut(f, "=")
+		if name == "--model" {
+			return joined, true
+		}
+		if f == "serve" && i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
+			// Appended rather than substituted: the positional word stays where
+			// it is and normaliseOptions drops it as a bare word, so the result
+			// carries exactly one --model.
+			return joined + " --model " + fields[i+1], true
+		}
+	}
+	return joined, false
 }
 
 // warmableFlags are the vLLM options a warm copy may inherit from a workload.
