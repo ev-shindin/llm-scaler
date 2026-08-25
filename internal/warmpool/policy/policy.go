@@ -247,6 +247,13 @@ func Decide(in Input, cfg Config) Plan {
 		plan.Admit, plan.Declined = admissions(in, cfg, byPod, free)
 	}
 
+	// 3b. Evictions: copies a variant no longer wants.
+	//
+	// Only for a variant that stated a number. Automatic mode never evicts,
+	// because it has no basis to: a model it warmed is a model it judged worth
+	// warming, and the pool holds no more than one copy of each anyway.
+	plan.Evict = evictions(in, byPod, lent)
+
 	// 4. What the reserve will be once this plan is carried out.
 	//
 	// `free` has already had borrows and admissions removed from it in place, so
@@ -281,6 +288,68 @@ func returnsFor(v VariantDemand, lent []pool.Membership, in Input, cfg Config) [
 	for i, m := range lent {
 		expired := in.Now.Sub(borrowedAt(in, m)) >= cfg.MaxHold
 		if i < excess || expired {
+			out = append(out, Action{Pod: m.Pod, Model: m.Model})
+		}
+	}
+	return out
+}
+
+// evictions releases warm copies beyond what a variant asked for.
+//
+// Without this, warmPoolCopies could only ever ADD. Setting it to 0 on a model
+// already resident would leave that model warm forever, and lowering it from
+// two copies to one would leave both -- so the setting would silently mean
+// "at least this many", which is not what it says and not what an operator
+// asking to free a slot needs.
+//
+// A LENT copy is never evicted, whatever the count says. It is serving live
+// traffic, and the hold timeout already returns it; taking it out from under a
+// request to satisfy a configuration change trades a real response for a
+// bookkeeping one.
+//
+// Oldest first, so the copy released is the one least likely to be about to be
+// used.
+func evictions(in Input, byPod map[types.NamespacedName][]pool.Membership, lent map[string][]pool.Membership) []Action {
+	isLent := map[types.NamespacedName]map[string]bool{}
+	for variant, ms := range lent {
+		for _, m := range ms {
+			if isLent[m.Pod] == nil {
+				isLent[m.Pod] = map[string]bool{}
+			}
+			isLent[m.Pod][variant] = true
+		}
+	}
+
+	var out []Action
+	for _, v := range in.Variants {
+		want, explicit := v.wantedCopies()
+		if !explicit {
+			continue
+		}
+		var held []pool.Membership
+		for podRef, inPod := range byPod {
+			for _, m := range inPod {
+				if m.Model.Variant != v.Model.Variant || m.Model.Variant == "" {
+					continue
+				}
+				if isLent[podRef][m.Model.Variant] {
+					continue
+				}
+				held = append(held, m)
+			}
+		}
+		if len(held) <= want {
+			continue
+		}
+		sort.Slice(held, func(i, j int) bool {
+			if !held[i].LastUsed.Equal(held[j].LastUsed) {
+				return held[i].LastUsed.Before(held[j].LastUsed)
+			}
+			// Deterministic when nothing has been used yet, so two processes
+			// evicting the same excess choose the same copy.
+			return held[i].Pod.Name < held[j].Pod.Name
+		})
+		for _, m := range held[:len(held)-want] {
 			out = append(out, Action{Pod: m.Pod, Model: m.Model})
 		}
 	}

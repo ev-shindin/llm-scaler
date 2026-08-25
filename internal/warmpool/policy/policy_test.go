@@ -1174,3 +1174,130 @@ func TestASecondCopyAvoidsThePodThatAlreadyHoldsOne(t *testing.T) {
 		t.Fatalf("the second copy must go to the Pod without one, got %q", got.Admit[0].Pod.Name)
 	}
 }
+
+func TestZeroCopiesReleasesAModelAlreadyWarm(t *testing.T) {
+	// Found on a cluster: setting "0" on a resident model left it warm forever,
+	// because eviction was never implemented. The setting then silently meant
+	// "at least this many", which is not what it says and not what an operator
+	// asking to free a slot needs.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	held := withGPUs(resident("a", "leaving", pool.Asleep), 1)
+	held.Model.EngineOptions = smallModel
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{held},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "leaving", EngineOptions: smallModel},
+			WarmCopies: copies(0),
+		}},
+		Now: now,
+	}, c)
+	if len(got.Evict) != 1 || got.Evict[0].Model.Variant != "leaving" {
+		t.Fatalf("an opted-out model must be released: %+v", got.Evict)
+	}
+}
+
+func TestLoweringTheCountReleasesOnlyTheExcess(t *testing.T) {
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	first := withGPUs(resident("a", "busy", pool.Asleep), 1)
+	first.Model.EngineOptions = smallModel
+	first.LastUsed = now.Add(-time.Hour) // the older copy
+	second := withGPUs(resident("b", "busy", pool.Asleep), 1)
+	second.Model.EngineOptions = smallModel
+	second.LastUsed = now
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{first, second},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "busy", EngineOptions: smallModel},
+			WarmCopies: copies(1),
+		}},
+		Now: now,
+	}, c)
+	if len(got.Evict) != 1 {
+		t.Fatalf("two copies down to one releases exactly one: %+v", got.Evict)
+	}
+	if got.Evict[0].Pod.Name != "a" {
+		t.Errorf("the LEAST recently used copy goes, got %q", got.Evict[0].Pod.Name)
+	}
+}
+
+func TestALentCopyIsNeverEvicted(t *testing.T) {
+	// It is serving live traffic. The hold timeout already returns it; taking it
+	// out from under a request to satisfy a configuration change trades a real
+	// response for a bookkeeping one.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	serving := withGPUs(resident("a", "busy", pool.Serving), 1)
+	serving.Model.EngineOptions = smallModel
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{serving},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "busy", EngineOptions: smallModel},
+			WarmCopies: copies(0),
+			Desired:    2,
+			Ready:      1,
+		}},
+		Now: now,
+	}, c)
+	for _, e := range got.Evict {
+		if e.Pod.Name == "a" {
+			t.Fatalf("a serving copy must not be evicted: %+v", got.Evict)
+		}
+	}
+}
+
+func TestAutomaticModeNeverEvicts(t *testing.T) {
+	// A model automatic mode warmed is one it judged worth warming, and it holds
+	// no more than one copy of each, so there is nothing for eviction to fix.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	held := withGPUs(resident("a", "auto", pool.Asleep), 1)
+	held.Model.EngineOptions = smallModel
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{held},
+		Variants:    []VariantDemand{{Model: pool.ModelRef{Variant: "auto", EngineOptions: smallModel}}},
+		Now:         now,
+	}, c)
+	if len(got.Evict) != 0 {
+		t.Fatalf("automatic mode must not evict: %+v", got.Evict)
+	}
+}
+
+func TestAutomaticModeLeavesExtraCopiesAlone(t *testing.T) {
+	// The case that distinguishes "automatic never evicts" from "automatic has
+	// nothing to evict". A variant can hold two copies and then lose its
+	// explicit count -- someone removes warmPoolCopies from the trigger -- and
+	// automatic mode must not start tearing down what it did not put there.
+	// With only ONE copy held, want defaults to 1 and no eviction follows
+	// either way, so that fixture proves nothing.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	first := withGPUs(resident("a", "auto", pool.Asleep), 1)
+	first.Model.EngineOptions = smallModel
+	second := withGPUs(resident("b", "auto", pool.Asleep), 1)
+	second.Model.EngineOptions = smallModel
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{first, second},
+		Variants:    []VariantDemand{{Model: pool.ModelRef{Variant: "auto", EngineOptions: smallModel}}},
+		Now:         now,
+	}, c)
+	if len(got.Evict) != 0 {
+		t.Fatalf("automatic mode must leave copies it did not choose: %+v", got.Evict)
+	}
+}

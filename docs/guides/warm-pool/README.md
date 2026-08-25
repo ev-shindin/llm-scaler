@@ -175,7 +175,7 @@ triggers:
 | value | means |
 | --- | --- |
 | *absent* | automatic — the pool ranks it, and holds at most one copy |
-| `"0"` | never warm this model, freeing its slot for models that gain more |
+| `"0"` | never warm this model — and release it if it already is |
 | `"1"` | always keep one warm, whatever the ranking thinks |
 | `"N"` | keep N warm, so N scale-ups of this model can bridge **at once** |
 
@@ -190,6 +190,12 @@ since automatic mode holds one copy of each and no more.
 
 Copies always land in different Pods — a second copy in the same Pod would share
 the first's accelerators and could never serve a second bridge.
+
+Lowering the number releases the excess, oldest copy first, so the setting means
+what it says rather than "at least this many". A copy that is currently BRIDGING
+is never released: it is serving live traffic, and `max-hold` already returns it.
+Automatic mode never releases anything — a model it warmed is one it judged
+worth warming.
 
 ## Letting the pool resize itself
 
