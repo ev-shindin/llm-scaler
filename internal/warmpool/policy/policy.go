@@ -67,6 +67,10 @@ type VariantDemand struct {
 	Parked bool
 	// Share is this variant's fraction of requests, used for preloading.
 	Share float64
+	// WarmPool is the pool this variant selected in its trigger metadata, or
+	// empty to take the namespace's only pool. Selection, not identity, which is
+	// why it sits here rather than on ModelRef.
+	WarmPool string
 }
 
 // Borrow identifies one lent Pod.

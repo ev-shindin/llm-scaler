@@ -187,7 +187,13 @@ func TestEachPoolKeepsItsOwnReserve(t *testing.T) {
 		},
 		warmStarted: make(chan struct{}, 2),
 	}
-	d := &staticDemand{variants: []policy.VariantDemand{{Model: model("parked"), Parked: true}}}
+	// Each variant SELECTS its pool, which is required once a namespace holds
+	// more than one -- with two pools of different accelerators, guessing is
+	// wrong half the time and costs a ~35 s load that can never serve.
+	d := &staticDemand{variants: []policy.VariantDemand{
+		{Model: model("wants-roomy"), Parked: true, WarmPool: "zzz-roomy"},
+		{Model: model("wants-strict"), Parked: true, WarmPool: "aaa-strict"},
+	}}
 
 	roomy, strict := testConfig(), testConfig()
 	roomy.SleepMinSize = 0
@@ -213,11 +219,14 @@ func TestEachPoolKeepsItsOwnReserve(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no admission was started at all")
 	}
-	if !p.did("warm parked@roomy-0") {
-		t.Fatalf("the pool with room must admit: %v", p.seen())
+	if !p.did("warm wants-roomy@roomy-0") {
+		t.Fatalf("the pool with room must admit its variant: %v", p.seen())
 	}
-	if p.did("warm parked@strict-0") {
-		t.Fatalf("a pool whose every Pod is reserve must not: %v", p.seen())
+	if p.didPrefix("warm wants-strict@") {
+		t.Fatalf("a pool whose every Pod is reserve must not admit: %v", p.seen())
+	}
+	if p.did("warm wants-roomy@strict-0") {
+		t.Fatalf("a variant must never be admitted into a pool it did not select: %v", p.seen())
 	}
 }
 

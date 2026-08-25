@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 )
@@ -200,5 +202,62 @@ func Orphaned(all []pool.Membership, pools []PoolSpec) []string {
 		out = append(out, m.Pod.Name)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// VariantsFor returns the variants that may borrow from one pool.
+//
+// The rule is that selection is only needed where there is real ambiguity:
+//
+//	one pool, variant names none    -> it takes that pool
+//	variant names this pool         -> it takes this pool
+//	variant names another pool      -> not this pool's concern
+//	several pools, names none       -> NO pool, reported by Unassignable
+//	names a pool that does not exist -> NO pool, reported by Unassignable
+//
+// The first line is the whole point. A namespace with one pool is the common
+// case by a wide margin, and requiring every ScaledObject to name it would be
+// ceremony that buys nothing. The fourth is the reason the rule cannot simply
+// default to "the first pool": with two pools of different accelerators, a guess
+// is wrong half the time, and being wrong costs a ~35 s load that can never
+// serve the variant that triggered it.
+func VariantsFor(variants []policy.VariantDemand, spec PoolSpec, pools []PoolSpec) []policy.VariantDemand {
+	out := make([]policy.VariantDemand, 0, len(variants))
+	for _, v := range variants {
+		if v.WarmPool == spec.Name || (v.WarmPool == "" && len(pools) == 1) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// Unassignable reports the variants that will get no warm copy because their
+// pool selection cannot be resolved, with the reason for each.
+//
+// Keyed by variant so a caller can report each one once. Silence here would be
+// the worst kind: the variant scales normally and simply never runs warm, which
+// looks exactly like a pool that is too small.
+func Unassignable(variants []policy.VariantDemand, pools []PoolSpec) map[string]string {
+	declared := make(map[string]bool, len(pools))
+	names := make([]string, 0, len(pools))
+	for _, p := range pools {
+		declared[p.Name] = true
+		names = append(names, p.Name)
+	}
+	sort.Strings(names)
+
+	out := map[string]string{}
+	for _, v := range variants {
+		switch {
+		case v.WarmPool == "" && len(pools) > 1:
+			out[v.Model.Variant] = fmt.Sprintf(
+				"names no warm pool and this namespace has %d (%s); set the %q trigger metadata key",
+				len(pools), strings.Join(names, ", "), registry.WarmPoolKey)
+		case v.WarmPool != "" && !declared[v.WarmPool]:
+			out[v.Model.Variant] = fmt.Sprintf(
+				"names warm pool %q, which no pool Deployment declares (have: %s)",
+				v.WarmPool, strings.Join(names, ", "))
+		}
+	}
 	return out
 }

@@ -2,6 +2,7 @@ package warmpool
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,5 +183,87 @@ func TestAPodBelongingToNoDeclaredPoolIsReported(t *testing.T) {
 	}
 	if none := Orphaned(all, []PoolSpec{{Name: "fast"}, {Name: "typo"}}); len(none) != 0 {
 		t.Fatalf("nothing is orphaned once both pools are declared: %+v", none)
+	}
+}
+
+// variantSelecting is one variant naming the pool it wants, or "" for none.
+func variantSelecting(warmPool string) policy.VariantDemand {
+	return policy.VariantDemand{
+		Model:    pool.ModelRef{Namespace: "workload", Variant: "qwen"},
+		WarmPool: warmPool,
+	}
+}
+
+func TestOnePoolNeedsNoSelection(t *testing.T) {
+	// The common case by a wide margin, and the reason the metadata key is not
+	// boilerplate: with one pool there is nothing to disambiguate, so a
+	// ScaledObject that says nothing still gets a warm copy.
+	only := []PoolSpec{{Name: "default"}}
+	got := VariantsFor([]policy.VariantDemand{variantSelecting("")}, only[0], only)
+	if len(got) != 1 {
+		t.Fatalf("a variant naming no pool must take the only pool: %+v", got)
+	}
+	if bad := Unassignable([]policy.VariantDemand{variantSelecting("")}, only); len(bad) != 0 {
+		t.Errorf("nothing is unassignable when there is one pool: %+v", bad)
+	}
+}
+
+func TestAVariantGoesOnlyToThePoolItNamed(t *testing.T) {
+	two := []PoolSpec{{Name: "a100"}, {Name: "h100"}}
+	vs := []policy.VariantDemand{variantSelecting("h100")}
+
+	if got := VariantsFor(vs, two[1], two); len(got) != 1 {
+		t.Fatalf("the named pool must take it: %+v", got)
+	}
+	if got := VariantsFor(vs, two[0], two); len(got) != 0 {
+		t.Fatalf("the other pool must not: %+v", got)
+	}
+}
+
+func TestSeveralPoolsAndNoSelectionIsReportedRatherThanGuessed(t *testing.T) {
+	// Defaulting to the first pool would be wrong half the time with two
+	// accelerators, and being wrong costs a load that can never serve.
+	two := []PoolSpec{{Name: "a100"}, {Name: "h100"}}
+	vs := []policy.VariantDemand{variantSelecting("")}
+
+	for _, p := range two {
+		if got := VariantsFor(vs, p, two); len(got) != 0 {
+			t.Fatalf("no pool may claim an unselected variant: %+v", got)
+		}
+	}
+	bad := Unassignable(vs, two)
+	if bad["qwen"] == "" {
+		t.Fatal("it must be reported, not silently dropped")
+	}
+	for _, want := range []string{"a100", "h100", "warmPool"} {
+		if !strings.Contains(bad["qwen"], want) {
+			t.Errorf("the reason must name %q so it can be acted on: %q", want, bad["qwen"])
+		}
+	}
+}
+
+func TestNamingAPoolThatDoesNotExistIsReported(t *testing.T) {
+	// A typo in trigger metadata otherwise reads as a pool that is merely too
+	// small, which sends an operator after entirely the wrong thing.
+	one := []PoolSpec{{Name: "a100-fast"}}
+	vs := []policy.VariantDemand{variantSelecting("a100-fst")}
+
+	if got := VariantsFor(vs, one[0], one); len(got) != 0 {
+		t.Fatalf("a misnamed pool must not fall back to the only one: %+v", got)
+	}
+	bad := Unassignable(vs, one)
+	if !strings.Contains(bad["qwen"], "a100-fst") || !strings.Contains(bad["qwen"], "a100-fast") {
+		t.Fatalf("the reason must show both what was asked for and what exists: %q", bad["qwen"])
+	}
+}
+
+func TestTheUnnamedPoolTakesVariantsThatNameNothing(t *testing.T) {
+	// An install that predates named pools: no llm-d.ai/warm-pool label anywhere
+	// and no trigger metadata. Both sides are empty and must still match, or the
+	// pool stops warming anything the moment this ships.
+	unnamed := []PoolSpec{{Name: ""}}
+	got := VariantsFor([]policy.VariantDemand{variantSelecting("")}, unnamed[0], unnamed)
+	if len(got) != 1 {
+		t.Fatalf("an unnamed pool must serve variants that name nothing: %+v", got)
 	}
 }

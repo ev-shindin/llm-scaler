@@ -39,6 +39,22 @@ const (
 	// resolving policy from an InferencePool's selector.
 	ScalingPolicyKey = "scalingPolicy"
 
+	// WarmPoolKey names the warm pool this variant may borrow from, when the
+	// namespace holds more than one. Optional, and deliberately NOT boilerplate:
+	// a namespace with a single pool needs no selection at all, because there is
+	// nothing to disambiguate. Writing a pool name on every ScaledObject would
+	// be ceremony in the case that is by far the most common.
+	//
+	// More than one pool is a real configuration rather than a hypothetical: a
+	// warm copy is only reusable on the accelerator it was loaded on, so a
+	// cluster with two GPU types needs a pool per type, and a tensor-parallel
+	// variant needs Pods holding that many devices.
+	//
+	// When a namespace holds several pools and a variant names none, it gets no
+	// warm copy and WVA says so. Picking one for it would be a guess with a cost:
+	// the wrong pool means a ~35 s load that can never serve.
+	WarmPoolKey = "warmPool"
+
 	// ScalerAddressKey is KEDA's own key naming this scaler's address. It is
 	// consumed by KEDA, never by WVA; named here only so it is not mistaken for a
 	// WVA key when reading a trigger.
@@ -60,6 +76,9 @@ type Meta struct {
 	// ScalingPolicy names the reusable policy tier this variant scales under, or
 	// is empty to take the cluster default.
 	ScalingPolicy string
+	// WarmPool names the warm pool this variant may borrow from, or is empty to
+	// take the namespace's only pool.
+	WarmPool string
 }
 
 // ParseMeta validates a trigger's metadata.
@@ -90,5 +109,6 @@ func ParseMeta(metadata map[string]string) (Meta, error) {
 		ModelID:       modelID,
 		VariantCost:   cost,
 		ScalingPolicy: metadata[ScalingPolicyKey],
+		WarmPool:      metadata[WarmPoolKey],
 	}, nil
 }

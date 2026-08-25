@@ -105,6 +105,11 @@ type Reconciler struct {
 	// under Config, which is what every install had before pools were named.
 	Pools PoolSource
 
+	// lastUnassignable is the last reason given for each variant that could not
+	// be matched to a pool, so a standing misconfiguration is stated once rather
+	// than every Interval.
+	lastUnassignable map[string]string
+
 	// lastSummary is the previous pass's one-line state PER POOL, so a steady
 	// pool logs once rather than every Interval. Guarded by passMu, which
 	// already serialises the whole pass.
@@ -122,12 +127,13 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		ActTimeout:     defaultActTimeout,
 		AdmitTimeout:   defaultAdmitTimeout,
 
-		borrowedAt:    map[policy.Borrow]time.Time{},
-		missesAt:      map[string][]time.Time{},
-		admitting:     map[string]bool{},
-		admittingPods: map[types.NamespacedName]bool{},
-		lastSummary:   map[string]string{},
-		now:           time.Now,
+		borrowedAt:       map[policy.Borrow]time.Time{},
+		missesAt:         map[string][]time.Time{},
+		admitting:        map[string]bool{},
+		admittingPods:    map[types.NamespacedName]bool{},
+		lastSummary:      map[string]string{},
+		lastUnassignable: map[string]string{},
+		now:              time.Now,
 	}
 }
 
@@ -198,14 +204,31 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	// One decision per pool. The per-variant state below -- borrows, misses,
 	// admissions in flight -- is keyed by Pod and variant, both already unique
 	// across pools, so it needs no splitting.
+	// A variant that selected no resolvable pool gets no warm copy. Said once
+	// per variant, because the alternative -- a variant that scales normally and
+	// silently never runs warm -- is indistinguishable from a pool too small to
+	// hold it.
+	for variant, why := range Unassignable(variants, pools) {
+		if r.lastUnassignable[variant] == why {
+			continue
+		}
+		if r.lastUnassignable == nil {
+			r.lastUnassignable = map[string]string{}
+		}
+		r.lastUnassignable[variant] = why
+		log.FromContext(ctx).WithName("warmpool").Info(
+			"variant will get no warm copy", "variant", variant, "reason", why)
+	}
+
 	var merged policy.Plan
 	for _, spec := range pools {
 		mine := MembershipsIn(memberships, spec.Name)
+		theirs := VariantsFor(variants, spec, pools)
 
 		r.mu.Lock()
 		in := policy.Input{
 			Memberships: mine,
-			Variants:    variants,
+			Variants:    theirs,
 			BorrowedAt:  copyBorrows(r.borrowedAt),
 			MissesAt:    copyMisses(r.missesAt),
 			Admitting:   maps.Clone(r.admittingPods),
@@ -216,7 +239,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		plan := policy.Decide(in, spec.Config)
 		free := pool.FreePods(mine)
 		metrics.SetWarmPoolFreePods(r.metricName(spec), free)
-		r.report(ctx, spec, mine, variants, free)
+		r.report(ctx, spec, mine, theirs, free)
 		r.apply(ctx, plan)
 		merged = mergePlans(merged, plan)
 	}

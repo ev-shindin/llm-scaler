@@ -128,6 +128,9 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			},
 			Desired: desired,
 			Ready:   ready,
+			// Which pool this variant may borrow from. Empty is the ordinary
+			// case: a namespace with one pool needs no selection.
+			WarmPool: entry.Metadata[registry.WarmPoolKey],
 			// Share is filled in below, once every variant's desire is known.
 			// It cannot be computed one variant at a time.
 			// Parked is the case with no alternative: at zero replicas a cold
