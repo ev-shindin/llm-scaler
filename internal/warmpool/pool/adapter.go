@@ -523,7 +523,28 @@ func (a *Adapter) setLabels(ctx context.Context, p *corev1.Pod, labels map[strin
 	for k, v := range labels {
 		p.Labels[k] = v
 	}
+	// Priced out of a scale-down for as long as it is serving. A pool that
+	// resizes itself shrinks by lowering replicas, and the ReplicaSet
+	// controller -- not the caller -- picks which Pod dies. Without this the
+	// victim can be the one bridging live traffic, at the one moment the pool
+	// exists for.
+	setDeletionCost(p, deletionCostLent)
 	return a.client.Patch(ctx, p, patch)
+}
+
+// Deletion costs the ReplicaSet controller reads when choosing a scale-down
+// victim; it removes the cheapest. Relative values only.
+const (
+	deletionCostAnnotation = "controller.kubernetes.io/pod-deletion-cost"
+	deletionCostLent       = "1000"
+	deletionCostIdle       = "0"
+)
+
+func setDeletionCost(p *corev1.Pod, cost string) {
+	if p.Annotations == nil {
+		p.Annotations = map[string]string{}
+	}
+	p.Annotations[deletionCostAnnotation] = cost
 }
 
 // identityLabels are the ones a join must never write and a leave must never
@@ -552,6 +573,11 @@ func (a *Adapter) removeLabels(ctx context.Context, p *corev1.Pod, labels map[st
 		}
 		delete(p.Labels, k)
 	}
+	// Back to being an ordinary scale-down candidate now that it serves nothing.
+	// Leaving it expensive would make an elastic pool shrink by removing an
+	// EMPTY Pod in preference to this one forever, which is the wrong Pod once
+	// this one is idle and still holding models nobody asked for.
+	setDeletionCost(p, deletionCostIdle)
 	return a.client.Patch(ctx, p, patch)
 }
 

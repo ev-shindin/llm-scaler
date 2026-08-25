@@ -1,0 +1,51 @@
+# Lets WVA resize THIS pool, and nothing else.
+#
+# The controller's own ClusterRole is deliberately read-only: KEDA owns the HPA
+# and performs every write, and a cluster-wide licence to resize workloads is
+# the single permission a cluster admin is most right to refuse. See
+# internal/controller/rbac.go, which says so and says not to re-add it.
+#
+# An elastic warm pool is the one caller that genuinely needs a write, so the
+# permission ships HERE — with the pool, not with the controller:
+#
+#   - namespaced, so it grants nothing in any other namespace;
+#   - scoped by resourceNames to the pool Deployment by name, so it cannot touch
+#     a tenant's workload even in this one;
+#   - on the SCALE subresource, so it can change a replica count and not an
+#     image, command, volume or service account;
+#   - applied only if you deploy a pool at all, and only needed if you set the
+#     min/max annotations that make one elastic.
+#
+# If you rename the pool Deployment, rename it in resourceNames too. WVA logs
+# the failure rather than resizing silently, but a pool that cannot resize looks
+# exactly like one that has chosen not to.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wva-warm-pool-resizer
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["wva-warm-pool"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wva-warm-pool-resizer
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wva-warm-pool-resizer
+subjects:
+  # The controller's ServiceAccount. Change the namespace if WVA runs elsewhere;
+  # a cluster-scoped controller managing this namespace lives in its own.
+  - kind: ServiceAccount
+    name: wva-controller-manager
+    namespace: >>> EDIT THIS <<<

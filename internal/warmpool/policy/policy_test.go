@@ -729,7 +729,7 @@ func TestAModelPinnedToAnotherAcceleratorIsDeclined(t *testing.T) {
 		Model: pool.ModelRef{
 			Namespace:     "workload",
 			Variant:       "pinned",
-			EngineOptions: "--model Qwen/Qwen3-0.6B",
+			EngineOptions: smallModel,
 			Accelerator:   "NVIDIA-H100-80GB-HBM3",
 		},
 		Parked: true,
@@ -804,7 +804,7 @@ func TestAModelThatFitsIsStillAdmitted(t *testing.T) {
 		Variants: []VariantDemand{{
 			Model: pool.ModelRef{
 				Variant:       "small",
-				EngineOptions: "--model Qwen/Qwen3-0.6B",
+				EngineOptions: smallModel,
 			},
 			Parked: true,
 		}},
@@ -1001,5 +1001,176 @@ func TestReturnsHandBackTheOldestBridgeFirst(t *testing.T) {
 	}
 	if got.Return[0].Pod != pod("old") {
 		t.Errorf("returned %s, want the oldest bridge", got.Return[0].Pod)
+	}
+}
+
+// smallModel is an engine command line whose size is known and tiny, so these
+// cases turn on the rule under test rather than on the memory budget.
+const smallModel = "--model Qwen/Qwen3-0.6B"
+
+func copies(n int) *int { return &n }
+
+func TestAVariantCanAskForSeveralWarmCopies(t *testing.T) {
+	// The case automatic mode cannot express at all. One warm copy bridges one
+	// scale-up, so a variant that scales twice in quick succession takes a cold
+	// start for the second with free Pods sitting beside it.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{
+			withGPUs(resident("a", "", pool.Absent), 1),
+			withGPUs(resident("b", "", pool.Absent), 1),
+		},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "busy", EngineOptions: smallModel},
+			WarmCopies: copies(2),
+		}},
+		Now: now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 2 {
+		t.Fatalf("two copies were asked for: admit=%+v declined=%+v", got.Admit, got.Declined)
+	}
+	// And they must land in DIFFERENT Pods, or the second shares the first's
+	// GPUs and could never serve a second bridge.
+	if got.Admit[0].Pod == got.Admit[1].Pod {
+		t.Fatalf("both copies went to the same Pod: %+v", got.Admit)
+	}
+}
+
+func TestASecondCopyIsNotAdmittedWhenOnlyOneWasAsked(t *testing.T) {
+	// Automatic mode is one copy, which is the behaviour every existing install
+	// has. A second free Pod must not quietly become a second copy.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{
+			withGPUs(resident("a", "", pool.Absent), 1),
+			withGPUs(resident("b", "", pool.Absent), 1),
+		},
+		Variants: []VariantDemand{{
+			Model:  pool.ModelRef{Variant: "qwen", EngineOptions: smallModel},
+			Parked: true,
+		}},
+		Now: now,
+	}
+	if got := Decide(in, c); len(got.Admit) != 1 {
+		t.Fatalf("automatic mode holds one copy: %+v", got.Admit)
+	}
+}
+
+func TestZeroCopiesOptsOutEvenWhenParked(t *testing.T) {
+	// The point of writing "0" is to free the slot for models that gain more.
+	// Parked is the strongest automatic reason to warm something, so if it can
+	// override the opt-out the setting is useless.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "optout", EngineOptions: smallModel},
+			Parked:     true,
+			WarmCopies: copies(0),
+		}},
+		Now: now,
+	}
+	if got := Decide(in, c); len(got.Admit) != 0 {
+		t.Fatalf("an explicit opt-out must win over parking: %+v", got.Admit)
+	}
+}
+
+func TestAPinnedVariantOutranksAPopularOne(t *testing.T) {
+	// A low-traffic but latency-critical model is exactly what popularity
+	// ranking can never warm. With one slot free, the pinned variant takes it.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+	c.PreloadTop = 5
+
+	in := Input{
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
+		Variants: []VariantDemand{
+			{
+				Model: pool.ModelRef{Variant: "popular", EngineOptions: smallModel},
+				Share: 0.99,
+			},
+			{
+				Model:      pool.ModelRef{Variant: "pinned", EngineOptions: smallModel},
+				Share:      0.01,
+				WarmCopies: copies(1),
+			},
+		},
+		Now: now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 1 {
+		t.Fatalf("one slot, one admission: %+v", got.Admit)
+	}
+	if got.Admit[0].Model.Variant != "pinned" {
+		t.Fatalf("the pinned variant must take the slot, got %q", got.Admit[0].Model.Variant)
+	}
+}
+
+func TestMoreCopiesThanPodsTakesWhatThereIs(t *testing.T) {
+	// Asking for more than the pool can hold must not stall the loop or starve
+	// everything else -- it takes what is free and stops.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	in := Input{
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "greedy", EngineOptions: smallModel},
+			WarmCopies: copies(5),
+		}},
+		Now: now,
+	}
+	if got := Decide(in, c); len(got.Admit) != 1 {
+		t.Fatalf("one Pod, one copy: %+v", got.Admit)
+	}
+}
+
+func TestASecondCopyAvoidsThePodThatAlreadyHoldsOne(t *testing.T) {
+	// The case that distinguishes a real exclusion from an accident. A Pod
+	// holding a SLEEPING copy is still free, so the roomiest-free-Pod search can
+	// return the very Pod that already has this model. A second copy there would
+	// share the first's GPUs and could never serve a second bridge -- and the
+	// supervisor keys instances by variant, so the create would be refused.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	// Pod "a" is the ROOMIEST -- one resident model against "b"'s two -- so the
+	// ordinary search returns it, and only the exclusion sends the copy
+	// elsewhere. With "b" roomier the test would pass either way and prove
+	// nothing, which is exactly what an earlier version of it did.
+	holding := withGPUs(resident("a", "busy", pool.Asleep), 1)
+	holding.Model.EngineOptions = smallModel
+	otherA := withGPUs(resident("b", "other-1", pool.Asleep), 1)
+	otherA.Model.EngineOptions = smallModel
+	otherB := withGPUs(resident("b", "other-2", pool.Asleep), 1)
+	otherB.Model.EngineOptions = smallModel
+
+	in := Input{
+		Memberships: []pool.Membership{holding, otherA, otherB},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "busy", EngineOptions: smallModel},
+			WarmCopies: copies(2),
+		}},
+		Now: now,
+	}
+	got := Decide(in, c)
+	if len(got.Admit) != 1 {
+		t.Fatalf("one copy exists, so exactly one more is needed: %+v", got.Admit)
+	}
+	if got.Admit[0].Pod.Name != "b" {
+		t.Fatalf("the second copy must go to the Pod without one, got %q", got.Admit[0].Pod.Name)
 	}
 }

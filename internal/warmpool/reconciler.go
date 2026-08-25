@@ -105,6 +105,24 @@ type Reconciler struct {
 	// under Config, which is what every install had before pools were named.
 	Pools PoolSource
 
+	// shortFor and idleFor count CONSECUTIVE passes a pool has been below its
+	// reserve, or idle above it. Resizing acts on a run rather than a reading:
+	// a single short pass is a borrow doing its job, and growing on it would
+	// buy a Pod for every spike.
+	shortFor map[string]int
+	idleFor  map[string]int
+
+	// Resizer applies a size change, or is nil when the pool may not resize
+	// itself -- which is the default and every install today.
+	Resizer *Resizer
+
+	// GrowAfter and ShrinkAfter are how many consecutive passes justify each.
+	// Shrinking is deliberately slower: a pool that is too small costs latency
+	// on every spike, a pool that is too large costs money, and paying a model
+	// load to grow back is the worst of both.
+	GrowAfter   int
+	ShrinkAfter int
+
 	// lastUnassignable is the last reason given for each variant that could not
 	// be matched to a pool, so a standing misconfiguration is stated once rather
 	// than every Interval.
@@ -133,6 +151,10 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		admittingPods:    map[types.NamespacedName]bool{},
 		lastSummary:      map[string]string{},
 		lastUnassignable: map[string]string{},
+		shortFor:         map[string]int{},
+		idleFor:          map[string]int{},
+		GrowAfter:        3,
+		ShrinkAfter:      60,
 		now:              time.Now,
 	}
 }
@@ -241,6 +263,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		metrics.SetWarmPoolFreePods(r.metricName(spec), free)
 		r.report(ctx, spec, mine, theirs, free)
 		r.apply(ctx, plan)
+		r.resize(ctx, spec, plan, free, len(r.Lent()))
 		merged = mergePlans(merged, plan)
 	}
 	return merged, nil
@@ -297,6 +320,54 @@ func acceleratorsIn(memberships []pool.Membership) string {
 	}
 	sort.Strings(models)
 	return strings.Join(models, ",")
+}
+
+// resize grows or shrinks a pool that was given a range to move within.
+//
+// Off unless the operator set both bounds, which is every install by default: a
+// pool holds accelerators continuously, so its size is a spending decision and
+// not one to take on anyone's behalf.
+func (r *Reconciler) resize(ctx context.Context, spec PoolSpec, plan policy.Plan, free, lent int) {
+	logger := log.FromContext(ctx).WithName("warmpool")
+	name := r.metricName(spec)
+
+	if spec.BoundsErr != nil {
+		// Half a range is a misconfiguration, not a partial opt-in, and silence
+		// here would read as a pool that simply chose not to grow.
+		logger.Info("warm pool resize bounds could not be read; the pool will not resize itself",
+			"pool", name, "err", spec.BoundsErr.Error())
+		return
+	}
+	if !spec.Bounds.Enabled || r.Resizer == nil || spec.Deployment == "" {
+		return
+	}
+
+	if plan.GrowBy > 0 {
+		r.shortFor[name]++
+		r.idleFor[name] = 0
+	} else {
+		r.shortFor[name] = 0
+		if lent == 0 && free > spec.Config.SleepMinSize {
+			r.idleFor[name]++
+		} else {
+			r.idleFor[name] = 0
+		}
+	}
+
+	action, want := SizeFor(spec, spec.Bounds, free, lent, r.shortFor[name], r.idleFor[name], r.GrowAfter, r.ShrinkAfter)
+	if !want {
+		return
+	}
+	if err := r.Resizer.Apply(ctx, spec.Deployment, action.To); err != nil {
+		logger.V(1).Info("could not resize the warm pool", "pool", name, "err", err.Error())
+		return
+	}
+	// Counters reset on the ACTION, not on the next observation: a resize takes
+	// a Pod start to show up, and counting those passes again would step the
+	// pool twice for one shortfall.
+	r.shortFor[name], r.idleFor[name] = 0, 0
+	logger.Info("resized the warm pool", "pool", name,
+		"from", spec.Replicas, "to", action.To, "reason", action.Why)
 }
 
 // report logs what the pass saw, but only when it differs from the last one.

@@ -55,6 +55,30 @@ const (
 	// the wrong pool means a ~35 s load that can never serve.
 	WarmPoolKey = "warmPool"
 
+	// WarmPoolCopiesKey is how many warm copies of this variant the pool should
+	// hold. Optional; a non-negative integer.
+	//
+	// Absent means AUTOMATIC, which is the default and the right answer for
+	// almost everything: the pool decides from parking, popularity and miss
+	// frequency, and holds at most one copy. Setting it takes that judgement
+	// away, and is worth doing in two cases automatic mode cannot express.
+	//
+	//	"0"  never warm this variant -- it opts out of a pool it shares, freeing
+	//	     the slot for models that gain more from it
+	//	"1"  always keep one warm, whatever the pool's own ranking thinks
+	//	"N"  keep N warm, so N scale-ups of this variant can bridge AT ONCE
+	//
+	// The last is the one automatic mode cannot do at all. A single warm copy
+	// bridges a single scale-up, so a variant that scales twice in quick
+	// succession takes a cold start for the second with free Pods sitting
+	// beside it. It is also the only way to weight a shared pool toward one
+	// model, since automatic mode holds one copy of each and no more.
+	//
+	// "1" is not the same as absent. Absent lets a quiet variant lose its slot
+	// to a busier one; "1" pins it, which is what a low-traffic but
+	// latency-critical model needs and what popularity ranking can never give.
+	WarmPoolCopiesKey = "warmPoolCopies"
+
 	// ScalerAddressKey is KEDA's own key naming this scaler's address. It is
 	// consumed by KEDA, never by WVA; named here only so it is not mistaken for a
 	// WVA key when reading a trigger.
@@ -79,6 +103,10 @@ type Meta struct {
 	// WarmPool names the warm pool this variant may borrow from, or is empty to
 	// take the namespace's only pool.
 	WarmPool string
+	// WarmPoolCopies is how many warm copies to hold, or nil for automatic. A
+	// POINTER because zero is a real setting -- never warm this -- and has to be
+	// distinguishable from "not specified".
+	WarmPoolCopies *int
 }
 
 // ParseMeta validates a trigger's metadata.
@@ -105,10 +133,23 @@ func ParseMeta(metadata map[string]string) (Meta, error) {
 		return Meta{}, fmt.Errorf("trigger metadata %q must be non-negative, got %v", VariantCostKey, costVal)
 	}
 
+	// Parsed here rather than at the point of use so a bad value is rejected
+	// with the trigger that carried it, where the operator can act on it.
+	var copies *int
+	if raw := metadata[WarmPoolCopiesKey]; raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return Meta{}, fmt.Errorf("trigger metadata %q must be a non-negative whole number, got %q",
+				WarmPoolCopiesKey, raw)
+		}
+		copies = &n
+	}
+
 	return Meta{
-		ModelID:       modelID,
-		VariantCost:   cost,
-		ScalingPolicy: metadata[ScalingPolicyKey],
-		WarmPool:      metadata[WarmPoolKey],
+		ModelID:        modelID,
+		VariantCost:    cost,
+		ScalingPolicy:  metadata[ScalingPolicyKey],
+		WarmPool:       metadata[WarmPoolKey],
+		WarmPoolCopies: copies,
 	}, nil
 }

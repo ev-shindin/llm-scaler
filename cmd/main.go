@@ -829,6 +829,13 @@ func main() {
 			// second pool is a manifest rather than a manifest plus a controller
 			// restart. The flags above become the base every pool's annotations
 			// are layered onto, and are used whole when nothing declares a pool.
+			// Applies a size change when a pool was given a range to move
+			// within. Constructed unconditionally; it does nothing unless a
+			// pool's annotations opt in, so the default stays "never resizes".
+			reconciler.Resizer = &warmpool.Resizer{
+				Client:    mgr.GetClient(),
+				Namespace: warmPoolNS,
+			}
 			reconciler.Pools = &warmpool.DeploymentPools{
 				Client:    mgr.GetClient(),
 				Namespace: warmPoolNS,

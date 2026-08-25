@@ -15,8 +15,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
@@ -131,6 +133,11 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			// Which pool this variant may borrow from. Empty is the ordinary
 			// case: a namespace with one pool needs no selection.
 			WarmPool: entry.Metadata[registry.WarmPoolKey],
+			// How many copies to hold, or nil for automatic. Parsed through
+			// ParseMeta so a bad value is refused with the trigger that carried
+			// it rather than silently read as zero, which would be an opt-out
+			// nobody asked for.
+			WarmCopies: warmCopies(logger, entry),
 			// Share is filled in below, once every variant's desire is known.
 			// It cannot be computed one variant at a time.
 			// Parked is the case with no alternative: at zero replicas a cold
@@ -201,6 +208,24 @@ func (d *Demand) poolLabels(namespace string, workloadLabels map[string]string) 
 		return nil, fmt.Errorf("InferencePool for %s has no selector", namespace)
 	}
 	return maps.Clone(found.Selector), nil
+}
+
+// warmCopies reads the variant's requested warm-copy count, or nil for
+// automatic.
+//
+// A value that does not parse is treated as ABSENT, not as zero. Zero is the
+// opt-out, so reading "two" as zero would silently stop warming a model whose
+// operator was asking for more of it -- the exact opposite of the intent, and
+// invisible.
+func warmCopies(logger logr.Logger, entry registry.Entry) *int {
+	meta, err := registry.ParseMeta(entry.Metadata)
+	if err != nil {
+		logger.V(logging.DEFAULT).Info("ignoring unreadable warm-pool trigger metadata; "+
+			"this variant falls back to automatic warming",
+			"variant", entry.Name, "namespace", entry.Namespace, "err", err.Error())
+		return nil
+	}
+	return meta.WarmPoolCopies
 }
 
 // EngineOptionsFrom derives the vLLM command line for a warm copy from the

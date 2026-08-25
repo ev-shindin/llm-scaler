@@ -155,6 +155,76 @@ never serve. It names the variant and the pools that exist instead.
 WVA also declines a model whose accelerator does not match the pool's, so a
 mismatched `warmPool` costs you a log line rather than a wasted Pod.
 
+## Choosing what stays warm
+
+By default the pool decides: parked models first, then the busiest, then
+anything that has missed twice. That is right for almost everything, and needs
+no configuration.
+
+Two things it cannot work out for itself, both set per model in the ScaledObject
+trigger metadata:
+
+```yaml
+triggers:
+  - type: external-push
+    metadata:
+      modelID: <model>
+      warmPoolCopies: "2"
+```
+
+| value | means |
+| --- | --- |
+| *absent* | automatic — the pool ranks it, and holds at most one copy |
+| `"0"` | never warm this model, freeing its slot for models that gain more |
+| `"1"` | always keep one warm, whatever the ranking thinks |
+| `"N"` | keep N warm, so N scale-ups of this model can bridge **at once** |
+
+`"1"` is not the same as absent. Absent lets a quiet model lose its slot to a
+busier one; `"1"` pins it — which is what a low-traffic but latency-critical
+model needs, and what popularity ranking can never give it.
+
+`"N"` is the only way to cover **simultaneous** scale-ups of one model. A single
+warm copy bridges a single scale-up; the second goes cold with free Pods sitting
+beside it. It is also the only way to weight a shared pool toward one model,
+since automatic mode holds one copy of each and no more.
+
+Copies always land in different Pods — a second copy in the same Pod would share
+the first's accelerators and could never serve a second bridge.
+
+## Letting the pool resize itself
+
+Off by default, and it stays off unless you give it a range. Both bounds are
+required: a ceiling alone could never grow, and a floor alone could shrink the
+pool the first quiet period and never bring it back.
+
+```yaml
+metadata:
+  annotations:
+    llm-d.ai/warm-pool-min-replicas: "2"
+    llm-d.ai/warm-pool-max-replicas: "6"
+```
+
+It grows when the pool has been **short of its reserve for several consecutive
+passes** — one short pass is a borrow doing its job, and growing on that buys a
+Pod for every spike.
+
+It shrinks only after a much longer quiet period, and only when **no bridge is
+open anywhere**. The asymmetry is deliberate: a pool that is too small costs
+latency on every spike it cannot cover, a pool that is too large costs money,
+and paying a full model load to grow back is the worst of both.
+
+Two things worth knowing before you turn it on:
+
+- **It needs a permission the controller does not have by default.**
+  `config/warmpool` ships a `Role` granting WVA the `scale` subresource on the
+  pool Deployment *by name*, in that namespace only. Edit its `namespace` to
+  name where WVA runs. Everything else in WVA's own ClusterRole is read-only, on
+  purpose — KEDA does the writing — so this is the one narrow exception, and it
+  arrives only if you deploy a pool.
+- **GitOps will see drift.** WVA owns `replicas` once you set a range. If Argo or
+  Flux manages the pool Deployment, tell it to ignore that field, exactly as you
+  would for a workload under an HPA.
+
 ## Checking it works
 
 The pool reports its state whenever that state changes:
@@ -212,4 +282,14 @@ metadata.
 
 **The first spike is never bridged.** Expected. A model has to miss twice before
 the pool warms it, so it does not spend a load on a one-off. Set `preload-top`
-to warm your busiest variants without waiting.
+to warm your busiest variants without waiting, or `warmPoolCopies: "1"` on the
+one model you cannot afford to miss.
+
+**The pool never resizes.** Check both bounds are set — half a range is refused
+whole, and WVA logs why. If they are set, check the `Role` from
+`config/warmpool`: its `namespace` has to name where WVA runs, and its
+`resourceNames` has to match your pool Deployment's name.
+
+**Two scale-ups of one model, only one bridged.** Automatic mode holds one warm
+copy per model. Set `warmPoolCopies` to the number of concurrent scale-ups you
+want covered.

@@ -7,3 +7,4 @@ kind: Kustomization
 resources:
   - warmpool-deployment.yaml
   - warmpool-networkpolicy.yaml
+  - warmpool-role.yaml

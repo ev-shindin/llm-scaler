@@ -71,6 +71,19 @@ type VariantDemand struct {
 	// empty to take the namespace's only pool. Selection, not identity, which is
 	// why it sits here rather than on ModelRef.
 	WarmPool string
+	// WarmCopies is how many warm copies this variant asked for, or nil for
+	// automatic. Nil and zero mean opposite things -- automatic, and never --
+	// which is why it is a pointer.
+	WarmCopies *int
+}
+
+// wantedCopies is how many warm copies a variant should have, and whether it
+// asked explicitly. Automatic mode holds at most one.
+func (v VariantDemand) wantedCopies() (int, bool) {
+	if v.WarmCopies == nil {
+		return 1, false
+	}
+	return *v.WarmCopies, true
 }
 
 // Borrow identifies one lent Pod.
@@ -190,7 +203,7 @@ func Decide(in Input, cfg Config) Plan {
 			// a variant resident in Pods that are all lent or loading yields no
 			// candidates -- and reporting that as a miss would say "the warm
 			// set was wrong" when the truth is "the reserve was too small".
-			if residentSomewhere(byPod, v.Model.Variant) {
+			if residentCount(byPod, v.Model.Variant) > 0 {
 				plan.Blocked = append(plan.Blocked, v.Model)
 			} else {
 				plan.Missed = append(plan.Missed, v.Model)
@@ -289,24 +302,52 @@ func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Memb
 		if budget == 0 {
 			break
 		}
-		if residentSomewhere(byPod, v.Model.Variant) {
-			continue
+		// How many SHORT of what this variant wants, not whether it is resident
+		// at all. A variant asking for several copies can bridge that many
+		// scale-ups at once; automatic mode wants one, which is the old
+		// behaviour expressed as a count.
+		want, _ := v.wantedCopies()
+		// Filled in ONE pass, not one copy per pass. A variant asking for two
+		// copies to cover two simultaneous scale-ups would otherwise take a
+		// second reconcile and a second model load to get there, by which time
+		// the spike it was for has been served cold.
+		placed := admittedSoFar(out, v.Model.Variant)
+		for residentCount(byPod, v.Model.Variant)+placed < want && budget > 0 {
+			// Excluding Pods that already hold it, and ones this pass has
+			// already chosen for it. A second copy in the same Pod shares that
+			// Pod's GPUs with the first, so it could never serve a second
+			// bridge -- and the supervisor keys instances by variant, so it
+			// would refuse the create anyway.
+			target, ok := roomiestFreePodWithout(byPod, free, cfg, v.Model.Variant)
+			if !ok {
+				break
+			}
+			if reason := doesNotFit(v.Model, byPod[target], cfg); reason != "" {
+				// Skipped rather than breaking the outer loop: this variant does
+				// not fit, but a smaller one further down the list still might.
+				declined = append(declined, Declined{Model: v.Model, Reason: reason})
+				break
+			}
+			out = append(out, Action{Pod: target, Model: v.Model})
+			delete(free, target)
+			budget--
+			placed++
 		}
-		target, ok := roomiestFreePod(byPod, free, cfg)
-		if !ok {
-			break
-		}
-		if reason := doesNotFit(v.Model, byPod[target], cfg); reason != "" {
-			// Skipped rather than breaking the loop: this variant does not fit,
-			// but a smaller one further down the list still might.
-			declined = append(declined, Declined{Model: v.Model, Reason: reason})
-			continue
-		}
-		out = append(out, Action{Pod: target, Model: v.Model})
-		delete(free, target)
-		budget--
 	}
 	return out, declined
+}
+
+// admittedSoFar counts the copies of a variant this pass has already placed.
+// The membership view is a snapshot taken before the pass, so it cannot see
+// them.
+func admittedSoFar(placed []Action, variant string) int {
+	count := 0
+	for _, a := range placed {
+		if a.Model.Variant == variant {
+			count++
+		}
+	}
+	return count
 }
 
 // candidatesForAdmission ranks the variants worth warming.
@@ -324,6 +365,20 @@ func candidatesForAdmission(in Input, cfg Config) []VariantDemand {
 
 	var out []VariantDemand
 	for _, v := range byShare {
+		want, explicit := v.wantedCopies()
+		if explicit && want == 0 {
+			// An explicit opt-out. Checked before everything else so a parked or
+			// popular variant cannot be warmed against the operator's wishes --
+			// the whole reason to write "0" is to free the slot for models that
+			// gain more from it.
+			continue
+		}
+		if explicit {
+			// Asked for by name, so it does not have to earn its place through
+			// parking, popularity or repeated misses. Ranked first below.
+			out = append(out, v)
+			continue
+		}
 		switch {
 		case v.Parked:
 			// No ordinary replicas exist, so the pool is this variant's only
@@ -335,9 +390,16 @@ func candidatesForAdmission(in Input, cfg Config) []VariantDemand {
 			out = append(out, v)
 		}
 	}
-	// Parked variants first, then by share, so a small budget is spent where
-	// the alternative is worst.
+	// Explicitly requested copies first, then parked, then by share, so a small
+	// budget is spent where the alternative is worst -- and where an operator
+	// has stated a requirement, on that requirement rather than on the pool's
+	// own guess about it.
 	sort.SliceStable(out, func(i, j int) bool {
+		_, iExplicit := out[i].wantedCopies()
+		_, jExplicit := out[j].wantedCopies()
+		if iExplicit != jExplicit {
+			return iExplicit
+		}
 		if out[i].Parked != out[j].Parked {
 			return out[i].Parked
 		}
@@ -586,23 +648,45 @@ func holding(byPod map[types.NamespacedName][]pool.Membership, free map[types.Na
 	return out
 }
 
-func residentSomewhere(byPod map[types.NamespacedName][]pool.Membership, variant string) bool {
+// residentCount is how many Pods hold a warm copy of this variant.
+func residentCount(byPod map[types.NamespacedName][]pool.Membership, variant string) int {
 	if variant == "" {
-		return false // the empty variant marks an idle Pod, not a model
+		return 0 // the empty variant marks an idle Pod, not a model
 	}
+	count := 0
 	for _, inPod := range byPod {
 		for _, m := range inPod {
 			if m.Model.Variant == variant {
-				return true
+				count++
+				break // one instance per variant per Pod
 			}
 		}
 	}
-	return false
+	return count
 }
 
 // roomiestFreePod spreads the warm set: the Pod holding fewest models takes the
 // next one, so copies of popular models do not pile into one Pod that can serve
 // only one wake at a time.
+// roomiestFreePodWithout is roomiestFreePod, skipping Pods that already hold
+// this variant. Only different when a variant asks for more than one copy.
+func roomiestFreePodWithout(byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool, cfg Config, variant string) (types.NamespacedName, bool) {
+	eligible := make(map[types.NamespacedName]bool, len(free))
+	for podRef := range free {
+		holds := false
+		for _, m := range byPod[podRef] {
+			if m.Model.Variant == variant && variant != "" {
+				holds = true
+				break
+			}
+		}
+		if !holds {
+			eligible[podRef] = true
+		}
+	}
+	return roomiestFreePod(byPod, eligible, cfg)
+}
+
 func roomiestFreePod(byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool, cfg Config) (types.NamespacedName, bool) {
 	best, found := types.NamespacedName{}, false
 	for p := range free {
