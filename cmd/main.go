@@ -807,6 +807,22 @@ func main() {
 					PodMemoryBytes:     *warmPoolMemoryBudget,
 				},
 			)
+			// Asked before anything is loaded. Without patch on pods the pool
+			// admits happily, holds GPUs, and then fails at the only moment
+			// that matters -- once per spike, in a path nobody is watching.
+			// An UNANSWERABLE question is not a denial: if the review itself
+			// fails the pool starts, because refusing to run on a broken API
+			// call would be a worse failure than the one being guarded against.
+			switch allowed, err := warmpool.CanBorrow(ctx, mgr.GetClient(), warmPoolNS); {
+			case err != nil:
+				setupLog.Info("could not check whether this controller may patch Pods; "+
+					"starting the warm pool anyway. If borrows fail, check RBAC first",
+					"namespace", warmPoolNS, "err", err.Error())
+			case !allowed:
+				setupLog.Error(nil, warmpool.BorrowDenied, "namespace", warmPoolNS)
+				return nil
+			}
+
 			reconciler.Name = warmPoolNS
 			reconciler.Trigger = trigger
 			// Pools are DISCOVERED from the Deployments that declare them, so a

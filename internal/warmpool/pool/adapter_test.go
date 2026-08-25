@@ -1,9 +1,11 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	stdlog "log"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -12,6 +14,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/go-logr/stdr"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -961,4 +967,60 @@ func TestThePortIsNotPartOfWhatMakesTwoInstancesTheSame(t *testing.T) {
 		t.Fatalf("a resident instance differing only by port must be reused: %v", err)
 	}
 	h.journal.never(t, "create")
+}
+
+func TestEveryPodUnreadableIsDiagnosedAsItsOwnFault(t *testing.T) {
+	// Some Pods unreadable is flakiness. ALL of them at once is a network path
+	// that does not exist, and it has one overwhelmingly common cause. The
+	// per-Pod messages are individually accurate and collectively misleading:
+	// each reads as an unhealthy Pod, when the Pods are fine and nothing can
+	// reach them. Without this line the pool reports itself EMPTY -- which looks
+	// exactly like a pool that is merely too small -- while holding every GPU.
+	h := newHarness(t,
+		poolPod("pod-a", "10.0.0.1", nil),
+		poolPod("pod-b", "10.0.0.2", nil),
+	)
+	h.brokenPods["10.0.0.1"] = true
+	h.brokenPods["10.0.0.2"] = true
+
+	var buf bytes.Buffer
+	old := stdr.SetVerbosity(logging.DEFAULT)
+	t.Cleanup(func() { stdr.SetVerbosity(old) })
+	ctx := ctrllog.IntoContext(context.Background(), stdr.New(stdlog.New(&buf, "", 0)))
+
+	got, err := h.adapter.ListWarm(ctx)
+	if err != nil {
+		t.Fatalf("an unreachable pool is not a failed observation: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("nothing is readable, so nothing is observed: %+v", got)
+	}
+	if !strings.Contains(buf.String(), "NetworkPolicy") {
+		t.Errorf("the likely cause must be named: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "EMPTY") {
+		t.Errorf("and the consequence, or it reads as a pool that is merely small: %q", buf.String())
+	}
+}
+
+func TestOneReadablePodIsNotDiagnosedAsANetworkFault(t *testing.T) {
+	// The other half. One Pod answering proves the path exists, so blaming the
+	// NetworkPolicy would send an operator after the wrong thing entirely.
+	h := newHarness(t,
+		poolPod("pod-a", "10.0.0.1", nil),
+		poolPod("pod-b", "10.0.0.2", nil),
+	)
+	h.brokenPods["10.0.0.2"] = true
+
+	var buf bytes.Buffer
+	old := stdr.SetVerbosity(logging.DEFAULT)
+	t.Cleanup(func() { stdr.SetVerbosity(old) })
+	ctx := ctrllog.IntoContext(context.Background(), stdr.New(stdlog.New(&buf, "", 0)))
+
+	if _, err := h.adapter.ListWarm(ctx); err != nil {
+		t.Fatalf("ListWarm: %v", err)
+	}
+	if strings.Contains(buf.String(), "NetworkPolicy") {
+		t.Errorf("a partly reachable pool is not a network fault: %q", buf.String())
+	}
 }

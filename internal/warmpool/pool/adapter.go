@@ -118,11 +118,13 @@ func (a *Adapter) ListWarm(ctx context.Context) ([]Membership, error) {
 	}
 
 	var out []Membership
+	addressable, unreadable := 0, 0
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Status.PodIP == "" || p.DeletionTimestamp != nil {
 			continue // not addressable, or on its way out
 		}
+		addressable++
 		found, err := a.membershipsIn(ctx, p)
 		if err != nil {
 			// One unreachable Pod must not blind the controller to the rest:
@@ -138,9 +140,27 @@ func (a *Adapter) ListWarm(ctx context.Context) ([]Membership, error) {
 			log.FromContext(ctx).V(logging.DEFAULT).Info(
 				"warm pool Pod could not be read; it is absent from this observation",
 				"pod", p.Name, "err", err.Error())
+			unreadable++
 			continue
 		}
 		out = append(out, found...)
+	}
+
+	// EVERY Pod unreadable is a different fault from some of them, and it has
+	// one overwhelmingly common cause. Per-Pod messages describe it accurately
+	// and still mislead: each reads as a flaky Pod, and a reader seeing several
+	// concludes the Pods are unhealthy. They are fine -- nothing can reach them.
+	//
+	// Said only when the pool is otherwise plausible (Pods exist and have
+	// addresses), because "no Pods at all" is a different problem with a
+	// different answer.
+	if addressable > 0 && unreadable == addressable {
+		log.FromContext(ctx).V(logging.DEFAULT).Info(
+			"no warm pool Pod could be read, so the pool reports itself EMPTY while holding GPUs. "+
+				"Every Pod being unreachable at once is usually the pool NetworkPolicy: its "+
+				"ingress namespaceSelector has to name the namespace this controller runs in. "+
+				"See config/warmpool/warmpool-networkpolicy.yaml",
+			"pods", addressable, "namespace", a.namespace)
 	}
 	return out, nil
 }
