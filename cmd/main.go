@@ -141,7 +141,11 @@ func main() {
 	// The warm pool is OFF unless a namespace is named, because it holds GPUs
 	// continuously: that is a cost decision an operator makes, never a default.
 	warmPoolNamespace := flag.String("warm-pool-namespace", "",
-		"Namespace holding warm-pool Pods. Empty disables the pool entirely.")
+		"Namespace holding warm-pool Pods. For a NAMESPACE-SCOPED install this is already "+
+			"known -- the pool lives where the workloads it warms live -- so leaving it empty "+
+			"derives it from the watched namespace rather than making an operator restate it. "+
+			"A cluster-scoped install has no such namespace to derive, so naming one there is "+
+			"what turns the pool on.")
 	warmPoolSleepMinSize := flag.Int("warm-pool-sleep-min-size", 1,
 		"Floor on FREE pool Pods -- ones with every instance asleep. This is the reserve "+
 			"the pool keeps for the next spike, per pool rather than per model.")
@@ -149,13 +153,15 @@ func main() {
 		"How long a borrowed Pod may serve before it is returned regardless. Bounds the case "+
 			"where the ordinary replicas never arrive, which would otherwise turn insurance "+
 			"into permanent capacity for one variant.")
-	warmPoolMemoryBudget := flag.Int64("warm-pool-memory-bytes", 120<<30,
+	warmPoolMemoryBudget := flag.Int64("warm-pool-memory-bytes", 0,
 		"Host memory ONE pool Pod may commit to sleeping weights. A level-1 sleeper keeps its "+
 			"weights in host memory, so admitting one model too many does not fail that "+
 			"admission -- it OOM-kills the launcher and destroys every model already resident "+
 			"in the Pod. Clamped to the container's own limit, so it cannot pretend to be a "+
 			"wall it is not; 0 means use that limit. A sleeper costs 2.6GiB + 1.4x its weights, "+
-			"measured -- so 120Gi is four 8B models, which is where the break-even sits.")
+			"measured -- so 120Gi is four 8B models, which is where the break-even sits. "+
+			"Defaults to 0: TAKE the container's limit, which is the wall the kubelet actually "+
+			"enforces, rather than restating it here where the two can disagree.")
 	warmPoolGPUUtil := flag.Float64("warm-pool-gpu-memory-utilization", 0.90,
 		"Override --gpu-memory-utilization for warm copies. A workload's value is sized for a "+
 			"Pod running ONE engine and typically claims ~95% of the card, which leaves room "+
@@ -171,10 +177,6 @@ func main() {
 			"of waiting for each to miss. Popularity is share of desired replicas, which "+
 			"tracks share of requests. 0 disables preloading, leaving admission to parking "+
 			"and the frequency filter.")
-	warmPoolGPUsPerPod := flag.Int("warm-pool-gpus-per-pod", 1,
-		"GPUs each pool Pod holds. A warm copy inherits the ordinary replicas' parallelism "+
-			"flags, so a variant wanting more devices than this is declined rather than "+
-			"loaded and failed. Must match the pool Deployment's nvidia.com/gpu request.")
 
 	// Leader election timeout configuration flags
 	// These can be overridden in manager.yaml to tune for different environments
@@ -765,7 +767,18 @@ func main() {
 	// never touches the metric KEDA reads -- it borrows underneath the same
 	// decision KEDA is about to act on, which is what keeps lent capacity out of
 	// the scaling arithmetic.
-	if *warmPoolNamespace != "" {
+	// The pool namespace is derived, not configured, wherever it can be: a
+	// namespace-scoped install watches exactly one namespace, and the pool warms
+	// the workloads in it, so the flag could only ever repeat watchNS or
+	// contradict it. Contradicting it is the interesting case -- the controller
+	// cannot see across the boundary, so every read fails and the pool reports
+	// itself empty, which is indistinguishable from a pool that is simply too
+	// small.
+	warmPoolNS := *warmPoolNamespace
+	if warmPoolNS == "" {
+		warmPoolNS = watchNS
+	}
+	if warmPoolNS != "" {
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 			trigger := warmpool.NewDecisionTrigger(decision.Default, nil)
 			defer trigger.Close()
@@ -775,9 +788,9 @@ func main() {
 			go trigger.WatchRegistry(ctx, registry.Default, 30*time.Second)
 
 			reconciler := warmpool.New(
-				warmpoolpool.NewAdapter(mgr.GetClient(), *warmPoolNamespace, warmpoolpool.Ram),
+				warmpoolpool.NewAdapter(mgr.GetClient(), warmPoolNS, warmpoolpool.Ram),
 				&warmpool.Demand{
-					Namespace:            *warmPoolNamespace,
+					Namespace:            warmPoolNS,
 					GPUMemoryUtilization: *warmPoolGPUUtil,
 					Registry:             registry.Default,
 					Decisions:            decision.Default,
@@ -792,17 +805,15 @@ func main() {
 					PreloadTop:         *warmPoolPreloadTop,
 					MaxInstancesPerPod: warmpoolpool.MaxInstancesPerPod,
 					PodMemoryBytes:     *warmPoolMemoryBudget,
-					GPUsPerPod:         *warmPoolGPUsPerPod,
 				},
 			)
-			reconciler.Name = *warmPoolNamespace
+			reconciler.Name = warmPoolNS
 			reconciler.Trigger = trigger
 			setupLog.Info("warm pool enabled",
-				"namespace", *warmPoolNamespace,
+				"namespace", warmPoolNS,
 				"sleepMinSize", *warmPoolSleepMinSize,
 				"maxHold", *warmPoolMaxHold,
 				"memoryBudgetBytes", *warmPoolMemoryBudget,
-				"gpusPerPod", *warmPoolGPUsPerPod,
 				"gpuMemoryUtilization", *warmPoolGPUUtil,
 				"preloadTop", *warmPoolPreloadTop)
 			return reconciler.Start(ctx)

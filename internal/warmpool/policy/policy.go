@@ -51,14 +51,6 @@ type Config struct {
 	// larger than the limit cannot pretend to be a wall. Zero means "use the
 	// container's limit", which is the honest default.
 	PodMemoryBytes int64
-
-	// GPUsPerPod is how many devices a pool Pod holds.
-	//
-	// A warm copy inherits the ordinary replicas' parallelism flags, so a
-	// tensor-parallel workload asks for more GPUs than a Pod has. Without this
-	// the admission is accepted, the engine cannot start, and the ~35 s load is
-	// spent and re-spent every cycle. Zero means one.
-	GPUsPerPod int
 }
 
 // VariantDemand is what WVA has decided about one variant, plus what the pool
@@ -391,14 +383,13 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 	shape := pool.ShapeOf(model.EngineOptions)
 	capacity := capacityOf(resident)
 
-	// What the POD says it has beats what the controller was told to believe.
-	// The flag is a fallback for a Pod declaring nothing, not an override: a
-	// flag claiming four GPUs against a one-GPU Pod would admit engines that
-	// cannot start, which is the failure this check exists to prevent.
+	// The POD is the only source. There used to be a --warm-pool-gpus-per-pod
+	// flag beside this whose own help said it "must match the pool Deployment's
+	// nvidia.com/gpu request" -- a second copy of a fact the Pod already states,
+	// which could only ever agree or cause a silent decline. Every pool Pod
+	// carries its declared capacity, including an EMPTY one (the placeholder
+	// membership sets it), so there is nothing left for a fallback to cover.
 	gpus := capacity.GPUs
-	if gpus < 1 {
-		gpus = cfg.GPUsPerPod
-	}
 	if gpus < 1 {
 		gpus = 1
 	}

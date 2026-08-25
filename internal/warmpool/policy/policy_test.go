@@ -34,6 +34,11 @@ func model(variant string) pool.ModelRef {
 	return pool.ModelRef{Namespace: "workload", Variant: variant}
 }
 
+func withGPUs(m pool.Membership, gpus int) pool.Membership {
+	m.Capacity.GPUs = gpus
+	return m
+}
+
 func resident(podName, variant string, state pool.State) pool.Membership {
 	return pool.Membership{Model: model(variant), Pod: pod(podName), State: state}
 }
@@ -647,7 +652,6 @@ func TestAModelNeedingMoreGPUsThanAPodHasIsDeclined(t *testing.T) {
 	// has. Without this the admission is accepted, the engine cannot start, and
 	// the ~35 s load is spent and re-spent every cycle.
 	c := cfg()
-	c.GPUsPerPod = 1
 	c.PodMemoryBytes = 100 << 30
 	c.SleepMinSize = 0 // the reserve floor is not what these cases are about
 
@@ -660,7 +664,7 @@ func TestAModelNeedingMoreGPUsThanAPodHasIsDeclined(t *testing.T) {
 		Parked: true,
 	}
 	in := Input{
-		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
 		Variants:    []VariantDemand{big},
 		Now:         now,
 	}
@@ -673,21 +677,57 @@ func TestAModelNeedingMoreGPUsThanAPodHasIsDeclined(t *testing.T) {
 	}
 }
 
+func TestThePodsOwnGPUCountDecidesWhatFits(t *testing.T) {
+	// The positive half, and the reason --warm-pool-gpus-per-pod could go: the
+	// SAME tensor-parallel model that a one-GPU Pod declines is admitted by a
+	// two-GPU one, with no configuration telling the controller either number.
+	// Only the Pod's declared capacity differs between the two cases.
+	tp2 := VariantDemand{
+		Model: pool.ModelRef{
+			Namespace:     "workload",
+			Variant:       "tp2",
+			EngineOptions: "--model Qwen/Qwen3-0.6B --tensor-parallel-size 2",
+		},
+		Parked: true,
+	}
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	small := Decide(Input{
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
+		Variants:    []VariantDemand{tp2},
+		Now:         now,
+	}, c)
+	if len(small.Admit) != 0 {
+		t.Fatalf("a one-GPU Pod cannot run a TP=2 engine: %+v", small.Admit)
+	}
+
+	big := Decide(Input{
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 2)},
+		Variants:    []VariantDemand{tp2},
+		Now:         now,
+	}, c)
+	if len(big.Admit) != 1 {
+		t.Fatalf("a two-GPU Pod must take it: admit=%+v declined=%+v", big.Admit, big.Declined)
+	}
+}
+
 func TestAModelTooLargeForTheBudgetIsDeclined(t *testing.T) {
 	// The expensive one to get wrong. A level-1 sleeper keeps its weights in
 	// HOST memory against a hard container limit, so one model too many does not
 	// fail its own admission -- it OOM-kills the launcher and takes every model
 	// already resident in that Pod with it.
 	c := cfg()
-	c.GPUsPerPod = 1
 	c.PodMemoryBytes = 20 << 30 // room for one 8B, not two
 	c.SleepMinSize = 0
 
 	in := Input{
 		Memberships: []pool.Membership{{
-			Pod:   pod("a"),
-			Model: pool.ModelRef{Variant: "first", EngineOptions: "--model meta-llama/Llama-3.1-8B"},
-			State: pool.Asleep,
+			Pod:      pod("a"),
+			Model:    pool.ModelRef{Variant: "first", EngineOptions: "--model meta-llama/Llama-3.1-8B"},
+			State:    pool.Asleep,
+			Capacity: pool.PodCapacity{GPUs: 1},
 		}},
 		Variants: []VariantDemand{{
 			Model: pool.ModelRef{
@@ -710,12 +750,11 @@ func TestAModelTooLargeForTheBudgetIsDeclined(t *testing.T) {
 func TestAModelThatFitsIsStillAdmitted(t *testing.T) {
 	// The check must not become a blanket refusal.
 	c := cfg()
-	c.GPUsPerPod = 1
 	c.PodMemoryBytes = 20 << 30
 	c.SleepMinSize = 0
 
 	in := Input{
-		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
 		Variants: []VariantDemand{{
 			Model: pool.ModelRef{
 				Variant:       "small",
@@ -740,7 +779,7 @@ func TestAModelWhoseSizeCannotBeWorkedOutIsDeclined(t *testing.T) {
 	c.SleepMinSize = 0
 
 	in := Input{
-		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
 		Variants: []VariantDemand{{
 			Model:  pool.ModelRef{Variant: "mystery", EngineOptions: "--model BAAI/bge-m3"},
 			Parked: true,
@@ -763,7 +802,7 @@ func TestTheFitCheckIsOffWhenNoBudgetIsSet(t *testing.T) {
 	c.SleepMinSize = 0
 
 	in := Input{
-		Memberships: []pool.Membership{resident("a", "", pool.Absent)},
+		Memberships: []pool.Membership{withGPUs(resident("a", "", pool.Absent), 1)},
 		Variants: []VariantDemand{{
 			Model:  pool.ModelRef{Variant: "mystery", EngineOptions: "--model BAAI/bge-m3"},
 			Parked: true,
