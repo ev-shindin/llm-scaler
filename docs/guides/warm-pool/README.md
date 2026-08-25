@@ -193,37 +193,47 @@ the first's accelerators and could never serve a second bridge.
 
 ## Letting the pool resize itself
 
-Off by default, and it stays off unless you give it a range. Both bounds are
-required: a ceiling alone could never grow, and a floor alone could shrink the
-pool the first quiet period and never bring it back.
+The pool is scaled the same way every other workload here is: **WVA computes a
+size, KEDA writes it.** `config/warmpool` ships a ScaledObject for the pool
+alongside its Deployment — delete it and the pool simply stays the size the
+Deployment says, which is what most installs want to begin with.
 
 ```yaml
-metadata:
-  annotations:
-    llm-d.ai/warm-pool-min-replicas: "2"
-    llm-d.ai/warm-pool-max-replicas: "6"
+spec:
+  minReplicaCount: 2      # must EXCEED the pool's reserve
+  maxReplicaCount: 6
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:   { stabilizationWindowSeconds: 60 }
+        scaleDown: { stabilizationWindowSeconds: 900 }
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: wva-external-scaler.<wva-namespace>.svc.cluster.local:9090
+        warmPoolName: default   # must match the Deployment's llm-d.ai/warm-pool
 ```
 
-It grows when the pool has been **short of its reserve for several consecutive
-passes** — one short pass is a borrow doing its job, and growing on that buys a
-Pod for every spike.
+WVA publishes `lent + reserve + 1`: enough Pods to keep the reserve free
+alongside whatever is currently bridging, plus the one spare that makes
+admission possible at all.
 
-It shrinks only after a much longer quiet period, and only when **no bridge is
-open anywhere**. The asymmetry is deliberate: a pool that is too small costs
-latency on every spike it cannot cover, a pool that is too large costs money,
-and paying a full model load to grow back is the worst of both.
+Three things follow from scaling it this way, and they are the reason for it:
 
-Two things worth knowing before you turn it on:
+- **WVA needs no permission to resize anything.** Its ClusterRole stays
+  read-only. A cluster-wide licence to change replica counts is the permission a
+  cluster admin is most right to refuse, and the pool no longer asks for one.
+- **The asymmetry lives where you can see it.** Grow promptly, shrink slowly —
+  because a pool that is too small costs latency on every spike it cannot cover,
+  one that is too large costs money, and paying a full model load to grow back
+  is the worst of both. That is the `behavior` block, not something buried in
+  the controller.
+- **`minReplicaCount` must exceed the reserve.** Otherwise the pool spends every
+  quiet period in the one state where it can never warm anything.
 
-- **It needs a permission the controller does not have by default.**
-  `config/warmpool` ships a `Role` granting WVA the `scale` subresource on the
-  pool Deployment *by name*, in that namespace only. Edit its `namespace` to
-  name where WVA runs. Everything else in WVA's own ClusterRole is read-only, on
-  purpose — KEDA does the writing — so this is the one narrow exception, and it
-  arrives only if you deploy a pool.
-- **GitOps will see drift.** WVA owns `replicas` once you set a range. If Argo or
-  Flux manages the pool Deployment, tell it to ignore that field, exactly as you
-  would for a workload under an HPA.
+Never scale the pool to zero. A pool at zero holds nothing warm, so the first
+spike after a quiet period pays a full cold start — and then the pool grows,
+loads a model, and is ready exactly in time for the spike that is already over.
 
 ## Checking it works
 
@@ -285,10 +295,10 @@ the pool warms it, so it does not spend a load on a one-off. Set `preload-top`
 to warm your busiest variants without waiting, or `warmPoolCopies: "1"` on the
 one model you cannot afford to miss.
 
-**The pool never resizes.** Check both bounds are set — half a range is refused
-whole, and WVA logs why. If they are set, check the `Role` from
-`config/warmpool`: its `namespace` has to name where WVA runs, and its
-`resourceNames` has to match your pool Deployment's name.
+**The pool never resizes.** Check the pool ScaledObject exists, that its
+`scalerAddress` names the namespace WVA runs in, and that its `warmPoolName`
+matches the Deployment's `llm-d.ai/warm-pool` label. A pool with no ScaledObject
+stays exactly the size its Deployment says, which is not a fault.
 
 **Two scale-ups of one model, only one bridged.** Automatic mode holds one warm
 copy per model. Set `warmPoolCopies` to the number of concurrent scale-ups you

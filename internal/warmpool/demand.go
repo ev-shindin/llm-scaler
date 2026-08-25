@@ -87,6 +87,9 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 		if entry.Target.Name == "" {
 			continue // never enriched; nothing to scale and nothing to bridge
 		}
+		if registry.ScalesAWarmPool(entry.Metadata) {
+			continue // the pool's own ScaledObject; it is not a model to warm
+		}
 		target := types.NamespacedName{Namespace: entry.Namespace, Name: entry.Target.Name}
 
 		var workload appsv1.Deployment

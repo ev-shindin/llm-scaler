@@ -1,0 +1,58 @@
+# Makes the warm pool elastic, the same way every other workload here is: WVA
+# computes a size, KEDA writes it.
+#
+# This is deliberate rather than convenient. WVA's own ClusterRole is read-only,
+# and internal/controller/rbac.go says why -- a cluster-wide licence to resize
+# workloads is the single permission a cluster admin is most right to refuse.
+# Scaling the pool through KEDA means WVA needs no write permission at all, not
+# even a narrow one, and the pool is bounded by the same object an operator
+# already reads to understand any other autoscaled workload.
+#
+# It also means the pool inherits HPA's stabilization for free, which is the
+# behaviour a warm pool most needs: growing promptly when spikes are being
+# missed, and shrinking slowly, because throwing away a loaded model to save
+# money and then paying a full load to get it back is the worst of both.
+#
+# ENTIRELY OPTIONAL. Delete this file and the pool stays exactly the size its
+# Deployment says, which is what most installs want to start with.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: wva-warm-pool
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  scaleTargetRef:
+    name: wva-warm-pool
+  # The floor MUST exceed the pool's reserve (llm-d.ai/warm-pool-sleep-min-size
+  # on the Deployment), or the pool spends its quiet periods in the one state
+  # where it can never warm anything: every Pod is reserve, so the admission
+  # budget is zero. WVA reports that if it happens.
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  # Never to zero. A pool at zero holds nothing warm, so the first spike after a
+  # quiet period pays a full cold start -- and then the pool grows, loads a
+  # model, and is ready exactly in time for the spike that is already over.
+  idleReplicaCount: null
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          # Prompt: every pass spent short of the reserve is a spike that may go
+          # unbridged.
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          # Slow, and asymmetric on purpose. A pool that is too small costs
+          # latency on every spike it cannot cover; one that is too large costs
+          # money. Shrinking eagerly turns a cost problem into a latency one.
+          stabilizationWindowSeconds: 900
+  triggers:
+    - type: external-push
+      metadata:
+        # WVA's external scaler. Same address the model ScaledObjects use.
+        scalerAddress: wva-external-scaler.>>> EDIT THIS <<<.svc.cluster.local:9090
+        # Marks this as a POOL rather than a model, which is what lets WVA
+        # answer for it without a modelID and keeps it out of variant discovery.
+        # It must match the pool Deployment's llm-d.ai/warm-pool label.
+        warmPoolName: default

@@ -61,12 +61,6 @@ type PoolSpec struct {
 	// Deployment is the object to resize. Empty when the pool was not
 	// discovered from one, in which case it cannot be resized at all.
 	Deployment string
-	// Bounds is the range this pool may resize within. Disabled unless the
-	// operator set both annotations.
-	Bounds SizeBounds
-	// BoundsErr is why bounds could not be read, if they could not be. Held
-	// rather than logged here so the caller can report it once.
-	BoundsErr error
 }
 
 // Inert reports whether this pool can never admit anything, and why.
@@ -136,7 +130,6 @@ func (d *DeploymentPools) Pools(ctx context.Context) ([]PoolSpec, error) {
 			Config:     d.Fallback,
 			Deployment: dep.Name,
 		}
-		spec.Bounds, spec.BoundsErr = BoundsFrom(dep.Annotations)
 		if dep.Spec.Replicas != nil {
 			spec.Replicas = int(*dep.Spec.Replicas)
 		}

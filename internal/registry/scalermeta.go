@@ -79,6 +79,20 @@ const (
 	// latency-critical model needs and what popularity ranking can never give.
 	WarmPoolCopiesKey = "warmPoolCopies"
 
+	// WarmPoolNameKey marks a ScaledObject as scaling a warm POOL rather than a
+	// model, and names which pool it is.
+	//
+	// A pool is scaled the same way every other workload here is -- WVA computes
+	// a size, KEDA writes it -- which is what lets the controller stay read-only.
+	// The alternative was a write permission on the pool Deployment, and
+	// internal/controller/rbac.go is explicit that a licence to resize workloads
+	// is the single permission a cluster admin is most right to refuse.
+	//
+	// Its presence is also what excuses this trigger from carrying a modelID: a
+	// pool serves no model in particular, and every consumer that builds
+	// variants skips these entries rather than inventing one.
+	WarmPoolNameKey = "warmPoolName"
+
 	// ScalerAddressKey is KEDA's own key naming this scaler's address. It is
 	// consumed by KEDA, never by WVA; named here only so it is not mistaken for a
 	// WVA key when reading a trigger.
@@ -103,6 +117,9 @@ type Meta struct {
 	// WarmPool names the warm pool this variant may borrow from, or is empty to
 	// take the namespace's only pool.
 	WarmPool string
+	// WarmPoolName is set when this trigger scales a warm POOL rather than a
+	// model. When it is set, nothing else here is meaningful.
+	WarmPoolName string
 	// WarmPoolCopies is how many warm copies to hold, or nil for automatic. A
 	// POINTER because zero is a real setting -- never warm this -- and has to be
 	// distinguishable from "not specified".
@@ -116,9 +133,17 @@ type Meta struct {
 // anywhere on the ScaledObject, so an unhelpful message here is the whole
 // diagnostic.
 func ParseMeta(metadata map[string]string) (Meta, error) {
+	// A pool's trigger names no model because it serves none. Returned early so
+	// the model-shaped validation below does not reject it, and so callers have
+	// one field to test rather than a rule to remember.
+	if poolName := metadata[WarmPoolNameKey]; poolName != "" {
+		return Meta{WarmPoolName: poolName}, nil
+	}
+
 	modelID := metadata[ModelIDKey]
 	if modelID == "" {
-		return Meta{}, fmt.Errorf("trigger metadata %q is required and must not be empty", ModelIDKey)
+		return Meta{}, fmt.Errorf("trigger metadata %q is required and must not be empty; "+
+			"a ScaledObject that scales a warm pool sets %q instead", ModelIDKey, WarmPoolNameKey)
 	}
 
 	cost := metadata[VariantCostKey]
@@ -152,4 +177,11 @@ func ParseMeta(metadata map[string]string) (Meta, error) {
 		WarmPool:       metadata[WarmPoolKey],
 		WarmPoolCopies: copies,
 	}, nil
+}
+
+// ScalesAWarmPool reports whether a trigger's metadata scales a warm pool rather
+// than a model. Callers that build variants must skip these: a pool has no
+// model, no engine options and nothing to autoscale on demand for.
+func ScalesAWarmPool(metadata map[string]string) bool {
+	return metadata[WarmPoolNameKey] != ""
 }

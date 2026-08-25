@@ -220,6 +220,13 @@ func registrySourcedVariants(ctx context.Context, reg *registry.Registry) []wvav
 	entries := reg.Snapshot()
 	out := make([]wvav1alpha1.VariantAutoscaling, 0, len(entries))
 	for _, entry := range entries {
+		if registry.ScalesAWarmPool(entry.Metadata) {
+			// A warm pool is a workload WVA sizes, not a model it optimizes. It
+			// has no model, no engine options and no saturation to measure, so
+			// letting it through would create a variant that every engine then
+			// has to special-case.
+			continue
+		}
 		meta, err := registry.ParseMeta(entry.Metadata)
 		if err != nil {
 			// The operator's only view of this: KEDA does not surface a scaler's

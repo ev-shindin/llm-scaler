@@ -1,6 +1,9 @@
 package registry
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestParseMetaAcceptsAFullTrigger — the shape a working ScaledObject carries.
 func TestParseMetaAcceptsAFullTrigger(t *testing.T) {
@@ -86,5 +89,66 @@ func TestScalingPolicyIsOptional(t *testing.T) {
 	}
 	if m.ScalingPolicy != "" {
 		t.Errorf("expected no policy, have %q", m.ScalingPolicy)
+	}
+}
+
+func TestAPoolTriggerNeedsNoModelID(t *testing.T) {
+	// A warm pool serves no model in particular. Requiring modelID would force
+	// an operator to invent one, and an invented model id becomes a variant
+	// every engine then has to special-case.
+	meta, err := ParseMeta(map[string]string{WarmPoolNameKey: "default"})
+	if err != nil {
+		t.Fatalf("a pool trigger must be accepted without a model: %v", err)
+	}
+	if meta.WarmPoolName != "default" {
+		t.Errorf("the pool name must survive: %+v", meta)
+	}
+}
+
+func TestAModelTriggerStillRequiresAModelID(t *testing.T) {
+	// The pool exemption must not become a way to register a model with no
+	// identity.
+	_, err := ParseMeta(map[string]string{VariantCostKey: "10.0"})
+	if err == nil {
+		t.Fatal("a trigger that names neither a model nor a pool must be refused")
+	}
+	if !strings.Contains(err.Error(), WarmPoolNameKey) {
+		t.Errorf("the error should point at the pool key as the alternative: %v", err)
+	}
+}
+
+func TestScalesAWarmPoolIsHowConsumersTell(t *testing.T) {
+	if !ScalesAWarmPool(map[string]string{WarmPoolNameKey: "default"}) {
+		t.Error("a pool trigger must be recognisable")
+	}
+	if ScalesAWarmPool(map[string]string{ModelIDKey: "m"}) {
+		t.Error("a model trigger is not a pool")
+	}
+	if ScalesAWarmPool(map[string]string{WarmPoolNameKey: ""}) {
+		t.Error("an empty pool name names no pool")
+	}
+}
+
+func TestWarmPoolCopiesIsParsedAndValidated(t *testing.T) {
+	meta, err := ParseMeta(map[string]string{ModelIDKey: "m", WarmPoolCopiesKey: "2"})
+	if err != nil || meta.WarmPoolCopies == nil || *meta.WarmPoolCopies != 2 {
+		t.Fatalf("copies must be read: %+v %v", meta, err)
+	}
+
+	// Zero is a real setting -- never warm this -- and must survive as zero
+	// rather than collapsing into "unset".
+	meta, err = ParseMeta(map[string]string{ModelIDKey: "m", WarmPoolCopiesKey: "0"})
+	if err != nil || meta.WarmPoolCopies == nil || *meta.WarmPoolCopies != 0 {
+		t.Fatalf("zero must be distinguishable from absent: %+v %v", meta, err)
+	}
+
+	if meta, _ := ParseMeta(map[string]string{ModelIDKey: "m"}); meta.WarmPoolCopies != nil {
+		t.Error("absent must stay nil, which is what selects automatic mode")
+	}
+
+	for _, bad := range []string{"-1", "two", "1.5"} {
+		if _, err := ParseMeta(map[string]string{ModelIDKey: "m", WarmPoolCopiesKey: bad}); err == nil {
+			t.Errorf("%q must be refused with its trigger, not read as zero", bad)
+		}
 	}
 }
