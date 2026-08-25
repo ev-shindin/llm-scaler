@@ -252,9 +252,13 @@ Pod serves while the variant has zero ordinary replicas.
 3. **Done.** `warmPool` in trigger metadata, needed only to disambiguate;
    unresolvable selection is declined and reported per variant.
 3a. **Done.** Accelerator matching, from nodeAffinity as well as nodeSelector.
-4. **Not started.** RBAC preflight (`SelfSubjectAccessReview` for pods `patch`)
-   and a distinct diagnosis for the NetworkPolicy case.
+4. **Done.** RBAC preflight (`SelfSubjectAccessReview` for pods `patch`, the pool
+   refuses to start without it) and a distinct diagnosis when EVERY Pod is
+   unreadable at once.
 5. **Deferred.** Cross-namespace pools, only if a real deployment needs them.
+
+The user guide is written: [Bridge a scale-up with a warm
+pool](../guides/warm-pool/).
 
 ### Verified on the cluster, 2026-08-25
 
@@ -285,6 +289,14 @@ Setting `warmPool: default` in the trigger metadata restored it on the next KEDA
 call, and both pools reported their own state independently. The warm copy was
 NOT destroyed while the variant was unassignable, which is the right behaviour:
 eviction answers pressure, not a variant that stopped asking.
+
+The step 4 preflight was verified on the cluster in the allowing direction (the
+pool starts silently), and the API server was asked both ways through the same
+review machinery -- `yes` for the controller's ServiceAccount, `no` for an
+identity with no such grant. The DENIAL branch was not exercised end to end: on
+pokprod the controller's ServiceAccount draws `patch` from a ClusterRole shared
+with other namespaces' installs, so revoking it to observe one log line would
+have broken other tenants. That branch is unit-tested and mutation-checked.
 
 **Not verified on a cluster:** the accelerator MISMATCH path. Every GPU node on
 pokprod is an H100, so there is no second type to be declined against, and the

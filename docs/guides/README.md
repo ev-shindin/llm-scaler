@@ -30,6 +30,7 @@ source docs/guides/env.sh
 | [Test against a full llm-d stack](testing-with-llm-d/) | llm-d + WVA on kind, emulated GPUs, no hardware |
 | [Benchmark WVA](benchmarking/) | drive load through a real stack and compare runs |
 | [Autoscale a Fast Model Actuation stack](fma/) | FMA runs the engine in a pod no ScaledObject owns |
+| [Bridge a scale-up with a warm pool](warm-pool/) | hold models loaded and asleep so a scale-up serves while its replica starts |
 
 ## Reference
 
