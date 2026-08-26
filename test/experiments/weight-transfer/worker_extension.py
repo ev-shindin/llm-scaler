@@ -1,43 +1,72 @@
-"""Worker extension that lets a SERVING vLLM replica donate its own weights.
+"""Worker extension letting a SERVING replica donate its weights, at any TP.
 
-vLLM's weight-transfer engine is receiver-side over HTTP; the sender exists only
-as a Python API. `worker_extension_cls` is the supported way in: methods defined
-here are inherited by the worker class and callable through /collective_rpc.
+The shipped protocol is one UNSHARDED sender (always rank 0) broadcasting to N
+inference ranks, each of which shards on load. A replica running tensor
+parallelism holds only its own shard, so it cannot be that sender as-is.
 
-The open question this is written to answer: a running engine holds FUSED
-parameters (qkv_proj, gate_up_proj), while the receiver's load_weights expects
-CHECKPOINT-format names. If those disagree, a live replica cannot donate its
-weights without un-fusing them, and the whole "sender is a replica you already
-have" story needs rethinking.
+It can become one. Every parameter a parallel layer creates is tagged with the
+dimension it was split along -- `output_dim` for column-parallel, `input_dim` for
+row-parallel, neither for replicated -- so the shards can be gathered back into
+the checkpoint-shaped tensor the receiver expects, one parameter at a time.
+
+That keeps the sender's TP independent of the receiver's, which rank-pairing
+would not.
 """
 
 
 class WeightDonor:
+    def _tp_group(self):
+        from vllm.distributed.parallel_state import get_tp_group
+        return get_tp_group()
+
+    def _full(self, param):
+        """This parameter as the checkpoint holds it, gathered across TP ranks."""
+        import torch
+        group = self._tp_group()
+        if group.world_size == 1:
+            return param.data
+        dim = getattr(param, "output_dim", None)
+        if dim is None:
+            dim = getattr(param, "input_dim", None)
+        if dim is None:
+            # Untagged means replicated: every rank has the whole thing, and
+            # gathering would concatenate duplicates.
+            return param.data
+        gathered = group.all_gather(param.data.contiguous(), dim=dim)
+        return gathered
+
     def weight_metadata(self):
-        """(name, dtype, shape) for every parameter this worker holds."""
         model = self.model_runner.model
-        return [
-            (name, str(p.dtype).replace("torch.", ""), list(p.shape))
-            for name, p in model.named_parameters()
-        ]
+        out = []
+        for name, p in model.named_parameters():
+            full = self._full(p)
+            out.append((name, str(full.dtype).replace("torch.", ""), list(full.shape)))
+        return out
 
     def send_weights_to(self, master_address, master_port, world_size=2):
-        """Form an NCCL group as rank 0 and broadcast our parameters into it."""
         from vllm.distributed.weight_transfer.nccl_common import trainer_init
         from vllm.distributed.weight_transfer.nccl_engine import (
             NCCLTrainerSendWeightsArgs,
             NCCLWeightTransferEngine,
         )
 
-        group = trainer_init({
+        model = self.model_runner.model
+        group = self._tp_group()
+
+        # Only ONE process may be rank 0 of the transfer group. Every TP rank has
+        # to run the gather, though -- it is a collective, and a rank that skips
+        # it hangs the others.
+        pairs = [(n, self._full(p)) for n, p in model.named_parameters()]
+        if group.rank_in_group != 0:
+            return 0
+
+        comm = trainer_init({
             "master_address": master_address,
             "master_port": int(master_port),
             "world_size": int(world_size),
         })
-        model = self.model_runner.model
-        names = [n for n, _ in model.named_parameters()]
         NCCLWeightTransferEngine.trainer_send_weights(
-            ((n, p) for n, p in model.named_parameters()),
-            NCCLTrainerSendWeightsArgs(group=group, src=0, packed=False),
+            iter(pairs),
+            NCCLTrainerSendWeightsArgs(group=comm, src=0, packed=False),
         )
-        return len(names)
+        return len(pairs)
