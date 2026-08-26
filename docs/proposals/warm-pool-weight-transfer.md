@@ -166,6 +166,66 @@ weight server amortises across all five while a pool does not.
 That is a real case, and it is not the case this pool was built for. Price it
 only if that fan-out is what actually happens.
 
+## 4c. The combination worth building: level-2 sleepers filled from a peer
+
+Everything above treats "restore from storage" and "receive from a peer" as
+alternatives to each other. They are alternatives to the SAME step, and the
+interesting design uses the second inside the first's structure.
+
+A level-2 sleeper is a process that is alive, compiled, its CUDA graphs captured,
+holding ~1.3 GiB of GPU residue and **no host RAM at all** — with garbage where
+its weights were. That is precisely a receiver waiting for a broadcast.
+
+```
+/wake_up                 ~88 ms   remaps memory, restores buffers
+/start_weight_update
+/update_weights  x N              NCCL from a SERVING replica of that model
+/finish_weight_update
+```
+
+It skips both terms: the ~100 s fixed startup, because the process never died,
+and the storage read, because the bytes come over the fabric.
+
+### What it changes is capacity, not latency
+
+| GLM-5.2, 744 GB, TP=16 | bridge | host RAM/node | models per Pod |
+| --- | --- | --- | --- |
+| level 1 pool | ~19 s | **488 GiB each** | **3** |
+| level 2 + storage reload (node-local) | ~72 s | 0 | 16 |
+| **level 2 + peer transfer** | **~30 s** | **0** | **16** |
+
+Level 1 is still the fastest wake. What level 2 buys is that a sleeper stops
+costing host RAM, so the warm set is bounded by the 16-per-Pod port range and
+~1.3 GiB of GPU residue each rather than by RAM. **One two-node group could hold
+sixteen 744 GB models warm instead of three.** For a fleet with many large models
+that are individually idle, that is a different order of usefulness.
+
+### It only covers scale-UP, which is what the pool is for
+
+The transfer needs a peer holding that model's weights, so it works when the
+model is already running and is being scaled — and not when it is at zero
+replicas. That is not a gap: bridging a scale-up is the pool's stated job, and
+scale-from-zero falls back to a storage reload at ~72 s from node-local NVMe,
+which is still far better than a ~513 s cold start.
+
+### Why this is not a recommendation yet
+
+- **Nobody has run it.** Every number above is arithmetic. The composition is
+  *permitted* -- there is no `is_sleeping` guard anywhere in `gpu_worker.py` or
+  the transfer base -- but permitted is not tested.
+- **Nothing guards the ordering either**, and that cuts the other way: calling
+  `update_weights` before `/wake_up` has remapped the allocator is undefined, and
+  nothing will stop it.
+- **The silent-garbage failure is multiplied by sixteen.** Each sleeper in a Pod
+  can independently end up with random weights and a 200 on every request. §4's
+  readiness rule is the price of entry, not a refinement.
+- It needs the `worker_extension_cls` sender (§2) on every serving replica.
+
+**The experiment that would decide it** is small and does not need a big model:
+take a 0.6B, sleep it to level 2, wake it, and drive `update_weights` from a
+second engine holding the same weights. If the output comes back byte-identical,
+the design is real and the only remaining question is bandwidth.
+
 ## 5. Other transports, ranked by what they would actually buy
 
 1. **CUDA IPC (`ipc` backend), same node.** Shares GPU memory by handle rather
