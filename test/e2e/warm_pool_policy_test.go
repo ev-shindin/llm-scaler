@@ -289,6 +289,23 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 				fmt.Sprintf(`{"address":%q}`, engine))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(up.Status).To(Equal(200), "body: %s", up.Body)
+
+			// The three calls above returned 200, which says the SUPERVISOR
+			// accepted them -- not that the controller has observed the result.
+			// Wait for it to, here, where a failure names the precondition.
+			//
+			// Without this the wait happens inside the It instead, and a pool
+			// that never became resident fails an assertion about counting
+			// bridges. That is how it read when this spec failed under full-suite
+			// load: both pools reported lent=0, the bug under test was never
+			// exercised, and the message pointed at the accounting.
+			Eventually(func(g Gomega) {
+				logs, err := controllerLog()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(logs).To(MatchRegexp(
+					`"pool": "`+fixtureName+`", "state": "pods=\d+ free=\d+ resident=[1-9]`),
+					"pool %s never became resident, so nothing was lent from it", fixtureName)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 		}
 
 		BeforeAll(func() {
