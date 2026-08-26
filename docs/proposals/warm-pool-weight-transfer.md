@@ -374,6 +374,25 @@ two role variants of one model are counted as independent demand by the policy.
 Both are repo questions rather than vLLM questions, and both should be checked
 before this is designed.
 
+## 4f. A note on which cluster these numbers came from
+
+Every bandwidth figure here was measured on pokprod, and pokprod is not the
+hardware any of this would be deployed on. Its fabric is what it is; a fleet
+bought for multi-node inference would have a faster one.
+
+So read the transfer numbers as **existence proofs and lower bounds**, not as the
+design's expected performance:
+
+- that the mechanism works at all, that the output is byte-identical, and that
+  the three prerequisites in §4c are real -- those transfer to any cluster;
+- the GB/s -- same-host or cross-node -- is this cluster's fabric, and the same
+  design on a properly provisioned interconnect should do better.
+
+Where a decision turns on bandwidth rather than on mechanism, it must be re-taken
+against the target fleet's numbers. That applies to the whole of §4b, which
+compares a transfer against staging weights on local disk: both sides of that
+comparison move with the hardware.
+
 ## 5. Other transports, ranked by what they would actually buy
 
 1. **CUDA IPC (`ipc` backend), same node.** Shares GPU memory by handle rather
