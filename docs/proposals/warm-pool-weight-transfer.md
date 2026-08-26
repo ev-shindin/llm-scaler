@@ -4,6 +4,31 @@ Status: investigated against `vllm/vllm-openai:v0.26.0` on pokprod, 2026-08-26.
 Nothing built. This is what the shipped machinery can and cannot do, and which
 of it is worth building.
 
+## 0. What is settled, and what is not
+
+This document grew in the order things were discovered, and several later
+sections overturn earlier ones. **Read this table before reading linearly**, or
+§3 and §4b will tell you things §4h and §4i take back.
+
+| claim | status | where |
+| --- | --- | --- |
+| A level-2 sleeper can be refilled from a peer instead of storage | **MEASURED** -- byte-identical, 9x faster than `reload_weights` | §4c |
+| A fresh `--load-format dummy` replica can be filled the same way, with no pool | **MEASURED** -- byte-identical | §4e |
+| It works across nodes | **MEASURED** -- byte-identical | §4g |
+| A SERVING replica can donate its own weights (no weight server) | **MEASURED at TP=1** | §4h |
+| ...at TP>1 | **DESIGNED, NOT RUN** -- needs the sender to un-shard first | §4i |
+| A *dedicated* weight server is worth building | **NO** -- costs what a warm pool costs and is slower | §4b |
+| NIXL can move weights | **NO** -- the engine ships NCCL and IPC backends only | see sleep-levels §5c |
+| The bandwidth figures predict your fleet | **NO** -- pokprod is not the deployment target, and one run used TCP by mistake | §4f, §4g |
+
+**The failure mode that governs all of it** (§4): a receiver that is dummy-loaded
+or level-2 woken, and whose transfer does not complete, serves confident nonsense
+with a 200 -- and a later level-1 sleep preserves the damage. Four independent
+routes to that state are now known. Readiness must gate on a verified transfer.
+
+**If you only build one thing:** §4c and §4e are the measured wins, and neither
+needs a weight server.
+
 ## 1. Why this is a different question from sleep levels
 
 [warm-pool-sleep-levels.md](warm-pool-sleep-levels.md) asked how to restore ONE
