@@ -1403,3 +1403,54 @@ func TestAPodWithNoDeclaredGPUStillReportsItsAccelerator(t *testing.T) {
 		t.Fatalf("and the decline must name it: %+v", got.Declined)
 	}
 }
+
+func TestAPermanentDeclineIsToldApartFromAFullPod(t *testing.T) {
+	// Which fault it is decides which knob an operator turns -- the same
+	// distinction this policy already draws between a MISS and a BLOCK. A model
+	// on the wrong accelerator needs its configuration fixed; a Pod with no room
+	// left needs capacity, and resolves on its own when something is evicted.
+	// Reporting both as "declined" leaves an operator unable to tell which.
+	c := cfg()
+	c.SleepMinSize = 0
+	c.PodMemoryBytes = 100 << 30
+
+	wrongAccel := withGPUs(resident("a", "", pool.Absent), 1)
+	wrongAccel.Capacity.Accelerator = "HELD"
+	got := Decide(Input{
+		Memberships: []pool.Membership{wrongAccel},
+		Variants: []VariantDemand{{
+			Model:  pool.ModelRef{Variant: "pinned", EngineOptions: smallModel, Accelerator: "WANTED"},
+			Parked: true,
+		}},
+		Now: now,
+	}, c)
+	if len(got.Declined) != 1 || !got.Declined[0].Permanent {
+		t.Fatalf("an accelerator mismatch can never resolve: %+v", got.Declined)
+	}
+
+	// A full Pod is the other kind: the budget is spent on what is resident, so
+	// an eviction or a bigger pool fixes it.
+	tight := cfg()
+	tight.SleepMinSize = 0
+	tight.PodMemoryBytes = 20 << 30 // room for one 8B, not two
+	full := pool.Membership{
+		Pod:      pod("a"),
+		Model:    pool.ModelRef{Variant: "first", EngineOptions: "--model meta-llama/Llama-3.1-8B"},
+		State:    pool.Asleep,
+		Capacity: pool.PodCapacity{GPUs: 1},
+	}
+	got = Decide(Input{
+		Memberships: []pool.Membership{full},
+		Variants: []VariantDemand{{
+			Model:  pool.ModelRef{Variant: "second", EngineOptions: "--model meta-llama/Llama-3.1-8B"},
+			Parked: true,
+		}},
+		Now: now,
+	}, tight)
+	if len(got.Declined) != 1 {
+		t.Fatalf("the second 8B does not fit: %+v", got.Declined)
+	}
+	if got.Declined[0].Permanent {
+		t.Fatalf("a full Pod resolves when something is evicted; it is not permanent: %+v", got.Declined[0])
+	}
+}

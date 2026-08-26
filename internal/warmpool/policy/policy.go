@@ -157,6 +157,22 @@ type Plan struct {
 type Declined struct {
 	Model  pool.ModelRef
 	Reason string
+	// Permanent separates a decline that will never resolve from one that
+	// might, and the two need different actions from an operator.
+	//
+	// A PERMANENT decline is a property of the model and the pool: too many
+	// GPUs, the wrong accelerator, a size that cannot be worked out. Nothing
+	// that happens in the pool will change it -- the model is pointed at a pool
+	// that cannot ever hold it, and the fix is configuration.
+	//
+	// A TRANSIENT one is the memory budget: it depends on what else is resident
+	// right now, so it resolves on its own when something is evicted or the pool
+	// grows. The fix, if any, is capacity.
+	//
+	// Conflating them is the same mistake as conflating a MISS with a BLOCK,
+	// which this policy is careful not to make: one says the warm set is wrong,
+	// the other says the reserve is too small.
+	Permanent bool
 }
 
 // Decide produces the plan. It never mutates its input.
@@ -404,10 +420,12 @@ func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Memb
 			if !ok {
 				break
 			}
-			if reason := doesNotFit(v.Model, byPod[target], cfg); reason != "" {
+			if reason, permanent := doesNotFit(v.Model, byPod[target], cfg); reason != "" {
 				// Skipped rather than breaking the outer loop: this variant does
 				// not fit, but a smaller one further down the list still might.
-				declined = append(declined, Declined{Model: v.Model, Reason: reason})
+				declined = append(declined, Declined{
+					Model: v.Model, Reason: reason, Permanent: permanent,
+				})
 				break
 			}
 			out = append(out, Action{Pod: target, Model: v.Model})
@@ -527,7 +545,7 @@ func lentByVariant(all []pool.Membership) map[string][]pool.Membership {
 // that costs a wasted load. And a Pod has a hard memory limit that a level-1
 // sleeper's weights count against, so one model too many does not fail its own
 // admission, it takes the whole Pod down with every model already in it.
-func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) string {
+func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) (reason string, permanent bool) {
 	shape := pool.ShapeOf(model.EngineOptions)
 	capacity := capacityOf(resident)
 
@@ -542,7 +560,8 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 		gpus = 1
 	}
 	if shape.GPUs > gpus {
-		return fmt.Sprintf("needs %d GPUs, this Pod holds %d", shape.GPUs, gpus)
+		// The Pod's device count is fixed; no amount of waiting changes it.
+		return fmt.Sprintf("needs %d GPUs, this Pod holds %d", shape.GPUs, gpus), true
 	}
 
 	// The right NUMBER of the wrong GPU is still the wrong GPU. A warm copy is
@@ -551,7 +570,8 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 	// hardware the workload's own affinity refuses, and the load that produced
 	// it is spent for nothing.
 	if why, bad := pool.AcceleratorMismatch(model.Accelerator, capacity.Accelerator); bad {
-		return why
+		// A Pod cannot change node, so this pool will never hold this model.
+		return why, true
 	}
 
 	budget := cfg.PodMemoryBytes
@@ -563,14 +583,15 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 		budget = capacity.MemoryLimitBytes
 	}
 	if budget <= 0 {
-		return "" // nothing to check against; the check is off
+		return "", false // nothing to check against; the check is off
 	}
 	if !shape.Known() {
 		// Declining is the conservative direction and the consistent one: the
 		// engine-flag allowlist already refuses to guess, and a warm copy the
 		// pool declines to make costs a cold start, where a warm copy that
 		// does not fit costs every model in the Pod.
-		return "its size cannot be worked out from its name, so it cannot be shown to fit"
+		// Permanent: the name will not become parseable later.
+		return "its size cannot be worked out from its name, so it cannot be shown to fit", true
 	}
 
 	committed := int64(0)
@@ -580,10 +601,12 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 		}
 	}
 	if committed+shape.HostBytes > budget {
+		// TRANSIENT, and the only one that is: it depends on what else is
+		// resident, so an eviction or a bigger pool resolves it.
 		return fmt.Sprintf("needs %s on top of the %s already resident, over the %s budget",
-			gib(shape.HostBytes), gib(committed), gib(budget))
+			gib(shape.HostBytes), gib(committed), gib(budget)), false
 	}
-	return ""
+	return "", false
 }
 
 // capacityOf is what the Pod these memberships belong to declares. Every

@@ -717,6 +717,20 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 	// Deduplicated per variant+reason, because a standing mismatch is decided
 	// again on every pass and would otherwise be the only thing in the log.
 	for _, declined := range plan.Declined {
+		if !declined.Permanent {
+			// TRANSIENT: the Pod is full right now. Not a fault and not
+			// actionable as configuration -- it resolves when something is
+			// evicted or the pool grows, and the pressure it represents is
+			// already visible as blocked borrows and the reserve shortfall.
+			// Reported quietly so it can be found when investigating, and not
+			// at a level that buries the permanent ones.
+			logger.V(1).Info("warm pool has no room for this model right now",
+				"variant", declined.Model.Variant, "reason", declined.Reason)
+			continue
+		}
+		// PERMANENT: this pool can never hold this model -- wrong accelerator,
+		// more GPUs than a Pod has, a size that cannot be read. Nothing in the
+		// pool will change it, so it is said once and it names what to fix.
 		key := declineKey{Variant: declined.Model.Variant, Reason: declined.Reason}
 		if r.lastDeclined[key] {
 			continue
@@ -725,7 +739,7 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 			r.lastDeclined = map[declineKey]bool{}
 		}
 		r.lastDeclined[key] = true
-		logger.Info("warm pool will not warm this model",
+		logger.Info("warm pool will never warm this model; it is pointed at a pool that cannot hold it",
 			"variant", declined.Model.Variant, "namespace", declined.Model.Namespace,
 			"reason", declined.Reason)
 	}

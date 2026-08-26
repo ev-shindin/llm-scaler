@@ -712,7 +712,7 @@ func TestADeclinedModelIsSaidOutLoud(t *testing.T) {
 		t.Fatalf("Once: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "will not warm this model") {
+	if !strings.Contains(out, "will never warm this model") {
 		t.Fatalf("a decline must be reported: %s", out)
 	}
 	// The reason has to name both figures, or an operator cannot act on it.
@@ -741,7 +741,7 @@ func TestAStandingDeclineIsNotRepeatedEveryPass(t *testing.T) {
 			t.Fatalf("Once: %v", err)
 		}
 	}
-	if got := strings.Count(buf.String(), "will not warm this model"); got != 1 {
+	if got := strings.Count(buf.String(), "will never warm this model"); got != 1 {
 		t.Fatalf("a standing decline must be said once, got %d", got)
 	}
 }
