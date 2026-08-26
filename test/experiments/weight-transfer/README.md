@@ -40,3 +40,25 @@ Also: on OpenShift set `USER` and `HOME`, or torch's `cache_dir` calls
 Two GPUs in one Pod, TP=1, 1.4 GiB. It says nothing yet about inter-node RoCE,
 about a live serving replica acting as the sender, about TP>1 where each rank
 needs its own shard, or about a model 500x this size.
+
+## A live replica as the sender
+
+`worker_extension.py` + `orchestrator.py` do the same transfer with no
+checkpoint on the sender: a SERVING replica donates its own parameters.
+
+```bash
+kubectl create configmap wext --from-file=wext.py=worker_extension.py
+# sender:   --worker-extension-cls wext.WeightDonor   (PYTHONPATH=/ext, configMap at /ext)
+# receiver: --enable-sleep-mode --weight-transfer-config '{"backend":"nccl"}'
+SENDER=http://127.0.0.1:8000 RECEIVER=http://<recv-ip>:8000 MASTER=<sender-ip> \
+  python3 orchestrator.py 29810
+```
+
+Measured 2026-08-26 across two nodes: byte-identical output, 291 parameters of
+which 72 are FUSED (`qkv_proj`, `gate_up_proj`) against the checkpoint's 399
+separate ones. The receiver accepts the fused layout because its own parameters
+carry those names — **but only while both sides run the same vLLM version and
+parallelism.** Fusion layout is an internal detail, not a wire format.
+
+**The sender returns early.** `/collective_rpc` came back in 0.77 s while the
+receiver's `/update_weights` took 14.78 s. Do not gate readiness on the sender.

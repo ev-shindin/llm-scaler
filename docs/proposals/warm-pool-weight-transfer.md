@@ -412,6 +412,60 @@ run.**
 3. Confirm from NCCL's own logs which transport was selected before believing
    any number -- that is the check this run failed to make.
 
+## 4h. A SERVING replica can be the sender -- measured
+
+§2 said no HTTP route makes a running vLLM a sender, and §3 proposed a dedicated
+weight server as the way round it. `worker_extension_cls` is the better way, and
+it now has a measurement rather than an argument behind it.
+
+A ~40-line class with `weight_metadata()` and `send_weights_to()`, mounted from a
+ConfigMap and named by `--worker-extension-cls wext.WeightDonor`. vLLM reports:
+
+```
+Injected <class 'wext.WeightDonor'> into <class 'vllm.v1.worker.gpu_worker.Worker'>
+for extended collective_rpc calls ['send_weights_to', 'weight_metadata']
+```
+
+Qwen3-8B, sender and receiver on **different nodes**, receiver level-2 poisoned
+first:
+
+```
+sender holds 291 parameters (fused: 72)
+  init_weight_transfer_engine / start / update_weights / finish   all 200
+  same seeded prompt   ' Paris. The capital of Italy is Rome. The capital of'
+  a second prompt      ' 4, 4 + 2'
+```
+
+**Byte-identical**, and the second prompt matches the checkpoint-sourced run
+exactly. No dedicated weight server, no checkpoint access on the sender, no
+extra accelerator: the donor is a replica the fleet is already paying for.
+
+### The fused-parameter worry was real and does not bite
+
+A running engine holds **fused** parameters -- `qkv_proj`, `gate_up_proj` -- where
+the checkpoint has separate `q_proj`/`k_proj`/`v_proj` and `gate_proj`/`up_proj`:
+291 parameters against the checkpoint's 399. The NCCL engine's docstring says it
+carries "dense checkpoint-format weights", so there was a real chance the
+receiver would reject them or, worse, mis-load them silently.
+
+It accepts them, because the receiving model's own parameters carry exactly those
+names and `load_weights` matches by name. One benign warning appears --
+`RotaryEmbedding: Failed to load weights`, a module with no learnable weights --
+and the output is unaffected.
+
+**This only holds while sender and receiver run the same vLLM version and
+parallelism.** Fusion layout is an internal detail, not a wire format: two
+engines that fuse differently would exchange names that do not match, and
+nothing in the protocol would notice. Any implementation must pin both.
+
+### A trap for whoever writes the orchestration
+
+The sender's `/collective_rpc` returned in **0.77 s** while the receiver's
+`/update_weights` took **14.78 s**. **The sender returning does not mean the
+receiver has the weights.** Anything that gates readiness on the sender's
+response will mark a replica ready with most of a model still in flight -- which
+is the silent-garbage failure of §4, reached by a new route.
+
 ## 4f. A note on which cluster these numbers came from
 
 Every bandwidth figure here was measured on pokprod, and pokprod is not the
