@@ -341,14 +341,23 @@ the case that looks solved and is not.
 
 ### What it does not buy
 
-**It does not make scale-up fast.** Measured on a shared PVC here: ~430 MB/s, so
-an 8B model spends about 37 seconds reading weights it already has locally, and a
-70B model minutes. That is the same order as a cold start.
+**It does not make scale-up fast.** An 8B model still spends tens of seconds
+getting weights it already has locally into GPU memory, and a 70B model minutes.
+That is the same order as a cold start.
 
-The cache removes the *download*, not the *load*. Anything aimed at the load
-itself is a different mechanism — keeping a process warm, or snapshotting a
-loaded engine — and the numbers above are why: at 430 MB/s, re-reading from
-storage is not a shortcut.
+The reason is not the disk. Measured here with direct I/O, the shared RWX PVC
+reads at ~1.8 GB/s and local NVMe at ~5.2 GB/s — fast enough that an 8B model's
+weights are a few seconds of pure I/O. What costs is the *load*: parsing
+safetensors, sharding, and copying to the device runs at roughly 2 GB/s even
+with the file already in page cache.
+
+So the cache removes the *download*, not the *load*, and faster storage does not
+remove the load either. Anything aimed at it is a different mechanism — keeping
+a process warm, or snapshotting a loaded engine.
+
+(An earlier revision of this section gave ~430 MB/s as the PVC's bandwidth. That
+was an end-to-end weight-load rate, not storage throughput; the conclusion above
+is unchanged, but the reason it gave was wrong.)
 
 ## Draining before scale-down
 
