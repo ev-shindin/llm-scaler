@@ -95,6 +95,56 @@ indistinguishable, to the router, from not running.
 That is also why this is not simply "turn on a flag". The RLHF path assumes a
 trainer that knows it is pushing weights; a scale-up path has to prove it.
 
+## 4b. Worked example: GLM-5.2 on 8xH100-80GB, and why the answer is no
+
+744B parameters at fp8 is ~744 GB of weights. On 8xH100-80GB (637 GiB/node) that
+does not fit one node, so it is 2 nodes at TP=16. The fleet advertises
+`rdma/roce_gdr`, so GPU-to-GPU RDMA is genuinely available.
+
+Scale-up from one replica to two, every option priced the same way:
+
+| approach | time to serving | GPUs the MECHANISM costs |
+| --- | --- | --- |
+| cold, shared PVC | ~513 s | 0 |
+| cold, weights staged on node-local NVMe | ~172 s | 0 |
+| weight transfer, GPU-resident weight server | ~130 s | **16** |
+| weight transfer, host-RAM server staging through a GPU | ~167 s | ~2 + 744 GB RAM |
+| **warm pool, level 1** | **~19 s** | 16 |
+
+**A GPU-resident weight server for this model needs 744 GB of GPU memory — two
+nodes, sixteen H100s. That is exactly what warm-pooling the model costs, and it
+delivers 130 s instead of 19 s.** It is strictly dominated: same accelerators,
+seven times slower. The pool wins because it skips the ~100 s fixed startup as
+well as the weight load; a transfer only skips the load, since the receiving
+process still has to start, import, compile and capture.
+
+The host-RAM variant avoids most of the GPU cost and lands at ~167 s — which is
+no better than simply staging the weights on node-local NVMe, for a new
+component, a new failure mode, and four HTTP calls.
+
+### The economics are inverted at both ends
+
+This generalises, and it is the reason not to keep reaching for the idea:
+
+- **Weight transfer helps most where weights dominate the cold start** — big
+  models. That is exactly where the weight server is most expensive, because it
+  must hold the whole model.
+- **The server is cheapest for small models** — an 8B needs 16 GB on one GPU.
+  That is exactly where it helps least: the weight read is ~9 s of a ~109 s cold
+  start, so it saves 8%.
+
+There is no size at which both halves are favourable.
+
+### The one case that survives
+
+Many replicas of ONE big model, scaling up several at once. A pool holds one warm
+copy and bridges one scale-up at a time; an NCCL broadcast reaches every receiver
+in the same transfer. If the fleet routinely goes from one replica to five, a
+weight server amortises across all five while a pool does not.
+
+That is a real case, and it is not the case this pool was built for. Price it
+only if that fan-out is what actually happens.
+
 ## 5. Other transports, ranked by what they would actually buy
 
 1. **CUDA IPC (`ipc` backend), same node.** Shares GPU memory by handle rather
@@ -117,16 +167,20 @@ should be priced before (2) or a weight server.
 
 ## 6. Recommendation
 
-1. **Do not build a weight server for the current fleet.** At 8B it saves 6% of a
-   cold start. The models where it pays — 70B and above — are not what the pool
-   serves today.
-2. **If big-model support becomes real, this is the mechanism to reach for**, not
-   sleep level 2: it removes the same term, costs one GPU per model instead of
-   one per replica, and does not require the receiving engine to have been kept
-   alive.
-3. **Measure page-cache warming first.** It is free, it needs no component, and
+1. **Do not build a weight server.** At 8B it saves 6% of a cold start; at
+   GLM-5.2 scale it costs the same sixteen GPUs as warm-pooling the model and is
+   seven times slower (§4b). The economics are inverted at both ends of the size
+   range, so there is no model for which it is the right first move.
+2. **Stage weights on node-local storage instead.** It reaches ~172 s against
+   the transfer's ~130 s, costs no accelerator, needs no component, and cannot
+   serve a wrong answer. On a fleet with node-local NVMe this is most of the
+   benefit for almost none of the risk.
+3. **The only shape worth pricing later** is a high fan-out scale-up of one big
+   model, where a broadcast reaches every receiver at once and a pool bridges one
+   at a time (§4b).
+4. **Measure page-cache warming first.** It is free, it needs no component, and
    nobody has measured what it does to a real cold start here.
-4. Whatever is built, the readiness rule in §4 comes with it. Three ways to reach
+5. Whatever is built, the readiness rule in §4 comes with it. Three ways to reach
    a silently-wrong engine are already known from the sleep-level work; a
    dummy-loaded replica is a fourth.
 

@@ -40,6 +40,11 @@ PARSE_RATE_GBPS = 2.7
 # Host-to-device over PCIe: what a level-1 wake actually costs.
 PCIE_GBPS = 20.0
 
+# A pool Pod can hold at most this many engines -- a port-range constant in the
+# supervisor, not a tuning knob. Node RAM can imply far more than this, and the
+# implication is wrong.
+MAX_INSTANCES_PER_POD = 16
+
 BYTES_PER_PARAM = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0, "fp4": 0.5, "int4": 0.5}
 
 
@@ -108,11 +113,17 @@ def recommend(node, params_b, dtype, kv_headroom, shared_bw, local_bw, ram_frac)
     # 2 + 3. can host RAM hold sleepers, and how many
     usable_ram = node["ram_gib"] * ram_frac
     per_sleeper = SLEEPER_FIXED_GIB + SLEEPER_FACTOR * (per_node_weights_gb / 1.073741824)
-    fits = int(usable_ram // per_sleeper) if per_sleeper > 0 else 0
+    by_ram = int(usable_ram // per_sleeper) if per_sleeper > 0 else 0
+    fits = min(by_ram, MAX_INSTANCES_PER_POD)
+    capped = by_ram > MAX_INSTANCES_PER_POD
     if fits < 1:
         lines.append(("SLEEP", "level 1 IMPOSSIBLE: one sleeper needs %.0f GiB per node, "
                                "%.0f GiB usable. No warm copy on this hardware."
                       % (per_sleeper, usable_ram)))
+    elif capped:
+        lines.append(("SLEEP", "level 1: RAM would allow %d, capped at %d per Pod "
+                               "(port range, not a knob). %.0f GiB each."
+                      % (by_ram, MAX_INSTANCES_PER_POD, per_sleeper)))
     else:
         lines.append(("SLEEP", "level 1 fits %d model(s) per node: %.0f GiB each, %.0f GiB usable"
                       % (fits, per_sleeper, usable_ram)))
@@ -254,6 +265,9 @@ def main():
             print("   -> %s" % v)
         print("")
 
+    print("The warm-set budget is the POD's memory LIMIT, not the node's RAM: a Pod is\n"
+          "admitted against its own limit, so these counts are what the hardware permits,\n"
+          "not what a Pod will hold until you set that limit to match.\n")
     print("Coefficients are MEASURED at 0.6B and extrapolated: a sleeper costs\n"
           "%.1f GiB + %.1fx weights of host RAM, the fixed startup is ~%.0f s, and the\n"
           "load path runs ~%.1f GB/s per rank. Distrust these first if a prediction\n"
