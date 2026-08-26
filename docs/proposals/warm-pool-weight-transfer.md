@@ -466,6 +466,56 @@ receiver has the weights.** Anything that gates readiness on the sender's
 response will mark a replica ready with most of a model still in flight -- which
 is the silent-garbage failure of §4, reached by a new route.
 
+## 4i. LIMIT: a live replica can only donate at TP=1
+
+§4h showed a serving replica donating its own weights. That result has a boundary,
+and it is the one that matters most for big models.
+
+Asked what it holds, a TP=2 engine answers with **sharded** parameters -- both
+ranks, measured:
+
+| parameter | TP=1 | TP=2, per rank |
+| --- | --- | --- |
+| `layers.0.self_attn.qkv_proj.weight` | `[6144, 4096]` | **`[3072, 4096]`** |
+| `embed_tokens.weight` | `[151936, 4096]` | **`[75968, 4096]`** |
+
+Each rank holds half. The receiver's `load_weights` expects **full**
+checkpoint-shaped tensors and does the sharding itself, and the shipped sender
+primitive is a **broadcast from rank 0 to everyone** -- it has no way to pair
+rank *i* with rank *i*.
+
+So broadcasting a TP>1 replica's parameters sends half-tensors under full-tensor
+names. Best case it fails on shape; worst case something accepts it.
+
+**A donor must hold UNSHARDED weights.** That is true of an RLHF trainer, and of
+the checkpoint-backed sender in §4c -- and false of any replica running the
+tensor parallelism a big model requires.
+
+### What this does to the recommendation
+
+The appeal of §4h was "the sender is a replica you already pay for". That holds
+only for models that serve at TP=1. Above that:
+
+- the receiver may still be filled by transfer -- §4c and §4g are unaffected, they
+  used a checkpoint-backed sender;
+- but the sender must read the checkpoint, so it is a **weight server** again,
+  with the cost §4b priced -- and for a model needing two nodes, that cost is two
+  nodes.
+
+**A rank-paired transfer is conceivable** -- same TP on both sides, rank *i*
+sending to rank *i*, no re-sharding at all -- and would be both cheaper and
+faster than anything here, since no tensor is ever materialised whole. Nothing
+ships it. It would need a custom extension on **both** sides and a point-to-point
+primitive instead of the broadcast, and it inherits the version-pinning
+constraint from §4h with a second edge: the two sides must agree on shard layout
+as well as fusion layout.
+
+**Verdict.** For single-GPU models, donation from a live replica is real and
+measured. For the multi-node models that most need a fast scale-up, the shipped
+path requires an unsharded sender, and the rank-paired design that would remove
+that requirement is unbuilt. Do not cost big-model weight transfer on the
+strength of §4h.
+
 ## 4f. A note on which cluster these numbers came from
 
 Every bandwidth figure here was measured on pokprod, and pokprod is not the
