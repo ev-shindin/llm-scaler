@@ -293,6 +293,55 @@ something in this cluster removes `nodeName`-pinned pods. Schedule with
 `nodeSelector` or affinity here, not `nodeName`, or a measurement disappears
 with no error to read.
 
+## 5e. The gate is closed: level 1 measured at 8B
+
+Every big-model figure in this document was extrapolated from a 0.6B model, and
+§7 made that the gate before anything was costed. Qwen3-8B was downloaded to the
+shared cache and measured, on one H100:
+
+| | value |
+| --- | --- |
+| weights | 15.27 GiB |
+| awake | GPU 48207 MiB, host 18.44 GiB |
+| **asleep, level 1** | GPU **1911 MiB**, host **40.49 GiB** |
+| **host RAM cost of the sleeper** | **+22.05 GiB** = 1.44x weights |
+| sleep call | 7.8 s |
+| **wake call** | **0.42 s** |
+| output after wake | byte-identical |
+| cold start | 14.87 s weights + 37.25 s engine init (17.75 s of it compilation) |
+
+### The extrapolation held; two constants were wrong
+
+Fitting both measured points -- 1.11 GiB of weights costing 2.91 GiB asleep, and
+15.27 GiB costing 22.05 -- gives
+
+```
+sleeper host cost  =  1.41 GiB  +  1.352 x weights
+```
+
+against the `2.6 GiB + 1.4 x weights` used until now. **The slope, which is the
+only term that matters at any model worth pooling, was right within 3.4%.** The
+intercept was over by 1.2 GiB, which mattered only at 0.6B where it dominated.
+
+**The wake rate was wrong in the useful direction.** 15.27 GiB restored in 0.42 s
+is ~39 GB/s, not the 20 GB/s assumed from PCIe. Every wake figure published
+before today was about twice as pessimistic as reality: GLM-5.2's per-node wake
+falls from ~19 s to **~10 s**.
+
+### And the parse rate holds across a 14x size change
+
+"Loading weights took 14.87 seconds" for 16 GB is 1.08 GB/s, against 1.26 GB/s
+measured at 0.6B. So §5d's model -- one rank bound by parse at ~1.1-1.3 GB/s,
+storage binding only above `parse x TP` -- survives the only size change
+available to test it with.
+
+### What this does NOT settle
+
+8B is 46x smaller than GLM-5.2 and ran at TP=1 on one GPU. The linear fit is two
+points; nothing here proves it stays linear at 500 GiB, where allocator and NUMA
+effects could appear. But the direction of risk is now known rather than
+guessed, and the slope has survived one order of magnitude.
+
 ## 6. Method trap: `kubectl exec` cost more than everything measured
 
 Every wake figure this project recorded before today was taken by timing a

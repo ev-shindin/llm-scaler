@@ -21,14 +21,17 @@ import json
 import subprocess
 import sys
 
-# Measured on pokprod, 2026-08-26 -- see docs/proposals/warm-pool-sleep-levels.md.
+# Measured on pokprod 2026-08-26, FITTED TO TWO POINTS -- see
+# docs/proposals/warm-pool-sleep-levels.md.
 #
-# A level-1 sleeper's host cost was 2.9 GiB for a 1.2 GiB model. Read as
-# `FIXED + FACTOR x weights`: at 0.6B the fixed term dominates, and at any model
-# worth pooling it vanishes, so FACTOR is what matters at scale and it is the
-# figure extrapolated furthest beyond its evidence.
-SLEEPER_FIXED_GIB = 2.6
-SLEEPER_FACTOR = 1.4
+#   Qwen3-0.6B: 1.11 GiB of weights cost 2.91 GiB of host RAM asleep
+#   Qwen3-8B:   15.27 GiB           cost 22.05 GiB
+#
+# Solving both gives 1.41 GiB + 1.352 x weights. The SLOPE is what matters at any
+# model worth pooling, and it was extrapolated from the 0.6B point alone as 1.4 --
+# confirmed within 3.4% once a real model was measured.
+SLEEPER_FIXED_GIB = 1.41
+SLEEPER_FACTOR = 1.352
 
 # Cold start to serving, cached image, 0.6B: ~100 s, of which the weight read was
 # 0.56 s. So this is the part that does NOT scale with the model.
@@ -42,8 +45,10 @@ FIXED_STARTUP_S = 100.0
 # bound by parse and host-to-device, not by storage. Ranks parse concurrently, so
 # the fleet's aggregate is this x TP, and storage only binds above that.
 PARSE_RATE_GBPS = 1.26
-# Host-to-device over PCIe: what a level-1 wake actually costs.
-PCIE_GBPS = 20.0
+# Host-to-device: what a level-1 wake actually costs. MEASURED, not assumed --
+# Qwen3-8B woke in 0.42 s from 15.27 GiB, i.e. ~39 GB/s. An earlier guess of
+# 20 GB/s made every published wake time about twice as pessimistic as reality.
+PCIE_GBPS = 39.0
 
 # A pool Pod can hold at most this many engines -- a port-range constant in the
 # supervisor, not a tuning knob. Node RAM can imply far more than this, and the
