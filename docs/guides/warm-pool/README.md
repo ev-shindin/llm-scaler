@@ -38,7 +38,44 @@ The pool needs, in its namespace:
   was scoped by hand, WVA refuses to start the pool and says so — it will not
   hold accelerators to warm models it could never lend.
 
+## Which pools do you need?
+
+Before creating anything, ask what the namespace actually wants. A pool serves
+exactly one **(accelerator, GPUs-per-replica)** shape, because neither is
+negotiable at run time: a warm copy is only reusable on the GPU it was loaded
+on, and a model needing more devices than a Pod holds cannot start in one. Every
+other difference between models — size, traffic, policy — a pool absorbs.
+
+```bash
+deploy/warmpool.sh plan -n <namespace>
+```
+
+It groups the namespace's model ScaledObjects by that pair, says which of them
+could share one pool, and prints a `create` line for each group. It also names
+models that select a pool nobody declared, which is worse than selecting none
+because it reads as configured.
+
 ## Turning it on
+
+The two objects a pool is made of — the Deployment and its ScaledObject — are
+only meaningful together, so there is one command that makes both:
+
+```bash
+deploy/warmpool.sh create -n <namespace> --name <pool>   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --proxy-image <your image> --wva-namespace <where WVA runs>
+```
+
+`--models` and `--model-size` are how you size the Pod: they set the memory
+limit, which **is** the warm-set budget. Pass `--dry-run` to see the manifests
+without applying, and use `delete` to remove both objects together — removing
+only one leaves either accelerators nobody can borrow, or a trigger pointing at
+nothing.
+
+The script does not create the NetworkPolicy, and it deliberately does not guess
+your accelerator: omit `--accelerator` and the Pods may schedule on any GPU node,
+at which point WVA declines every model whose accelerator it can prove differs.
+
+The rest of this section is the manual path, for when you want to edit the
+manifests directly.
 
 ### 1. Point the controller at the pool
 
