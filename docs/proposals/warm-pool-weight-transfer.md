@@ -285,6 +285,51 @@ take a 0.6B, sleep it to level 2, wake it, and drive `update_weights` from a
 second engine holding the same weights. If the output comes back byte-identical,
 the design is real and the only remaining question is bandwidth.
 
+## 4d. Prefill/decode is the case this fits best
+
+A P/D deployment runs the same model twice with different plumbing: the roles
+differ by `--kv-transfer-config` (`kv_producer` vs `kv_consumer`) and by
+scheduling flags, and **their parameters are byte-identical**.
+
+Two consequences, and the second is the interesting one.
+
+**The pool already models them correctly.** A resident instance is keyed by its
+full engine options, and `adapter.go` refuses to reuse one whose options differ:
+"an instance carrying different options is a different model, a different shape,
+or a different compile cache key". So a prefill engine and a decode engine of one
+model are already two warm entries rather than one that could be misused. That
+refusal is not a limitation to work around -- serving decode traffic from a
+prefill-configured engine would answer one variant's requests with another's
+engine.
+
+**P/D guarantees the peer that route 2 needs.** The awkward precondition for a
+weight transfer is that something must already hold the model's weights in GPU
+memory. In a P/D deployment that is free: the decode replicas hold exactly the
+weights a prefill sleeper needs, and vice versa. The thing that makes transfer
+conditional everywhere else is structural here.
+
+So switching the P/D ratio without a cold start looks like:
+
+- the pool holds both role variants of the model, level-2 asleep. Each costs
+  ~0.8 GiB of GPU residue and **no host RAM**, so holding both is two slots of
+  the sixteen, not two copies of the weights.
+- when the ratio must change, wake the role that is short and fill it from a
+  serving replica of the other role.
+- measured cost of that fill: ~0.2 s for a 0.6B; extrapolated ~30-60 s for a
+  GLM-5.2-sized model.
+
+A running engine's role cannot be mutated -- the KV connector is constructed at
+engine init -- so this is "have the other role already warm", not "convert this
+one". With level 1 that would cost a second full copy in host RAM and would
+usually be refused on those grounds. With level 2 it is nearly free, which is
+what makes the idea practical rather than merely possible.
+
+**Unverified:** whether the supervisor's instance options can carry a
+`--kv-transfer-config` unchanged (it is a JSON blob inside a flag), and whether
+two role variants of one model are counted as independent demand by the policy.
+Both are repo questions rather than vLLM questions, and both should be checked
+before this is designed.
+
 ## 5. Other transports, ranked by what they would actually buy
 
 1. **CUDA IPC (`ipc` backend), same node.** Shares GPU memory by handle rather
