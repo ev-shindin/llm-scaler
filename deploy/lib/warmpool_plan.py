@@ -98,6 +98,15 @@ def main():
 
     if not models:
         print("No model ScaledObjects found in %s." % namespace)
+        if pools:
+            # The inverse of a dangling selection, and just as quiet: every Pod
+            # these pools hold is an accelerator nothing can ever borrow.
+            print(
+                "\n%d pool(s) are declared here with no model to serve. They hold\n"
+                "accelerators that nothing can borrow. Delete them, or point a model\n"
+                "at them:  deploy/warmpool.sh delete -n %s --name <pool>"
+                % (len(pools), namespace)
+            )
         return 0
 
     buckets = collections.defaultdict(list)
@@ -158,6 +167,21 @@ def main():
                 % (namespace, name, gpus, accelerator)
             )
         print("")
+
+    # With exactly one pool a model needs no warmPool key -- there is nothing to
+    # disambiguate -- so a lone pool is in use by everything. Past one, a pool
+    # nobody names serves nobody, however many models the namespace has.
+    if len(declared) > 1:
+        selected = {name for _, members in buckets.items() for _, sels in members for name in sels if name}
+        unused = sorted(declared - selected)
+        if unused:
+            print(
+                "%d declared pool(s) are named by no model: %s.\n"
+                "They hold accelerators nothing can borrow. Once a namespace has more\n"
+                "than one pool, every model must name the one it wants -- WVA will not\n"
+                "guess, because guessing wrong spends a full load on a copy that can\n"
+                "never serve.\n" % (len(unused), ", ".join(unused))
+            )
 
     if dangling:
         print(
