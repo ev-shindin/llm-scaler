@@ -50,20 +50,26 @@ be told:
 --warm-pool-namespace=<namespace>
 ```
 
-### 2. Deploy the pool
+### 2. Edit the four things the manifests cannot know
+
+`config/warmpool` is a template, not a working install. Each of these is
+cluster-specific, and three fail in a way that looks like something else:
+
+| in | what to set | if you skip it |
+| --- | --- | --- |
+| `warmpool-networkpolicy.yaml` | the `>>> EDIT THIS <<<` `namespaceSelector` — the namespace WVA runs in | every read fails; the pool reports itself **empty** while holding accelerators |
+| `warmpool-scaledobject.yaml` | the `>>> EDIT THIS <<<` in `scalerAddress` | applies cleanly, KEDA creates the HPA, the address never resolves, the pool never resizes |
+| `warmpool-deployment.yaml` | the proxy `image` — build your own with `make docker-build-warmpool-proxy` | `ImagePullBackOff`; the shipped digest is a personal registry namespace |
+| `warmpool-deployment.yaml` | `runtimeClassName`, and the `claimName` of your model cache | admission fails outright; or the second replica sits Pending forever if the claim is not **ReadWriteMany** |
+
+The `scalerAddress` one is the quiet one: the placeholder is a legal YAML
+string, so nothing rejects it and nothing warns.
+
+### 3. Deploy the pool
 
 ```bash
 kubectl apply -k config/warmpool -n <namespace>
 ```
-
-### 3. Let the controller reach it
-
-`config/warmpool/warmpool-networkpolicy.yaml` denies everything except WVA, and
-it cannot guess where WVA runs. Edit the marked `namespaceSelector` to name the
-controller's namespace **before** applying, or every read fails and the pool
-reports itself empty while holding accelerators.
-
-WVA says so when this happens — see [Troubleshooting](#troubleshooting).
 
 ## Sizing
 
@@ -122,18 +128,30 @@ A warm copy is only reusable on the accelerator it was loaded on. A cluster with
 two GPU models therefore needs **two pools** — and a variant that needs several
 devices needs a pool whose Pods hold that many.
 
-Copy the Deployment and give it a different name in both places:
+Copy the Deployment and change the pool name in **all three** places, plus the
+object's own name:
 
 ```yaml
 metadata:
+  name: wva-warm-pool-h100        # must differ from the first pool's
   labels:
     llm-d.ai/warm-pool: h100      # the pool's name
 spec:
+  selector:
+    matchLabels:
+      llm-d.ai/warm-pool: h100    # or both Deployments select the same Pods
   template:
     metadata:
       labels:
         llm-d.ai/warm-pool: h100  # must match
 ```
+
+Missing the **selector** is the one that bites quietly: two Deployments with
+identical selectors fight over one set of Pods, and neither's replica count
+means anything afterwards.
+
+A second pool that should resize itself needs its own ScaledObject too, with a
+matching `warmPoolName` and `scaleTargetRef`.
 
 Then each model says which pool it may borrow from, in its ScaledObject trigger
 metadata:
@@ -152,8 +170,14 @@ once a namespace holds more than one pool — and then it is required: WVA will
 not guess, because guessing wrong spends a full model load on a copy that can
 never serve. It names the variant and the pools that exist instead.
 
-WVA also declines a model whose accelerator does not match the pool's, so a
-mismatched `warmPool` costs you a log line rather than a wasted Pod.
+WVA also declines a model whose accelerator does not match the pool's, or that
+needs more devices than a Pod holds, and says so:
+
+```
+warm pool will not warm this model {"variant":"...","reason":"needs 4 GPUs, this Pod holds 1"}
+```
+
+Said once per reason, not once per cycle.
 
 ## Choosing what stays warm
 
@@ -246,7 +270,7 @@ loads a model, and is ready exactly in time for the spike that is already over.
 The pool reports its state whenever that state changes:
 
 ```bash
-kubectl logs deploy/wva-controller-manager -n <namespace> | grep "warm pool"
+kubectl logs deploy/wva-controller-manager -n <wva-namespace> | grep "warm pool"
 ```
 
 ```
@@ -254,7 +278,7 @@ warm pool state {"pool":"default","state":"pods=2 free=2 resident=1 variants=1 l
 ```
 
 - `pods` / `free` — how many exist, and how many are available to lend
-- `resident` — models currently held warm
+- `resident` — models currently held warm (`0` on a pool that has warmed nothing)
 - `lent` — bridges open right now
 - `accelerator` — what the pool's Pods sit on. `unknown` means WVA cannot read
   the nodes, so it cannot match a model's accelerator against the pool's and

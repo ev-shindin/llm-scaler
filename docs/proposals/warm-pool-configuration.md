@@ -395,15 +395,21 @@ INPUTS are proven on a cluster (the accelerator is read from the node and
 appears in the pool state line; the access review answers correctly both
 ways) -- but the decision itself has not been observed end to end.
 
-**Not verified on a cluster:** everything in Part 5 — `warmPoolCopies` and the
-pool ScaledObject are unit-tested only, and the second changes how the pool's
-size reaches Kubernetes at all.
+**Everything above is now verified on a cluster.** The two paragraphs that used
+to sit here said the opposite, and were left stale when the section above them
+was added — worth recording, because a document that contradicts itself is worse
+than one that admits a gap.
 
-**Not verified on a cluster:** the accelerator MISMATCH path. Every GPU node on
-pokprod is an H100, so there is no second type to be declined against, and the
-alternatives -- repinning the live workload to a fake accelerator -- would take
-the tenant's own deployment down to test a log line. The reading of both sides is
-verified above; the decline itself rests on mutation-checked unit tests.
+The accelerator MISMATCH decline and two named pools are covered by
+`test/e2e/warm_pool_policy_test.go` (label `warmpool-policy`), which required new
+fixture support to exist at all: a controller run with the pool enabled and
+restored afterwards, a pool Pod pinned to a node whose accelerator the test
+chooses, and named pools. Those specs are proven able to fail — a controller
+built with the accelerator check stubbed out fails the decline spec while the
+read-only spec still passes.
+
+pokprod is all-H100, so the mismatch cannot be manufactured there without
+repinning a tenant's live workload; kind is where it is tested.
 
 A user-facing guide is now worth writing, which it was not before: the surface no
 longer contains three duplicated facts and a footgun.
