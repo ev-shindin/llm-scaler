@@ -108,6 +108,15 @@ type Reconciler struct {
 	// under Config, which is what every install had before pools were named.
 	Pools PoolSource
 
+	// Undeclared reports warm pool Deployments that no pool declares. Nil skips
+	// the check. It exists so that deleting a pool's ScaledObject and leaving
+	// its Deployment behind cannot quietly become a GPU leak.
+	Undeclared func(ctx context.Context, declared []PoolSpec) ([]string, error)
+
+	// lastUndeclared is the last set reported, so a standing orphan is named
+	// once rather than every pass.
+	lastUndeclared string
+
 	// Contended reports whether a model replica in this namespace is being
 	// denied GPUs of a given accelerator. Nil disables the arbitration, which
 	// is what a pool with no optimizer running should do.
@@ -214,6 +223,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	if err != nil {
 		return policy.Plan{}, err
 	}
+	r.reportUndeclaredPools(ctx, pools)
 	if orphans := Orphaned(memberships, pools); len(orphans) > 0 {
 		// A Pod labelled for a pool nothing declares holds a GPU that no pool
 		// will ever lend. Silence here reads as a pool that is simply small.
@@ -491,6 +501,34 @@ func residentModels(memberships []pool.Membership) int {
 		n += pool.Resident(inPod)
 	}
 	return n
+}
+
+// reportUndeclaredPools names pool Deployments that no ScaledObject declares.
+//
+// Said once per distinct set: a standing orphan repeated every pass is noise, and
+// noise is how a real one gets missed.
+func (r *Reconciler) reportUndeclaredPools(ctx context.Context, pools []PoolSpec) {
+	if r.Undeclared == nil {
+		return
+	}
+	orphans, err := r.Undeclared(ctx, pools)
+	if err != nil {
+		log.FromContext(ctx).WithName("warmpool").V(1).Info(
+			"could not check for undeclared warm pool Deployments", "err", err.Error())
+		return
+	}
+	summary := strings.Join(orphans, ",")
+	if summary == r.lastUndeclared {
+		return
+	}
+	r.lastUndeclared = summary
+	if len(orphans) == 0 {
+		return
+	}
+	log.FromContext(ctx).WithName("warmpool").Info(
+		"warm pool Deployments are holding accelerators but no ScaledObject declares them; "+
+			"WVA will not use them. Give each a trigger carrying warmPoolName, or delete them",
+		"deployments", orphans)
 }
 
 // report logs what the pass saw, but only when it differs from the last one.

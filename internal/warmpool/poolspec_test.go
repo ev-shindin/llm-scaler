@@ -6,12 +6,9 @@ import (
 	"testing"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 )
@@ -20,41 +17,39 @@ func podNamed(name string) types.NamespacedName {
 	return types.NamespacedName{Namespace: "pool", Name: name}
 }
 
-func poolDeployment(name, poolName string, replicas int32, annotations map[string]string) *appsv1.Deployment {
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: "workload",
-			Labels: map[string]string{
-				pool.ComponentLabel: pool.ComponentValue,
-				pool.PoolLabel:      poolName,
-			},
-			Annotations: annotations,
+// poolTrigger is a registered ScaledObject declaring a warm pool, as KEDA would
+// have delivered it.
+func poolTrigger(soName, poolName string, maxReplicas int32, tuning map[string]string) registry.Entry {
+	metadata := map[string]string{registry.WarmPoolNameKey: poolName}
+	for k, v := range tuning {
+		metadata[k] = v
+	}
+	return registry.Entry{
+		Namespace: "workload",
+		Name:      soName,
+		Metadata:  metadata,
+		Target: registry.Target{
+			Name:        soName,
+			MaxReplicas: &maxReplicas,
 		},
-		Spec: appsv1.DeploymentSpec{Replicas: &replicas},
 	}
 }
 
-func pools(t *testing.T, objects ...runtime.Object) []PoolSpec {
+func pools(t *testing.T, entries ...registry.Entry) []PoolSpec {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := appsv1.AddToScheme(scheme); err != nil {
-		t.Fatalf("scheme: %v", err)
-	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
-	d := &DeploymentPools{
-		Client:    c,
+	r := &RegistryPools{
+		Snapshot:  func() []registry.Entry { return entries },
 		Namespace: "workload",
 		Fallback:  policy.Config{SleepMinSize: 1, MaxHold: 2 * time.Minute, PreloadTop: 2},
 	}
-	got, err := d.Pools(context.Background())
+	got, err := r.Pools(context.Background())
 	if err != nil {
 		t.Fatalf("Pools: %v", err)
 	}
 	return got
 }
 
-func TestANamespaceWithNoPoolDeploymentStillHasOnePool(t *testing.T) {
+func TestANamespaceDeclaringNoPoolStillHasOnePool(t *testing.T) {
 	// Every install that predates named pools: Pods labelled for discovery but
 	// not for a named pool, and the config in flags. Returning nothing here
 	// would silently switch a working pool off on upgrade.
@@ -67,19 +62,19 @@ func TestANamespaceWithNoPoolDeploymentStillHasOnePool(t *testing.T) {
 	}
 }
 
-func TestAnnotationsOverrideTheFlagsPerPool(t *testing.T) {
-	got := pools(t, poolDeployment("a", "fast", 4, map[string]string{
-		AnnotationSleepMinSize:         "2",
-		AnnotationMaxHold:              "30s",
-		AnnotationPreloadTop:           "5",
-		AnnotationGPUMemoryUtilization: "0.75",
+func TestTriggerMetadataOverridesTheFlagsPerPool(t *testing.T) {
+	got := pools(t, poolTrigger("a", "fast", 4, map[string]string{
+		registry.WarmPoolSleepMinSizeKey:         "2",
+		registry.WarmPoolMaxHoldKey:              "30s",
+		registry.WarmPoolPreloadTopKey:           "5",
+		registry.WarmPoolGPUMemoryUtilizationKey: "0.75",
 	}))
 	if len(got) != 1 {
 		t.Fatalf("want one pool, got %+v", got)
 	}
 	p := got[0]
-	if p.Name != "fast" || p.Replicas != 4 {
-		t.Errorf("name/replicas wrong: %+v", p)
+	if p.Name != "fast" || p.MaxReplicas != 4 {
+		t.Errorf("name/ceiling wrong: %+v", p)
 	}
 	if p.Config.SleepMinSize != 2 || p.Config.MaxHold != 30*time.Second || p.Config.PreloadTop != 5 {
 		t.Errorf("annotations did not win: %+v", p.Config)
@@ -89,29 +84,29 @@ func TestAnnotationsOverrideTheFlagsPerPool(t *testing.T) {
 	}
 }
 
-func TestAnUnsetAnnotationKeepsTheFlagValue(t *testing.T) {
+func TestAnUnsetKnobKeepsTheFlagValue(t *testing.T) {
 	// Layering, not replacement: a pool that tunes one knob must not silently
 	// zero the other three.
-	got := pools(t, poolDeployment("a", "fast", 3, map[string]string{
-		AnnotationSleepMinSize: "2",
+	got := pools(t, poolTrigger("a", "fast", 3, map[string]string{
+		registry.WarmPoolSleepMinSizeKey: "2",
 	}))
 	if got[0].Config.MaxHold != 2*time.Minute || got[0].Config.PreloadTop != 2 {
 		t.Fatalf("unset knobs must keep the flag value: %+v", got[0].Config)
 	}
 }
 
-func TestAnUnparseableAnnotationIsIgnoredRatherThanZeroed(t *testing.T) {
+func TestAnUnreadablePoolTriggerIsRefusedWhole(t *testing.T) {
 	// Zero is meaningful for every one of these -- no reserve, no hold limit, no
 	// preloading -- so parsing a typo as zero turns it into a policy change, and
 	// a silent one. "2x" must leave the reserve alone, not remove it.
-	got := pools(t, poolDeployment("a", "fast", 3, map[string]string{
-		AnnotationSleepMinSize: "2x",
-		AnnotationMaxHold:      "banana",
-		AnnotationPreloadTop:   "-1",
+	// A pool whose trigger cannot be read is refused WHOLE rather than partly
+	// applied: its knobs decide how many GPUs it holds, so carrying on with
+	// some of them would leave an operator reading a number in force nowhere.
+	got := pools(t, poolTrigger("a", "fast", 3, map[string]string{
+		registry.WarmPoolSleepMinSizeKey: "2x",
 	}))
-	c := got[0].Config
-	if c.SleepMinSize != 1 || c.MaxHold != 2*time.Minute || c.PreloadTop != 2 {
-		t.Fatalf("a bad value must be ignored, not applied as zero: %+v", c)
+	if len(got) != 1 || got[0].Name != "" {
+		t.Fatalf("an unreadable pool must be dropped, leaving the unnamed fallback: %+v", got)
 	}
 }
 
@@ -123,8 +118,8 @@ func TestTwoPoolsAreDiscoveredInAStableOrder(t *testing.T) {
 	// aligned the fake client's own name ordering produces the right answer
 	// whether or not anything sorts, so the test agreed with a missing sort.
 	got := pools(t,
-		poolDeployment("a", "h100", 2, nil),
-		poolDeployment("z", "a100", 3, nil),
+		poolTrigger("a", "h100", 2, nil),
+		poolTrigger("z", "a100", 3, nil),
 	)
 	if len(got) != 2 {
 		t.Fatalf("want two pools, got %+v", got)
@@ -137,7 +132,7 @@ func TestTwoPoolsAreDiscoveredInAStableOrder(t *testing.T) {
 func TestAPoolWhoseReserveDoesNotFitIsCalledOut(t *testing.T) {
 	// Read from the Deployment, so it is reported whether or not any model has
 	// asked for anything yet.
-	inert := PoolSpec{Name: "x", Replicas: 1, Config: policy.Config{SleepMinSize: 1}}
+	inert := PoolSpec{Name: "x", MaxReplicas: 1, Config: policy.Config{SleepMinSize: 1}}
 	why, got := inert.Inert()
 	if !got {
 		t.Fatal("replicas equal to the reserve can never admit anything")
@@ -146,7 +141,7 @@ func TestAPoolWhoseReserveDoesNotFitIsCalledOut(t *testing.T) {
 		t.Error("the reason must say what to change")
 	}
 
-	ok := PoolSpec{Name: "x", Replicas: 2, Config: policy.Config{SleepMinSize: 1}}
+	ok := PoolSpec{Name: "x", MaxReplicas: 2, Config: policy.Config{SleepMinSize: 1}}
 	if _, bad := ok.Inert(); bad {
 		t.Error("a pool with room above its reserve is fine")
 	}

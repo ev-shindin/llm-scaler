@@ -3,6 +3,7 @@ package registry
 import (
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // Trigger metadata keys. These are the whole per-variant configuration surface:
@@ -184,4 +185,93 @@ func ParseMeta(metadata map[string]string) (Meta, error) {
 // model, no engine options and nothing to autoscale on demand for.
 func ScalesAWarmPool(metadata map[string]string) bool {
 	return metadata[WarmPoolNameKey] != ""
+}
+
+// Trigger metadata keys that tune a warm POOL. They appear only on a trigger
+// that carries WarmPoolNameKey.
+//
+// The pool's configuration lives with its ScaledObject rather than on the
+// Deployment that supplies its Pods, because a warm pool is a WVA concept that
+// happens to have Pods rather than a workload WVA happens to manage. Nothing
+// outside WVA reads it, nothing outside WVA creates it, and there is no sensible
+// way to operate one except through WVA -- so its declaration belongs with
+// everything else WVA is told, and the invariant stays whole: WVA manages what
+// it is CALLED about, with no exceptions.
+//
+// It also puts the reserve beside the envelope it has to fit inside. The rule
+// that decides whether a pool can warm anything at all -- maxReplicaCount must
+// exceed the reserve -- is now checkable within one object.
+const (
+	// WarmPoolSleepMinSizeKey is the floor on FREE Pods: the reserve kept for
+	// the next spike. Admission draws on free-minus-reserve, so a reserve that
+	// reaches maxReplicaCount leaves a budget of zero forever.
+	WarmPoolSleepMinSizeKey = "warmPoolSleepMinSize"
+	// WarmPoolMaxHoldKey bounds how long a borrowed Pod may serve before it is
+	// returned regardless, so a scale-up that never arrives cannot turn the
+	// reserve into permanent capacity for one variant. A Go duration.
+	WarmPoolMaxHoldKey = "warmPoolMaxHold"
+	// WarmPoolPreloadTopKey warms this many of the busiest variants without
+	// waiting for each to miss first.
+	WarmPoolPreloadTopKey = "warmPoolPreloadTop"
+	// WarmPoolGPUMemoryUtilizationKey overrides --gpu-memory-utilization for
+	// warm copies, trading KV cache for warm-set size.
+	WarmPoolGPUMemoryUtilizationKey = "warmPoolGPUMemoryUtilization"
+)
+
+// PoolMeta is a warm pool's tuning, as its trigger declares it. Every field is
+// optional; an absent one leaves the controller's own default in place.
+type PoolMeta struct {
+	Name                 string
+	SleepMinSize         *int
+	MaxHold              *time.Duration
+	PreloadTop           *int
+	GPUMemoryUtilization float64
+}
+
+// ParsePoolMeta reads a pool trigger's tuning.
+//
+// A value that does not parse is REFUSED rather than defaulted, and the whole
+// trigger with it. A pool's knobs decide how many GPUs it holds and whether it
+// can warm anything; silently ignoring one and carrying on would leave an
+// operator looking at a number that is not in force anywhere.
+func ParsePoolMeta(metadata map[string]string) (PoolMeta, error) {
+	name := metadata[WarmPoolNameKey]
+	if name == "" {
+		return PoolMeta{}, fmt.Errorf("trigger metadata %q is required on a warm pool trigger", WarmPoolNameKey)
+	}
+	out := PoolMeta{Name: name}
+
+	if raw := metadata[WarmPoolSleepMinSizeKey]; raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return PoolMeta{}, fmt.Errorf("trigger metadata %q must be a non-negative whole number, got %q",
+				WarmPoolSleepMinSizeKey, raw)
+		}
+		out.SleepMinSize = &n
+	}
+	if raw := metadata[WarmPoolMaxHoldKey]; raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return PoolMeta{}, fmt.Errorf("trigger metadata %q must be a positive duration such as 2m, got %q",
+				WarmPoolMaxHoldKey, raw)
+		}
+		out.MaxHold = &d
+	}
+	if raw := metadata[WarmPoolPreloadTopKey]; raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return PoolMeta{}, fmt.Errorf("trigger metadata %q must be a non-negative whole number, got %q",
+				WarmPoolPreloadTopKey, raw)
+		}
+		out.PreloadTop = &n
+	}
+	if raw := metadata[WarmPoolGPUMemoryUtilizationKey]; raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v <= 0 || v > 1 {
+			return PoolMeta{}, fmt.Errorf("trigger metadata %q must be a fraction above 0 and at most 1, got %q",
+				WarmPoolGPUMemoryUtilizationKey, raw)
+		}
+		out.GPUMemoryUtilization = v
+	}
+	return out, nil
 }

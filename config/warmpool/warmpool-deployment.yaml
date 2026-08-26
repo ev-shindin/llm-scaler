@@ -14,40 +14,15 @@ metadata:
     # Models select a pool by name; a namespace with only one needs no selection
     # at all.
     llm-d.ai/warm-pool: default
-  # This pool's tuning. Read from the DEPLOYMENT rather than from the pod
-  # template on purpose: a template annotation is part of the template, so
-  # editing one would roll every Pod in the pool -- each of them holding
-  # sleeping models that would then have to be loaded again, which is the most
-  # expensive thing the pool does. Editing these is free and takes effect on the
-  # next reconcile.
-  #
-  # Controller flags are the defaults; anything set here wins for this pool.
-  annotations:
-    # The reserve: how many Pods stay FREE for the next spike. It must be LOWER
-    # than replicas below -- the admission budget is free minus reserve, so at
-    # equality it is zero forever and the pool holds GPUs while warming nothing.
-    # WVA logs when this pool is configured that way.
-    llm-d.ai/warm-pool-sleep-min-size: "1"
-    # How long a borrowed Pod may serve before it is returned regardless, so a
-    # scale-up that never arrives cannot turn the reserve into permanent
-    # capacity for one variant.
-    llm-d.ai/warm-pool-max-hold: "2m"
-    # Warm this many of the busiest variants without waiting for each to miss.
-    llm-d.ai/warm-pool-preload-top: "2"
-    # Overrides --gpu-memory-utilization for warm copies, trading KV cache for
-    # warm-set size. A workload's own value is sized for a Pod running ONE
-    # engine and typically claims ~95% of the card, which leaves room for no
-    # sleepers beside an awake one.
-    llm-d.ai/warm-pool-gpu-memory-utilization: "0.90"
 spec:
   # K: how many models the pool can have AWAKE at once, one per Pod. Start at 1
   # and size it from measurement -- the loss model in
   # docs/proposals/fast-model-loading.md turns spike rate and hold time into K,
   # and neither has been measured on a fleet with organic traffic.
   #
-  # Must EXCEED the reserve above, or nothing is ever admitted. One replica with
-  # the default reserve of one is the inert pool: it holds a GPU for its whole
-  # life and warms nothing, with no error anywhere because nothing is wrong.
+  # A STARTING size only. Once the pool's ScaledObject exists, KEDA owns this
+  # field -- what decides whether the pool can warm anything is
+  # maxReplicaCount there against warmPoolSleepMinSize, not this number.
   replicas: 2
   # Recreate, not RollingUpdate: a surge needs a SECOND GPU before the old Pod
   # releases its own, so on a node with one free GPU the default strategy

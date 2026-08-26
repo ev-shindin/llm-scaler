@@ -4,43 +4,15 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
-)
-
-// Annotations carrying a pool's tuning, read from the pool Deployment.
-//
-// They live on the DEPLOYMENT, not on its pod template, for two reasons. A pod
-// template annotation is part of the template, so editing one rolls every Pod in
-// the pool -- each of which is holding sleeping models that would have to be
-// loaded again, which is the most expensive thing the pool does. And the
-// Deployment is the object these values have to agree with: replicas against the
-// reserve, the GPU request against what a tensor-parallel variant needs. A knob
-// that must agree with an object belongs on it.
-const (
-	// AnnotationSleepMinSize is the floor on FREE Pods -- the reserve kept for
-	// the next spike. It must be LOWER than the Deployment's replica count: at
-	// equality the admission budget is replicas-minus-reserve, which is zero
-	// forever, and the pool holds GPUs while warming nothing.
-	AnnotationSleepMinSize = "llm-d.ai/warm-pool-sleep-min-size"
-	// AnnotationMaxHold bounds how long a borrowed Pod may serve before it is
-	// returned regardless, so a scale-up that never arrives cannot turn the
-	// reserve into permanent capacity for one variant.
-	AnnotationMaxHold = "llm-d.ai/warm-pool-max-hold"
-	// AnnotationPreloadTop warms this many of the busiest variants without
-	// waiting for each to miss first.
-	AnnotationPreloadTop = "llm-d.ai/warm-pool-preload-top"
-	// AnnotationGPUMemoryUtilization overrides --gpu-memory-utilization for warm
-	// copies, trading KV cache for warm-set size.
-	AnnotationGPUMemoryUtilization = "llm-d.ai/warm-pool-gpu-memory-utilization"
+	appsv1 "k8s.io/api/apps/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // PoolSpec is one pool: a name, the policy to run it under, and the replica
@@ -51,10 +23,14 @@ type PoolSpec struct {
 	Name string
 	// Config is the flag defaults with this pool's annotations layered on top.
 	Config policy.Config
-	// Replicas is what the Deployment asks for, used only to tell an operator
-	// that a reserve cannot fit inside it. Zero when the pool was not discovered
-	// from a Deployment.
+	// Replicas is the pool's CURRENT size, used for the arbitration hold. Zero
+	// when unknown.
 	Replicas int
+	// MaxReplicas is the ceiling KEDA will hold this pool within, from its
+	// ScaledObject. It, not the current size, is what decides whether a pool
+	// can ever admit anything: a reserve that reaches the ceiling leaves a
+	// budget of zero forever. Zero means unbounded/unknown.
+	MaxReplicas int
 	// GPUMemoryUtilization is a pool-scoped override of the adapter's value.
 	// Zero inherits it.
 	GPUMemoryUtilization float64
@@ -72,15 +48,22 @@ type PoolSpec struct {
 // saying out loud: it is the state the obvious first deployment lands in, with
 // one replica and the default reserve of one.
 func (p PoolSpec) Inert() (string, bool) {
-	if p.Replicas <= 0 || p.Config.SleepMinSize <= 0 {
+	if p.Config.SleepMinSize <= 0 {
 		return "", false
 	}
-	if p.Replicas > p.Config.SleepMinSize {
+	// The CEILING, not the current size. A pool sitting at its reserve right now
+	// is ordinary -- it grows on the next pass. A pool whose ceiling is its
+	// reserve can never grow past it, and that is the state worth reporting.
+	ceiling := p.MaxReplicas
+	if ceiling <= 0 {
+		ceiling = p.Replicas // no ScaledObject to bound it; judge what it has
+	}
+	if ceiling <= 0 || ceiling > p.Config.SleepMinSize {
 		return "", false
 	}
-	return fmt.Sprintf("replicas=%d does not exceed the reserve of %d, so the admission budget "+
-		"is zero forever: raise replicas or lower %s",
-		p.Replicas, p.Config.SleepMinSize, AnnotationSleepMinSize), true
+	return fmt.Sprintf("maxReplicaCount=%d does not exceed the reserve of %d, so the admission "+
+		"budget is zero forever: raise maxReplicaCount or lower %s",
+		ceiling, p.Config.SleepMinSize, registry.WarmPoolSleepMinSizeKey), true
 }
 
 // PoolSource reports the pools that exist. Substituted in tests.
@@ -88,91 +71,90 @@ type PoolSource interface {
 	Pools(ctx context.Context) ([]PoolSpec, error)
 }
 
-// DeploymentPools discovers pools by listing the Deployments that declare them.
+// RegistryPools discovers pools from the ScaledObjects that declare them.
 //
-// The Deployment IS the pool: it is what holds the GPUs, and it already carries
-// every physical fact about one. Discovering pools from it means an operator
-// creates a pool by applying a manifest rather than by applying a manifest AND
-// restarting the controller with a matching flag -- which is the split that made
-// three of this feature's four setup steps fail closed and silently.
-type DeploymentPools struct {
-	Client    client.Client
+// A warm pool is a WVA concept that happens to have Pods, not a workload WVA
+// happens to manage: nothing outside WVA reads one, nothing outside WVA creates
+// one, and there is no way to operate one except through WVA. So it is declared
+// the same way everything else WVA knows about is -- by a KEDA trigger -- and
+// the invariant holds without exception: WVA manages what it is CALLED about.
+//
+// The Deployment still supplies the Pods and still states their physical facts,
+// which are READ from the Pod rather than declared here. What moved is the
+// tuning, which now sits beside the minReplicaCount and maxReplicaCount it has
+// to agree with.
+type RegistryPools struct {
+	// Snapshot returns the registered ScaledObjects. Injected rather than taken
+	// from the package default so tests need no global.
+	Snapshot func() []registry.Entry
+	// Namespace bounds discovery to the pool namespace.
 	Namespace string
-	// Fallback is the flag-derived config, used as the base every pool's
-	// annotations are layered onto, and used whole for the single unnamed pool
-	// when no Deployment declares one.
+	// Fallback is the flag-derived config each pool's trigger is layered onto,
+	// and the whole config for an install that declares no pool at all.
 	Fallback policy.Config
 }
 
-// Pools lists the pool Deployments in the namespace.
+// Pools lists the warm pools declared in this namespace.
 //
-// A namespace with no pool Deployment still yields ONE pool, unnamed, carrying
-// the flag config: that is every install that predates this, and the Pods it
-// finds are labelled for discovery but not for a named pool. Returning nothing
-// there would silently disable a working pool on upgrade.
-func (d *DeploymentPools) Pools(ctx context.Context) ([]PoolSpec, error) {
-	var deployments appsv1.DeploymentList
-	if err := d.Client.List(ctx, &deployments,
-		client.InNamespace(d.Namespace),
-		client.MatchingLabels{pool.ComponentLabel: pool.ComponentValue},
-	); err != nil {
-		return nil, fmt.Errorf("list pool deployments: %w", err)
-	}
-	if len(deployments.Items) == 0 {
-		return []PoolSpec{{Name: "", Config: d.Fallback}}, nil
-	}
+// A namespace whose triggers declare no pool still yields ONE pool, unnamed,
+// carrying the flag config: that is every install that predates named pools, and
+// returning nothing would silently switch a working pool off on upgrade.
+func (r *RegistryPools) Pools(ctx context.Context) ([]PoolSpec, error) {
+	logger := log.FromContext(ctx).WithName("warmpool")
 
-	out := make([]PoolSpec, 0, len(deployments.Items))
-	for i := range deployments.Items {
-		dep := &deployments.Items[i]
-		spec := PoolSpec{
-			Name:       dep.Labels[pool.PoolLabel],
-			Config:     d.Fallback,
-			Deployment: dep.Name,
+	var out []PoolSpec
+	for _, entry := range r.Snapshot() {
+		if r.Namespace != "" && entry.Namespace != r.Namespace {
+			continue
 		}
-		if dep.Spec.Replicas != nil {
-			spec.Replicas = int(*dep.Spec.Replicas)
+		if !registry.ScalesAWarmPool(entry.Metadata) {
+			continue
 		}
-		applyAnnotations(&spec, dep.Annotations)
-		out = append(out, spec)
+		meta, err := registry.ParsePoolMeta(entry.Metadata)
+		if err != nil {
+			// Refused whole rather than partly applied: a pool's knobs decide
+			// how many GPUs it holds, so carrying on with some of them would
+			// leave an operator reading a number that is in force nowhere.
+			logger.Info("ignoring a warm pool whose trigger metadata cannot be read",
+				"scaledObject", entry.Name, "namespace", entry.Namespace, "err", err.Error())
+			continue
+		}
+		out = append(out, poolSpecFrom(meta, entry, r.Fallback))
 	}
-	// Ordered so two pools are processed the same way on every pass and every
-	// process. Map and list order are not guaranteed, and a pool that wins a
-	// free Pod only on some passes is worse than either outcome consistently.
+	if len(out) == 0 {
+		return []PoolSpec{{Name: "", Config: r.Fallback}}, nil
+	}
+	// Ordered so two pools resolve the same way on every pass and every process.
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 
-// applyAnnotations layers a Deployment's annotations over the flag defaults.
-//
-// An unparseable value is IGNORED rather than treated as zero. Zero is a
-// meaningful setting for every one of these -- no reserve, no hold limit, no
-// preloading -- so parsing "2x" as "disable the reserve" would turn a typo into
-// a policy change, and a silent one.
-func applyAnnotations(spec *PoolSpec, annotations map[string]string) {
-	if v, ok := parseInt(annotations[AnnotationSleepMinSize]); ok {
-		spec.Config.SleepMinSize = v
+// poolSpecFrom layers a pool's trigger over the flag defaults.
+func poolSpecFrom(meta registry.PoolMeta, entry registry.Entry, fallback policy.Config) PoolSpec {
+	spec := PoolSpec{
+		Name:                 meta.Name,
+		Config:               fallback,
+		Deployment:           entry.Target.Name,
+		GPUMemoryUtilization: meta.GPUMemoryUtilization,
 	}
-	if v, err := time.ParseDuration(annotations[AnnotationMaxHold]); err == nil && v > 0 {
-		spec.Config.MaxHold = v
+	if meta.SleepMinSize != nil {
+		spec.Config.SleepMinSize = *meta.SleepMinSize
 	}
-	if v, ok := parseInt(annotations[AnnotationPreloadTop]); ok {
-		spec.Config.PreloadTop = v
+	if meta.MaxHold != nil {
+		spec.Config.MaxHold = *meta.MaxHold
 	}
-	if v, err := strconv.ParseFloat(annotations[AnnotationGPUMemoryUtilization], 64); err == nil && v > 0 && v <= 1 {
-		spec.GPUMemoryUtilization = v
+	if meta.PreloadTop != nil {
+		spec.Config.PreloadTop = *meta.PreloadTop
 	}
-}
-
-func parseInt(s string) (int, bool) {
-	if s == "" {
-		return 0, false
+	if entry.Target.MaxReplicas != nil {
+		spec.MaxReplicas = int(*entry.Target.MaxReplicas)
 	}
-	v, err := strconv.Atoi(s)
-	if err != nil || v < 0 {
-		return 0, false
+	if entry.Target.MinReplicas != nil {
+		// The floor is the best available reading of current size when nothing
+		// else says: KEDA holds the Deployment at or above it.
+		spec.Replicas = int(*entry.Target.MinReplicas)
 	}
-	return v, true
+	return spec
 }
 
 // MembershipsIn returns the memberships belonging to one pool.
@@ -264,4 +246,46 @@ func Unassignable(variants []policy.VariantDemand, pools []PoolSpec) map[string]
 		}
 	}
 	return out
+}
+
+// UndeclaredPools finds warm pool Deployments that no ScaledObject declares.
+//
+// This is the price of moving the declaration to the ScaledObject, paid
+// deliberately. A pool Deployment is still what holds the accelerators, so one
+// left behind after its ScaledObject is deleted goes on holding them while WVA
+// no longer knows it exists. That is a silent GPU leak, and the whole point of
+// this configuration surface is that nothing about a pool should be silent.
+//
+// Diagnostics only. It reads Deployments to REPORT them, never to configure
+// anything, so there remains exactly one place a pool is defined.
+type UndeclaredPools struct {
+	Client    client.Client
+	Namespace string
+}
+
+// Find returns the names of pool Deployments not declared by any of the pools.
+func (u *UndeclaredPools) Find(ctx context.Context, declared []PoolSpec) ([]string, error) {
+	var deployments appsv1.DeploymentList
+	if err := u.Client.List(ctx, &deployments,
+		client.InNamespace(u.Namespace),
+		client.MatchingLabels{pool.ComponentLabel: pool.ComponentValue},
+	); err != nil {
+		return nil, fmt.Errorf("list pool deployments: %w", err)
+	}
+
+	claimed := make(map[string]bool, len(declared))
+	for _, spec := range declared {
+		if spec.Deployment != "" {
+			claimed[spec.Deployment] = true
+		}
+	}
+
+	var orphans []string
+	for i := range deployments.Items {
+		if name := deployments.Items[i].Name; !claimed[name] {
+			orphans = append(orphans, name)
+		}
+	}
+	sort.Strings(orphans)
+	return orphans, nil
 }

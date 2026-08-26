@@ -13,8 +13,10 @@
 # missed, and shrinking slowly, because throwing away a loaded model to save
 # money and then paying a full load to get it back is the worst of both.
 #
-# ENTIRELY OPTIONAL. Delete this file and the pool stays exactly the size its
-# Deployment says, which is what most installs want to start with.
+# REQUIRED. This is what declares the pool to WVA; without it the Deployment is
+# just Pods holding GPUs that nothing will ever use. For a FIXED-size pool set
+# minReplicaCount and maxReplicaCount to the same number -- do not delete this
+# file.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -52,7 +54,37 @@ spec:
       metadata:
         # WVA's external scaler. Same address the model ScaledObjects use.
         scalerAddress: wva-external-scaler.>>> EDIT THIS <<<.svc.cluster.local:9090
-        # Marks this as a POOL rather than a model, which is what lets WVA
-        # answer for it without a modelID and keeps it out of variant discovery.
-        # It must match the pool Deployment's llm-d.ai/warm-pool label.
+
+        # THIS TRIGGER IS THE POOL'S DECLARATION. A warm pool is a WVA concept
+        # that happens to have Pods, not a workload WVA happens to manage --
+        # nothing outside WVA reads one or creates one -- so it is declared the
+        # same way every other thing WVA knows about is, by a KEDA trigger.
+        #
+        # Deleting this ScaledObject therefore deletes the POOL, not just its
+        # elasticity. The Deployment below goes on holding accelerators, and WVA
+        # reports it as undeclared rather than using it.
+        #
+        # Must match the Deployment's llm-d.ai/warm-pool label, which is what
+        # groups its Pods.
         warmPoolName: default
+
+        # The reserve: Pods kept FREE for the next spike. Admission draws on
+        # free-minus-reserve, so this must stay BELOW maxReplicaCount above --
+        # at or beyond it the admission budget is zero forever and the pool
+        # holds accelerators while warming nothing. WVA says so if it happens.
+        warmPoolSleepMinSize: "1"
+
+        # How long a borrowed Pod may serve before it is returned regardless, so
+        # a scale-up that never arrives cannot turn the reserve into permanent
+        # capacity for one variant.
+        warmPoolMaxHold: "2m"
+
+        # Warm this many of the busiest variants without waiting for each to
+        # miss first.
+        warmPoolPreloadTop: "2"
+
+        # Overrides --gpu-memory-utilization for warm copies, trading KV cache
+        # for warm-set size. A workload's own value is sized for a Pod running
+        # ONE engine and typically claims ~95% of the card, leaving room for no
+        # sleepers beside an awake one.
+        warmPoolGPUMemoryUtilization: "0.90"

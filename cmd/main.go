@@ -842,11 +842,22 @@ func main() {
 			reconciler.Contended = func(namespace, accelerator string) bool {
 				return decision.GPUContended(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
 			}
-			reconciler.Pools = &warmpool.DeploymentPools{
-				Client:    mgr.GetClient(),
+			// Pools are DECLARED by their ScaledObjects, like everything else
+			// WVA knows about. The flags above are the base each pool's trigger
+			// is layered onto, and the whole config for an install that
+			// declares no pool at all.
+			reconciler.Pools = &warmpool.RegistryPools{
+				Snapshot:  registry.Default.Snapshot,
 				Namespace: warmPoolNS,
 				Fallback:  reconciler.Config,
 			}
+			// Listed only to REPORT a pool Deployment nothing declares. It
+			// holds GPUs and WVA will not use it, which is exactly the silence
+			// moving the declaration to the ScaledObject could have introduced.
+			reconciler.Undeclared = (&warmpool.UndeclaredPools{
+				Client:    mgr.GetClient(),
+				Namespace: warmPoolNS,
+			}).Find
 			setupLog.Info("warm pool enabled",
 				"namespace", warmPoolNS,
 				"sleepMinSize", *warmPoolSleepMinSize,
