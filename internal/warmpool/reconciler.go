@@ -261,7 +261,65 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		r.publishSize(spec, lent)
 		merged = mergePlans(merged, plan)
 	}
+	r.forgetVanishedVariants(variants)
 	return merged, nil
+}
+
+// forgetVanishedVariants drops per-variant bookkeeping for variants that are no
+// longer being called about.
+//
+// Two reasons, and the second is the one that matters. Discovery is call-driven
+// and the registry ages entries out, so variants come and go over a controller's
+// life; maps keyed by variant name would otherwise only ever grow.
+//
+// More importantly, the report-once maps would keep a variant's silence FOREVER.
+// A model declined for a reason, removed, and redeployed with the same problem
+// would never be reported again -- the operator investigating it would find
+// nothing in the log, which is precisely the silence these maps were added to
+// break. Forgetting a variant that went away means its return is news again.
+//
+// missesAt is pruned on the same pass but by AGE, not by liveness: a variant
+// that flickers out and back should not have to earn its admission twice.
+func (r *Reconciler) forgetVanishedVariants(variants []policy.VariantDemand) {
+	live := make(map[string]bool, len(variants))
+	for _, v := range variants {
+		live[v.Model.Variant] = true
+	}
+
+	for variant := range r.lastUnassignable {
+		if !live[variant] {
+			delete(r.lastUnassignable, variant)
+		}
+	}
+	for key := range r.lastDeclined {
+		if !live[key.Variant] {
+			delete(r.lastDeclined, key)
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cutoff := r.now().Add(-orDefaultWindow(r.Config.AdmissionWindow))
+	for variant, times := range r.missesAt {
+		newest := time.Time{}
+		for _, at := range times {
+			if at.After(newest) {
+				newest = at
+			}
+		}
+		if newest.Before(cutoff) {
+			delete(r.missesAt, variant)
+		}
+	}
+}
+
+// orDefaultWindow keeps a zero AdmissionWindow from pruning every miss the
+// instant it is recorded.
+func orDefaultWindow(window time.Duration) time.Duration {
+	if window <= 0 {
+		return time.Hour
+	}
+	return window
 }
 
 // poolSpecs is the declared pools, or the single unnamed one when nothing

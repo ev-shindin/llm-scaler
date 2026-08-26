@@ -96,6 +96,42 @@ WVA reports it at startup rather than letting you find out from the bill.
 Start with `replicas: 2`, `sleep-min-size: 1`, and raise replicas if you see
 borrows blocked.
 
+### How many models fit in one Pod
+
+A third number, and it lives in the pod template rather than in an annotation:
+
+```yaml
+resources:
+  limits:   { memory: 128Gi }
+  requests: { memory: 128Gi }
+```
+
+**This is the warm-set budget.** A level-1 sleeper moves its weights into shared
+memory and the container's cgroup is charged for all of it, so what a Pod can
+hold is decided here and nowhere else. Measured on an H100, a resident model
+costs roughly **2.6 GiB + 1.4× its weights**:
+
+| model | weights | charged while asleep | fit in 128Gi |
+| --- | --- | --- | --- |
+| 0.6B | 1.1 GiB | 4.1 GiB | ~30 (capped at 16) |
+| 8B | 14.9 GiB | 23.4 GiB | ~5 |
+
+There is a hard ceiling of 16 instances per Pod, but for anything above about a
+3B model **memory binds first** — you will run out of budget long before ports.
+
+Two things follow:
+
+- Getting it wrong is the expensive mistake. One model too many does not fail
+  its own admission; it OOM-kills the launcher and takes **every model already
+  resident in that Pod** with it. WVA will not admit against a budget larger
+  than the limit for exactly this reason.
+- Unlike the annotations, changing it **rolls the pool** — it is a pod-template
+  field, so every Pod restarts and every resident model is loaded again. Size it
+  at deploy time; the annotations are the things that are free to retune.
+
+Watch `memory.current`, not `anon`: a sleeper's anonymous memory barely moves,
+so anything watching `anon` reports it as costing nothing.
+
 ## Tuning
 
 Everything else is an annotation on the pool Deployment. They take effect on the
@@ -118,9 +154,10 @@ value is usually sized for a Pod running one engine and claims nearly the whole
 card, which leaves no room for sleepers beside an awake one; the pool's default
 is lower for that reason.
 
-What you do **not** configure: how many accelerators a Pod holds and how much
-memory it may use. Both are read from the pool Pod itself, so they cannot
-disagree with it.
+What you do **not** configure here: how many accelerators a Pod holds and how
+much memory it may use. Both are read from the pool Pod's own spec, so they
+cannot disagree with it — but the memory limit is still a decision, and a
+load-bearing one. See [How many models fit in one Pod](#how-many-models-fit-in-one-pod).
 
 ## More than one pool
 
