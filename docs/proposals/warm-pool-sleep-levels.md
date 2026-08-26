@@ -250,6 +250,49 @@ none of them is visible from outside. §7's rule follows from this, not from
 taste: if level 2 is ever built, the reload must be inseparable from the wake and
 its failure must take the engine out of service.
 
+## 5d. Page-cache warming, measured at last -- and it is parse that binds
+
+Recommended three times in this document and its neighbours as "the cheapest
+thing on the list, price it first". Now priced, on a pokprod GPU node:
+
+| | rate |
+| --- | --- |
+| raw read, `iflag=direct` (cache bypassed) | 1.1 GB/s |
+| raw read, buffered, cache warm | **6.3 GB/s** |
+| **vLLM's own weight load, cache warm** | **1.26 GB/s** ("Loading weights took 1.11 seconds") |
+
+**The load runs five times slower than the read it depends on.** So it is bound
+by parsing safetensors and copying to the device, not by storage, and warming the
+page cache cannot take it below that floor.
+
+What warming is actually worth, at TP=1: the cached read saves ~1.1 s of a ~2.2 s
+cold load, so roughly **2x on the weight-load term** -- not the 5x the raw
+numbers suggest. Worth having, free, and much smaller than it looks.
+
+### This resolves the NVMe question too
+
+§5 said NVMe converts poorly and §5b said it converts at TP=8. Both are right,
+and the parse rate is why:
+
+- **TP=1**: one rank parses at ~1.26 GB/s. Storage at 1.8 (PVC) or 5.2 (NVMe)
+  is already faster than that, so neither NVMe nor a warm cache moves the
+  binding constraint much.
+- **TP=8-16**: every rank parses its own shard concurrently, so aggregate parse
+  capacity is ~10-20 GB/s. NOW storage binds, and the 1.8 -> 5.2 GB/s jump
+  converts nearly fully.
+
+So the single rule to carry: **compare storage bandwidth against
+`1.26 GB/s x TP`, and spend on whichever side is smaller.** Below the crossover,
+faster storage buys nothing; above it, it buys almost everything.
+
+### A cluster trap found while measuring this
+
+Two pods pinned with `nodeName` vanished outright -- `Failed`, then NotFound --
+while an unpinned pod on the same fleet ran fine. The nodes carry no taints, so
+something in this cluster removes `nodeName`-pinned pods. Schedule with
+`nodeSelector` or affinity here, not `nodeName`, or a measurement disappears
+with no error to read.
+
 ## 6. Method trap: `kubectl exec` cost more than everything measured
 
 Every wake figure this project recorded before today was taken by timing a
