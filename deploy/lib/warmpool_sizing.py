@@ -143,10 +143,19 @@ def recommend(node, params_b, dtype, kv_headroom, shared_bw, local_bw, ram_frac)
     # The verdict, which is the only part anyone should act on.
     verdict = []
     if fits < 1:
+        # Level 2 holds no host RAM at all, so it is the only warm option left --
+        # and its wake is a reload, which means node-local storage is what decides
+        # whether it is a bridge or a slow cold start.
         verdict.append(
-            "DO NOT warm this model here: host RAM cannot hold a level-1 sleeper. "
-            "Level 2 would fit but serves garbage unless its reload is guaranteed "
-            "(see warm-pool-sleep-levels.md). Pin minReplicaCount instead.")
+            "Level 1 is IMPOSSIBLE here: host RAM cannot hold one sleeper. Level 2 "
+            "holds no RAM, and its wake is a reload: ~%.0f s from node-local storage, "
+            "~%.0f s from shared. That is the only warm option on this hardware."
+            % (local_s, shared_s))
+        verdict.append(
+            "But level 2 SERVES GARBAGE unless reload_weights is called after every "
+            "wake, and a failed reload poisons the engine until it restarts. Nothing "
+            "implements that today. Pin minReplicaCount unless you build it "
+            "(see warm-pool-sleep-levels.md).")
     elif fits == 1:
         verdict.append(
             "DO NOT pool this model: one sleeper per node means the pool holds exactly "

@@ -36,9 +36,17 @@ The split that decides the design:
 | **receiver** | HTTP: `/init_weight_transfer_engine`, `/start_weight_update`, `/update_weights`, `/finish_weight_update` — with `HTTPVLLMWeightSyncClient` as a ready-made client |
 | **sender** | Python only: `trainer_init()`, `trainer_send_weights()` |
 
-**No HTTP route makes a running vLLM a sender.** Confirmed by grep over
-`entrypoints/openai/`: every weight route is receiver-side. So a serving replica
-cannot be asked to donate its weights without new code inside it.
+No *built-in* HTTP route makes a running vLLM a sender: every weight route under
+`entrypoints/openai/` is receiver-side. **But one can be added without patching
+vLLM.** `ParallelConfig.worker_extension_cls` is "dynamically inherited by the
+worker class ... to inject new attributes and methods to the worker class for use
+in `collective_rpc` calls". So a small extension class exposing `send_weights()`,
+mounted into the image and named by a flag, makes a SERVING replica a sender,
+driven through the `/collective_rpc` route that already exists.
+
+That matters more than it looks, and §4b was originally written without it: it
+means the sender need not be a dedicated weight server holding its own copy. It
+can be a replica the fleet is already running and already paying for.
 
 The NCCL engine is a **broadcast from rank 0 to N receivers** of dense
 checkpoint-format weights — one sender, many receivers, which is the right shape
@@ -111,12 +119,25 @@ Scale-up from one replica to two, every option priced the same way:
 | weight transfer, host-RAM server staging through a GPU | ~167 s | ~2 + 744 GB RAM |
 | **warm pool, level 1** | **~19 s** | 16 |
 
-**A GPU-resident weight server for this model needs 744 GB of GPU memory — two
+**A DEDICATED weight server for this model needs 744 GB of GPU memory — two
 nodes, sixteen H100s. That is exactly what warm-pooling the model costs, and it
-delivers 130 s instead of 19 s.** It is strictly dominated: same accelerators,
-seven times slower. The pool wins because it skips the ~100 s fixed startup as
-well as the weight load; a transfer only skips the load, since the receiving
-process still has to start, import, compile and capture.
+delivers 130 s instead of 19 s.** On that comparison it is strictly dominated.
+
+**But the sender does not have to be dedicated.** With `worker_extension_cls`
+(§2) the existing serving replica broadcasts its own weights, and the mechanism
+costs **no additional accelerator at all** — only bandwidth and some GPU time
+stolen from a replica that is serving. That row is the one to read:
+
+| approach | time to serving | extra GPUs |
+| --- | --- | --- |
+| transfer from a SERVING replica | ~130 s | **0** |
+| cold, staged on node-local NVMe | ~172 s | 0 |
+| warm pool, level 1 | ~19 s | 16 |
+
+So it is not dominated after all: it beats NVMe staging on time and matches it on
+accelerator cost. What it costs instead is engineering — an extension class, an
+orchestrator to drive four calls in order, and the readiness rule in §4, which is
+not optional because the receiver starts with random weights.
 
 The host-RAM variant avoids most of the GPU cost and lands at ~167 s — which is
 no better than simply staging the weights on node-local NVMe, for a new
@@ -167,20 +188,25 @@ should be priced before (2) or a weight server.
 
 ## 6. Recommendation
 
-1. **Do not build a weight server.** At 8B it saves 6% of a cold start; at
-   GLM-5.2 scale it costs the same sixteen GPUs as warm-pooling the model and is
-   seven times slower (§4b). The economics are inverted at both ends of the size
-   range, so there is no model for which it is the right first move.
-2. **Stage weights on node-local storage instead.** It reaches ~172 s against
+1. **Do not build a DEDICATED weight server.** At 8B it saves 6% of a cold
+   start; at GLM-5.2 scale it costs the same sixteen GPUs as warm-pooling the
+   model and is seven times slower (§4b).
+2. **Transfer from a serving replica is a different proposition** and is not
+   ruled out: `worker_extension_cls` makes it possible without patching vLLM, and
+   it costs no extra accelerator. For a big model it reaches ~130 s against
+   ~172 s for NVMe staging and ~513 s cold. It is worth building only after the
+   two free options below, because it carries a silent-garbage failure mode that
+   neither of them has.
+3. **Stage weights on node-local storage first.** It reaches ~172 s against
    the transfer's ~130 s, costs no accelerator, needs no component, and cannot
    serve a wrong answer. On a fleet with node-local NVMe this is most of the
    benefit for almost none of the risk.
-3. **The only shape worth pricing later** is a high fan-out scale-up of one big
+4. **The shape that most favours a transfer** is a high fan-out scale-up of one big
    model, where a broadcast reaches every receiver at once and a pool bridges one
    at a time (§4b).
-4. **Measure page-cache warming first.** It is free, it needs no component, and
+5. **Measure page-cache warming.** It is free, it needs no component, and
    nobody has measured what it does to a real cold start here.
-5. Whatever is built, the readiness rule in §4 comes with it. Three ways to reach
+6. Whatever is built, the readiness rule in §4 comes with it. Three ways to reach
    a silently-wrong engine are already known from the sleep-level work; a
    dummy-loaded replica is a fourth.
 
