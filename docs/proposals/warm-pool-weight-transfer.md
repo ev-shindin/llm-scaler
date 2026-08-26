@@ -208,11 +208,70 @@ replicas. That is not a gap: bridging a scale-up is the pool's stated job, and
 scale-from-zero falls back to a storage reload at ~72 s from node-local NVMe,
 which is still far better than a ~513 s cold start.
 
-### Why this is not a recommendation yet
+### RUN AND CONFIRMED, 2026-08-26
 
-- **Nobody has run it.** Every number above is arithmetic. The composition is
-  *permitted* -- there is no `is_sleeping` guard anywhere in `gpu_worker.py` or
-  the transfer base -- but permitted is not tested.
+It works. Qwen3-0.6B on one Pod with two H100s: vLLM on device 0, a sender
+process on device 1 holding the same checkpoint, NCCL between them.
+
+```
+baseline                          ' Paris. The capital of France is also the capital of the'
+POST /sleep?level=2               GPU 22.7 GiB -> 0.81 GiB
+POST /wake_up                     200
+  same prompt                     '!!!!!!!!!!!!'          <- poisoned, as expected
+  broadcast 1.40 GiB from peer    0.11 s  (13.1 GB/s)
+  same prompt                     ' Paris. The capital of France is also the capital of the'
+  a second prompt                 ' 4, so the sum is '    <- coherent, not just memorised
+```
+
+**Byte-identical to the pre-sleep answer.** The engine's own log confirms the
+mechanism: level-2 sleep "freed 19.97 GiB ... of which 0.00 GiB is backed up in
+CPU and the rest 19.97 GiB is discarded directly".
+
+Timed on the same engine and model, the two ways to refill it:
+
+| fill path | time | rate |
+| --- | --- | --- |
+| storage, `reload_weights` | **999 ms** | ~1.5 GB/s |
+| **peer, NCCL broadcast** | **110 ms** | **13.1 GB/s** |
+
+So the whole bridge is ~80 ms wake + ~110 ms fill ~= **0.2 s**, against level 1's
+0.12 s -- within about 2x of level 1 **while holding no host RAM at all.** That
+is the result that matters: it is the host RAM, not the latency, that caps how
+many models a Pod can hold.
+
+Extrapolating to GLM-5.2 (744 GB) at the same 13.1 GB/s: ~57 s same-node.
+Inter-node RoCE will be slower -- call it ~30-60 s -- against ~275-500 s for the
+storage reload and ~19 s for a level-1 wake that needs 488 GiB of RAM per node.
+
+### Three prerequisites nobody had written down
+
+1. **The receiver must be started with `--weight-transfer-config
+   '{"backend":"nccl"}'`.** Without it every route returns "Weight transfer not
+   configured". It is a startup flag, so a pool Pod's engines must carry it from
+   the beginning -- it cannot be turned on when a transfer is first needed.
+2. **`WeightTransferTrainerFactory` has no registered engines in v0.26.0.**
+   `WeightTransferEngineFactory` registers nccl/ipc/sparse_nccl at import;
+   the trainer-side factory registers nothing, so `trainer_init` raises
+   "Available trainer engines: []". The sender must drive
+   `nccl_common.trainer_init` and `NCCLWeightTransferEngine.trainer_send_weights`
+   directly.
+3. **The two halves must overlap.** The receiver blocks inside `/update_weights`
+   waiting on the broadcast, so the HTTP calls and the broadcast must run
+   concurrently. Drive them in sequence and it deadlocks.
+
+The reproduction is `test/experiments/weight-transfer/`.
+
+### What is still untested
+
+- **Inter-node.** This was two GPUs in one Pod. The 13.1 GB/s is a same-host
+  number and says nothing about RoCE across nodes.
+- **A serving replica as the sender.** The sender here was a standalone process
+  holding the checkpoint. Using a live replica needs the `worker_extension_cls`
+  route in §2, which is unbuilt.
+- **At size.** 1.4 GiB transferred; GLM-5.2 is 500x that.
+- **Under TP>1**, where every rank must receive its own shard.
+- The composition is *permitted* -- there is no `is_sleeping` guard anywhere in
+  `gpu_worker.py` or the transfer base -- but that also means
 - **Nothing guards the ordering either**, and that cuts the other way: calling
   `update_weights` before `/wake_up` has remapped the allocator is undefined, and
   nothing will stop it.
