@@ -44,7 +44,11 @@ FIXED_STARTUP_S = 100.0
 # It is FIVE TIMES slower than a warm cached read (6.3 GB/s), so a single rank is
 # bound by parse and host-to-device, not by storage. Ranks parse concurrently, so
 # the fleet's aggregate is this x TP, and storage only binds above that.
-PARSE_RATE_GBPS = 1.26
+PARSE_RATE_GBPS = 1.08
+# How aggregate load scales with tensor parallelism. FITTED TO TWO POINTS
+# (TP=1 and TP=2 on one 8B model); extrapolating it to TP=16 is the weakest
+# number in this file. Linear would be 1.0.
+PARSE_TP_EXPONENT = 0.34
 # Host-to-device: what a level-1 wake actually costs. MEASURED, not assumed --
 # Qwen3-8B woke in 0.42 s from 15.27 GiB, i.e. ~39 GB/s. An earlier guess of
 # 20 GB/s made every published wake time about twice as pessimistic as reality.
@@ -56,6 +60,30 @@ PCIE_GBPS = 39.0
 MAX_INSTANCES_PER_POD = 16
 
 BYTES_PER_PARAM = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0, "fp4": 0.5, "int4": 0.5}
+
+
+def gpu_requests_by_node():
+    """GPUs already requested per node, which allocatable does not tell you."""
+    out = subprocess.run(
+        ["kubectl", "get", "pods", "--all-namespaces", "--field-selector",
+         "status.phase=Running", "-o", "json"],
+        capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        return None
+    used = {}
+    for pod in json.loads(out.stdout).get("items", []):
+        node = (pod.get("spec") or {}).get("nodeName")
+        if not node:
+            continue
+        n = 0
+        for c in (pod["spec"].get("containers") or []):
+            res = (c.get("resources") or {}).get("requests") or {}
+            lim = (c.get("resources") or {}).get("limits") or {}
+            g = lim.get("nvidia.com/gpu") or res.get("nvidia.com/gpu")
+            if g:
+                n += int(g)
+        used[node] = used.get(node, 0) + n
+    return used
 
 
 def nodes_from_cluster(selector):
@@ -75,6 +103,11 @@ def nodes_from_cluster(selector):
         gpus = cap.get("nvidia.com/gpu") or cap.get("amd.com/gpu")
         if not gpus or int(gpus) == 0:
             continue
+        # ALLOCATABLE is capacity minus what the node cannot schedule -- it is
+        # NOT capacity minus what is already requested. Reading it as "free"
+        # overstates availability, sometimes badly: this fleet reported 4-7
+        # allocatable per node while the scheduler answered "15 Insufficient
+        # nvidia.com/gpu" for a 4-GPU pod. Real availability needs the Pods.
         free = alloc.get("nvidia.com/gpu") or alloc.get("amd.com/gpu") or "0"
         labels = n["metadata"].get("labels") or {}
         per_gpu_mib = labels.get("nvidia.com/gpu.memory")
@@ -82,11 +115,17 @@ def nodes_from_cluster(selector):
             "name": n["metadata"]["name"],
             "gpus": int(gpus),
             "free": int(free),
+            "requested": 0,  # filled in below when the Pod list is readable
             "per_gpu_gib": (float(per_gpu_mib) / 1024.0) if per_gpu_mib else None,
             "product": labels.get("nvidia.com/gpu.product", "unknown"),
             "ram_gib": _quantity_gib(cap.get("memory", "0")),
             "disk_gib": _quantity_gib(cap.get("ephemeral-storage", "0")),
         })
+    used = gpu_requests_by_node()
+    if used is not None:
+        for n in nodes:
+            n["requested"] = used.get(n["name"], 0)
+            n["free"] = max(0, n["free"] - n["requested"])
     return nodes
 
 
@@ -150,7 +189,16 @@ def recommend(node, params_b, dtype, kv_headroom, shared_bw, local_bw, ram_frac)
                       % (fits, per_sleeper, usable_ram)))
 
     # 4. what dominates the cold start
-    aggregate_parse = PARSE_RATE_GBPS * tp
+    #
+    # Aggregate load rate grows SUB-LINEARLY with TP. Measured on Qwen3-8B:
+    # 1.08 GB/s at TP=1 and 1.37 GB/s at TP=2 -- 1.27x for twice the ranks, and
+    # only 8% of that came back when CPU was tripled, so it is not CPU contention.
+    # Fitting gives tp**0.34.
+    #
+    # This replaces a linear `rate x tp` model that was badly optimistic: it put
+    # TP=16 at 17 GB/s where the fit says 2.8, and made node-local storage look
+    # 5.7x better than shared for a 744 GB model when the real figure is 1.55x.
+    aggregate_parse = PARSE_RATE_GBPS * (tp ** PARSE_TP_EXPONENT)
     shared_s = weights_gb / min(shared_bw, aggregate_parse)
     local_s = weights_gb / min(local_bw * nodes_needed, aggregate_parse)
     wake_s = per_node_weights_gb / PCIE_GBPS

@@ -281,9 +281,13 @@ and the parse rate is why:
   capacity is ~10-20 GB/s. NOW storage binds, and the 1.8 -> 5.2 GB/s jump
   converts nearly fully.
 
-So the single rule to carry: **compare storage bandwidth against
-`1.26 GB/s x TP`, and spend on whichever side is smaller.** Below the crossover,
-faster storage buys nothing; above it, it buys almost everything.
+So the single rule to carry: **compare storage bandwidth against the aggregate
+load rate, and spend on whichever side is smaller.** Below the crossover, faster
+storage buys nothing.
+
+**But do not compute that aggregate as `rate x TP`.** It was measured after this
+section was written and it is badly sub-linear -- see §5f, which corrects the
+"it buys almost everything" this paragraph originally ended with.
 
 ### A cluster trap found while measuring this
 
@@ -341,6 +345,53 @@ available to test it with.
 points; nothing here proves it stays linear at 500 GiB, where allocator and NUMA
 effects could appear. But the direction of risk is now known rather than
 guessed, and the slope has survived one order of magnitude.
+
+## 5f. Correction: aggregate load does NOT scale with TP
+
+§5d closed with a rule -- "compare storage bandwidth against `1.26 GB/s x TP`,
+and spend on whichever side is smaller" -- which assumed each rank parses its own
+shard concurrently, so N ranks give N times the throughput. **Measured, it does
+not.**
+
+Qwen3-8B, same node, same checkpoint:
+
+| | weight load | aggregate |
+| --- | --- | --- |
+| TP=1 | 14.87 s | 1.08 GB/s |
+| TP=2 | 12.70 s | 1.26 GB/s |
+| TP=2, CPU tripled (32 cores) | 11.71 s | **1.37 GB/s** |
+
+**1.27x for twice the ranks**, and tripling CPU returned only 8% more -- so it is
+not CPU contention. Fitting gives `1.08 GB/s x TP**0.34`, against the linear
+model's `x TP`.
+
+| TP | fitted aggregate | the linear model said |
+| --- | --- | --- |
+| 2 | 1.37 GB/s (measured) | 2.2 |
+| 8 | 2.20 GB/s | 8.6 |
+| 16 | 2.80 GB/s | 17.3 |
+
+### What this changes
+
+**Node-local storage is worth much less than §5b claimed.** For GLM-5.2 at TP=16
+the linear model put a staged load at ~72 s against the shared PVC's 413 s -- a
+5.7x win. With the fitted exponent the parse ceiling is ~2.8 GB/s, so NVMe's
+5.2 GB/s cannot be used and the load is **~268 s: a 1.55x win, not 5.7x.**
+
+Still worth doing -- 145 s off a cold start for no accelerator and no code -- but
+it is an improvement, not a transformation, and it should not be sold as one.
+
+**And it strengthens the case for warming.** If the load path cannot be made fast
+by any amount of storage or parallelism, the only thing that removes it is not
+performing it: a level-1 wake (~10 s per node for GLM-5.2) or a peer transfer.
+
+### Confidence
+
+Two points, one model, one node. The exponent is the weakest number in this
+document and TP=16 is eight times beyond the largest TP measured. TP=4 could not
+be scheduled -- the fleet reported "15 Insufficient nvidia.com/gpu" -- so the
+gap between 2 and 16 is unmeasured. Treat `tp**0.34` as "sub-linear, direction
+known, magnitude uncertain" rather than as a calibrated law.
 
 ## 6. Method trap: `kubectl exec` cost more than everything measured
 
