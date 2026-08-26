@@ -374,6 +374,44 @@ two role variants of one model are counted as independent demand by the policy.
 Both are repo questions rather than vLLM questions, and both should be checked
 before this is designed.
 
+## 4g. Inter-node: the mechanism holds, the bandwidth was not measured
+
+Run on 2026-08-26 with Qwen3-8B, sender and receiver on **different nodes**
+(required anti-affinity), 15.26 GiB of weights:
+
+```
+receiver: sleep level 2, wake        -> '!!!!!!!!!!!!'
+rendezvous across nodes              0.4 s
+BROADCAST 15.26 GiB                  14.77 s   (1.11 GB/s)
+same seeded prompt                   ' Paris. The capital of Italy is Rome. The capital of'
+```
+
+**The mechanism works across machines**: the rendezvous forms over the pod
+network, the broadcast completes, and the output is byte-identical to the
+pre-sleep answer. That is the result worth having, and it transfers to any
+cluster.
+
+**The 1.11 GB/s is not a fabric measurement, it is a misconfiguration of mine.**
+The pods requested `{cpu, memory, nvidia.com/gpu}` and nothing else, so NCCL had
+no RDMA device and fell back to TCP over the default CNI. For scale, this cluster
+advertises `rdma/roce_gdr: 1k` per node and defines two multi-NIC attachments
+(`multi-nic-compute`, `multi-nic-inference`, ipvlan at MTU 9000) -- none of which
+this run touched.
+
+Taken at face value the number would say something false and discouraging:
+1.11 GB/s is about what the same model loads from the shared PVC (1.08 GB/s), so
+a transfer would look pointless. **That conclusion does not follow from this
+run.**
+
+### To measure the fast path
+
+1. Annotate both pods `k8s.v1.cni.cncf.io/networks: multi-nic-compute`, or
+   request `rdma/roce_gdr: 1` for the verbs path.
+2. Point NCCL at the secondary interface (`NCCL_SOCKET_IFNAME`) and use its
+   address for `MASTER`, not the default pod IP.
+3. Confirm from NCCL's own logs which transport was selected before believing
+   any number -- that is the check this run failed to make.
+
 ## 4f. A note on which cluster these numbers came from
 
 Every bandwidth figure here was measured on pokprod, and pokprod is not the
