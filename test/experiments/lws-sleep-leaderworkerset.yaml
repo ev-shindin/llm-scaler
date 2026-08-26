@@ -1,0 +1,115 @@
+# Multi-node vLLM sleep/wake, the experiment behind docs/proposals/warm-pool-lws.md §3.
+#
+# One LWS group, TP=2, one GPU per Pod, Pods forced onto DIFFERENT nodes -- that
+# anti-affinity is the whole point, not a detail. It answers: does a /sleep the
+# LEADER receives release the GPU of a rank on another machine?
+#
+# Answered yes on 2026-08-26 with Qwen3-0.6B. What is still open is the HOST
+# memory cost of a level-1 sleeper per node, which 0.6B is too small to show.
+# To measure it, change the model path below to one whose weights dominate and
+# raise --gpu-memory-utilization and the memory limits to match.
+#
+# Three things here are load-bearing and easy to drop:
+#   USER/HOME     -- OpenShift runs an arbitrary UID with no passwd entry, and
+#                    torch's cache_dir calls getpass.getuser(). Without these,
+#                    `import vllm` dies with KeyError: getpwuid().
+#   --headless    -- how a worker joins. It runs vllm serve too, at its own
+#                    node-rank, and starts a MultiprocExecutor rather than an API.
+#   no Ray        -- with nnodes > 1 vLLM 0.26 REJECTS the ray backend. Do not
+#                    reintroduce `--distributed-executor-backend ray` here.
+#
+#   kubectl apply -f test/experiments/lws-sleep-leaderworkerset.yaml
+#   kubectl exec lws-sleep-0 -- curl -s -XPOST 'localhost:8000/sleep?level=1'
+#   kubectl exec lws-sleep-0-1 -- nvidia-smi --query-gpu=memory.used --format=csv
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: lws-sleep
+  namespace: CHANGE-ME
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels: { role: leader, app: lws-sleep }
+      spec:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels: { app: lws-sleep }
+                topologyKey: kubernetes.io/hostname
+        containers:
+          - name: vllm
+            image: vllm/vllm-openai:v0.26.0
+            env:
+              - { name: USER, value: vllm }
+              - { name: HOME, value: /tmp }
+              - { name: VLLM_SERVER_DEV_MODE, value: "1" }
+              - { name: LWS_LEADER, valueFrom: { fieldRef: { fieldPath: "metadata.annotations['leaderworkerset.sigs.k8s.io/leader-name']" } } }
+            command: ["/bin/bash","-lc"]
+            args:
+              - |
+                set -x
+                echo "leader addr=${LWS_LEADER_ADDRESS} rank=${LWS_WORKER_INDEX:-0}"
+                exec vllm serve /model-cache/models/Qwen/Qwen3-0.6B \
+                  --served-model-name Qwen/Qwen3-0.6B \
+                  --host 0.0.0.0 --port 8000 \
+                  --tensor-parallel-size 2 \
+                  --nnodes 2 --node-rank 0 \
+                  --master-addr "${LWS_LEADER_ADDRESS}" --master-port 29500 \
+                  --max-model-len 2048 --enforce-eager \
+                  --gpu-memory-utilization 0.30 \
+                  --enable-sleep-mode
+            ports: [{ containerPort: 8000 }]
+            resources:
+              limits: { nvidia.com/gpu: "1", memory: 48Gi, cpu: "8" }
+              requests: { nvidia.com/gpu: "1", memory: 48Gi, cpu: "4" }
+            volumeMounts:
+              - { name: model-storage, mountPath: /model-cache }
+              - { name: dshm, mountPath: /dev/shm }
+        volumes:
+          - { name: model-storage, persistentVolumeClaim: { claimName: model-pvc } }
+          - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }
+    workerTemplate:
+      metadata:
+        labels: { role: worker, app: lws-sleep }
+      spec:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels: { app: lws-sleep }
+                topologyKey: kubernetes.io/hostname
+        containers:
+          - name: vllm
+            image: vllm/vllm-openai:v0.26.0
+            env:
+              - { name: USER, value: vllm }
+              - { name: HOME, value: /tmp }
+              - { name: VLLM_SERVER_DEV_MODE, value: "1" }
+            command: ["/bin/bash","-lc"]
+            args:
+              - |
+                set -x
+                echo "worker idx=${LWS_WORKER_INDEX} leader=${LWS_LEADER_ADDRESS}"
+                exec vllm serve /model-cache/models/Qwen/Qwen3-0.6B \
+                  --served-model-name Qwen/Qwen3-0.6B \
+                  --headless \
+                  --tensor-parallel-size 2 \
+                  --nnodes 2 --node-rank "${LWS_WORKER_INDEX}" \
+                  --master-addr "${LWS_LEADER_ADDRESS}" --master-port 29500 \
+                  --max-model-len 2048 --enforce-eager \
+                  --gpu-memory-utilization 0.30 \
+                  --enable-sleep-mode
+            resources:
+              limits: { nvidia.com/gpu: "1", memory: 48Gi, cpu: "8" }
+              requests: { nvidia.com/gpu: "1", memory: 48Gi, cpu: "4" }
+            volumeMounts:
+              - { name: model-storage, mountPath: /model-cache }
+              - { name: dshm, mountPath: /dev/shm }
+        volumes:
+          - { name: model-storage, persistentVolumeClaim: { claimName: model-pvc } }
+          - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }

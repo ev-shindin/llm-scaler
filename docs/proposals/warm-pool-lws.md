@@ -1,7 +1,8 @@
 # Warming an engine that spans Pods (LeaderWorkerSet)
 
-Status: proposal, and **gated on an experiment nobody has run**. Read §3 before
-costing any of the work below.
+Status: proposal. **The gate in §3 has now been run and it passed** -- multi-node
+sleep and wake work, on the fleet's own image, without Ray. Read §3 for what was
+measured before costing the work below.
 
 ## 1. The question
 
@@ -21,10 +22,11 @@ Three facts decide the design, all confirmed against upstream:
 
 - **The group is the unit.** `replicas` counts GROUPS; `size` counts Pods per
   group. Scaling adds and removes whole groups.
-- **Only the leader serves.** In both deployment modes vLLM documents — Ray and
-  native multiprocessing — the HTTP API runs on the leader; workers join via
-  `LWS_LEADER_ADDRESS` as Ray nodes or by `--master-addr` / `--node-rank`. There
-  is exactly one endpoint per group.
+- **Only the leader serves.** The HTTP API runs on the leader; workers join it
+  headless. Measured on v0.26.0: the worker runs `vllm serve ... --headless
+  --nnodes N --node-rank i --master-addr $LWS_LEADER_ADDRESS`, which starts a
+  `MultiprocExecutor` and joins the leader's `torch.distributed` group over NCCL.
+  There is exactly one endpoint per group.
 - **A group is fragile as a unit.** With `RestartPolicy:
   RecreateGroupOnPodRestart`, any Pod failing recreates the whole group. Even
   under the default policy a vLLM group whose worker restarts is not coherent.
@@ -34,64 +36,92 @@ server, so they are calls to **the leader** — structurally the same shape as t
 single-Pod case, one address to talk to, with vLLM responsible for reaching the
 ranks.
 
-## 3. The gate: multi-node sleep is claimed, not demonstrated
+## 3. The gate: multi-node sleep, measured
 
 vLLM's sleep-mode documentation says it "supports distributed workloads: works
-with tensor parallelism, pipeline parallelism, etc.", and that TP groups
-synchronise sleep and wake across workers. What it does **not** say anywhere is
-whether that holds when the ranks are on different MACHINES. There are no
-rank-coordination specifics, and no statement that all ranks participate in a
-wake.
+with tensor parallelism, pipeline parallelism, etc." What it does not say is
+whether that holds when the ranks are on different MACHINES. That was the whole
+design resting on an undemonstrated claim, and this repository has been bitten by
+exactly that before: sleepers that could not wake at all, and woken engines with
+open output-correctness bugs upstream.
 
-That is the whole design resting on an undemonstrated claim, and this repository
-has been bitten by exactly that before: sleepers that could not wake at all, and
-woken engines with open output-correctness bugs upstream. Level-1 sleep also
-moves weights to HOST memory — per node — so a multi-node sleeper's cost is per
-Pod, and nobody here has measured it.
+It has now been run, twice over, and the second run answers it.
 
-**Run this before anything else.** Two Pods, one LWS group, vLLM with
-`--distributed-executor-backend ray` and `--enable-sleep-mode`, then:
+### First attempt, 2026-08-26: blocked by following the wrong instructions
 
-1. `POST /sleep?level=1` on the leader. Check GPU memory falls on **both** nodes,
-   not just the leader's — `nvidia-smi` per node, and `memory.current` for host
-   cost, not `anon` (a sleeper's anonymous memory barely moves).
-2. `GET /is_sleeping` — and confirm the workers are actually asleep, not merely
-   the leader reporting for itself.
-3. `POST /wake_up`, then **check the output is correct**, not merely that it
-   returns 200. A woken engine that produces plausible nonsense is the failure
-   mode to look for.
-4. Repeat across a worker restart to see what a group does when one Pod is
-   recreated under it.
+A two-Pod group with `--distributed-executor-backend ray` failed with `ray:
+command not found`, and the group churned under
+`RecreateGroupOnPodRestart` until it was torn down. Ray really is absent from
+`vllm/vllm-openai:v0.26.0` -- confirmed since, as a missing Python module and not
+merely a missing binary on `PATH`.
 
-If (1) or (3) fails, everything below is unbuildable and the honest answer stays
-"LWS is out of scope". If they pass, the design is tractable and mostly reuses
-what exists.
+That was recorded here as "an LWS warm pool cannot use the image the fleet is on
+today." **That conclusion was wrong**, and the way it was wrong is worth keeping:
+it came from following vLLM's LWS documentation, which describes the Ray path,
+without checking whether the installed vLLM still needed it. It does not.
 
-### First attempt, 2026-08-26: blocked before it could measure anything
+### Ray is not required, and for this image is not even allowed
 
-A two-Pod group was stood up on pokprod — anti-affinity across nodes, TP=2,
-`--enable-sleep-mode`, `VLLM_SERVER_DEV_MODE=1`, the same
-`vllm/vllm-openai:v0.26.0` image the cluster's own decode Pods run.
+From `vllm/config/parallel.py` in the image itself:
 
-**The image has no Ray.** `ray: command not found` in the leader. So the
-Ray-based multi-node path vLLM documents for LWS is not available in the image
-this cluster actually runs, and `ray start --head` failed silently — the leader
-sat in its wait loop, the group hit `RecreateGroupOnPodRestart`, and it churned
-until it was torn down.
+- with `nnodes > 1` on CUDA, the executor backend **defaults to `mp`**;
+- `nnodes > 1` is rejected outright unless the backend is `mp`, `uni` or
+  `external_launcher` -- *"nnodes > 1 can only be set when distributed executor
+  backend is mp, uni or external_launcher."*
 
-That is a prerequisite nobody had written down, and it changes the shape of the
-experiment rather than its conclusion. Before retrying, decide which of these is
-being tested:
+So Ray is the legacy multi-node path, not the required one. The supported shape
+for this image is:
 
-- **an image with Ray in it** — closest to the documented path, but it is not the
-  image llm-d ships, so a pass would prove sleep works somewhere this cluster
-  does not run;
-- **vLLM's non-Ray multi-node**, if v0.26.0 supports it — proves the thing that
-  matters for THIS deployment, and is the more useful answer.
+```
+leader:  vllm serve MODEL --tensor-parallel-size 2            --nnodes 2 --node-rank 0            --master-addr $LWS_LEADER_ADDRESS --master-port 29500            --enable-sleep-mode                      # VLLM_SERVER_DEV_MODE=1
+worker:  vllm serve MODEL --headless            --tensor-parallel-size 2            --nnodes 2 --node-rank $LWS_WORKER_INDEX            --master-addr $LWS_LEADER_ADDRESS --master-port 29500            --enable-sleep-mode
+```
 
-Either way the finding stands on its own: **an LWS warm pool cannot use the
-image the fleet is on today.** Whatever else is true of multi-node sleep, that
-has to be solved first, and it is a packaging problem rather than a design one.
+### Second attempt, 2026-08-26: it works
+
+One LWS group, `size: 2`, TP=2, one H100 per Pod, Pods forced onto **different
+nodes** by required anti-affinity, Qwen3-0.6B from the shared RWX cache, on
+`vllm/vllm-openai:v0.26.0` -- the image the fleet's own decode Pods run.
+
+The group formed across nodes: `world_size=2 rank=0` on the leader,
+`rank=1` on the worker, NCCL over `tcp://<leader-fqdn>:29500`.
+
+| | leader node | worker node |
+| --- | --- | --- |
+| GPU in use, awake | 28093 MiB | 28093 MiB |
+| GPU in use, `POST /sleep?level=1` | **1169 MiB** | **1169 MiB** |
+| GPU in use, after `POST /wake_up` | 25321 MiB | 25321 MiB |
+
+- **Both ranks release.** The remote rank's GPU frees on a call the leader
+  received. This is the fact the whole design needed and could not assume.
+- `GET /is_sleeping` reported `true` asleep and `false` awake.
+- **Wake took 2.5 s**, against ~100 s for this group to cold-start from a local
+  PVC. That ratio, not the absolute number, is the case for an LWS pool.
+- **The output is correct, not merely a 200.** Same prompt, greedy, seeded,
+  before and after: `' Paris. The capital of France is also the capital of the'`
+  byte-identical. That was the failure mode most worth looking for.
+
+### What the fourth check found: a group is all-or-nothing, including asleep
+
+Deleting the WORKER Pod of a **sleeping** group took the LEADER down with it --
+the leader's container went to `Completed`, and LWS rebuilt both Pods. Under
+`RecreateGroupOnPodRestart` that is documented behaviour, and it confirms the
+rule in §4c rather than contradicting it: a group missing a Pod is not a degraded
+engine, it is no engine, and every warm model it held is gone with it.
+
+For a pool this is sharper than for a serving deployment. A single worker
+eviction destroys the entire warm set of that group, not one model's copy.
+
+### What is still unmeasured, and needs a bigger model
+
+Level-1 sleep moves weights to host memory, per node. At 0.6B the cgroup
+`memory.current` did not visibly move (5.83 GiB leader / 5.34 GiB worker, awake
+and asleep alike) -- the weights are simply too small to see against the
+runtime's own footprint. **The mechanism was the question here and size does not
+change it; the economics are the question next, and size is all that changes
+them.** Before §4a is costed, repeat the sleep at a model whose weights dominate:
+the per-node host cost is what sets the memory limit of a pooled LWS Pod, and
+that limit is the warm-set budget.
 
 ## 4. Design
 
@@ -100,10 +130,9 @@ has to be solved first, and it is a packaging problem rather than a design one.
 A pool for LWS is a set of standing LWS groups, each running the launcher on its
 leader:
 
-- the **leader** Pod runs the supervisor and the Ray head; the engine it spawns
-  spans the group
-- **worker** Pods are generic Ray nodes — they hold GPUs and join, and hold no
-  pool-specific logic
+- the **leader** Pod runs the supervisor; the engine it spawns spans the group
+- **worker** Pods run vLLM headless at their own `node-rank` — they hold GPUs and
+  join the leader's process group, and hold no pool-specific logic
 - sleep, wake and `is_sleeping` are issued to the leader, exactly as they are to
   a single pool Pod today
 - a borrow labels **the leader only** into the model's InferencePool; a worker
@@ -176,18 +205,33 @@ thing to do first if GPUs are scarce.
 
 ## 7. Recommendation
 
-1. **Run the §3 experiment.** It is a day's work and it decides everything else.
-   Publish the numbers whether they are good or bad.
-2. If multi-node sleep holds, build §4a — the controller changes are modest
-   because the leader is a single endpoint and named pools already carry shape.
-3. If it does not, say so in the guide and price §6 instead.
+1. ~~Run the §3 experiment.~~ **Done, and it passed.** Multi-node sleep releases
+   both ranks' GPUs, wakes in 2.5 s against a ~100 s cold start, and returns
+   byte-identical output. Ray is not needed and, for `nnodes > 1`, not permitted.
+2. **Measure the host-memory cost at a model whose weights dominate**, before
+   costing anything. That number sets a pooled LWS Pod's memory limit, which is
+   its warm-set budget, and 0.6B could not show it. This is now the gate.
+3. Then build §4a — the controller changes are modest because the leader is a
+   single endpoint and named pools already carry shape.
 
-Do not build §4a speculatively. The single-Pod pool spent this month discovering
-that its silent states were the expensive part; an LWS pool holds an order of
-magnitude more GPU per unit, and a silent failure there is proportionally worse.
+Still do not build §4a speculatively. The single-Pod pool spent this month
+discovering that its silent states were the expensive part; an LWS pool holds an
+order of magnitude more GPU per unit, and §3 showed the blast radius is the whole
+group: one evicted worker destroys every warm model that group held. A silent
+failure there is proportionally worse.
+
+One correction worth carrying beyond this document: the first attempt's
+conclusion — "an LWS warm pool cannot use the image the fleet is on today" — was
+wrong, and it was wrong because it trusted vLLM's LWS documentation over the
+installed vLLM. The documentation describes the Ray path; the code rejects it.
+Read the config the image actually ships before recording a prerequisite.
 
 ## Sources
 
+- `vllm/config/parallel.py` in `vllm/vllm-openai:v0.26.0` — the backend rules for
+  `nnodes > 1`, read from the image rather than the docs
+- `vllm/entrypoints/cli/serve.py:209` — "Run headless workers (for multi-node
+  PP/TP)", the join path a worker Pod takes
 - vLLM, [Sleep Mode](https://docs.vllm.ai/en/latest/features/sleep_mode/)
 - vLLM, [LWS deployment](https://docs.vllm.ai/en/stable/deployment/frameworks/lws/)
 - LWS, [Failure handling and restart policies](https://lws.sigs.k8s.io/docs/concepts/failure-handling/)
