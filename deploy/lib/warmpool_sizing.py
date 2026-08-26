@@ -34,9 +34,14 @@ SLEEPER_FACTOR = 1.4
 # 0.56 s. So this is the part that does NOT scale with the model.
 FIXED_STARTUP_S = 100.0
 
-# Weight load, single rank, page cache warm. Ranks parse in parallel, so N ranks
-# demand N x this -- storage becomes the constraint before the parse does.
-PARSE_RATE_GBPS = 2.7
+# vLLM's startup weight loader, ONE rank, page cache warm: "Loading weights took
+# 1.11 seconds" for 1.4 GiB. This is the rate that matters for a cold start --
+# reload_weights runs a little faster (1.5-2.7 GB/s) but is a different path.
+#
+# It is FIVE TIMES slower than a warm cached read (6.3 GB/s), so a single rank is
+# bound by parse and host-to-device, not by storage. Ranks parse concurrently, so
+# the fleet's aggregate is this x TP, and storage only binds above that.
+PARSE_RATE_GBPS = 1.26
 # Host-to-device over PCIe: what a level-1 wake actually costs.
 PCIE_GBPS = 20.0
 
@@ -101,10 +106,21 @@ def recommend(node, params_b, dtype, kv_headroom, shared_bw, local_bw, ram_frac)
     per_node_weights_gb = weights_gb / nodes_needed
 
     # 1. shape
+    #
+    # TP is what the MODEL needs, not what the node has. Assuming a model spreads
+    # over every GPU on its node overstates the aggregate parse rate for small
+    # models by the node's GPU count, and parse aggregate is what decides whether
+    # storage is worth spending on.
     lines = []
-    tp = nodes_needed * node["gpus"]
+    per_gpu = node["per_gpu_gib"]
     if nodes_needed == 1:
-        lines.append(("SHAPE", "fits one node: Deployment, TP=%d" % tp))
+        tp = max(1, -(-int(need_gib * 1000) // int(per_gpu * 1000)))
+        tp = min(tp, node["gpus"])
+    else:
+        tp = nodes_needed * node["gpus"]
+    if nodes_needed == 1:
+        lines.append(("SHAPE", "fits one node: Deployment, TP=%d of %d GPUs"
+                      % (tp, node["gpus"])))
     else:
         lines.append(("SHAPE", "does NOT fit one node (%.0f GiB needed vs %.0f GiB): "
                                "%d nodes, TP=%d, engine spans Pods -> LWS required"
@@ -162,7 +178,8 @@ def recommend(node, params_b, dtype, kv_headroom, shared_bw, local_bw, ram_frac)
             "the accelerators a replica would, while serving nothing. Pin "
             "minReplicaCount >= 1 -- same GPU cost, and it answers requests.")
     else:
-        held = nodes_needed * node["gpus"]
+        # What a pool Pod HOLDS is the model's device count, not the node's.
+        held = tp
         verdict.append(
             "POOL IT: %d models share %d GPU(s) instead of %d, switching in ~%.0f s "
             "against a ~%.0f s cold start. That multiplexing is the whole gain."
