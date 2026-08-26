@@ -298,6 +298,26 @@ Three things follow from scaling it this way, and they are the reason for it:
 - **`minReplicaCount` must exceed the reserve.** Otherwise the pool spends every
   quiet period in the one state where it can never warm anything.
 
+### Keeping the pool a fixed size
+
+Set them equal:
+
+```yaml
+minReplicaCount: 3
+maxReplicaCount: 3
+```
+
+KEDA accepts it, the HPA is created with min and max both 3, and the pool stays
+there whatever WVA publishes. This is the better way to pin a pool when KEDA is
+present, because the size still lives in the one object you already read to
+understand it. Deleting the ScaledObject also works and is the right answer on a
+cluster with no KEDA at all — the pool then stays at the Deployment's `replicas`.
+
+A pinned pool never relieves its own blocked borrows: if `outcome="blocked"`
+appears, it will keep appearing until you raise the numbers. That is the trade
+you are choosing, and it is a legitimate one — a fixed GPU budget is easier to
+reason about than an elastic one.
+
 Never scale the pool to zero. A pool at zero holds nothing warm, so the first
 spike after a quiet period pays a full cold start — and then the pool grows,
 loads a model, and is ready exactly in time for the spike that is already over.
