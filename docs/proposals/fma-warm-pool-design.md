@@ -1,6 +1,15 @@
 # Design: a shared warm pool for fast multi-model actuation
 
-**Status:** design, not implemented.
+**Status: PARKED, and superseded in practice.** This design was never built.
+A warm pool WAS built, on a different plan -- see
+[the review](fast-model-loading.md) for the argument and
+[the implementation design](fast-model-loading-implementation.md) for what
+shipped as `internal/warmpool`. Read this document for its reasoning about
+launcher-owned GPUs, not as a description of the system.
+
+FMA itself is NOT superseded: the pool that shipped runs FMA's launcher as the
+per-Pod engine supervisor (`llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13`
+in `config/warmpool/warmpool-deployment.yaml`).
 **Supersedes the exploration in** [`fma-launcher-owned-warm-pool.md`](fma-launcher-owned-warm-pool.md),
 which records why every alternative was rejected and should be read only for that
 reasoning.

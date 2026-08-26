@@ -1,5 +1,11 @@
 # Requests to Fast Model Actuation
 
+**Status: gathered 2026-08-14 against FMA `v0.6.0-alpha.13`, and NOT tracked
+since.** Nothing here records whether a request was filed upstream, accepted, or
+has already been fixed in a later release. The pool still runs that same launcher
+build (`config/warmpool/warmpool-deployment.yaml`), so these findings were true
+of what we deploy — but check them against current FMA before acting on any.
+
 Findings and change requests for
 [`llm-d-incubation/llm-d-fast-model-actuation`](https://github.com/llm-d-incubation/llm-d-fast-model-actuation),
 gathered while making the Workload Variant Autoscaler work with FMA. Everything
