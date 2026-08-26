@@ -179,6 +179,70 @@ Two runs give both coefficients — the fixed floor and the per-byte rate — an
 every row above stops being an extrapolation. Do that before costing any big
 model work.
 
+## 5c. Can NVMe back level 1? Can NIXL move the weights? No, and no
+
+Both were asked directly, and the image answers both.
+
+### Level 1 cannot be backed by NVMe
+
+The offload buffer is one allocation, in `device_allocator/cumem.py`:
+
+```python
+cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8,
+                                device="cpu", pin_memory=PIN_MEMORY)
+```
+
+Pinned memory is page-locked by definition: the kernel may not swap it and may
+not back it with a file. So **no configuration puts a level-1 sleeper's weights
+on NVMe** — not swap, not mmap. It would take a patch at that allocation site,
+and it would trade away the pinned-memory copy that makes an L1 wake 119 ms.
+A small patch with a real cost, not a knob.
+
+### The weight-transfer engine does not speak NIXL, and does not read storage
+
+vLLM 0.26 ships a weight-transfer engine (`/init_weight_transfer_engine`,
+`/start_weight_update`, `/update_weights`). Its backends are:
+
+```
+distributed/weight_transfer/{ipc_engine,nccl_engine,nccl_common}.py
+```
+
+NCCL and CUDA-IPC. **There is no NIXL engine for weights** — NIXL 1.3.1 is in the
+image for the KV connector, not for this. And the engine is built for RLHF: it
+RECEIVES weights pushed from a trainer over GPU-to-GPU transport, and never reads
+storage. For N different models that is circular — something must already hold
+each model's weights in GPU memory, which is the cost being avoided.
+
+### The fast loaders exist, and `reload_weights` refuses them
+
+The image ships `runai_model_streamer` 0.16.1 and `fastsafetensors` 0.3.3, and
+vLLM exposes `runai_streamer` and `runai_streamer_sharded` as load formats. They
+look like the obvious fix for a parse-bound reload. They are not:
+
+```
+POST /collective_rpc {"method":"reload_weights"}
+  -> 500  Exception: Model reloading with `runai_streamer` format
+```
+
+The fast loaders serve the INITIAL load only. `reload_weights` supports the
+default safetensors path, so the ~2 GB/s single-rank reload measured in §4 is
+what level 2 costs, and no flag improves it.
+
+### And a failed rescue is permanent
+
+This is the part that settles it. After the refused reload, the engine served
+`'!!!!!!!!!!!!'` — and **an L1 sleep/wake cycle afterwards did not recover it.**
+Level 1 faithfully backs up whatever is in GPU memory, which by then is garbage.
+So a level-2 wake whose reload does not happen does not serve one bad answer: it
+poisons that engine until the process restarts, and every later sleep preserves
+the damage.
+
+Three separate ways to reach that state are now known — forgetting the call,
+calling it against an unsupported loader, and the call failing at run time — and
+none of them is visible from outside. §7's rule follows from this, not from
+taste: if level 2 is ever built, the reload must be inseparable from the wake and
+its failure must take the engine out of service.
+
 ## 6. Method trap: `kubectl exec` cost more than everything measured
 
 Every wake figure this project recorded before today was taken by timing a
