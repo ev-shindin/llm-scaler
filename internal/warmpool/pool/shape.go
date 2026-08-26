@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // What a warm copy would COST, worked out from the options it would run with.
@@ -75,8 +76,55 @@ const (
 // because a family name may carry digits of its own.
 var paramCount = regexp.MustCompile(`(?i)(?:^|[-_/.])(?:(\d+)x)?(\d+(?:\.\d+)?)b(?:$|[-_/.])`)
 
+// shapeMemo caches ShapeOf by its argument.
+//
+// A MEMO, not remembered state, and the difference is what makes it safe. Shape
+// is a pure value computed from the options string alone, so a hit cannot be
+// stale: different options are a different key, and nothing outside the string
+// can change the answer. This branch has twice been bitten by maps that
+// remembered a fact the world then changed underneath -- neither hazard exists
+// here.
+//
+// Worth having because the inputs to a fit check are almost all STATIC. What a
+// model needs comes from its engine options; what a Pod holds comes from its own
+// spec and its node, and a container's memory limit cannot change without
+// rolling the Pod. Only which models are RESIDENT moves, and that is arithmetic
+// once the shapes are known. Without this, doesNotFit recomputed a regex and
+// half a dozen argv scans for the candidate AND for every resident model, on
+// every pass, for facts that had not changed.
+//
+// Cleared wholesale rather than evicted one at a time: recomputing costs
+// microseconds, so the cheapest correct policy is the simplest one.
+var (
+	shapeMu   sync.Mutex
+	shapeMemo = map[string]Shape{}
+)
+
+// shapeMemoMax bounds the memo. Options strings churn only as variants come and
+// go, so this is generous.
+const shapeMemoMax = 1024
+
 // ShapeOf estimates what an engine started with these options would occupy.
 func ShapeOf(options string) Shape {
+	shapeMu.Lock()
+	cached, ok := shapeMemo[options]
+	shapeMu.Unlock()
+	if ok {
+		return cached
+	}
+
+	shape := computeShape(options)
+
+	shapeMu.Lock()
+	if len(shapeMemo) >= shapeMemoMax {
+		clear(shapeMemo)
+	}
+	shapeMemo[options] = shape
+	shapeMu.Unlock()
+	return shape
+}
+
+func computeShape(options string) Shape {
 	shape := Shape{GPUs: parallelism(options)}
 
 	params, ok := paramsOf(flagValue(options, "--model"))

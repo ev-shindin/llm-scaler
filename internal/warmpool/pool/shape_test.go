@@ -1,6 +1,9 @@
 package pool
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // The two points this estimate is fitted to, measured on an H100 with vLLM
 // level-1 sleep. They are what the arithmetic must reproduce; the formula is
@@ -182,5 +185,45 @@ func TestDataParallelismMultipliesBecauseEachRankIsAnEngine(t *testing.T) {
 	got := ShapeOf("--model m --tensor-parallel-size 2 --data-parallel-size 2")
 	if got.GPUs != 4 {
 		t.Errorf("GPUs = %d, want 4", got.GPUs)
+	}
+}
+
+func TestShapeIsMemoisedWithoutChangingTheAnswer(t *testing.T) {
+	// The memo is a pure-function cache: the same options must give the same
+	// Shape whether computed or recalled, and different options must not
+	// collide. A memo that returned a neighbour's answer would mis-size a warm
+	// set, which is the failure that OOM-kills a Pod and takes every model in it.
+	small := "--model Qwen/Qwen3-0.6B --tensor-parallel-size 1"
+	big := "--model meta-llama/Llama-3.1-8B --tensor-parallel-size 2"
+
+	first := ShapeOf(small)
+	if first != ShapeOf(small) {
+		t.Fatal("a memo hit must equal the computed value")
+	}
+	if first != computeShape(small) {
+		t.Fatal("the memo must not diverge from the function it caches")
+	}
+
+	other := ShapeOf(big)
+	if other == first {
+		t.Fatal("different options must not share an entry")
+	}
+	if other != computeShape(big) {
+		t.Fatal("the second entry is wrong")
+	}
+}
+
+func TestTheShapeMemoStaysBounded(t *testing.T) {
+	// Variants come and go over a controller's life, so an unbounded memo would
+	// only ever grow. Cleared wholesale rather than evicted one at a time --
+	// recomputing costs microseconds, so the simplest correct policy wins.
+	for i := 0; i < shapeMemoMax+50; i++ {
+		ShapeOf(fmt.Sprintf("--model org/model-%dB", i%97+1))
+	}
+	shapeMu.Lock()
+	size := len(shapeMemo)
+	shapeMu.Unlock()
+	if size > shapeMemoMax {
+		t.Fatalf("memo grew past its bound: %d", size)
 	}
 }

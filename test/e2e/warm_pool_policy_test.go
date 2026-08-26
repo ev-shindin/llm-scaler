@@ -248,6 +248,80 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 		})
 	})
 
+	Context("when two pools each have a bridge open", func() {
+		const (
+			poolC = "e2e-pool-c"
+			poolD = "e2e-pool-d"
+			model = "Qwen/Qwen3-0.6B"
+		)
+
+		// serving drives one pool Pod into the state a BORROW leaves it in:
+		// an instance created, awake, and the proxy pointed at it. That is what
+		// stateOf reads as Serving, and Serving is what the controller counts as
+		// lent.
+		//
+		// Manufactured rather than borrowed on purpose. What is under test is
+		// the ACCOUNTING -- that one pool's bridges do not appear in another's
+		// numbers -- and driving two real borrows would add a demand-shaping
+		// problem to a test about arithmetic.
+		serving := func(fixtureName string) {
+			GinkgoHelper()
+			pods, err := k8sClient.CoreV1().Pods(cfg.LLMDNamespace).List(ctx, metav1.ListOptions{
+				LabelSelector: "warm-pool-fixture=" + fixtureName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).To(HaveLen(1))
+			podName := pods.Items[0].Name
+			engine := fmt.Sprintf("127.0.0.1:%d", fixtures.WarmPoolBasePort)
+
+			put, err := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
+				fixtures.WarmPoolSupervisorPort, "PUT", "/v2/vllm/instances/pooled",
+				fmt.Sprintf(`{"options":%q,"env_vars":{"VLLM_SERVER_DEV_MODE":"1"}}`,
+					fixtures.WarmPoolInstanceOptions(model, fixtures.WarmPoolBasePort)))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(put.Status).To(BeNumerically("<", 300), "body: %s", put.Body)
+
+			wake, err := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
+				fixtures.WarmPoolBasePort, "POST", "/wake_up", "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(wake.Status).To(Equal(200), "body: %s", wake.Body)
+
+			up, err := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
+				fixtures.WarmPoolControlPort, "PUT", "/upstream",
+				fmt.Sprintf(`{"address":%q}`, engine))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(up.Status).To(Equal(200), "body: %s", up.Body)
+		}
+
+		BeforeAll(func() {
+			for _, name := range []string{poolC, poolD} {
+				declarePool(name, name, nil)
+				serving(name)
+			}
+		})
+
+		It("counts only its own bridges", func() {
+			// The bug this exists for: the published size and the state line
+			// both took the PROCESS-WIDE borrow count, so with two pools each
+			// was told it was carrying the other's bridges. A quiet pool beside
+			// a busy one was sized for Pods it had no use for -- permanently,
+			// on an accelerator the busy pool cannot even run on.
+			//
+			// Two pools, one bridge each: correct is lent=1 twice. The bug reads
+			// lent=2 twice, and no single-pool fixture can tell them apart.
+			Eventually(func(g Gomega) {
+				logs, err := controllerLog()
+				g.Expect(err).NotTo(HaveOccurred())
+				for _, name := range []string{poolC, poolD} {
+					g.Expect(logs).To(MatchRegexp(`"pool": "`+name+`", "state": "pods=1 [^"]*lent=1`),
+						"pool %s should count one bridge -- its own", name)
+					g.Expect(logs).NotTo(MatchRegexp(`"pool": "`+name+`", "state": "[^"]*lent=2`),
+						"pool %s must not count the other pool's bridge", name)
+				}
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		})
+	})
+
 	Context("when a namespace holds two named pools", func() {
 		BeforeAll(func() {
 			for _, name := range []string{poolA, poolB} {
