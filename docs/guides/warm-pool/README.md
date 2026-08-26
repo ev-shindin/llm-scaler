@@ -38,6 +38,34 @@ The pool needs, in its namespace:
   was scoped by hand, WVA refuses to start the pool and says so — it will not
   hold accelerators to warm models it could never lend.
 
+## Should this model be warmed here at all?
+
+Before pools, one question: can this cluster warm this model, and would it gain
+anything? Four thresholds decide it and all four move with the hardware, so it
+reads the nodes rather than quoting one fleet's numbers.
+
+```bash
+deploy/warmpool.sh sizing --params 744B --dtype fp8
+```
+
+For a cluster you cannot reach -- choosing hardware rather than using it --
+describe a node instead:
+
+```bash
+deploy/warmpool.sh sizing --params 744B --dtype fp8   --gpus-per-node 8 --gpu-mem-gib 141 --ram-gib 2016
+```
+
+It answers whether the model fits one node (if not, its engine spans Pods and a
+pool cannot hold it), whether host RAM can hold a level-1 sleeper at all,
+whether it can hold MORE THAN ONE -- which is the whole question, because a pool
+that holds one model is an idle replica that costs the same accelerators without
+answering requests -- and whether the cold start is dominated by reading weights
+or by fixed startup, which decides whether faster storage helps or nothing does.
+
+Two results tend to surprise: **host RAM, not GPU memory, is what rules warming
+out**, and a model split across MORE nodes is often more poolable, because the
+per-node sleeper burden falls while total RAM rises.
+
 ## Which pools do you need?
 
 Before creating anything, ask what the namespace actually wants. A pool serves

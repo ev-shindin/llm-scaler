@@ -46,6 +46,9 @@ Warm pool lifecycle.
   warmpool.sh plan   -n NS                     which pools this namespace wants
   warmpool.sh create -n NS --name NAME ...     make one (Deployment + ScaledObject)
   warmpool.sh delete -n NS --name NAME         remove both objects
+  warmpool.sh sizing --params 744B [--dtype fp8]
+                                              should this model be warmed on THIS
+                                              cluster? Reads the nodes and answers.
 
 create options:
   --name NAME          pool name (llm-d.ai/warm-pool). Default: default
@@ -220,6 +223,13 @@ spec:
 YAML
 }
 
+# sizing answers the question that comes before "which pools" -- whether a given
+# model can be warmed on this hardware at all. Every threshold moves with the
+# node shape, so it reads the nodes rather than quoting one fleet's numbers.
+cmd_sizing() {
+  python3 "$HERE/lib/warmpool_sizing.py" "$@"
+}
+
 cmd_delete() {
   require NAMESPACE namespace
   # BOTH, and the ScaledObject FIRST: it is what declares the pool, so removing
@@ -235,6 +245,11 @@ if [ $# -lt 1 ]; then
 fi
 ACTION="$1"
 shift
+SIZING_ARGS=()
+if [ "$ACTION" = "sizing" ]; then
+  SIZING_ARGS=("$@")
+  set --
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--namespace)  NAMESPACE="$2"; shift 2 ;;
@@ -257,6 +272,7 @@ done
 
 case "$ACTION" in
   plan)   cmd_plan ;;
+  sizing) cmd_sizing "${SIZING_ARGS[@]}" ;;
   create) cmd_create ;;
   delete) cmd_delete ;;
   *) usage; log_error "unknown action: $ACTION" ;;
