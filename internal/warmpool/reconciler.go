@@ -108,6 +108,14 @@ type Reconciler struct {
 	// under Config, which is what every install had before pools were named.
 	Pools PoolSource
 
+	// Contended reports whether a model replica in this namespace is being
+	// denied GPUs of a given accelerator. Nil disables the arbitration, which
+	// is what a pool with no optimizer running should do.
+	Contended func(namespace, accelerator string) bool
+
+	// lastHeld is the last reason each pool was held at its current size.
+	lastHeld map[string]string
+
 	// PublishSize records the size a pool should be, for KEDA to act on. Nil
 	// leaves the pool exactly the size its Deployment says, which is what an
 	// install without a pool ScaledObject wants.
@@ -146,6 +154,7 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		lastSummary:      map[string]string{},
 		lastUnassignable: map[string]string{},
 		lastDeclined:     map[declineKey]bool{},
+		lastHeld:         map[string]string{},
 		now:              time.Now,
 	}
 }
@@ -258,7 +267,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		lent := lentPods(mine)
 		r.report(ctx, spec, mine, theirs, free, lent)
 		r.apply(ctx, plan)
-		r.publishSize(spec, lent)
+		r.publishSize(ctx, spec, mine, lent)
 		merged = mergePlans(merged, plan)
 	}
 	r.forgetVanishedVariants(variants)
@@ -385,11 +394,61 @@ func acceleratorsIn(memberships []pool.Membership) string {
 // Published on every pass, unconditionally. It is a level, not an edge: KEDA
 // polls for it, and a size withheld because "nothing changed" would read as no
 // decision at all the first time KEDA asked after a restart.
-func (r *Reconciler) publishSize(spec PoolSpec, lent int) {
+func (r *Reconciler) publishSize(ctx context.Context, spec PoolSpec, memberships []pool.Membership, lent int) {
 	if r.PublishSize == nil || spec.Deployment == "" {
 		return
 	}
-	r.PublishSize(r.Namespace, spec.Deployment, int32(SizeFor(spec.Config.SleepMinSize, lent))) //nolint:gosec // small counts
+	want := SizeFor(spec.Config.SleepMinSize, lent)
+
+	// Yield to model replicas. While a variant of this pool's accelerator is
+	// being denied GPUs, the pool stops asking for more -- see HoldAt.
+	if hold := HoldAt(spec.Replicas); r.Contended != nil && want > hold {
+		if accelerator := soleAccelerator(memberships); accelerator != "" &&
+			r.Contended(r.Namespace, accelerator) {
+			r.reportHeld(ctx, spec, accelerator, want, hold)
+			want = hold
+		}
+	}
+	r.PublishSize(r.Namespace, spec.Deployment, int32(want)) //nolint:gosec // small counts
+}
+
+// soleAccelerator is the accelerator every Pod in this pool sits on, or "" if
+// they differ or none is known.
+//
+// A pool spanning two accelerator types is a misconfiguration rather than a
+// case to reason about -- a warm copy is only reusable on the GPU it was loaded
+// on -- so rather than guess which type the contention applies to, this declines
+// to answer and the pool grows as it otherwise would.
+func soleAccelerator(memberships []pool.Membership) string {
+	found := ""
+	for _, m := range memberships {
+		if m.Capacity.Accelerator == "" {
+			continue
+		}
+		if found != "" && found != m.Capacity.Accelerator {
+			return ""
+		}
+		found = m.Capacity.Accelerator
+	}
+	return found
+}
+
+// reportHeld says why a pool that wanted to grow did not, once per pool per
+// reason. Silence here would read as a pool that had all the Pods it wanted.
+func (r *Reconciler) reportHeld(ctx context.Context, spec PoolSpec, accelerator string, want, held int) {
+	name := r.metricName(spec)
+	summary := fmt.Sprintf("%s want=%d held=%d", accelerator, want, held)
+	if r.lastHeld[name] == summary {
+		return
+	}
+	if r.lastHeld == nil {
+		r.lastHeld = map[string]string{}
+	}
+	r.lastHeld[name] = summary
+	log.FromContext(ctx).WithName("warmpool").Info(
+		"warm pool is not growing: a model replica on this accelerator is being denied GPUs. "+
+			"The pool keeps what it holds and stops competing for more",
+		"pool", name, "accelerator", accelerator, "wanted", want, "holdingAt", held)
 }
 
 // lentPods counts THIS pool's Pods that are serving a bridge.

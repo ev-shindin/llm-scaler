@@ -2,7 +2,9 @@ package allocation
 
 import (
 	"math"
+	"time"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 )
@@ -43,6 +45,13 @@ func applyGPULimitAttribution(
 	limited gpuLimitTracker,
 	constraints []*ResourceConstraints,
 ) {
+	// Published on EVERY pass, including the one where nothing was limited.
+	// An empty snapshot is a real answer -- it says this pass denied nobody --
+	// and publishing only the non-empty ones would leave the last contended
+	// reading standing forever, holding warm pools down long after the burst.
+	contended := map[string]map[string]bool{}
+	defer func() { decision.PublishGPUContention(contended, time.Now()) }()
+
 	if len(limited) == 0 {
 		return
 	}
@@ -55,6 +64,16 @@ func applyGPULimitAttribution(
 		d.WasLimited = true
 		d.LimitedBy = bindingProvider(constraints, d.Namespace, d.AcceleratorName)
 		emitter.RecordDecisionsLimitedTotalMetric(d.VariantName, d.Namespace, d.LimitedBy)
+
+		// A warm pool of this accelerator type, in this namespace, should stop
+		// competing for GPUs a model replica is being denied. See
+		// decision.GPUContention.
+		if d.AcceleratorName != "" {
+			if contended[d.Namespace] == nil {
+				contended[d.Namespace] = map[string]bool{}
+			}
+			contended[d.Namespace][d.AcceleratorName] = true
+		}
 	}
 }
 

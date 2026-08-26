@@ -835,6 +835,13 @@ func main() {
 			// the pool stays the size its Deployment says.
 			reconciler.Namespace = warmPoolNS
 			reconciler.PublishSize = decision.Set
+			// Arbitration: while the optimizer is denying GPUs to a model
+			// replica on this pool's accelerator, the pool stops asking for
+			// more. contentionMaxAge keeps a stale reading from holding it
+			// down forever if the optimizer stops running.
+			reconciler.Contended = func(namespace, accelerator string) bool {
+				return decision.GPUContended(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
+			}
 			reconciler.Pools = &warmpool.DeploymentPools{
 				Client:    mgr.GetClient(),
 				Namespace: warmPoolNS,

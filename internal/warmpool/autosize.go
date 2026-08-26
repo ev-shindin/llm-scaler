@@ -1,5 +1,15 @@
 package warmpool
 
+import "time"
+
+// ContentionMaxAge is how long a contention reading is believed.
+//
+// A pool held down by an observation nobody has refreshed is held down forever,
+// and the failure is invisible -- it looks exactly like a pool that has all the
+// Pods it wants. Two optimizer intervals is long enough to survive one slow
+// pass and short enough that a stopped optimizer releases the pool quickly.
+const ContentionMaxAge = 2 * time.Minute
+
 // SizeFor is how many Pods a pool needs right now.
 //
 // PUBLISHED, not written. WVA computes this and KEDA scales the pool, exactly as
@@ -38,4 +48,31 @@ func SizeFor(reserve, lent int) int {
 		lent = 0
 	}
 	return lent + reserve + 1
+}
+
+// HoldAt is the size a pool publishes while a model replica of its accelerator
+// type is being denied GPUs.
+//
+// The pool keeps what it holds and asks for nothing more. Growing is what has to
+// stop: the pool takes accelerators by growing its own Deployment, and no
+// limiter bounds that -- the optimizer's budgets govern what model REPLICAS may
+// have, and a pool is not a model. Left alone, a burst blocks borrows, the pool
+// asks for another Pod to relieve the block, and that Pod is a GPU a starved
+// replica needed. The pool would be competing with the very scale-up it exists
+// to bridge.
+//
+// It does not SHRINK, and that asymmetry is the point. A warm copy already
+// loaded is worth more than the accelerator under it is worth to a replica that
+// would need ~35 s to make use of it; yielding one would spend a real warm set
+// to buy a slow start. Insurance stops buying more during a fire. It does not
+// cancel itself.
+//
+// Publishing the current count is also safe against starving the pool: KEDA
+// clamps to minReplicaCount, so the configured floor holds regardless of what
+// this returns.
+func HoldAt(current int) int {
+	if current < 1 {
+		return 1
+	}
+	return current
 }
