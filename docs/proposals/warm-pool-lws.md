@@ -95,8 +95,12 @@ The group formed across nodes: `world_size=2 rank=0` on the leader,
 - **Both ranks release.** The remote rank's GPU frees on a call the leader
   received. This is the fact the whole design needed and could not assume.
 - `GET /is_sleeping` reported `true` asleep and `false` awake.
-- **Wake took 2.5 s**, against ~100 s for this group to cold-start from a local
-  PVC. That ratio, not the absolute number, is the case for an LWS pool.
+- **Wake was sub-second**, against ~100 s for this group to cold-start. The
+  2.5 s originally recorded here was almost entirely `kubectl exec` overhead,
+  which has a ~2.4 s floor on this cluster; timed inside the Pod, a single-Pod
+  level-1 wake is ~120 ms. See
+  [warm-pool-sleep-levels.md §6](warm-pool-sleep-levels.md). That ratio, not the
+  absolute number, is the case for an LWS pool.
 - **The output is correct, not merely a 200.** Same prompt, greedy, seeded,
   before and after: `' Paris. The capital of France is also the capital of the'`
   byte-identical. That was the failure mode most worth looking for.
