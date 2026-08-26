@@ -44,6 +44,13 @@ HAND_WRITTEN = {
     # launcher). Converting it would either lose that or fill the YAML with steps
     # nobody runs. Revisit if its runnable path is ever separated out.
     "fma",
+    # The warm pool guide is mostly a decision, not a procedure: whether this
+    # cluster can warm this model at all, how many fit in one Pod, which pools a
+    # namespace needs. Its commands are a few deploy/warmpool.sh calls whose
+    # ARGUMENTS are the answers to those questions, so a rendered linear path
+    # would either invent them or drop the reasoning that produces them. The
+    # runnable part is covered by test/e2e/warm_pool_policy_test.go instead.
+    "warm-pool",
 }
 
 # <!-- guide:some.path start --> ... <!-- guide:some.path end -->
