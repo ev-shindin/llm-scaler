@@ -108,6 +108,9 @@ string, so nothing rejects it and nothing warns.
 kubectl apply -k config/warmpool -n <namespace>
 ```
 
+`deploy/warmpool.sh create` renders and applies the same two objects, which is
+why the edits above do not arise on that path: it takes them as flags.
+
 ## The pool is its ScaledObject
 
 A warm pool is declared by a KEDA trigger, the same way every other thing WVA
@@ -130,6 +133,16 @@ spec:
 Deployment goes on holding accelerators and WVA reports it as undeclared rather
 than using it. For a fixed-size pool set `minReplicaCount` and `maxReplicaCount`
 to the same number — do not delete the trigger.
+
+To remove a pool, remove both together:
+
+```bash
+deploy/warmpool.sh delete -n <namespace> --name <pool>
+```
+
+It deletes the ScaledObject first, so WVA stops lending Pods that are about to
+disappear, and it is safe to repeat. Models still naming that pool in their
+trigger metadata are then warmed by nothing — `plan` lists them.
 
 ## Sizing
 
@@ -233,8 +246,18 @@ A warm copy is only reusable on the accelerator it was loaded on. A cluster with
 two GPU models therefore needs **two pools** — and a variant that needs several
 devices needs a pool whose Pods hold that many.
 
-Copy the Deployment and change the pool name in **all three** places, plus the
-object's own name:
+Each additional pool is another `create`, with its own name and the accelerator
+it is for:
+
+```bash
+deploy/warmpool.sh create -n <namespace> --name h100   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --proxy-image <your image> --wva-namespace <where WVA runs>
+```
+
+`plan` will have told you which pools the namespace wants, and which models can
+share each one.
+
+If you copy the manifests by hand instead, change the pool name in **all three**
+places, plus the object's own name:
 
 ```yaml
 metadata:
@@ -276,6 +299,10 @@ ScaledObject that says nothing still gets a warm copy. The key is only needed
 once a namespace holds more than one pool — and then it is required: WVA will
 not guess, because guessing wrong spends a full model load on a copy that can
 never serve. It names the variant and the pools that exist instead.
+
+A pool created without `--accelerator` has no `nodeSelector`, so its Pods may
+land on any GPU node and the pool's accelerator is whatever they happened to get.
+That is the mismatch below, arriving by accident rather than by configuration.
 
 WVA also declines a model whose accelerator does not match the pool's, or that
 needs more devices than a Pod holds, and says so:
@@ -451,7 +478,12 @@ on pods in the pool namespace and restart.
 **A model never gets a warm copy in a multi-pool namespace.** WVA logs
 `variant will get no warm copy` with the reason — either it named no pool, or it
 named one that does not exist. Both are fixed in the ScaledObject trigger
-metadata.
+metadata, and `deploy/warmpool.sh plan -n <namespace>` lists every model in
+either state without waiting for the log:
+
+```
+- model-b    selects: h100  <- NO SUCH POOL
+```
 
 **The first spike is never bridged.** Expected. A model has to miss twice before
 the pool warms it, so it does not spend a load on a one-off. Set `preload-top`
@@ -466,6 +498,11 @@ trigger there is no pool — WVA logs:
 ```
 warm pool Deployments are holding accelerators but no ScaledObject declares them
 ```
+
+`plan` shows the other side of this: the pools a namespace has actually
+declared. A Deployment that does not appear there is holding accelerators for
+nothing. Either give it a trigger, or `delete` it — which removes both objects,
+so the state cannot recur.
 
 **Two scale-ups of one model, only one bridged.** Automatic mode holds one warm
 copy per model. Set `warmPoolCopies` to the number of concurrent scale-ups you
