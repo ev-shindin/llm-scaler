@@ -58,6 +58,12 @@ spec:
     matchLabels:
       app.kubernetes.io/name: workload-variant-autoscaler
       app.kubernetes.io/component: warm-pool
+      # The pool NAME is part of the selector, not decoration. Without it a
+      # second pool copied from this file selects the same Pods as the first --
+      # two Deployments fighting over one set, which Kubernetes warns about and
+      # which makes replica accounting meaningless. Change it in all three
+      # places when you copy this: the label above, here, and the template.
+      llm-d.ai/warm-pool: default
   template:
     metadata:
       labels:

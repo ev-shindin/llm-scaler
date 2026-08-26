@@ -113,6 +113,10 @@ type Reconciler struct {
 	// install without a pool ScaledObject wants.
 	PublishSize func(namespace, name string, replicas int32)
 
+	// lastDeclined remembers variant+reason pairs already reported, so a
+	// standing mismatch is stated once rather than every pass.
+	lastDeclined map[declineKey]bool
+
 	// lastUnassignable is the last reason given for each variant that could not
 	// be matched to a pool, so a standing misconfiguration is stated once rather
 	// than every Interval.
@@ -141,6 +145,7 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		admittingPods:    map[types.NamespacedName]bool{},
 		lastSummary:      map[string]string{},
 		lastUnassignable: map[string]string{},
+		lastDeclined:     map[declineKey]bool{},
 		now:              time.Now,
 	}
 }
@@ -349,6 +354,28 @@ func lentPods(memberships []pool.Membership) int {
 	return len(pods)
 }
 
+// declineKey identifies one reported decline. A pair rather than a joined
+// string, so no separator can collide with a reason that contains it.
+type declineKey struct {
+	Variant string
+	Reason  string
+}
+
+// residentModels counts the models actually held, across a pool's Pods.
+//
+// NOT len(memberships): an EMPTY Pod contributes one placeholder membership so
+// that idle Pods are visible as reserve, which means a two-Pod pool holding
+// nothing at all would report "resident=2". An operator reading that as "two
+// models warm" would conclude the pool was working when it had never warmed
+// anything.
+func residentModels(memberships []pool.Membership) int {
+	n := 0
+	for _, inPod := range pool.ByPod(memberships) {
+		n += pool.Resident(inPod)
+	}
+	return n
+}
+
 // report logs what the pass saw, but only when it differs from the last one.
 //
 // Everything else in this file logs on FAILURE only, which means a pool that is
@@ -375,7 +402,7 @@ func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []po
 	// then treats every model as portable. That is the right failure direction,
 	// but a silent one, and this line is deduplicated so saying it costs nothing.
 	summary := fmt.Sprintf("pods=%d free=%d resident=%d variants=%d lent=%d accelerator=%s",
-		pods, free, len(memberships), len(variants), lent, acceleratorsIn(memberships))
+		pods, free, residentModels(memberships), len(variants), lent, acceleratorsIn(memberships))
 	if summary != r.lastSummary[name] {
 		logger.V(1).Info("warm pool state", "pool", name, "state", summary)
 		r.lastSummary[name] = summary
@@ -522,6 +549,30 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 		}); err != nil {
 			logger.V(1).Info("eviction failed", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
 		}
+	}
+
+	// A DECLINE is the pool refusing a model outright: it needs more GPUs than a
+	// Pod holds, or an accelerator this pool is not on, or its size cannot be
+	// worked out. Nothing consumed this, so the whole class was silent -- the
+	// variant scaled normally and simply never ran warm, which from outside is
+	// indistinguishable from a pool that is merely too small. That is the exact
+	// failure this configuration work exists to remove, reintroduced by the code
+	// that reports everything else.
+	//
+	// Deduplicated per variant+reason, because a standing mismatch is decided
+	// again on every pass and would otherwise be the only thing in the log.
+	for _, declined := range plan.Declined {
+		key := declineKey{Variant: declined.Model.Variant, Reason: declined.Reason}
+		if r.lastDeclined[key] {
+			continue
+		}
+		if r.lastDeclined == nil {
+			r.lastDeclined = map[declineKey]bool{}
+		}
+		r.lastDeclined[key] = true
+		logger.Info("warm pool will not warm this model",
+			"variant", declined.Model.Variant, "namespace", declined.Model.Namespace,
+			"reason", declined.Reason)
 	}
 
 	for _, model := range plan.Missed {

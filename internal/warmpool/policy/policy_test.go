@@ -1301,3 +1301,72 @@ func TestAutomaticModeLeavesExtraCopiesAlone(t *testing.T) {
 		t.Fatalf("automatic mode must leave copies it did not choose: %+v", got.Evict)
 	}
 }
+
+func TestAGrownPodIsWarmedWhileABridgeIsStillOpen(t *testing.T) {
+	// The deadlock the empty-Pod rule exists to break, and the exact case a pool
+	// scale-up is FOR. A block means the model is warm but every Pod holding it
+	// is serving; a borrow can only take a Pod that already holds the model, so
+	// a fresh empty Pod cannot relieve it. The remedy is another warm copy --
+	// which the old code suppressed precisely because something was blocked. The
+	// pool grew a Pod to fix the block and then refused to use it.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	serving := withGPUs(resident("a", "busy", pool.Serving), 1)
+	serving.Model.EngineOptions = smallModel
+	fresh := withGPUs(resident("b", "", pool.Absent), 1)
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{serving, fresh},
+		Variants: []VariantDemand{{
+			Model:      pool.ModelRef{Variant: "busy", EngineOptions: smallModel},
+			Desired:    3,
+			Ready:      1,
+			WarmCopies: copies(2),
+		}},
+		Now: now,
+	}, c)
+	if len(got.Blocked) != 1 {
+		t.Fatalf("the fixture must actually be blocked, or this proves nothing: %+v", got.Blocked)
+	}
+	if len(got.Admit) != 1 {
+		t.Fatalf("the empty Pod must be warmed despite the block: %+v", got.Admit)
+	}
+	if got.Admit[0].Pod.Name != "b" {
+		t.Errorf("into the EMPTY Pod, got %q", got.Admit[0].Pod.Name)
+	}
+}
+
+func TestMidBurstAPodHoldingWarmModelsIsLeftBorrowable(t *testing.T) {
+	// The half of the old guard that was worth keeping. Admitting into a Pod
+	// takes it out of the free set for the whole load, so a Pod holding other
+	// warm models would stop being borrowable for them mid-burst. Only Pods
+	// holding nothing may be spent.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	serving := withGPUs(resident("a", "busy", pool.Serving), 1)
+	serving.Model.EngineOptions = smallModel
+	// Free, but holding a warm model someone could borrow.
+	occupied := withGPUs(resident("b", "other", pool.Asleep), 1)
+	occupied.Model.EngineOptions = smallModel
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{serving, occupied},
+		Variants: []VariantDemand{
+			{Model: pool.ModelRef{Variant: "busy", EngineOptions: smallModel}, Desired: 3, Ready: 1, WarmCopies: copies(2)},
+			{Model: pool.ModelRef{Variant: "other", EngineOptions: smallModel}},
+		},
+		Now: now,
+	}, c)
+	if len(got.Blocked) != 1 {
+		t.Fatalf("the fixture must be blocked: %+v", got.Blocked)
+	}
+	for _, a := range got.Admit {
+		if a.Pod.Name == "b" {
+			t.Fatalf("a Pod holding borrowable models must not be spent mid-burst: %+v", got.Admit)
+		}
+	}
+}

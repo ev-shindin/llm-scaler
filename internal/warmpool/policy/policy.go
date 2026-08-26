@@ -242,10 +242,23 @@ func Decide(in Input, cfg Config) Plan {
 	plan.Return = dropOrphanReturnsSupersededByBorrows(plan.Return, orphans, plan.Borrow)
 
 	// 3. Admissions, last and most cautiously: never spend the reserve to fill
-	//    the cache, and never during a burst.
-	if len(plan.Blocked) == 0 {
-		plan.Admit, plan.Declined = admissions(in, cfg, byPod, free)
-	}
+	//    the cache, and during a burst only into Pods that hold nothing.
+	//
+	// This used to be suppressed ENTIRELY whenever anything was blocked, which
+	// deadlocked the case the pool exists for. A block means the model is warm
+	// but every Pod holding it is already serving; a borrow can only take a Pod
+	// that ALREADY holds the model, so a free Pod cannot relieve it. The remedy
+	// is to warm another copy -- exactly the admission being suppressed. The
+	// pool would grow a Pod to fix the block, then refuse to use it, for as long
+	// as the block lasted. Worse, one blocked variant suppressed admission of
+	// every OTHER model too.
+	//
+	// The guard's real purpose survives as the empty-Pod restriction. Admitting
+	// into a Pod removes it from the free set for the whole ~35 s load, so a Pod
+	// holding other warm models would stop being borrowable for them. A Pod
+	// holding NOTHING can serve no borrow anyway, so spending it costs nothing
+	// that was available.
+	plan.Admit, plan.Declined = admissions(in, cfg, byPod, free, len(plan.Blocked) > 0)
 
 	// 3b. Evictions: copies a variant no longer wants.
 	//
@@ -359,7 +372,7 @@ func evictions(in Input, byPod map[types.NamespacedName][]pool.Membership, lent 
 // admissions chooses what to make resident, in descending order of confidence:
 // parked variants, then the most popular, then anything that has missed often
 // enough to look like a pattern rather than an accident.
-func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool) ([]Action, []Declined) {
+func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool, emptyPodsOnly bool) ([]Action, []Declined) {
 	var out []Action
 	var declined []Declined
 	budget := len(free) - cfg.SleepMinSize // never take the reserve below its floor
@@ -387,7 +400,7 @@ func admissions(in Input, cfg Config, byPod map[types.NamespacedName][]pool.Memb
 			// Pod's GPUs with the first, so it could never serve a second
 			// bridge -- and the supervisor keys instances by variant, so it
 			// would refuse the create anyway.
-			target, ok := roomiestFreePodWithout(byPod, free, cfg, v.Model.Variant)
+			target, ok := roomiestFreePodWithout(byPod, free, cfg, v.Model.Variant, emptyPodsOnly)
 			if !ok {
 				break
 			}
@@ -739,9 +752,16 @@ func residentCount(byPod map[types.NamespacedName][]pool.Membership, variant str
 // only one wake at a time.
 // roomiestFreePodWithout is roomiestFreePod, skipping Pods that already hold
 // this variant. Only different when a variant asks for more than one copy.
-func roomiestFreePodWithout(byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool, cfg Config, variant string) (types.NamespacedName, bool) {
+func roomiestFreePodWithout(byPod map[types.NamespacedName][]pool.Membership, free map[types.NamespacedName]bool, cfg Config, variant string, emptyOnly bool) (types.NamespacedName, bool) {
 	eligible := make(map[types.NamespacedName]bool, len(free))
 	for podRef := range free {
+		if emptyOnly && pool.Resident(byPod[podRef]) > 0 {
+			// Mid-burst: a Pod holding warm models is borrowable for them, and
+			// admitting into it would take it out of the free set for the whole
+			// load. An empty Pod is borrowable for nothing, so it is the only
+			// one that costs nothing to spend.
+			continue
+		}
 		holds := false
 		for _, m := range byPod[podRef] {
 			if m.Model.Variant == variant && variant != "" {

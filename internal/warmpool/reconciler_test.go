@@ -685,3 +685,84 @@ func TestAnUnsetTimeoutIsBoundedAnyway(t *testing.T) {
 		t.Error("an unset ObserveTimeout must fall back to a default, not run unbounded")
 	}
 }
+
+func TestADeclinedModelIsSaidOutLoud(t *testing.T) {
+	// Found in review: plan.Declined was built with a reason and then consumed
+	// by nothing. A model needing more GPUs than a Pod holds, or an accelerator
+	// this pool is not on, was refused in total silence -- the variant scaled
+	// normally and never ran warm, which from outside is indistinguishable from
+	// a pool that is merely too small.
+	big := pool.ModelRef{
+		Namespace:     "workload",
+		Variant:       "too-wide",
+		EngineOptions: "--model Qwen/Qwen3-0.6B --tensor-parallel-size 8",
+	}
+	p := &fakePool{memberships: []pool.Membership{
+		{Pod: podA(), State: pool.Absent, Capacity: pool.PodCapacity{GPUs: 1}},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: big, Parked: true}}}
+	cfg := testConfig()
+	cfg.SleepMinSize = 0
+	cfg.PodMemoryBytes = 100 << 30
+	r := New(p, d, cfg)
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "will not warm this model") {
+		t.Fatalf("a decline must be reported: %s", out)
+	}
+	// The reason has to name both figures, or an operator cannot act on it.
+	if !strings.Contains(out, "8") || !strings.Contains(out, "too-wide") {
+		t.Errorf("the reason must name the variant and what it needs: %s", out)
+	}
+}
+
+func TestAStandingDeclineIsNotRepeatedEveryPass(t *testing.T) {
+	// A mismatch is re-decided on every pass. Reported each time it would be the
+	// only thing in the log, which is how operators learn to filter the log.
+	big := pool.ModelRef{Variant: "too-wide", EngineOptions: "--model Qwen/Qwen3-0.6B --tensor-parallel-size 8"}
+	p := &fakePool{memberships: []pool.Membership{
+		{Pod: podA(), State: pool.Absent, Capacity: pool.PodCapacity{GPUs: 1}},
+	}}
+	d := &staticDemand{variants: []policy.VariantDemand{{Model: big, Parked: true}}}
+	cfg := testConfig()
+	cfg.SleepMinSize = 0
+	cfg.PodMemoryBytes = 100 << 30
+	r := New(p, d, cfg)
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	for i := 0; i < 3; i++ {
+		if _, err := r.Once(ctx); err != nil {
+			t.Fatalf("Once: %v", err)
+		}
+	}
+	if got := strings.Count(buf.String(), "will not warm this model"); got != 1 {
+		t.Fatalf("a standing decline must be said once, got %d", got)
+	}
+}
+
+func TestResidentCountsModelsNotEmptyPods(t *testing.T) {
+	// Found in review. An EMPTY Pod contributes a placeholder membership so idle
+	// Pods are visible as reserve, so len(memberships) reports a pool holding
+	// NOTHING as resident=2 -- which an operator reads as two models warm, and
+	// concludes the pool is working when it has never warmed anything.
+	p := &fakePool{memberships: []pool.Membership{
+		{Pod: podA(), State: pool.Absent},
+		{Pod: types.NamespacedName{Namespace: "pool", Name: "b"}, State: pool.Absent},
+	}}
+	r := New(p, &staticDemand{}, testConfig())
+
+	var buf bytes.Buffer
+	ctx := logTo(t, &buf)
+	if _, err := r.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if !strings.Contains(buf.String(), "resident=0") {
+		t.Fatalf("an empty pool holds no models: %s", buf.String())
+	}
+}

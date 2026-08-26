@@ -426,8 +426,13 @@ const (
 	// The outcomes name different faults and a hit rate alone shows neither. A
 	// MISS means the model was resident nowhere, so the warm set is wrong. A
 	// BLOCK means it was resident but every holding Pod was already serving, so
-	// the reserve is too small. One says raise the warm set, the other says
-	// raise sleepMinSize.
+	// the pool is too small. One says raise the warm set, the other says add
+	// PODS.
+	//
+	// Not "raise sleepMinSize", which is what this said and is the opposite of
+	// the fix: the reserve is a floor on FREE Pods and admission draws on
+	// free-minus-reserve, so raising it makes the pool warm LESS while the
+	// blocked borrows continue.
 	//
 	// Labels: exported_namespace, model_name, outcome
 	WVAWarmPoolBorrowTotal = "wva_warmpool_borrow_total"

@@ -121,6 +121,7 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 		}
 		ready := int(workload.Status.ReadyReplicas)
 
+		wantedPool, wantedCopies := warmPoolChoices(logger, entry)
 		out = append(out, policy.VariantDemand{
 			Model: pool.ModelRef{
 				Namespace:     entry.Namespace,
@@ -133,14 +134,11 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			},
 			Desired: desired,
 			Ready:   ready,
-			// Which pool this variant may borrow from. Empty is the ordinary
-			// case: a namespace with one pool needs no selection.
-			WarmPool: entry.Metadata[registry.WarmPoolKey],
-			// How many copies to hold, or nil for automatic. Parsed through
-			// ParseMeta so a bad value is refused with the trigger that carried
-			// it rather than silently read as zero, which would be an opt-out
-			// nobody asked for.
-			WarmCopies: warmCopies(logger, entry),
+			// Which pool this variant may borrow from, and how many copies it
+			// wants. Empty and nil are the ordinary case: a namespace with one
+			// pool needs no selection, and automatic warming needs no count.
+			WarmPool:   wantedPool,
+			WarmCopies: wantedCopies,
 			// Share is filled in below, once every variant's desire is known.
 			// It cannot be computed one variant at a time.
 			// Parked is the case with no alternative: at zero replicas a cold
@@ -213,22 +211,28 @@ func (d *Demand) poolLabels(namespace string, workloadLabels map[string]string) 
 	return maps.Clone(found.Selector), nil
 }
 
-// warmCopies reads the variant's requested warm-copy count, or nil for
-// automatic.
+// warmPoolChoices is what a variant asked of the pool: which pool, and how many
+// copies. Both come from ONE parse of the trigger metadata.
+//
+// Reading the pool name straight out of the raw map and the copy count through
+// ParseMeta -- which is what this did -- gave the two keys different rules for
+// the same trigger. A metadata block ParseMeta rejects would fall back to
+// automatic warming while still honouring its pool selection, so half of a
+// trigger nobody could read was obeyed anyway.
 //
 // A value that does not parse is treated as ABSENT, not as zero. Zero is the
 // opt-out, so reading "two" as zero would silently stop warming a model whose
-// operator was asking for more of it -- the exact opposite of the intent, and
+// operator was asking for MORE of it -- the exact opposite of the intent, and
 // invisible.
-func warmCopies(logger logr.Logger, entry registry.Entry) *int {
+func warmPoolChoices(logger logr.Logger, entry registry.Entry) (pool string, copies *int) {
 	meta, err := registry.ParseMeta(entry.Metadata)
 	if err != nil {
 		logger.V(logging.DEFAULT).Info("ignoring unreadable warm-pool trigger metadata; "+
-			"this variant falls back to automatic warming",
+			"this variant falls back to automatic warming in the default pool",
 			"variant", entry.Name, "namespace", entry.Namespace, "err", err.Error())
-		return nil
+		return "", nil
 	}
-	return meta.WarmPoolCopies
+	return meta.WarmPool, meta.WarmPoolCopies
 }
 
 // EngineOptionsFrom derives the vLLM command line for a warm copy from the
