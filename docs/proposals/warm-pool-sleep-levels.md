@@ -4,6 +4,40 @@ Status: measured on pokprod, 2026-08-26. The pool implements **level 1 only**,
 and this is the case for that, plus what level 2 would cost if host RAM ever
 becomes the binding constraint.
 
+## 0. The numbers, and which of them are trustworthy
+
+Written in discovery order, and §5f corrects §5d while §5e replaces the
+extrapolations §5b was built on. **Read this first.**
+
+### Measured
+
+| | value | where |
+| --- | --- | --- |
+| level-1 sleeper host cost | **`1.41 GiB + 1.352 x weights`** (fitted, 0.6B and 8B) | §5e |
+| level-1 wake | **~39 GB/s** host-to-device (8B: 15.27 GiB in 0.42 s) | §5e |
+| vLLM startup weight load, ONE rank | **1.08-1.26 GB/s** -- parse-bound, not storage-bound | §5d, §5e |
+| aggregate load vs tensor parallelism | **`x TP**0.34`** -- badly sub-linear, 1.27x for 2x the ranks | §5f |
+| raw storage | NVMe 5.0-5.3 GB/s, shared PVC 1.7-1.8 GB/s, cached read 6.3 GB/s | §5, §5d |
+| fixed cold-start cost | ~100 s, independent of model size | §5b |
+
+### Settled conclusions
+
+- **Level 2 does not reload the model.** It discards weights and serves garbage
+  unless `reload_weights` is called; a failed reload poisons the engine until
+  restart. §2, §5c.
+- **Level 1 cannot be backed by NVMe.** The offload buffer is pinned memory,
+  which the kernel may neither swap nor file-back. §5c.
+- **NIXL cannot move weights.** The transfer engine ships NCCL and IPC only. §5c.
+- **The fast loaders do not help.** `reload_weights` refuses `runai_streamer`. §5c.
+- **Faster storage is worth less than it looks.** One rank is parse-bound, and
+  aggregation across ranks is sub-linear, so node-local NVMe is ~1.55x for a
+  744 GB model rather than the 5.7x an earlier linear model predicted. §5f.
+
+### Weakest number here
+
+`TP**0.34`, fitted to two points on one model on one node, and applied at TP=16 --
+eight times beyond anything measured. Direction is known; magnitude is not. §5f.
+
 ## 1. The question
 
 A level-1 sleeper keeps its weights in host RAM, so a Pod's memory limit bounds
