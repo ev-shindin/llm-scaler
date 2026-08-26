@@ -213,6 +213,13 @@ RECEIVES weights pushed from a trainer over GPU-to-GPU transport, and never read
 storage. For N different models that is circular — something must already hold
 each model's weights in GPU memory, which is the cost being avoided.
 
+### Scale-up is a different question, and has a better answer
+
+Everything above is about restoring ONE engine from storage. Handing weights from
+a peer that already holds them is a separate mechanism with much better numbers,
+and it is the right lever for big models. See
+[warm-pool-weight-transfer.md](warm-pool-weight-transfer.md).
+
 ### The fast loaders exist, and `reload_weights` refuses them
 
 The image ships `runai_model_streamer` 0.16.1 and `fastsafetensors` 0.3.3, and
