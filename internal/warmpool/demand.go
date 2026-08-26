@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/go-logr/logr"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -91,6 +92,29 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 			continue // the pool's own ScaledObject; it is not a model to warm
 		}
 		target := types.NamespacedName{Namespace: entry.Namespace, Name: entry.Target.Name}
+
+		// An engine that spans PODS cannot be warmed, and saying why matters:
+		// the Deployment read below would fail for a LeaderWorkerSet anyway, but
+		// with "cannot read its scale target", which sends an operator looking
+		// for a permissions or naming problem that does not exist.
+		//
+		// It is not a gap the pool could close by trying harder. A pool Pod is
+		// ONE Pod holding several engines; an LWS engine is several Pods holding
+		// one. Warming it would mean holding an entire group warm and
+		// coordinating sleep and wake across every member, which is a different
+		// design rather than a missing feature.
+		//
+		// Parallelism WITHIN a Pod is fine and needs nothing special: tensor and
+		// pipeline sizes multiply into the GPU count, and a pool whose Pods hold
+		// that many devices warms it like any other model. See
+		// config/warmpool-multi-gpu.
+		if entry.Target.Kind == constants.LeaderWorkerSetKind {
+			logger.V(logging.DEFAULT).Info(
+				"not warming this variant: its engine spans Pods, and a warm pool Pod holds engines. "+
+					"Parallelism within a single Pod is supported; across Pods is a different design",
+				"variant", entry.Name, "namespace", entry.Namespace, "kind", entry.Target.Kind)
+			continue
+		}
 
 		var workload appsv1.Deployment
 		if err := d.Client.Get(ctx, target, &workload); err != nil {

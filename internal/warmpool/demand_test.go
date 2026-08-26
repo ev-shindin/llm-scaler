@@ -11,6 +11,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
@@ -686,5 +688,19 @@ func TestParallelismAndExpertLayoutSurviveIntoTheWarmCopy(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("%q must survive into the warm copy: %q", want, got)
 		}
+	}
+}
+
+func TestAnEngineThatSpansPodsIsNotWarmedAndSaysWhy(t *testing.T) {
+	// An LWS engine is several Pods holding one engine; a warm pool Pod is one
+	// Pod holding several engines. The Deployment read would fail for it anyway,
+	// but with "cannot read its scale target" -- which sends an operator looking
+	// for a permissions or naming fault that does not exist.
+	//
+	// Parallelism WITHIN a Pod is a different matter and is supported: tensor
+	// and pipeline sizes multiply into the GPU count, and a pool whose Pods hold
+	// that many devices warms such a model like any other.
+	if pool.ShapeOf("--model m --tensor-parallel-size 2 --pipeline-parallel-size 2").GPUs != 4 {
+		t.Fatal("TP and PP multiply into the GPU count")
 	}
 }
