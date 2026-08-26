@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
@@ -51,6 +52,11 @@ const (
 	WarmPoolServingPort    = 8000
 	WarmPoolControlPort    = 8002
 
+	// WarmPoolNameLabel names the pool a Pod belongs to, matching the label the
+	// controller groups by.
+	WarmPoolNameLabel = "llm-d.ai/warm-pool"
+	// gpuResourceName is what a pool Pod asks for when a spec gives it GPUs.
+	gpuResourceName = "nvidia.com/gpu"
 	// WarmPoolBasePort is the first port an emulated engine listens on, and the
 	// floor the proxy enforces on an upstream.
 	WarmPoolBasePort = 9001
@@ -222,6 +228,25 @@ type WarmPoolSpec struct {
 	Name       string
 	Namespace  string
 	ProxyImage string
+
+	// PoolName is the llm-d.ai/warm-pool label, on both the Deployment and its
+	// Pods. Empty leaves the pool unnamed, which is what an install with one
+	// pool has and what every spec before named pools existed assumed.
+	PoolName string
+	// NodeName pins the Pod to one node. Empty lets the scheduler choose.
+	//
+	// Needed because a pool Pod's ACCELERATOR is a property of the node it runs
+	// on, so a test about accelerator matching has to decide which node that is.
+	// Nothing else in the suite cares where a pool Pod lands.
+	NodeName string
+	// Replicas defaults to 1.
+	Replicas int32
+	// GPUs each Pod requests. Zero requests none, which is what an emulated pool
+	// wants on a cluster with no devices -- the count the policy reads comes
+	// from this field, so a spec about capacity sets it and the rest do not.
+	GPUs int
+	// Annotations go on the DEPLOYMENT, where the pool's tuning lives.
+	Annotations map[string]string
 }
 
 // CreateWarmPool stands up an emulated pool Pod: a supervisor emulator and the
@@ -243,15 +268,33 @@ func CreateWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 		WarmPoolComponentLabel:   WarmPoolComponentValue,
 		"warm-pool-fixture":      spec.Name,
 	}
+	if spec.PoolName != "" {
+		labels[WarmPoolNameLabel] = spec.PoolName
+	}
+	replicas := spec.Replicas
+	if replicas == 0 {
+		replicas = 1
+	}
+	supervisor := warmPoolSupervisorContainer()
+	if spec.GPUs > 0 {
+		// On the ENGINE container, which is where capacityOf looks: the proxy
+		// sidecar's own limits have nothing to do with how many models fit.
+		supervisor.Resources = corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				gpuResourceName: *resource.NewQuantity(int64(spec.GPUs), resource.DecimalSI),
+			},
+		}
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      spec.Name,
-			Namespace: spec.Namespace,
-			Labels:    labels,
+			Name:        spec.Name,
+			Namespace:   spec.Namespace,
+			Labels:      labels,
+			Annotations: spec.Annotations,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To[int32](1),
+			Replicas: ptr.To(replicas),
 			// Recreate, as the real manifest does: two pool Pods holding the
 			// same models is not a rollout, it is double the memory.
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
@@ -262,6 +305,7 @@ func CreateWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 					// The controller reaches this Pod over the network; it has
 					// no reason to hold a token of its own.
 					AutomountServiceAccountToken: ptr.To(false),
+					NodeName:                     spec.NodeName,
 					Volumes: []corev1.Volume{{
 						Name: "script",
 						VolumeSource: corev1.VolumeSource{
@@ -271,7 +315,7 @@ func CreateWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 						},
 					}},
 					Containers: []corev1.Container{
-						warmPoolSupervisorContainer(),
+						supervisor,
 						warmPoolProxyContainer(spec.ProxyImage),
 					},
 				},
