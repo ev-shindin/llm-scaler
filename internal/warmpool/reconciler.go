@@ -139,6 +139,10 @@ type Reconciler struct {
 	// than every Interval.
 	lastUnassignable map[string]string
 
+	// lastShort is the previous pass's reserve shortfall PER POOL. Zero is a
+	// real value: it is how a recovered pool re-arms, so the next shortfall is
+	// reported instead of being mistaken for the one already logged.
+	lastShort map[string]int
 	// lastSummary is the previous pass's one-line state PER POOL, so a steady
 	// pool logs once rather than every Interval. Guarded by passMu, which
 	// already serialises the whole pass.
@@ -160,6 +164,7 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		missesAt:         map[string][]time.Time{},
 		admitting:        map[string]bool{},
 		admittingPods:    map[types.NamespacedName]bool{},
+		lastShort:        map[string]int{},
 		lastSummary:      map[string]string{},
 		lastUnassignable: map[string]string{},
 		lastDeclined:     map[declineKey]bool{},
@@ -276,7 +281,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		// carry every other pool's borrows.
 		lent := lentPods(mine)
 		r.report(ctx, spec, mine, theirs, free, lent)
-		r.apply(ctx, plan)
+		r.apply(ctx, spec, plan)
 		r.publishSize(ctx, spec, mine, lent)
 		merged = mergePlans(merged, plan)
 	}
@@ -595,7 +600,7 @@ func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []po
 
 // apply carries out a plan. Returns come first, as the policy decided them:
 // a Pod handed back is reserve for every model, including the borrows below.
-func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
+func (r *Reconciler) apply(ctx context.Context, spec PoolSpec, plan policy.Plan) {
 	logger := log.FromContext(ctx).WithName("warmpool")
 
 	// Returns are planned as though they will succeed, and the borrows and
@@ -753,10 +758,24 @@ func (r *Reconciler) apply(ctx context.Context, plan policy.Plan) {
 		// too small, not that the warm set was wrong.
 		metrics.CountWarmPoolBorrow(model.Namespace, model.Variant, OutcomeBlocked)
 	}
-	if plan.GrowBy > 0 {
-		// Reported, not acted on: growing costs a model load per Pod, and a
-		// shortfall that lasts one cycle is a borrow doing its job.
-		logger.V(2).Info("warm pool is below its reserve", "short", plan.GrowBy)
+	// Reported, not acted on: growing costs a model load per Pod, and a
+	// shortfall that lasts one cycle is a borrow doing its job.
+	//
+	// Deduplicated per pool, like every other report here. Being below the
+	// reserve is a STATE, not an event: an undeduplicated line repeats on every
+	// pass for as long as the shortfall lasts, which is precisely as long as
+	// someone is trying to read the log to find out why. Observed burying every
+	// other message in the controller's output, including the pool state line
+	// the condition should be diagnosed from.
+	if r.lastShort == nil {
+		r.lastShort = map[string]int{}
+	}
+	if plan.GrowBy != r.lastShort[spec.Name] {
+		r.lastShort[spec.Name] = plan.GrowBy
+		if plan.GrowBy > 0 {
+			logger.V(2).Info("warm pool is below its reserve",
+				"pool", spec.Name, "short", plan.GrowBy)
+		}
 	}
 }
 

@@ -109,9 +109,75 @@ PCIe host-to-device speed:
 
 The last row is the point. At 70B, level 1 needs more host RAM than most nodes
 have, and level 2 takes a minute — which is no longer a bridge, it is a cold
-start with extra steps. **The interesting range for level 2 is the middle**: 8B
-to ~30B, on RAM-poor nodes, where 7 s is still far better than a ~100 s cold
-start and 36 GiB per model is more RAM than a Pod can spare.
+start with extra steps. **The interesting range for level 2 as a bridge is the
+middle**: 8B to ~30B, on RAM-poor nodes, where 7 s is still far better than a
+~100 s cold start and 36 GiB per model is more RAM than a Pod can spare.
+
+That is the conclusion **as a bridge**, and it is not the whole answer. Read
+§5b before acting on it: at TP=8 the NVMe arithmetic above changes, and above
+30B level 2 stops competing on latency and starts competing on GPU count, which
+is a different argument with a different winner.
+
+## 5b. Big models: what level 2 actually buys, and the case it unlocks
+
+A cold start is **fixed startup + weight load**. Level 1 skips both — its wake is
+a PCIe copy from host RAM. Level 2 skips only the fixed part and still pays the
+weight load, which is the term that grows with the model.
+
+Measured here, 0.6B, cached image, TP=1: **~100 s** cold to serving, of which
+`reload_weights` is **0.56 s**. So this cluster has a ~100 s fixed floor, and
+**level 2 saves approximately that, near-constantly, whatever the model size.**
+As models grow it stays 100 s and becomes a smaller fraction.
+
+Projected from the measured ~2 GB/s single-rank load rate. **Estimates**; only
+the first row is measured:
+
+| | cold start | L2 + reload | L1 wake |
+| --- | --- | --- | --- |
+| 0.6B | 100 s | 0.6 s | 0.12 s |
+| 70B, TP=4 | ~165 s | ~65 s (2.5x) | ~7 s (24x) |
+| 405B fp8, TP=8, shared PVC | ~310 s | ~210 s (1.5x) | ~19 s (16x) |
+| 405B fp8, TP=8, local NVMe | ~172 s | ~72 s (2.4x) | ~19 s |
+
+### TP=8 is where NVMe stops being second-order
+
+§5 concluded that NVMe converts poorly because the load path costs as much as the
+read. That was measured on ONE rank, and it does not generalise: with TP=8 each
+rank loads its own shard in its own process, so the parse and host-to-device work
+parallelises across eight cores while the **storage does not**. A shared 1.8 GB/s
+PVC then becomes the binding constraint, and NVMe's 3x converts.
+
+So: NVMe is second-order at TP=1 and first-order at TP=8. LWS extends the same
+logic — each node brings its own NVMe, so aggregate load bandwidth scales with
+the group, provided the weights are node-local rather than on the shared PVC.
+
+### The comparison that decides it is not against a cold start
+
+A sleeping Pod frees GPU **memory**, not the **device**: it still holds
+`nvidia.com/gpu`, so nothing else can schedule there. For a big model that needs
+a whole node, the real comparison is therefore not "level 2 versus a cold start"
+but **"level 2 versus simply running the replica"** — which costs the same eight
+accelerators and answers requests. On that comparison a single warm big model
+loses outright.
+
+Level 2 wins only when it **multiplexes**: N big models sharing one set of GPUs,
+one awake at a time, switching in ~1–3 minutes instead of ~5. Then the fleet
+holds 8 GPUs instead of 8N. That is a real design — cold storage for big models
+with minute-scale activation — and it is exactly what level 1 cannot do at this
+size, because level 1's host-RAM cost (~2.4x weights) allows about one resident
+model per Pod.
+
+**This corrects an earlier claim of mine** that a pool "earns nothing" above about
+30B. That was derived from level 1's RAM bound and silently assumed level 2 was
+unavailable. Level 2 has no RAM bound, so the multiplexing gain survives at any
+model size; what shrinks is the latency advantage, not the GPU saving.
+
+### The measurement that would settle it
+
+Run an 8B at TP=1 and TP=8 and time `reload_weights` against a full cold start.
+Two runs give both coefficients — the fixed floor and the per-byte rate — and
+every row above stops being an extrapolation. Do that before costing any big
+model work.
 
 ## 6. Method trap: `kubectl exec` cost more than everything measured
 
@@ -129,8 +195,10 @@ a bridge is too slow to be worth building.
 
 ## 7. Recommendation
 
-1. **Keep level 1 as the only implemented path.** It is one call, it is
-   ~5× faster, and it cannot serve garbage by omission.
+1. **Keep level 1 as the only implemented path for the pool as it exists**,
+   which serves small and medium models. It is one call, it is ~5x faster, and
+   it cannot serve garbage by omission. This is not an argument that level 2 is
+   useless — see §5b for the big-model case, which is a different product.
 2. **Do not add level 2 as a knob** on the strength of the RAM saving alone. It
    requires the pool to make a second call that has no failure signal of its own:
    skip `reload_weights` and the model answers, quickly, with nonsense. If it is
