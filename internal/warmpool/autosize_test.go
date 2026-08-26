@@ -3,7 +3,11 @@ package warmpool
 import (
 	"context"
 	"testing"
+	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 )
 
@@ -89,5 +93,44 @@ func TestAPoolNotDiscoveredFromADeploymentPublishesNothing(t *testing.T) {
 	}
 	if called {
 		t.Fatal("nothing to scale, so nothing to publish")
+	}
+}
+
+func TestAPoolIsSizedForItsOwnBridgesOnly(t *testing.T) {
+	// Found in review. The published size was computed from the process-wide
+	// borrow record, so with two pools each was told to carry the OTHER's
+	// bridges: a quiet pool beside a busy one is sized for Pods it has no use
+	// for, permanently, on an accelerator the busy pool cannot even run on. And
+	// in the mirror case a busy pool is told it needs fewer Pods than it is
+	// currently lending, which invites KEDA to scale it below its own floor.
+	busyPod := types.NamespacedName{Namespace: poolNamespace, Name: "busy-0"}
+	quietPod := types.NamespacedName{Namespace: poolNamespace, Name: "quiet-0"}
+	p := &fakePool{memberships: []pool.Membership{
+		{Model: model("qwen"), Pod: busyPod, State: pool.Serving, Pool: "busy"},
+		{Pod: quietPod, State: pool.Absent, Pool: "quiet"},
+	}}
+
+	cfg := testConfig()
+	cfg.SleepMinSize = 1
+	sizes := map[string]int32{}
+	r := New(p, &staticDemand{}, cfg)
+	r.Namespace = poolNamespace
+	r.Pools = fakePools{
+		{Name: "busy", Config: cfg, Replicas: 2, Deployment: "busy"},
+		{Name: "quiet", Config: cfg, Replicas: 2, Deployment: "quiet"},
+	}
+	r.PublishSize = func(_, name string, replicas int32) { sizes[name] = replicas }
+	// The borrow record is deliberately populated for the BUSY pool only, which
+	// is what the buggy version summed across both.
+	r.borrowedAt[policy.Borrow{Pod: busyPod, Variant: "qwen"}] = time.Now()
+
+	if _, err := r.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if got := sizes["busy"]; got != 3 {
+		t.Errorf("the lending pool needs its bridge plus reserve plus one: got %d, want 3", got)
+	}
+	if got := sizes["quiet"]; got != 2 {
+		t.Errorf("the idle pool must not be sized for another pool's bridge: got %d, want 2", got)
 	}
 }

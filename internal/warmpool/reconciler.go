@@ -247,9 +247,13 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 		plan := policy.Decide(in, spec.Config)
 		free := pool.FreePods(mine)
 		metrics.SetWarmPoolFreePods(r.metricName(spec), free)
-		r.report(ctx, spec, mine, theirs, free)
+		// This pool's own bridges, not the process-wide total. r.Lent() spans
+		// every pool, and feeding it to a per-pool size tells each pool to
+		// carry every other pool's borrows.
+		lent := lentPods(mine)
+		r.report(ctx, spec, mine, theirs, free, lent)
 		r.apply(ctx, plan)
-		r.publishSize(spec, len(r.Lent()))
+		r.publishSize(spec, lent)
 		merged = mergePlans(merged, plan)
 	}
 	return merged, nil
@@ -325,6 +329,26 @@ func (r *Reconciler) publishSize(spec PoolSpec, lent int) {
 	r.PublishSize(r.Namespace, spec.Deployment, int32(SizeFor(spec.Config.SleepMinSize, lent))) //nolint:gosec // small counts
 }
 
+// lentPods counts THIS pool's Pods that are serving a bridge.
+//
+// Distinct Pods, not memberships: a Pod holding several models is one Pod, and
+// the size a pool needs is measured in Pods.
+//
+// Scoped to the pool on purpose. r.Lent() is the process-wide record and is the
+// right answer for the exported diagnostic, but using it per pool made every
+// pool's published size include every other pool's borrows -- so a quiet pool
+// beside a busy one was told to hold Pods it had no use for, permanently, on an
+// accelerator the busy pool cannot even run on.
+func lentPods(memberships []pool.Membership) int {
+	pods := map[types.NamespacedName]bool{}
+	for _, m := range memberships {
+		if m.State == pool.Serving {
+			pods[m.Pod] = true
+		}
+	}
+	return len(pods)
+}
+
 // report logs what the pass saw, but only when it differs from the last one.
 //
 // Everything else in this file logs on FAILURE only, which means a pool that is
@@ -336,7 +360,7 @@ func (r *Reconciler) publishSize(spec PoolSpec, lent int) {
 //
 // Deduplicated rather than rate-limited so a steady pool is quiet and a change
 // is visible immediately, which is the opposite of what a periodic dump gives.
-func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []pool.Membership, variants []policy.VariantDemand, free int) {
+func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []pool.Membership, variants []policy.VariantDemand, free, lent int) {
 	logger := log.FromContext(ctx).WithName("warmpool")
 	if r.lastSummary == nil {
 		// A Reconciler built as a struct literal rather than through New has no
@@ -351,7 +375,7 @@ func (r *Reconciler) report(ctx context.Context, spec PoolSpec, memberships []po
 	// then treats every model as portable. That is the right failure direction,
 	// but a silent one, and this line is deduplicated so saying it costs nothing.
 	summary := fmt.Sprintf("pods=%d free=%d resident=%d variants=%d lent=%d accelerator=%s",
-		pods, free, len(memberships), len(variants), len(r.Lent()), acceleratorsIn(memberships))
+		pods, free, len(memberships), len(variants), lent, acceleratorsIn(memberships))
 	if summary != r.lastSummary[name] {
 		logger.V(1).Info("warm pool state", "pool", name, "state", summary)
 		r.lastSummary[name] = summary
