@@ -87,7 +87,7 @@ jobs:
         run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
 
       - name: Set up Go with cache
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "${{ env.GO_VERSION }}"
           cache-dependency-path: ./go.sum
@@ -191,7 +191,7 @@ jobs:
         run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
 
       - name: Set up Go with cache
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "${{ env.GO_VERSION }}"
           cache-dependency-path: ./go.sum
@@ -312,7 +312,7 @@ jobs:
 
       - name: Set up Go with cache
         if: steps.decide.outputs.run == 'true'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "${{ env.GO_VERSION }}"
           cache-dependency-path: ./go.sum
