@@ -14,8 +14,11 @@ kind: Kustomization
 # the same Deployment, so the namespace ends up with one pool whose Pods hold
 # four GPUs. If you want both shapes at once -- a cheap single-GPU pool for most
 # models and a wide one for tensor-parallel models -- deploy two pools with
-# different llm-d.ai/warm-pool names, and have each model name the one it wants
-# with the warmPool trigger metadata key. See docs/guides/warm-pool/.
+# different llm-d.ai/warm-pool names, EACH WITH ITS OWN ScaledObject carrying a
+# matching warmPoolName, and have each model name the one it wants with the
+# warmPool trigger metadata key. The trigger is what declares a pool: a second
+# Deployment without one holds accelerators nothing will ever use, which WVA
+# reports rather than using. See docs/guides/warm-pool/.
 #
 # WHAT THIS SUPPORTS, and what remains untested, because the difference matters
 # more than the list:

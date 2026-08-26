@@ -83,44 +83,75 @@ WVA tuning.
 
 **C. Annotations on the pool Deployment.** The knobs travel with the object they
 describe. Deleting the pool deletes its config; there is no "config for a pool
-that does not exist" state and no second watch.
+that does not exist" state and no second watch. *Originally recommended here, and
+superseded — see below.*
+
+**E. Trigger metadata on the pool's own ScaledObject.** The pool is declared the
+way every other thing WVA knows about is. **This is what shipped.**
 
 **D. A `WarmPool` CRD.** Rejected on project direction: the VariantAutoscaling
 CRD is being removed, and a ScalingPolicy CRD was already considered and
 rejected in favour of ConfigMap + trigger metadata. A CRD also does not remove
 the Deployment — it adds a controller to create one.
 
-### Recommendation: C, annotations on the pool Deployment
+### Decided: the pool's ScaledObject, not its Deployment
 
-The decisive argument is that **sizing and reserve are one decision**. You cannot
-sensibly set `sleepMinSize: 2` on a two-replica pool — that is the inert pool,
-which holds GPUs and warms nothing forever. `replicas` and `sleepMinSize` must be
-chosen together, and putting them on one object is what makes that possible to
-get right and trivial to validate.
+**This reverses the recommendation this document originally made**, and the
+reversal is worth recording because the argument that changed it was better than
+the one it replaced.
+
+The original case for annotations was that *sizing and reserve are one decision*
+— you cannot sensibly set a reserve of 2 on a two-replica pool — so both belong
+on one object. That reasoning was right; the object was wrong. Once a pool has a
+ScaledObject, `replicas` is no longer the operative number: **`maxReplicaCount`
+is.** So the pair that must agree is the reserve and the ceiling, and putting the
+reserve on the Deployment split exactly the pair the argument said to keep
+together.
+
+Two further things settled it:
+
+- **KEDA is not optional.** WVA is a KEDA external scaler, and `Observe` — called
+  from the scaler RPCs — is the *only* thing that populates the registry. Without
+  KEDA nothing is discovered and the controller does nothing at all. So "works
+  without KEDA" was never a property to protect.
+- **A pool is a WVA concept that happens to have Pods**, not a workload WVA
+  happens to manage. Nothing outside WVA reads one, creates one, or can operate
+  one. Declaring it through a trigger keeps one invariant with no exceptions:
+  WVA manages what it is CALLED about.
 
 ```yaml
-kind: Deployment
-metadata:
-  name: wva-warm-pool
-  labels:
-    app.kubernetes.io/component: warm-pool
-    llm-d.ai/warm-pool: default          # the pool's NAME
-  annotations:
-    llm-d.ai/warm-pool-sleep-min-size: "1"
-    llm-d.ai/warm-pool-max-hold: "2m"
-    llm-d.ai/warm-pool-preload-top: "2"
-    llm-d.ai/warm-pool-gpu-memory-utilization: "0.90"
+kind: ScaledObject
 spec:
-  replicas: 3                            # must exceed sleep-min-size
+  minReplicaCount: 2
+  maxReplicaCount: 6                 # must exceed the reserve
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: wva-external-scaler.<wva-namespace>.svc.cluster.local:9090
+        warmPoolName: default        # this is what declares the pool
+        warmPoolSleepMinSize: "1"
+        warmPoolMaxHold: "2m"
+        warmPoolPreloadTop: "2"
+        warmPoolGPUMemoryUtilization: "0.90"
 ```
 
-Annotations on the Deployment (not the pod template) do not restart Pods, so
-retuning a live pool costs nothing.
+Trigger metadata is re-read on the next reconcile and restarts no Pods, so
+retuning a live pool still costs nothing.
 
-Honest trade-off: **B is more consistent** with where operators already look. If
-consistency is judged to outweigh co-location, B is acceptable — but only now
-that the inert-pool case is loud, because B reintroduces exactly the
-two-places-one-fact split that made it silent.
+**The objection this had to answer**, raised against the change and paid rather
+than waved away: a pool Deployment whose ScaledObject is gone keeps holding
+accelerators while WVA no longer knows it exists. Deployments are therefore still
+listed — *only* to report such a Deployment, never to configure anything — so
+there is exactly one place a pool is defined and no way to leak GPUs quietly.
+
+An `ownerReference` was considered as the alternative coupling and rejected:
+nothing can set it at apply time, so WVA would have to, which means write
+permission on ScaledObjects — reopening precisely what the KEDA-centric design
+exists to avoid.
+
+**Consequence for existing installs:** deleting the pool ScaledObject now deletes
+the POOL, not just its elasticity. A fixed-size pool is `minReplicaCount ==
+maxReplicaCount`.
 
 ## Part 2: binding a model to a pool
 
