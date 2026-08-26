@@ -67,6 +67,32 @@ If (1) or (3) fails, everything below is unbuildable and the honest answer stays
 "LWS is out of scope". If they pass, the design is tractable and mostly reuses
 what exists.
 
+### First attempt, 2026-08-26: blocked before it could measure anything
+
+A two-Pod group was stood up on pokprod — anti-affinity across nodes, TP=2,
+`--enable-sleep-mode`, `VLLM_SERVER_DEV_MODE=1`, the same
+`vllm/vllm-openai:v0.26.0` image the cluster's own decode Pods run.
+
+**The image has no Ray.** `ray: command not found` in the leader. So the
+Ray-based multi-node path vLLM documents for LWS is not available in the image
+this cluster actually runs, and `ray start --head` failed silently — the leader
+sat in its wait loop, the group hit `RecreateGroupOnPodRestart`, and it churned
+until it was torn down.
+
+That is a prerequisite nobody had written down, and it changes the shape of the
+experiment rather than its conclusion. Before retrying, decide which of these is
+being tested:
+
+- **an image with Ray in it** — closest to the documented path, but it is not the
+  image llm-d ships, so a pass would prove sleep works somewhere this cluster
+  does not run;
+- **vLLM's non-Ray multi-node**, if v0.26.0 supports it — proves the thing that
+  matters for THIS deployment, and is the more useful answer.
+
+Either way the finding stands on its own: **an LWS warm pool cannot use the
+image the fleet is on today.** Whatever else is true of multi-node sleep, that
+has to be solved first, and it is a packaging problem rather than a design one.
+
 ## 4. Design
 
 ### 4a. A warm pool of GROUPS
