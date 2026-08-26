@@ -354,13 +354,46 @@ call, and both pools reported their own state independently. The warm copy was
 NOT destroyed while the variant was unassignable, which is the right behaviour:
 eviction answers pressure, not a variant that stopped asking.
 
-The step 4 preflight was verified on the cluster in the allowing direction (the
-pool starts silently), and the API server was asked both ways through the same
-review machinery -- `yes` for the controller's ServiceAccount, `no` for an
-identity with no such grant. The DENIAL branch was not exercised end to end: on
-pokprod the controller's ServiceAccount draws `patch` from a ClusterRole shared
-with other namespaces' installs, so revoking it to observe one log line would
-have broken other tenants. That branch is unit-tested and mutation-checked.
+The step 4 preflight is verified in BOTH directions, on two clusters.
+
+Allowing, on pokprod: the pool starts silently. Denying, on kind, where nothing
+else uses the cluster -- `patch` was removed from the ClusterRole the
+controller's ServiceAccount draws it from, the API server then answered `no`,
+and the controller refused to start the pool:
+
+```
+ERROR setup the warm pool is disabled: this controller may not patch Pods, so it
+could never lend one. Grant patch on pods in the pool namespace ... and restart.
+Running without it would hold GPUs, warm models, and fail every borrow.
+```
+
+RBAC was restored afterwards and the pool started again. This deliberately was
+NOT done on pokprod: there the ServiceAccount draws `patch` from a ClusterRole
+shared with other namespaces' installs, so revoking it to observe one log line
+would have broken other tenants.
+
+### Cluster testing, 2026-08-26
+
+Also verified on pokprod: the pool's own ScaledObject end to end -- raising the
+reserve changed the published size, the HPA followed, and KEDA moved the
+Deployment, with WVA writing nothing; the shrink direction likewise;
+`warmPoolCopies: "2"` warming the model in both Pods; and eviction releasing
+both copies on `"0"`, then automatic mode re-warming one when the key was
+removed.
+
+The existing warm-pool e2e passes on kind against this build -- 6 specs, 0
+failures -- which covers the pool Pod's traffic gate and the shipped
+NetworkPolicy.
+
+**Still not verified on any cluster:** the accelerator MISMATCH decline, and two
+pools each holding Pods. Both need e2e infrastructure that does not exist yet: a
+controller with the warm pool ENABLED, plus a pool Pod pinned to a node whose
+accelerator label the test chooses. The suite deploys its controller without
+warm-pool flags, and the pool fixture cannot pin a node. Neither gap is a
+guess -- both paths are unit-tested and mutation-checked, and both of their
+INPUTS are proven on a cluster (the accelerator is read from the node and
+appears in the pool state line; the access review answers correctly both
+ways) -- but the decision itself has not been observed end to end.
 
 **Not verified on a cluster:** everything in Part 5 — `warmPoolCopies` and the
 pool ScaledObject are unit-tested only, and the second changes how the pool's
