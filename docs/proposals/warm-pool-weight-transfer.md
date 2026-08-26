@@ -285,6 +285,50 @@ take a 0.6B, sleep it to level 2, wake it, and drive `update_weights` from a
 second engine holding the same weights. If the output comes back byte-identical,
 the design is real and the only remaining question is bandwidth.
 
+## 4e. It works on a plain scale-up too, with no pool at all
+
+§4c refilled a level-2 SLEEPER -- an existing process whose weights had been
+discarded. The same path works on a brand-new replica that never read weights,
+which is the case that needs no warm pool and therefore no held accelerators.
+
+Measured the same day, same rig:
+
+```
+vllm serve ... --load-format dummy --weight-transfer-config '{"backend":"nccl"}'
+  init engine (profile, kv cache, warmup)   18.5 s     <- no weight read at all
+  prompt                                    ' Intl is Intl is Intl is Intl is'
+  broadcast 1.40 GiB from peer              0.11 s  (13.1 GB/s)
+  prompt                                    ' Paris. The capital of France is also the capital of the'
+  a second prompt                           ' 4, so the sum is '
+```
+
+`--load-format dummy` allocates the parameter tensors and fills them with random
+values, reading nothing. Compile and CUDA-graph capture depend on shapes rather
+than values, so they proceed normally, and `/update_weights` then writes the real
+parameters into the tensors that are already there.
+
+**This removes the weight-read term from a cold start entirely**, without a pool
+and without holding a single extra accelerator, because the sender is a replica
+the fleet is already running.
+
+At 0.6B the saving is invisible -- the read is about a second. It scales with the
+model: for GLM-5.2 the shared-PVC read is ~413 s of a ~513 s cold start, so a
+scale-up becomes roughly the ~100 s fixed startup plus the transfer.
+
+### How it compares with the pool
+
+| | bridge | extra GPUs held | needs |
+| --- | --- | --- | --- |
+| level-1 warm pool | ~0.12 s | a pool Pod's worth | host RAM for every sleeper |
+| level-2 sleeper + peer fill | ~0.2 s | a pool Pod's worth | a peer with the weights |
+| **dummy-load + peer fill** | **~100 s (fixed startup)** | **none** | a peer with the weights |
+
+They are not competitors so much as different points on a curve. The pool buys
+away the fixed startup and pays accelerators for it; dummy-load plus transfer
+buys away only the weight read but costs nothing to hold. On a fleet where GPUs
+are scarce and models are large, the third row is the one that needs no argument
+about whether holding capacity is worth it.
+
 ## 4d. Prefill/decode is the case this fits best
 
 A P/D deployment runs the same model twice with different plumbing: the roles
