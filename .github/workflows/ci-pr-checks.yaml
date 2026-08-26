@@ -45,7 +45,7 @@ jobs:
       has_code_changes: ${{ steps.set-output.outputs.has_code_changes }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Check for code changes
         if: github.event_name == 'pull_request'
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Sanity check repo contents
         run: ls -la
@@ -115,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # The deploy libraries are ~5k lines of shell that no Go test covers, and
       # `make lint-deploy-scripts` -- their entire safety net -- ran in no
@@ -139,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # docs/guides/README.md tells contributors this runs in CI. It did not,
       # so a guide could drift from the guide.yaml it is generated from, and a
@@ -160,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install kustomize
         run: make kustomize
@@ -185,7 +185,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Extract Go version from go.mod
         run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
@@ -256,7 +256,7 @@ jobs:
       # fetch-depth: 0, because the step below diffs against the base. The
       # default shallow checkout has no merge base to diff from.
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
