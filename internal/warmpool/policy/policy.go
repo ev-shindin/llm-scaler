@@ -587,10 +587,23 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) str
 }
 
 // capacityOf is what the Pod these memberships belong to declares. Every
-// membership from one Pod carries the same value, so the first is enough.
+// membership from one Pod carries the same value, so the first informative one
+// is enough.
+//
+// The ACCELERATOR counts as informative, and leaving it out was a real defect.
+// The guard used to require a GPU count or a memory limit, so a Pod that
+// declared neither returned an empty capacity -- discarding an accelerator that
+// had been read from its node and was sitting right there on the membership.
+// The fit check then saw no accelerator, treated the model as portable, and
+// warmed it onto hardware its own affinity refuses.
+//
+// A real pool Pod always requests a GPU, which is what hid this: the rule worked
+// everywhere except on a Pod without one, and a Pod without one is exactly what
+// an emulated pool is. The e2e that exists to prove the accelerator rule was the
+// thing that could not.
 func capacityOf(resident []pool.Membership) pool.PodCapacity {
 	for _, m := range resident {
-		if m.Capacity.GPUs > 0 || m.Capacity.MemoryLimitBytes > 0 {
+		if m.Capacity.GPUs > 0 || m.Capacity.MemoryLimitBytes > 0 || m.Capacity.Accelerator != "" {
 			return m.Capacity
 		}
 	}

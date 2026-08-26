@@ -58,7 +58,7 @@ cluster-specific, and three fail in a way that looks like something else:
 | in | what to set | if you skip it |
 | --- | --- | --- |
 | `warmpool-networkpolicy.yaml` | the `>>> EDIT THIS <<<` `namespaceSelector` — the namespace WVA runs in | every read fails; the pool reports itself **empty** while holding accelerators |
-| `warmpool-scaledobject.yaml` | the `>>> EDIT THIS <<<` in `scalerAddress` | applies cleanly, KEDA creates the HPA, the address never resolves, the pool never resizes |
+| `warmpool-scaledobject.yaml` | the `>>> EDIT THIS <<<` in `scalerAddress` | applies cleanly, KEDA creates the HPA, the address never resolves, and WVA never learns the pool exists |
 | `warmpool-deployment.yaml` | the proxy `image` — build your own with `make docker-build-warmpool-proxy` | `ImagePullBackOff`; the shipped digest is a personal registry namespace |
 | `warmpool-deployment.yaml` | `runtimeClassName`, and the `claimName` of your model cache | admission fails outright; or the second replica sits Pending forever if the claim is not **ReadWriteMany** |
 
@@ -71,34 +71,54 @@ string, so nothing rejects it and nothing warns.
 kubectl apply -k config/warmpool -n <namespace>
 ```
 
-## Sizing
+## The pool is its ScaledObject
 
-Two numbers on the pool Deployment, and they have to agree:
+A warm pool is declared by a KEDA trigger, the same way every other thing WVA
+knows about is. `warmPoolName` is what makes it a pool; the Deployment beside it
+only supplies the Pods.
 
 ```yaml
-metadata:
-  annotations:
-    llm-d.ai/warm-pool-sleep-min-size: "1"   # the reserve
 spec:
-  replicas: 2                                 # must EXCEED the reserve
+  minReplicaCount: 2
+  maxReplicaCount: 6              # must EXCEED the reserve
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: wva-external-scaler.<wva-namespace>.svc.cluster.local:9090
+        warmPoolName: default     # must match the Deployment's llm-d.ai/warm-pool label
+        warmPoolSleepMinSize: "1" # the reserve
 ```
 
-`sleep-min-size` is the **reserve**: Pods kept free for the next spike. The pool
-may only warm models into what is left over, so:
+**Deleting this ScaledObject deletes the pool**, not just its elasticity. The
+Deployment goes on holding accelerators and WVA reports it as undeclared rather
+than using it. For a fixed-size pool set `minReplicaCount` and `maxReplicaCount`
+to the same number — do not delete the trigger.
 
-> **replicas must be greater than sleep-min-size.**
+## Sizing
+
+Two numbers, now in the same object, and they have to agree:
+
+`warmPoolSleepMinSize` is the **reserve**: Pods kept free for the next spike. The
+pool may only warm models into what is left over, so:
+
+> **maxReplicaCount must be greater than warmPoolSleepMinSize.**
 
 At equality there is nothing left over, so the pool warms nothing for its entire
-life while holding every accelerator it has. Nothing about this looks like an
+life while holding every accelerator it has. Nothing about it looks like an
 error, because nothing is wrong — the reserve is doing exactly what it was told.
-WVA reports it at startup rather than letting you find out from the bill.
+WVA reports it rather than letting you find out from the bill.
 
-Start with `replicas: 2`, `sleep-min-size: 1`, and raise replicas if you see
-borrows blocked.
+It is the **ceiling** that matters, not the pool's size right now: a pool
+momentarily at its reserve simply grows on the next pass, but a pool whose
+ceiling *is* its reserve can never grow past it. This is easiest to get wrong
+with a pinned pool, where `min == max` makes the ceiling the only number there is.
+
+Start with `maxReplicaCount: 6`, `warmPoolSleepMinSize: "1"`, and raise the
+ceiling if you see borrows blocked.
 
 ### How many models fit in one Pod
 
-A third number, and it lives in the pod template rather than in an annotation:
+A third number, and it lives in the pod template rather than in the trigger:
 
 ```yaml
 resources:
@@ -125,25 +145,30 @@ Two things follow:
   its own admission; it OOM-kills the launcher and takes **every model already
   resident in that Pod** with it. WVA will not admit against a budget larger
   than the limit for exactly this reason.
-- Unlike the annotations, changing it **rolls the pool** — it is a pod-template
-  field, so every Pod restarts and every resident model is loaded again. Size it
-  at deploy time; the annotations are the things that are free to retune.
+- Unlike the trigger metadata, changing it **rolls the pool** — it is a
+  pod-template field, so every Pod restarts and every resident model is loaded
+  again. Size it at deploy time; the trigger keys are what is free to retune.
 
 Watch `memory.current`, not `anon`: a sleeper's anonymous memory barely moves,
 so anything watching `anon` reports it as costing nothing.
 
 ## Tuning
 
-Everything else is an annotation on the pool Deployment. They take effect on the
-next reconcile and do **not** restart Pods, so retuning a live pool costs
-nothing — which is why they are not in the pod template.
+Everything else is trigger metadata on the pool's ScaledObject. Edits take
+effect on the next reconcile and do **not** restart Pods, so retuning a live
+pool costs nothing.
 
-| annotation | does |
+| key | does |
 | --- | --- |
-| `llm-d.ai/warm-pool-sleep-min-size` | Pods held free for the next spike |
-| `llm-d.ai/warm-pool-max-hold` | how long a borrowed Pod may serve before it is returned regardless |
-| `llm-d.ai/warm-pool-preload-top` | warm this many of the busiest variants without waiting for a miss |
-| `llm-d.ai/warm-pool-gpu-memory-utilization` | how much of the card a warm copy claims |
+| `warmPoolSleepMinSize` | Pods held free for the next spike |
+| `warmPoolMaxHold` | how long a borrowed Pod may serve before it is returned regardless |
+| `warmPoolPreloadTop` | warm this many of the busiest variants without waiting for a miss |
+| `warmPoolGPUMemoryUtilization` | how much of the card a warm copy claims |
+
+A value that cannot be read refuses the **whole** pool rather than being
+skipped: these decide how many accelerators it holds, so applying some of them
+would leave you reading a number that is in force nowhere. WVA names the pool
+and the key.
 
 `max-hold` bounds the case where the ordinary replica never arrives, so a
 failing scale-up cannot turn your reserve into permanent capacity for one
@@ -158,6 +183,12 @@ What you do **not** configure here: how many accelerators a Pod holds and how
 much memory it may use. Both are read from the pool Pod's own spec, so they
 cannot disagree with it — but the memory limit is still a decision, and a
 load-bearing one. See [How many models fit in one Pod](#how-many-models-fit-in-one-pod).
+
+**Why the tuning is not on the Deployment.** A warm pool is a WVA concept that
+happens to have Pods, not a workload WVA happens to manage: nothing outside WVA
+reads one or creates one. Declaring it through a trigger keeps one rule with no
+exceptions — WVA manages what it is called about — and puts the reserve beside
+the ceiling it has to fit inside.
 
 ## More than one pool
 
@@ -187,8 +218,10 @@ Missing the **selector** is the one that bites quietly: two Deployments with
 identical selectors fight over one set of Pods, and neither's replica count
 means anything afterwards.
 
-A second pool that should resize itself needs its own ScaledObject too, with a
-matching `warmPoolName` and `scaleTargetRef`.
+Then give it its own ScaledObject — **this is what makes it a pool**, not an
+extra. Its `warmPoolName` must match the label above and its `scaleTargetRef`
+must name this Deployment. A copied Deployment with no trigger of its own holds
+accelerators that nothing will ever use, and WVA reports it as undeclared.
 
 Then each model says which pool it may borrow from, in its ScaledObject trigger
 metadata:
@@ -308,10 +341,16 @@ maxReplicaCount: 3
 ```
 
 KEDA accepts it, the HPA is created with min and max both 3, and the pool stays
-there whatever WVA publishes. This is the better way to pin a pool when KEDA is
-present, because the size still lives in the one object you already read to
-understand it. Deleting the ScaledObject also works and is the right answer on a
-cluster with no KEDA at all — the pool then stays at the Deployment's `replicas`.
+there whatever WVA publishes.
+
+This is the **only** way to pin a pool. Deleting the ScaledObject does not give
+you a fixed pool — it gives you no pool at all, because the trigger is what
+declares it. The Deployment keeps its accelerators and WVA reports it as
+undeclared.
+
+Watch the ceiling when you pin: with `min == max`, `maxReplicaCount` is the only
+number there is, so it must still exceed `warmPoolSleepMinSize` or the pool can
+never warm anything.
 
 A pinned pool never relieves its own blocked borrows: if `outcome="blocked"`
 appears, it will keep appearing until you raise the numbers. That is the trade
@@ -382,10 +421,14 @@ the pool warms it, so it does not spend a load on a one-off. Set `preload-top`
 to warm your busiest variants without waiting, or `warmPoolCopies: "1"` on the
 one model you cannot afford to miss.
 
-**The pool never resizes.** Check the pool ScaledObject exists, that its
-`scalerAddress` names the namespace WVA runs in, and that its `warmPoolName`
-matches the Deployment's `llm-d.ai/warm-pool` label. A pool with no ScaledObject
-stays exactly the size its Deployment says, which is not a fault.
+**The pool never resizes, or is never used at all.** Check its ScaledObject
+exists, that `scalerAddress` names the namespace WVA runs in, and that
+`warmPoolName` matches the Deployment's `llm-d.ai/warm-pool` label. Without a
+trigger there is no pool — WVA logs:
+
+```
+warm pool Deployments are holding accelerators but no ScaledObject declares them
+```
 
 **Two scale-ups of one model, only one bridged.** Automatic mode holds one warm
 copy per model. Set `warmPoolCopies` to the number of concurrent scale-ups you

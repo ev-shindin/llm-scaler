@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/test/e2e/fixtures"
 	testutils "github.com/llm-d/llm-d-workload-variant-autoscaler/test/utils"
 )
@@ -91,6 +92,28 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 		}, time.Duration(cfg.PodReadyTimeout)*time.Second, 5*time.Second).Should(Succeed())
 	}
 
+	// declarePool stands up a pool the way an operator now does: a Deployment for
+	// the Pods, and a ScaledObject whose trigger DECLARES it. Without the
+	// trigger there is no pool -- the Deployment just holds accelerators.
+	declarePool := func(name, poolName string, tuning map[string]string) {
+		GinkgoHelper()
+		spec := fixtures.WarmPoolSpec{
+			Name: name, Namespace: cfg.LLMDNamespace,
+			ProxyImage: cfg.WarmPoolProxyImage, PoolName: poolName, NodeName: poolNode,
+		}
+		Expect(fixtures.CreateWarmPool(ctx, k8sClient, spec)).To(Succeed())
+		DeferCleanup(func() { _ = fixtures.DeleteWarmPool(context.Background(), k8sClient, spec) })
+		waitForPoolPod(name)
+
+		Expect(fixtures.EnsureScaledObject(ctx, crClient, cfg.LLMDNamespace, name, name, name,
+			1, 6, cfg.MonitoringNS,
+			fixtures.WithWarmPoolTrigger(poolName, tuning),
+		)).To(Succeed())
+		DeferCleanup(func() {
+			_ = fixtures.DeleteScaledObject(context.Background(), crClient, cfg.LLMDNamespace, name)
+		})
+	}
+
 	BeforeAll(func() {
 		ctx = context.Background()
 		controller = fixtures.ControllerDeployment{Namespace: cfg.WVANamespace, Name: "wva-controller-manager"}
@@ -127,23 +150,15 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 		)
 
 		BeforeAll(func() {
-			By("Standing up a pool Pod on the labelled node")
+			By("Declaring a pool on the labelled node")
 			// Reserve ZERO, deliberately. A pool keeps its reserve free and
-			// admits only out of what is left, so the default reserve of one
-			// against one Pod is the inert pool -- it can never admit anything,
-			// and a decline that never happens is not evidence of anything. The
-			// controller says so out loud, which is how this was found:
-			//   "replicas=1 does not exceed the reserve of 1 ... budget is zero"
-			spec := fixtures.WarmPoolSpec{
-				Name: poolPod, Namespace: cfg.LLMDNamespace,
-				ProxyImage: cfg.WarmPoolProxyImage, NodeName: poolNode,
-				Annotations: map[string]string{
-					"llm-d.ai/warm-pool-sleep-min-size": "0",
-				},
-			}
-			Expect(fixtures.CreateWarmPool(ctx, k8sClient, spec)).To(Succeed())
-			DeferCleanup(func() { _ = fixtures.DeleteWarmPool(context.Background(), k8sClient, spec) })
-			waitForPoolPod(poolPod)
+			// admits only out of what is left, so the default reserve against a
+			// small ceiling is the inert pool -- it can never admit anything, and
+			// a decline that never happens is not evidence of anything. The
+			// controller says so out loud, which is how this was found.
+			declarePool(poolPod, "mismatch", map[string]string{
+				registry.WarmPoolSleepMinSizeKey: "0",
+			})
 
 			By("Creating a model pinned to a DIFFERENT accelerator")
 			Expect(fixtures.EnsureModelService(ctx, k8sClient, cfg.LLMDNamespace, modelSvc,
@@ -154,6 +169,18 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 			DeferCleanup(func() {
 				_ = fixtures.DeleteModelService(context.Background(), k8sClient, cfg.LLMDNamespace, modelSvc)
 			})
+
+			By("Confirming the fixture really pinned it to another accelerator")
+			// The spec's whole premise. Without this a mismatch that never
+			// existed would read as a mismatch correctly ignored, and the
+			// decline would appear to work while testing nothing.
+			Eventually(func(g Gomega) {
+				dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).
+					Get(ctx, variant, metav1.GetOptions{})
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(dep.Spec.Template.Spec.NodeSelector).
+					To(HaveKeyWithValue("nvidia.com/gpu.product", wantAccelerator))
+			}, 60*time.Second, 3*time.Second).Should(Succeed())
 
 			By("Registering it, which is what makes WVA aware of it at all")
 			Expect(fixtures.EnsureScaledObject(ctx, crClient, cfg.LLMDNamespace, scaler, variant, variant,
@@ -170,16 +197,17 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 			// NODE and the model's from its own pod template. That is what makes
 			// this worth an e2e -- a unit test supplies both, and cannot show
 			// that either one arrives.
-			Eventually(controllerSaid("accelerator="+heldAccelerator), 3*time.Minute, 5*time.Second).
-				Should(Succeed())
+			Eventually(controllerSaid(`"pool": "mismatch"`, "accelerator="+heldAccelerator),
+				3*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
 		It("does not warm a model it could never serve", func() {
 			// Deliberately NOT a log match on the word "declined": a line saying
 			// declined and a model loaded anyway are indistinguishable in a log.
-			// `resident` counts observed memberships, and an EMPTY Pod
-			// contributes one placeholder -- so one Pod holding nothing reads as
-			// resident=1, and anything above that means it was warmed.
+			// `resident` counts the models actually HELD, so zero is the direct
+			// statement that nothing was warmed. (It used to count memberships,
+			// where an empty Pod contributed a placeholder and this read
+			// resident=1 -- the assertion moved with the fix.)
 			//
 			// The pool has admission budget here (reserve 0), so this is the
 			// accelerator rule refusing it, not the reserve.
@@ -205,7 +233,7 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 				last := lastPoolState(logs)
 				g.Expect(last).To(ContainSubstring("variants=1"),
 					"the model must remain visible throughout: "+last)
-				g.Expect(last).To(ContainSubstring("resident=1"),
+				g.Expect(last).To(ContainSubstring("resident=0"),
 					"a model on the wrong accelerator must not be warmed: "+last)
 			}, 60*time.Second, 15*time.Second).Should(Succeed())
 
@@ -223,13 +251,7 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 	Context("when a namespace holds two named pools", func() {
 		BeforeAll(func() {
 			for _, name := range []string{poolA, poolB} {
-				spec := fixtures.WarmPoolSpec{
-					Name: name, Namespace: cfg.LLMDNamespace,
-					ProxyImage: cfg.WarmPoolProxyImage, PoolName: name, NodeName: poolNode,
-				}
-				Expect(fixtures.CreateWarmPool(ctx, k8sClient, spec)).To(Succeed())
-				DeferCleanup(func() { _ = fixtures.DeleteWarmPool(context.Background(), k8sClient, spec) })
-				waitForPoolPod(name)
+				declarePool(name, name, nil)
 			}
 		})
 

@@ -1370,3 +1370,36 @@ func TestMidBurstAPodHoldingWarmModelsIsLeftBorrowable(t *testing.T) {
 		}
 	}
 }
+
+func TestAPodWithNoDeclaredGPUStillReportsItsAccelerator(t *testing.T) {
+	// Found by an e2e that could not fail. capacityOf required a GPU count or a
+	// memory limit before it would return anything, so a Pod declaring neither
+	// discarded the accelerator read from its node -- and the fit check, seeing
+	// none, treated every model as portable and warmed one onto hardware its own
+	// affinity refuses.
+	//
+	// A real pool Pod always requests a GPU, which is what hid it. An emulated
+	// one does not, so the suite written to prove the accelerator rule was the
+	// one place it silently did not hold.
+	c := cfg()
+	c.PodMemoryBytes = 100 << 30
+	c.SleepMinSize = 0
+
+	emulated := resident("a", "", pool.Absent) // no GPUs, no memory limit
+	emulated.Capacity.Accelerator = "HELD"
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{emulated},
+		Variants: []VariantDemand{{
+			Model:  pool.ModelRef{Variant: "pinned", EngineOptions: smallModel, Accelerator: "WANTED"},
+			Parked: true,
+		}},
+		Now: now,
+	}, c)
+	if len(got.Admit) != 0 {
+		t.Fatalf("a Pod with no GPU request still knows what it sits on: %+v", got.Admit)
+	}
+	if len(got.Declined) != 1 || !strings.Contains(got.Declined[0].Reason, "HELD") {
+		t.Fatalf("and the decline must name it: %+v", got.Declined)
+	}
+}

@@ -2,6 +2,7 @@ package fixtures
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -122,7 +123,37 @@ const (
 	pendingModelIDKey       = "e2e.llm-d.ai/pending-model-id"
 	pendingVariantCostKey   = "e2e.llm-d.ai/pending-variant-cost"
 	pendingScalingPolicyKey = "e2e.llm-d.ai/pending-scaling-policy"
+	pendingWarmPoolKey      = "e2e.llm-d.ai/pending-warm-pool"
 )
+
+// WithWarmPoolTrigger makes this ScaledObject DECLARE a warm pool rather than
+// scale a model.
+//
+// A pool is declared by its trigger, so this is what brings one into existence
+// as far as WVA is concerned -- a pool Deployment with no such trigger holds
+// accelerators nothing will use. tuning carries the warmPool* keys; nil takes
+// the controller's defaults.
+//
+// Deliberately exclusive with WithWVATriggerMetadata: a trigger names a model or
+// a pool, never both, and ParsePoolMeta would reject the mixture anyway.
+func WithWarmPoolTrigger(poolName string, tuning map[string]string) ScaledObjectOption {
+	return func(so *kedav1alpha1.ScaledObject) {
+		if so.Annotations == nil {
+			so.Annotations = make(map[string]string)
+		}
+		payload := map[string]string{registry.WarmPoolNameKey: poolName}
+		for k, v := range tuning {
+			payload[k] = v
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			// A map[string]string cannot fail to marshal; panicking here would
+			// be noise in a fixture.
+			return
+		}
+		so.Annotations[pendingWarmPoolKey] = string(encoded)
+	}
+}
 
 // applyWVATriggerMetadata moves the stashed WVA configuration into every trigger.
 //
@@ -130,6 +161,25 @@ const (
 // scalerMetadata on every external-scaler call, and that call is what registers
 // the workload. The llm-d.ai/* annotations that used to carry this are gone.
 func applyWVATriggerMetadata(so *kedav1alpha1.ScaledObject) {
+	// A POOL trigger first: it carries no modelID, so the model path below
+	// would return early and leave the ScaledObject declaring nothing.
+	if raw, isPool := so.Annotations[pendingWarmPoolKey]; isPool {
+		delete(so.Annotations, pendingWarmPoolKey)
+		payload := map[string]string{}
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			return
+		}
+		for i := range so.Spec.Triggers {
+			if so.Spec.Triggers[i].Metadata == nil {
+				so.Spec.Triggers[i].Metadata = make(map[string]string)
+			}
+			for k, v := range payload {
+				so.Spec.Triggers[i].Metadata[k] = v
+			}
+		}
+		return
+	}
+
 	modelID, ok := so.Annotations[pendingModelIDKey]
 	if !ok {
 		return
