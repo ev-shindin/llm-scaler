@@ -206,7 +206,7 @@ size a pool must hold at once. `deploy/warmpool.sh sizing -n <namespace>` answer
 that against this cluster's actual nodes.
 
 Full reasoning, the configuration surface, and the removal path are in the [warm
-pool guide](../guides/warm-pool/README.md).
+pool guide](../guides/warm-pool/).
 
 ## Platform-specific guides
 

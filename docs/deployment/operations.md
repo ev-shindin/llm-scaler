@@ -359,7 +359,7 @@ The first of those ships here as the **warm pool**: Pods that hold an engine
 already loaded on a GPU, which a scaling model borrows instead of paying the
 load for. Whether a pool is worth it, and how many models one Pod can hold, are
 cluster questions rather than defaults — see the [warm pool
-guide](../guides/warm-pool/README.md), and run `deploy/warmpool.sh plan -n <ns>`
+guide](../guides/warm-pool/), and run `deploy/warmpool.sh plan -n <ns>`
 to see which of a namespace's models could share one.
 
 (An earlier revision of this section gave ~430 MB/s as the PVC's bandwidth. That

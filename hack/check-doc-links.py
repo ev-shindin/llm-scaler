@@ -84,9 +84,20 @@ def main():
     # Every tracked markdown file, not a hand-listed subset: test/e2e/README.md and
     # comparison/ both carried link problems that a docs-only glob never looked at.
     import subprocess
-    files = [ROOT / f for f in subprocess.run(
+    listing = subprocess.run(
         ["git", "ls-files", "*.md"], capture_output=True, text=True, cwd=ROOT
-    ).stdout.splitlines()]
+    )
+    files = [ROOT / f for f in listing.stdout.splitlines()]
+    # A checker that cannot find the files must not report success. `git ls-files`
+    # fails inside WSL for a Windows-created worktree -- .git holds a `C:/...`
+    # gitdir that WSL cannot resolve -- and the empty result read as
+    # "0 files checked, 0 broken", exit 0. Green, having checked nothing.
+    if not files:
+        print("ERROR: no tracked markdown files found, so nothing was checked.",
+              file=sys.stderr)
+        if listing.returncode != 0:
+            print("git ls-files failed: " + listing.stderr.strip(), file=sys.stderr)
+        return 1
     bad = 0
     for p in files:
         raw = p.read_text(encoding="utf-8")

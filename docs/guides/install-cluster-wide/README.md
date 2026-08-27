@@ -100,7 +100,7 @@ One entry per model server, applying nothing until you say so. `apply` takes
 owns rather than adding a second. Each entry also carries `minReplicas`,
 `maxReplicas` and `variantCost`; the file explains all of them in its own
 comments. There is an example in
-[Install WVA in a namespace](../install-in-namespace/README.md#3-register-the-workloads).
+[Install WVA in a namespace](../install-in-namespace/README.md#4-register-the-workloads).
 
 ## Verification
 
