@@ -152,6 +152,19 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 			dep, err := k8sClient.AppsV1().Deployments(cfg.LLMDNamespace).Get(ctx, modelDecodeDeployment, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(dep.Status.ReadyReplicas).To(BeNumerically("==", targetReplicas))
+			// TOTAL replicas as well, not just the ready ones. Status.Replicas
+			// counts Pods that are still TERMINATING, and the guard below reads
+			// that same field: scaling down from a larger fleet reaches
+			// ReadyReplicas==2 while the third Pod is still going away, so the
+			// guard sees 3 and reports adoption -- a staging failure for a
+			// condition that is merely mid-scale-down.
+			//
+			// Invisible when this spec runs alone, because the Deployment starts
+			// at one replica and there is nothing to terminate. It only appears
+			// after a spec that left the fleet larger, which is why it failed in
+			// the full suite and passed on its own.
+			g.Expect(dep.Status.Replicas).To(BeNumerically("==", targetReplicas),
+				"a Pod from an earlier scale-down is still terminating, and it counts here")
 		}, time.Duration(cfg.PodReadyTimeout)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
 			Should(Succeed())
 
