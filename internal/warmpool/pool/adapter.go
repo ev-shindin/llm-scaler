@@ -406,25 +406,50 @@ func (a *Adapter) warmGroup(ctx context.Context, leader *corev1.Pod, model Model
 		return err
 	}
 
-	leaderSup := a.newSupervisor(leader.Status.PodIP)
-	existing, err := leaderSup.List(ctx)
+	// EVERY rank is asked, not just the leader. A rollback that could not reach
+	// one Pod leaves the instance on some ranks and not others, and a group like
+	// that can never form -- so believing the leader alone would report
+	// "already resident" for an engine that will never serve, permanently.
+	existing, err := a.newSupervisor(leader.Status.PodIP).List(ctx)
 	if err != nil {
 		return fmt.Errorf("list instances in %s: %w", ref, err)
 	}
-	for _, inst := range existing {
-		if inst.ID != InstanceID(model) {
-			continue
+	holding, mismatched := 0, ""
+	for _, m := range members {
+		insts := existing
+		if m.Name != leader.Name {
+			if insts, err = a.newSupervisor(m.Status.PodIP).List(ctx); err != nil {
+				return fmt.Errorf("list instances in %s: %w", m.Name, err)
+			}
 		}
-		// Idempotent on the same engine, refused on a different one -- exactly
-		// as the single-Pod path. Only the leader is consulted: its rank is the
-		// one that serves, so a group whose leader holds this model already
-		// holds it.
-		if optionsWithoutRank(inst.Options) != optionsWithoutRank(model.EngineOptions) {
-			return fmt.Errorf(
-				"%s is resident in group %s with different options (%q); refusing to reuse it",
-				model.Variant, ref, inst.Options)
+		for _, inst := range insts {
+			if inst.ID != InstanceID(model) {
+				continue
+			}
+			holding++
+			// Idempotent on the same engine, refused on a different one --
+			// exactly as the single-Pod path.
+			if optionsWithoutRank(inst.Options) != optionsWithoutRank(model.EngineOptions) {
+				mismatched = inst.Options
+			}
+			break
 		}
-		return nil
+	}
+	switch {
+	case mismatched != "":
+		return fmt.Errorf(
+			"%s is resident in group %s with different options (%q); refusing to reuse it",
+			model.Variant, ref, mismatched)
+	case holding == len(members):
+		return nil // every rank has it: admission is idempotent
+	case holding > 0:
+		// Neither resident nor absent. Warming again would collide with the
+		// ranks that are already there, and leaving it holds their GPUs on an
+		// engine that cannot form -- so say so rather than pick one.
+		return fmt.Errorf(
+			"%s is on %d of %d ranks in group %s: the engine cannot form and the "+
+				"remainder cannot be added; evict it from the group first",
+			model.Variant, holding, len(members), ref)
 	}
 
 	port, err := freePort(existing)
