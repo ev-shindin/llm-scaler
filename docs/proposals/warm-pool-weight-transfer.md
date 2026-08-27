@@ -586,11 +586,22 @@ comparison move with the hardware.
 
 ## 5. Other transports, ranked by what they would actually buy
 
-1. **CUDA IPC (`ipc` backend), same node.** Shares GPU memory by handle rather
-   than copying. In principle a same-node replica could map an existing
-   replica's weights at near-zero cost. Attractive and delicate: the two then
-   share memory, so eviction and lifetime become coupled. Worth measuring before
-   it is designed.
+1. ~~**CUDA IPC (`ipc` backend), same node.**~~ **UNUSABLE on this image.**
+   `distributed/weight_transfer/ipc_engine.py:11` is `import ray`, and Ray is
+   absent from `vllm/vllm-openai:v0.26.0` -- the same absence that made the LWS
+   documentation's Ray path unavailable. Measured by asking the factory to build
+   each backend:
+
+   ```
+   nccl         USABLE
+   ipc          UNUSABLE: ModuleNotFoundError: No module named 'ray'
+   sparse_nccl  USABLE
+   ```
+
+   This matters because `ipc` is the obvious transport for a CO-RESIDENT fill --
+   two engines of one model on the same devices, which is the prefill/decode
+   case. That fill has to use NCCL instead, which is ray-free and measured at
+   13.1 GB/s same-host. The recommendation survives; the transport changes.
 2. **GPUDirect Storage, NVMe straight to GPU.** Bypasses the host bounce and the
    parse. NIXL supports GDS, but vLLM's weight loader does not use it, so this
    is upstream work, not configuration.
