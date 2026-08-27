@@ -190,7 +190,7 @@ cmd_create() {
 # a writable HOME, the probes, the volumes -- comes from the manifest that is
 # reviewed and deployed.
 pool_pod_spec() {
-  local memory="$1" indent="$2"
+  local memory="$1" indent="$2" role="${3:-leader}"
   local built
   # NOTE: this function runs inside $( ). log_error EXITS THE SUBSHELL ONLY, so
   # every failure here returns non-zero and the CALLER reports it. Getting that
@@ -218,6 +218,16 @@ pool_pod_spec() {
   if [ -n "$ACCELERATOR" ]; then
     expr="${expr}
       | .nodeSelector[\"nvidia.com/gpu.product\"] = env(WP_ACCELERATOR)"
+  fi
+  # A WORKER runs no proxy. The proxy is the Pod's traffic gate and reports Ready
+  # only while a model is awake behind it -- but a worker holds a rank and serves
+  # nobody, so its gate would never open, the Pod would never be Ready, and the
+  # controller would never count the group as complete. Measured on pokprod: with
+  # the proxy present both Pods sat at Ready=false and the pool reported pods=0
+  # while holding two GPUs.
+  if [ "$role" = "worker" ]; then
+    expr="${expr}
+      | .containers = [.containers[] | select(.name != \"proxy\")]"
   fi
 
   local out
@@ -267,6 +277,33 @@ spec:
         llm-d.ai/warm-pool: ${POOL_NAME}
     spec:
 ${spec}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: wva-warm-pool-${POOL_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  scaleTargetRef:
+    name: wva-warm-pool-${POOL_NAME}
+  minReplicaCount: ${POOL_REPLICAS}
+  maxReplicaCount: ${POOL_MAX}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 900
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
+        warmPoolName: ${POOL_NAME}
+        warmPoolSleepMinSize: "${RESERVE}"
 YAML
 }
 
@@ -284,14 +321,18 @@ cmd_sizing() {
 warmpool_group_manifest() {
   local memory="$1"
   local spec
-  spec="$(pool_pod_spec "$memory" "        ")" || log_error "the pool Pod could not be described, so nothing was applied"
-  # The worker template is the SAME Pod as the leader, and that is the design
-  # rather than a placeholder. Every Pod runs one supervisor and holds GPUs; what
+  spec="$(pool_pod_spec "$memory" "        " leader)" || log_error "the pool Pod could not be described, so nothing was applied"
+  local worker_spec
+  worker_spec="$(pool_pod_spec "$memory" "        " worker)" || log_error "the worker Pod could not be described, so nothing was applied"
+  # Leader and worker run the same supervisor and hold the same devices; what
   # makes a Pod rank 2 of an engine is the OPTIONS it is given when a model is
   # admitted, not anything baked into its template. WVA reads the rank from the
   # Pod's LeaderWorkerSet worker index and passes --node-rank, --master-addr and
   # --headless accordingly (see warmGroup), so a rank written here would be a
   # second, fixed answer to a question the controller already answers per model.
+  #
+  # The ONE difference is the proxy, which only the leader runs: it is the Pod's
+  # traffic gate, and a worker takes no traffic.
   cat <<YAML
 apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
@@ -324,7 +365,36 @@ ${spec}
           app.kubernetes.io/component: warm-pool
           llm-d.ai/warm-pool: ${POOL_NAME}
       spec:
-${spec}
+${worker_spec}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: wva-warm-pool-${POOL_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  scaleTargetRef:
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    name: wva-warm-pool-${POOL_NAME}
+  minReplicaCount: ${POOL_REPLICAS}
+  maxReplicaCount: ${POOL_MAX}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 900
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
+        warmPoolName: ${POOL_NAME}
+        warmPoolSleepMinSize: "${RESERVE}"
 YAML
 }
 
