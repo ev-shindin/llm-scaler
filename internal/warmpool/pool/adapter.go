@@ -330,6 +330,13 @@ func (a *Adapter) Warm(ctx context.Context, pod types.NamespacedName, model Mode
 	if err != nil {
 		return err
 	}
+	// An engine that spans Pods has a rank in each of them, and every rank has
+	// to be created or none of them should be. Split here rather than
+	// threading the group through the single-Pod path, which stays exactly as
+	// it was for the pools that use it.
+	if groupSizeOf(p) > 1 {
+		return a.warmGroup(ctx, p, model, tier)
+	}
 	sup := a.newSupervisor(p.Status.PodIP)
 
 	existing, err := sup.List(ctx)
@@ -383,6 +390,175 @@ func (a *Adapter) Warm(ctx context.Context, pod types.NamespacedName, model Mode
 			fmt.Errorf("sleep newly admitted %s in %s: %w", model.Variant, pod, err))
 	}
 	return nil
+}
+
+// warmGroup admits a model into a unit that spans Pods: one instance per rank,
+// created on every Pod of the group, then woken and slept through the leader.
+//
+// ALL OR NOTHING, and that is the whole difficulty. A rank that fails to start
+// leaves the others waiting on a process group that can never form, holding
+// their GPUs and answering nothing -- so any failure rolls every rank back.
+// This is the same reasoning as abandon() for a single Pod, applied to N.
+func (a *Adapter) warmGroup(ctx context.Context, leader *corev1.Pod, model ModelRef, tier Tier) error {
+	ref := types.NamespacedName{Namespace: leader.Namespace, Name: leader.Name}
+	members, err := a.groupMembers(ctx, leader)
+	if err != nil {
+		return err
+	}
+
+	leaderSup := a.newSupervisor(leader.Status.PodIP)
+	existing, err := leaderSup.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list instances in %s: %w", ref, err)
+	}
+	for _, inst := range existing {
+		if inst.ID != InstanceID(model) {
+			continue
+		}
+		// Idempotent on the same engine, refused on a different one -- exactly
+		// as the single-Pod path. Only the leader is consulted: its rank is the
+		// one that serves, so a group whose leader holds this model already
+		// holds it.
+		if optionsWithoutPort(inst.Options) != optionsWithoutPort(rankOptions(model.EngineOptions, 0, leader.Status.PodIP, portOf(inst.Options))) {
+			return fmt.Errorf(
+				"%s is resident in group %s with different options (%q); refusing to reuse it",
+				model.Variant, ref, inst.Options)
+		}
+		return nil
+	}
+
+	port, err := freePort(existing)
+	if err != nil {
+		return fmt.Errorf("%s: %w", ref, err)
+	}
+	master := leader.Status.PodIP
+
+	// Workers first, leader last. A headless rank waits for the rendezvous; the
+	// leader is the one that starts serving, so it should be the last thing
+	// added and the first thing missed if a worker did not come up.
+	created := make([]*corev1.Pod, 0, len(members))
+	rollback := func(cause error) error {
+		for _, p := range created {
+			// A context of its own: the one that failed is very likely why it
+			// failed, and a rollback on an expired deadline rolls nothing back.
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			if err := a.newSupervisor(p.Status.PodIP).Delete(cleanup, InstanceID(model)); err != nil {
+				log.FromContext(ctx).V(logging.DEFAULT).Info(
+					"could not roll back a rank of a failed group admission; it holds its GPU "+
+						"until the Pod is replaced",
+					"pod", p.Name, "variant", model.Variant, "err", err.Error())
+			}
+			cancel()
+		}
+		return cause
+	}
+
+	for rank := len(members) - 1; rank >= 0; rank-- {
+		p := members[rank]
+		spec := InstanceSpec{
+			Options: rankOptions(model.EngineOptions, rank, master, port),
+			EnvVars: map[string]string{"VLLM_SERVER_DEV_MODE": "1"},
+		}
+		if _, err := a.newSupervisor(p.Status.PodIP).Create(ctx, InstanceID(model), spec); err != nil {
+			return rollback(fmt.Errorf("create rank %d of %s in %s: %w", rank, model.Variant, p.Name, err))
+		}
+		created = append(created, p)
+	}
+
+	// Only rank 0 serves, so only rank 0 is waited on. A worker that never
+	// joined shows up here as a leader that never serves, which is the same
+	// failure and is caught by the same wait.
+	ep := Endpoint{PodIP: master, Port: port}
+	engine := a.newEngine(ep)
+	if err := engine.WaitServing(ctx); err != nil {
+		return rollback(fmt.Errorf("group %s never served %s: %w", ref, model.Variant, err))
+	}
+	// Measured on this cluster: a /sleep the LEADER receives releases the GPU of
+	// every rank, including ones on other machines. So the group sleeps through
+	// rank 0 exactly as a single Pod does.
+	if err := engine.Sleep(ctx, tier); err != nil {
+		return rollback(fmt.Errorf("sleep newly admitted %s in group %s: %w", model.Variant, ref, err))
+	}
+	return nil
+}
+
+// groupMembers returns every Pod of the leader's group, ordered by rank: the
+// leader first, then each worker by its LeaderWorkerSet worker index.
+//
+// Order is the rank order, and it is load-bearing rather than cosmetic: the
+// index a Pod sits at here becomes its --node-rank, and two ranks claiming the
+// same number is a process group that never forms.
+//
+// A Pod outside any group returns just itself, so callers need no special case.
+func (a *Adapter) groupMembers(ctx context.Context, leader *corev1.Pod) ([]*corev1.Pod, error) {
+	key := groupKeyOf(leader)
+	if key == "" || groupSizeOf(leader) < 2 {
+		return []*corev1.Pod{leader}, nil
+	}
+
+	var pods corev1.PodList
+	if err := a.client.List(ctx, &pods,
+		client.InNamespace(leader.Namespace),
+		client.MatchingLabels{
+			lwsv1.SetNameLabelKey:    leader.Labels[lwsv1.SetNameLabelKey],
+			lwsv1.GroupIndexLabelKey: leader.Labels[lwsv1.GroupIndexLabelKey],
+		},
+	); err != nil {
+		return nil, fmt.Errorf("list the group of %s: %w", leader.Name, err)
+	}
+
+	byRank := map[int]*corev1.Pod{}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		rank, err := strconv.Atoi(p.Labels[lwsv1.WorkerIndexLabelKey])
+		if err != nil {
+			return nil, fmt.Errorf("%s has no readable worker index: %w", p.Name, err)
+		}
+		if other, clash := byRank[rank]; clash {
+			return nil, fmt.Errorf("%s and %s both claim rank %d", other.Name, p.Name, rank)
+		}
+		byRank[rank] = p
+	}
+
+	size := groupSizeOf(leader)
+	out := make([]*corev1.Pod, 0, size)
+	for rank := 0; rank < size; rank++ {
+		p, ok := byRank[rank]
+		if !ok {
+			// ALL OR NOTHING. A group missing a rank cannot form a process
+			// group, so warming into it would leave an engine waiting forever
+			// on a rank that does not exist -- while the group holds every one
+			// of its GPUs.
+			return nil, fmt.Errorf("group %s is missing rank %d of %d", key, rank, size)
+		}
+		if p.Status.PodIP == "" {
+			return nil, fmt.Errorf("rank %d of group %s has no address yet", rank, key)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// rankOptions is the engine's own options plus the three flags that place it in
+// a multi-node process group.
+//
+// Measured on this cluster: vLLM defaults to the `mp` backend when --nnodes > 1
+// and REJECTS ray outright, so the ranks rendezvous at master-addr with no
+// cluster scheduler involved. A worker runs --headless because it serves no
+// API; only rank 0 does, and that is the Pod the pool lends.
+//
+// --nnodes is already in the model's options -- the demand filter keeps it,
+// because it is part of the engine's shape and the pool matches groups against
+// it. Only the position within the group is added here.
+func rankOptions(base string, rank int, master string, port int) string {
+	opts := fmt.Sprintf("%s --port %d --node-rank %d --master-addr %s", base, port, rank, master)
+	if rank > 0 {
+		opts += " --headless"
+	}
+	return opts
 }
 
 // abandon removes an instance whose admission did not finish, and returns the
@@ -508,8 +684,30 @@ func (a *Adapter) Evict(ctx context.Context, pod types.NamespacedName, model Mod
 	if err != nil {
 		return err
 	}
-	if err := a.newSupervisor(p.Status.PodIP).Delete(ctx, InstanceID(model)); err != nil {
-		return fmt.Errorf("evict %s from %s: %w", model.Variant, pod, err)
+	members, err := a.groupMembers(ctx, p)
+	if err != nil {
+		// A group that cannot be enumerated still has to lose its leader's
+		// rank: leaving everything behind holds every GPU in it. Fall back to
+		// the Pod that was asked for and say why the rest were spared.
+		log.FromContext(ctx).V(logging.DEFAULT).Info(
+			"could not enumerate the group to evict from it; removing only the Pod named. "+
+				"Ranks elsewhere keep their GPUs until their Pod is replaced",
+			"pod", pod.Name, "variant", model.Variant, "err", err.Error())
+		members = []*corev1.Pod{p}
+	}
+
+	// EVERY rank, and the failures are collected rather than returned at the
+	// first one. An instance removed from the leader alone leaves the workers
+	// holding their GPUs on an engine whose rank 0 is gone -- the exact leak
+	// this is here to prevent, arrived at by giving up halfway.
+	var failed []string
+	for _, m := range members {
+		if err := a.newSupervisor(m.Status.PodIP).Delete(ctx, InstanceID(model)); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", m.Name, err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("evict %s from %s: %s", model.Variant, pod, strings.Join(failed, "; "))
 	}
 	return nil
 }

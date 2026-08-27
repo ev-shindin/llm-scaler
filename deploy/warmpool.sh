@@ -148,12 +148,11 @@ cmd_create() {
   if [ "$GROUP_SIZE" -gt 1 ]; then
     log_info "Group pool: each warm unit is ${GROUP_SIZE} Pods x ${GPUS_PER_POD} GPU = $((GROUP_SIZE * GPUS_PER_POD)) devices"
     log_warning "A group serves ONLY models declaring --nnodes ${GROUP_SIZE}. A group's size is fixed when it is created -- an engine laid out across a different number of Pods is a different engine, and WVA declines it permanently."
-    log_warning "WARMING A GROUP IS NOT IMPLEMENTED YET. WVA counts a group as one"
-    log_warning "  lendable unit, but every actuation path addresses a single Pod: nothing"
-    log_warning "  starts the ranks on the workers. A model matching this group is DECLINED,"
-    log_warning "  with that reason, rather than half-started. This pool will hold its GPUs"
-    log_warning "  and warm nothing until group actuation exists -- create it only to test"
-    log_warning "  the counting, not to serve traffic."
+    log_info "Each Pod of a group runs the SAME image and the same supervisor. WVA"
+    log_info "  gives each rank its position when it admits a model -- --node-rank from"
+    log_info "  the Pod's LeaderWorkerSet worker index, --master-addr from the leader,"
+    log_info "  and --headless on everything but rank 0. Nothing here has to say it,"
+    log_info "  and a worker template that hard-coded a rank would fight the fan-out."
   fi
 
   local manifest
@@ -286,11 +285,13 @@ warmpool_group_manifest() {
   local memory="$1"
   local spec
   spec="$(pool_pod_spec "$memory" "        ")" || log_error "the pool Pod could not be described, so nothing was applied"
-  # The worker template is the SAME Pod as the leader, deliberately and for now.
-  # A worker ought to run its own rank of the engine, and nothing does that yet
-  # -- see the decline in policy.doesNotFit. Giving it the leader's shape keeps
-  # the group countable (which is what is tested) without inventing a rank
-  # protocol here that the controller does not implement.
+  # The worker template is the SAME Pod as the leader, and that is the design
+  # rather than a placeholder. Every Pod runs one supervisor and holds GPUs; what
+  # makes a Pod rank 2 of an engine is the OPTIONS it is given when a model is
+  # admitted, not anything baked into its template. WVA reads the rank from the
+  # Pod's LeaderWorkerSet worker index and passes --node-rank, --master-addr and
+  # --headless accordingly (see warmGroup), so a rank written here would be a
+  # second, fixed answer to a question the controller already answers per model.
   cat <<YAML
 apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
