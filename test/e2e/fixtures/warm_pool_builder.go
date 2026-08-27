@@ -245,6 +245,11 @@ type WarmPoolSpec struct {
 	// wants on a cluster with no devices -- the count the policy reads comes
 	// from this field, so a spec about capacity sets it and the rest do not.
 	GPUs int
+	// GroupSize is how many Pods make ONE warm unit. Zero or one builds the
+	// ordinary Deployment pool; two or more builds a LeaderWorkerSet, where the
+	// leader runs the supervisor and the workers only have to exist. See
+	// CreateWarmPoolGroup.
+	GroupSize int
 	// Annotations go on the DEPLOYMENT, where the pool's tuning lives.
 	Annotations map[string]string
 }

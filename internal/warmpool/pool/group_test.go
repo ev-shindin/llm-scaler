@@ -218,3 +218,40 @@ func TestGroupsAreCountedSeparately(t *testing.T) {
 		t.Errorf("group 1: got %d, want 1", counts["warm/1"])
 	}
 }
+
+// The LEADER of an idle pool group is deliberately NotReady, and it must still
+// count toward its group.
+//
+// The pool proxy runs on the leader and reports Ready exactly when a model is
+// awake in the Pod -- that is how an idle Pod stays out of its InferencePool.
+// So an EMPTY pool leader, which is the only kind the controller has anything to
+// warm into, is NotReady by design.
+//
+// Counting readiness there deadlocked the group completely: the unit was never
+// offered, so nothing was ever warmed into it, so its leader never became Ready,
+// so it was never offered. A group warm pool could not be used at all. The
+// existing tests could not see it because they build every Pod Ready.
+func TestAnIdleLeaderStillCountsTowardItsGroup(t *testing.T) {
+	pods := []corev1.Pod{
+		groupPod("warm-0", 0, 2, 8, false), // leader: Running, NotReady -- no model awake
+		groupPod("warm-0-1", 1, 2, 8, true),
+	}
+
+	if got := readyGroupMembers(pods)["warm/0"]; got != 2 {
+		t.Errorf("idle leader counted %d of the group, want 2: a NotReady leader is an "+
+			"empty pool Pod, not a broken rank", got)
+	}
+}
+
+// A worker, though, is a rank and nothing else. Its readiness carries no traffic
+// meaning, so it remains the signal that the rank has joined.
+func TestANotReadyWorkerStillBreaksItsGroup(t *testing.T) {
+	pods := []corev1.Pod{
+		groupPod("warm-0", 0, 2, 8, false),
+		groupPod("warm-0-1", 1, 2, 8, false), // worker not Ready: rank has not joined
+	}
+
+	if got := readyGroupMembers(pods)["warm/0"]; got != 1 {
+		t.Errorf("group counted %d, want 1: a worker that is not Ready has no rank", got)
+	}
+}

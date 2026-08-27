@@ -265,17 +265,34 @@ func groupKeyOf(p *corev1.Pod) string {
 	return set + "/" + idx
 }
 
-// readyGroupMembers counts the Pods of each group that are Running and Ready.
+// readyGroupMembers counts the Pods of each group whose rank has joined.
 //
-// Ready rather than merely Running: a worker whose container has not started has
-// no rank in the engine's process group, and a leader that reports its engine
-// before every rank has joined would offer a warm unit that cannot serve.
+// A WORKER counts when it is Ready: a worker whose container has not started has
+// no rank in the engine's process group, and offering the unit would offer an
+// engine that cannot form.
+//
+// A LEADER counts when it is merely Running, and this asymmetry is load-bearing.
+// The leader carries the pool proxy, whose readiness is a TRAFFIC signal: it
+// reports Ready exactly when a model is awake in the Pod, which is how an idle
+// Pod is kept out of its InferencePool. So an idle pool leader is deliberately
+// NotReady -- and idle is the only state in which the controller has anything to
+// warm into it.
+//
+// Requiring Ready here deadlocked the group outright: not offered, so never
+// warmed, so never Ready, so never offered. A group pool could not be used at
+// all. Whether the leader can actually be TALKED to is a separate question, and
+// membershipsIn answers it by asking rather than by reading a condition that
+// means something else.
 func readyGroupMembers(pods []corev1.Pod) map[string]int {
 	counts := map[string]int{}
 	for i := range pods {
 		p := &pods[i]
 		key := groupKeyOf(p)
 		if key == "" || p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if !isLWSWorker(p) {
+			counts[key]++
 			continue
 		}
 		for _, c := range p.Status.Conditions {

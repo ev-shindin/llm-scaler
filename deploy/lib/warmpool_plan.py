@@ -159,6 +159,16 @@ def emit_plan_block(rows):
         if accelerator == "unknown":
             print("  # No accelerator declared on these, so no pool is suggested for")
             print("  # them: a pool that cannot name its GPU cannot prove a model fits.")
+            print("  #")
+            print("  # This is the COMMON case, not a strange one -- llm-d's modelservice")
+            print("  # chart requests a GPU without naming a product, so most real")
+            print("  # namespaces land here. It is a missing input, not a verdict against")
+            print("  # warming these models.")
+            print("  #")
+            print("  # To warm them, either give the model servers a nodeSelector on")
+            print("  # nvidia.com/gpu.product, or add an entry here by hand with the")
+            print("  # accelerator filled in. `kubectl get nodes -L nvidia.com/gpu.product`")
+            print("  # lists what this cluster has.")
             continue
         # Comments aligned to a fixed column so the file reads as a table. The
         # name and accelerator vary in length, so this cannot be done by hand.
@@ -297,8 +307,17 @@ def main():
             print("    Pool '%s' already exists -- point these at it with  warmPool: %s" % (name, name))
         elif accelerator == "unknown":
             print(
-                "    Accelerator undeclared, so no pool is suggested: a pool that cannot "
-                "name its GPU cannot prove a model fits it."
+                "    Accelerator undeclared, so no pool is suggested: a pool that cannot\n"
+                "    name its GPU cannot prove a model fits it. This is the COMMON case --\n"
+                "    llm-d's modelservice chart requests a GPU without naming a product --\n"
+                "    so it is a missing input, not a verdict against warming these models.\n"
+                "    Either pin the models to one product with a nodeSelector on\n"
+                "    nvidia.com/gpu.product, or name it yourself:\n"
+                "      deploy/warmpool.sh create -n %s --name <pool> --gpus %d \\\n"
+                "        --accelerator <product> --models 4 --model-size 8B \\\n"
+                "        --proxy-image REF --wva-namespace NS\n"
+                "    `kubectl get nodes -L nvidia.com/gpu.product` lists what this cluster has."
+                % (namespace, gpus)
             )
         else:
             print("    Suggested:")
