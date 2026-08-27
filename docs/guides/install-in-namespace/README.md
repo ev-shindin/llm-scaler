@@ -313,8 +313,16 @@ a scale-up serves while its own replica is still starting. It costs held
 accelerators, so it is worth it only where that load time actually costs
 something.
 
-This is a different plan from `wva-plan.yaml` above: that one registers
-workloads for scaling, and knows nothing about pools.
+`wva-plan.yaml` above already carries a `warmPools:` section suggesting this,
+grouped from the workloads it found, with every entry `apply: "no"` — so if you
+have applied that plan you have already seen the suggestion, and turning one
+entry to `"yes"` creates the pool on the next `scaledobjects-apply`. That path
+needs `WARMPOOL_PROXY_IMG` set, since the pool Pod runs an image this repo
+builds.
+
+The standalone command below answers the same question for a namespace that is
+already running, where the ScaledObjects exist and their triggers are the better
+evidence.
 
 <!-- guide:warmpool.plan start -->
 ```bash

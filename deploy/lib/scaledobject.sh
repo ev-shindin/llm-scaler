@@ -106,6 +106,12 @@ so_plan_preamble() {
 #   inferencePool  the EPP queue this workload sits behind, resolved by matching
 #                  pod labels against each pool's selector — the same way WVA
 #                  resolves it. "(none)" means no pool selects these pods.
+#
+# After the plan entries there is a second section, `warmPools:`. It groups the
+# workloads above by what a warm pool would have to provide and suggests one per
+# group; applying an entry there creates that pool. Everything in it is written
+# `apply: "no"`, because a pool holds its accelerators from the moment it exists.
+# Each field carries its own comment. Nothing is created unless you say yes.
 EOF
 }
 
@@ -163,6 +169,11 @@ so_plan_entry() {
     # so changing one cannot change what happens behind the reader's back.
     [ -z "$existing" ] || printf '    # scaledObject: %s\n' "$existing"
     printf '    # inferencePool: %s\n' "${pool:-(none)}"
+    # Remember what was offered, so the warm-pool block can be grouped from the
+    # same workloads rather than re-discovering them. Appended to a FILE because
+    # every caller runs inside a `while read` loop, and a variable set there does
+    # not reliably survive back to so_discover.
+    [ -z "${SO_WARMPOOL_ROWS:-}" ] || printf '%s|%s|%s\n' "$ns" "$kind" "$name" >> "$SO_WARMPOOL_ROWS"
 }
 
 # so_plan_rows echoes one row per plan entry, fields separated by US (\037): the
@@ -1726,6 +1737,8 @@ so_discover() {
     local min max cost policy
     so_plan_preamble
     echo "plan:"
+    # Collected by so_plan_entry, consumed by so_warmpool_block at the end.
+    SO_WARMPOOL_ROWS=$(mktemp)
     for ns in $(so_target_namespaces); do
         for kind in Deployment LeaderWorkerSet; do
             local resource='deployments' pod="$SO_POD_PATH_DEPLOYMENT"
@@ -1885,6 +1898,33 @@ so_discover() {
         # model. They carry no serving marker, so the loop above cannot see them.
         so_discover_fma_requesters "$ns"
     done
+    so_warmpool_block
+}
+
+# so_warmpool_block appends the plan's `warmPools:` section: which of the
+# workloads just listed could SHARE a warm pool, and one suggestion per group.
+#
+# Grouped from the WORKLOADS, not from ScaledObjects, because at plan time the
+# ScaledObjects do not exist yet -- this file is what creates them. The
+# standalone `deploy/warmpool.sh plan` answers the same question for a namespace
+# already running, where the triggers are the better evidence.
+#
+# Never fatal. A namespace whose shapes cannot be read still gets a usable
+# ScaledObject plan, and losing that to a missing pool suggestion would be a bad
+# trade.
+so_warmpool_block() {
+    local rows="${SO_WARMPOOL_ROWS:-}"
+    SO_WARMPOOL_ROWS=""
+    [ -n "$rows" ] || return 0
+    if [ -s "$rows" ]; then
+        if ! python3 "$(dirname "${BASH_SOURCE[0]}")/warmpool_plan.py" \
+                --from-workloads < "$rows"; then
+            echo ""
+            echo "# Warm pools: could not be worked out, so none are suggested here."
+            echo "# Run: deploy/warmpool.sh plan -n <namespace>"
+        fi
+    fi
+    rm -f "$rows"
 }
 
 # so_discover_fma_requesters writes plan entries for FMA requester Deployments in
@@ -2133,6 +2173,11 @@ so_apply_plan() {
     done <<< "$rows"
     log_success "ScaledObjects: $created created, $adopted adopted, $skipped not applied"
 
+    # Warm pools next, and only after the ScaledObjects exist: a pool is useless
+    # until something can borrow from it, and creating one first would hold
+    # accelerators for a namespace that is not yet being scaled at all.
+    so_apply_warmpools "$file"
+
     # Non-zero, after the rest of the plan has been applied: an entry asking to be
     # created with no model is a mistake in the file, and a caller that scripts
     # this — the installer, CI — must not read "some of what you asked for" as
@@ -2143,6 +2188,68 @@ so_apply_plan() {
             log_error "1 entry asked to be applied with no modelID and was skipped. Fill in its modelID, or set apply: no."
         fi
         log_error "$unresolved entries asked to be applied with no modelID and were skipped. Fill in their modelID, or set apply: no."
+    fi
+}
+
+# so_apply_warmpools creates the pools a plan asks for. Absent section, absent
+# entries, or every entry `apply: no` all mean "no pools", which is the ordinary
+# case and says nothing.
+#
+# A pool holds its accelerators from the moment it exists, so this only ever acts
+# on an explicit yes. Everything the planner writes is "no".
+so_apply_warmpools() {
+    local file="$1" json rows made=0
+    json=$(yq -o=json '.' "$file" 2>/dev/null) || return 0
+    # `// empty` on the section, not on each field: a plan written before this
+    # existed has no warmPools key at all, and that is not a defect in it.
+    rows=$(printf '%s' "$json" | jq -r '
+        (.warmPools // [])[]
+        | select((.apply // "no" | tostring | ascii_downcase) as $a
+                 | $a == "yes" or $a == "true")
+        | [ (.namespace // ""), (.name // ""), (.accelerator // ""),
+            (.gpus // 1 | tostring), (.models // 4 | tostring),
+            (.modelSize // "8B" | tostring), (.replicas // 2 | tostring),
+            (.max // 6 | tostring), (.reserve // 1 | tostring) ]
+        | join("\u001f")' 2>/dev/null) || return 0
+    [ -n "$rows" ] || return 0
+
+    # The one value a plan cannot know: the pool proxy is an image somebody built
+    # and pushed. WARMPOOL_PROXY_IMG is the same variable the Makefile builds it
+    # under, so the common case needs no extra input.
+    local image="${WARMPOOL_PROXY_IMG:-}"
+    if [ -z "$image" ]; then
+        log_warning "Warm pools were requested, but no proxy image is set, so none were created."
+        log_warning "  The pool Pod runs an image this repo builds:"
+        log_warning "    make docker-build-warmpool-proxy docker-push-warmpool-proxy"
+        log_warning "  Then re-apply with WARMPOOL_PROXY_IMG=<ref>."
+        return 0
+    fi
+
+    local wp_ns wp_name wp_acc wp_gpus wp_models wp_size wp_replicas wp_max wp_reserve
+    while IFS=$'\037' read -r wp_ns wp_name wp_acc wp_gpus wp_models wp_size wp_replicas wp_max wp_reserve; do
+        [ -n "$wp_name" ] || continue
+        # An accelerator is not optional and must not be defaulted: a pool that
+        # cannot name its GPU cannot prove any model fits it, and one named for
+        # the wrong GPU is the silent mismatch the whole design exists to avoid.
+        if [ -z "$wp_acc" ]; then
+            log_warning "  warm pool $wp_name: no accelerator, so it was not created."
+            continue
+        fi
+        if bash "$(dirname "${BASH_SOURCE[0]}")/../warmpool.sh" create \
+                -n "$wp_ns" --name "$wp_name" --gpus "$wp_gpus" \
+                --accelerator "$wp_acc" --models "$wp_models" --model-size "$wp_size" \
+                --replicas "$wp_replicas" --max "$wp_max" --reserve "$wp_reserve" \
+                --proxy-image "$image" --wva-namespace "${WVA_NS:-$wp_ns}"; then
+            made=$((made + 1))
+        else
+            log_warning "  warm pool $wp_name: could not be created."
+        fi
+    done <<< "$rows"
+    [ "$made" -eq 0 ] || log_success "Warm pools: $made created"
+    if [ "$made" -gt 0 ]; then
+        log_info "  A pool holds its accelerators from now on, warm model in it or not."
+        log_info "  Point a model at it with the warmPool trigger key; remove it with:"
+        log_info "    deploy/warmpool.sh delete -n <ns> --name <pool>"
     fi
 }
 

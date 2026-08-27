@@ -19,18 +19,35 @@ import subprocess
 import sys
 
 GPU_RESOURCE = "nvidia.com/gpu"
+# Column the plan's inline comments start at, so the block reads as a table.
+COMMENT_COLUMN = 26
 GPU_PRODUCT = "nvidia.com/gpu.product"
 
 
-def shape_of(namespace, target):
+# Where each kind keeps the pod template WVA would read. Mirrors
+# SO_POD_PATH_DEPLOYMENT / SO_POD_PATH_LWS in scaledobject.sh; the leader is the
+# right template for an LWS, since that is the Pod holding rank 0.
+POD_PATH = {
+    "deployment": ("deployment", ["spec", "template", "spec"]),
+    "leaderworkerset": (
+        "leaderworkerset",
+        ["spec", "leaderWorkerTemplate", "leaderTemplate", "spec"],
+    ),
+}
+
+
+def shape_of(namespace, target, kind="Deployment"):
     """Return (accelerator, gpus-per-replica) for a scale target, or None.
 
-    None means "not a Deployment this tool can read" -- an LWS engine spans
-    Pods, and a pool Pod holds engines, so those cannot be warmed at all. That
-    is reported rather than guessed at.
+    None means the workload could not be read at all. A kind this tool does not
+    know is reported rather than guessed at, because guessing a shape wrong
+    sizes a pool that then cannot start the model it was built for.
     """
+    resource, path = POD_PATH.get(kind.lower(), (None, None))
+    if resource is None:
+        return None
     proc = subprocess.run(
-        ["kubectl", "get", "deployment", target, "-n", namespace, "-o", "json"],
+        ["kubectl", "get", resource, target, "-n", namespace, "-o", "json"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -39,7 +56,9 @@ def shape_of(namespace, target):
     )
     if proc.returncode != 0:
         return None
-    spec = json.loads(proc.stdout)["spec"]["template"]["spec"]
+    spec = json.loads(proc.stdout)
+    for key in path:
+        spec = (spec or {}).get(key) or {}
 
     # llm-d declares its accelerator through nodeAffinity, not nodeSelector, so
     # reading only the latter finds nothing on a real deployment. Read both, and
@@ -74,7 +93,128 @@ def suggested_name(accelerator, gpus):
     return "%s-%dgpu" % (short, gpus)
 
 
+def emit_plan_block(rows):
+    """Write a `warmPools:` section for the ScaledObject plan.
+
+    `rows` are "namespace|kind|name" lines -- the workloads the install plan just
+    found. It groups by what a pool must provide and suggests one per group.
+
+    This runs at INSTALL-plan time, when the ScaledObjects do not exist yet: the
+    plan is what creates them. So it groups by the WORKLOADS, where the
+    standalone `warmpool.sh plan` groups by ScaledObject triggers on a namespace
+    that is already running. Same question, different evidence.
+
+    Everything is written `apply: "no"`. A pool holds accelerators from the
+    moment it exists, so it is never the safe default, and the two values that
+    decide its memory budget are placeholders only the operator can set.
+    """
+    buckets = collections.defaultdict(list)
+    unreadable = []
+    for row in rows:
+        parts = row.strip().split("|")
+        if len(parts) != 3 or not parts[2]:
+            continue
+        namespace, kind, name = parts
+        shape = shape_of(namespace, name, kind)
+        if shape is None:
+            unreadable.append("%s/%s" % (kind, name))
+            continue
+        buckets[(namespace,) + shape].append("%s/%s" % (kind, name))
+
+    print("")
+    print("# Warm pools. Each group below is a set of workloads that could SHARE one")
+    print("# pool: they agree on the accelerator and on how many devices a replica")
+    print("# takes, the two things a warm copy cannot change.")
+    print("#")
+    print("# A pool holds engines already loaded on a GPU, so a scale-up serves while")
+    print("# its own replica is still loading. It holds those accelerators the whole")
+    print("# time, so it is worth it only where the load time costs something.")
+    print("#")
+    print("# apply: \"yes\" creates the pool when this plan is applied. Everything is")
+    print("# \"no\" until you say otherwise.")
+    print("#")
+    print("# models/modelSize are PLACEHOLDERS. Together they set the Pod memory")
+    print("# limit, which IS the warm-set budget -- and that budget must cover the")
+    print("# level-1 sleep charge, which appears the first time a model sleeps and is")
+    print("# never released. `deploy/warmpool.sh sizing --params <size>` answers what")
+    print("# this cluster can actually hold.")
+    print("#")
+    print("# Full guide, including how to remove a pool:")
+    print("#   docs/guides/warm-pool/README.md")
+    if unreadable:
+        print("#")
+        print("# Not shaped, so not offered: %s." % ", ".join(sorted(set(unreadable))))
+    print("warmPools:")
+
+    if not buckets:
+        print("  # Nothing to suggest: no workload here declares both an accelerator")
+        print("  # and a device count. A pool that cannot name its GPU cannot prove a")
+        print("  # model fits it.")
+        return 0
+
+    for (namespace, accelerator, gpus), members in sorted(buckets.items()):
+        print("")
+        for member in sorted(members):
+            print("  # serves: %s" % member)
+        if accelerator == "unknown":
+            print("  # No accelerator declared on these, so no pool is suggested for")
+            print("  # them: a pool that cannot name its GPU cannot prove a model fits.")
+            continue
+        # Comments aligned to a fixed column so the file reads as a table. The
+        # name and accelerator vary in length, so this cannot be done by hand.
+        first = True
+
+        def field(text, *comment):
+            nonlocal first
+            lead = "  - " if first else "    "
+            first = False
+            body = lead + text
+            # At LEAST one space before the #, whatever the column. Without it a
+            # value longer than the column runs straight into the comment and
+            # YAML reads the whole line as the value: an accelerator called
+            # NVIDIA-H200-141GB came back as "NVIDIA-H200-141GB# nvidia.com/..."
+            # and would have built a pool that could never schedule.
+            width = max(COMMENT_COLUMN, len(body) + 1)
+            print("%-*s# %s" % (width, body, comment[0]))
+            for extra in comment[1:]:
+                print("%-*s# %s" % (width, "", extra))
+
+        field('apply: "no"', 'yes | no -- "yes" creates this pool on apply')
+        field("namespace: %s" % namespace,
+              "where the pool Pods run: with the models they serve")
+        field("name: %s" % suggested_name(accelerator, gpus),
+              "the pool's name; a model selects it with warmPool: <name>")
+        field("accelerator: %s" % accelerator,
+              "nvidia.com/gpu.product these Pods must land on. A pool",
+              "named for one GPU that schedules on another is the",
+              "silent mismatch this whole design exists to avoid.")
+        field("gpus: %d" % gpus,
+              "GPUs per Pod. Must match what one replica takes, or",
+              "the model cannot start in a pool Pod at all.")
+        field("models: 4",
+              "how many models one Pod must hold at once")
+        field("modelSize: 8B",
+              "the largest of them. With models:, these two COMPUTE",
+              "the Pod memory limit -- the warm-set budget.")
+        field("replicas: 2",
+              "Pods to start, and the floor KEDA holds. Each one holds",
+              "its GPUs from creation, warm model in it or not.")
+        field("max: 6",
+              "ceiling KEDA may grow the pool to. MUST exceed reserve,",
+              "or the admission budget is zero forever.")
+        field("reserve: 1",
+              "Pods kept free for the next borrow. Admission draws on",
+              "free-minus-reserve, so this is held back, not used.")
+    return 0
+
+
 def main():
+    # Two callers, two kinds of evidence. --from-workloads is the install plan,
+    # which has workload rows and no ScaledObjects yet; the default is the
+    # standalone command, which reads a running namespace's ScaledObjects.
+    if sys.argv[1] == "--from-workloads":
+        return emit_plan_block(sys.stdin.read().splitlines())
+
     namespace = sys.argv[1]
     document = json.load(sys.stdin)
 
