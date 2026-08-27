@@ -66,6 +66,57 @@ curl -sX POST localhost:8000/collective_rpc -H 'Content-Type: application/json' 
   -d '{"method":"__budget","kwargs":{"max_num_batched_tokens":2048,"max_num_seqs":16}}'
 ```
 
+## The init-only knobs the swap does NOT cover
+
+`max_num_seqs` is not only a count: it bounds CUDA-graph capture.
+
+```python
+max_graph_size = min(max_num_seqs * 2, 512)      # config/vllm.py
+```
+
+So graphs exist only up to twice the LAUNCH value. Lowering is safe (the sizes
+you need are a subset); raising past launch would silently drop batches into
+eager execution, which the bound already refuses.
+
+Three knobs carry behaviour and are init-only, so a budget swap does not reach
+them:
+
+| knob | why it matters |
+| --- | --- |
+| `enforce_eager` | all-or-nothing at init. An engine launched eager can NEVER become an efficient decode engine -- graphs cannot be captured later |
+| `max_num_partial_prefills` | how many long prefills run concurrently |
+| `enable_chunked_prefill` / `long_prefill_token_threshold` | shape how prefill is admitted |
+
+**So launch at the UNION of both roles**: `max_num_batched_tokens` from prefill
+(larger), `max_num_seqs` from decode (larger), graphs on if either role wants
+them. The engine is then a superset of both, and the swap moves the budget
+inside that envelope.
+
+## Does the swap actually change behaviour?
+
+Decode-shaped load (16 concurrent, 128 output tokens) does NOT discriminate --
+a purpose-built decode engine, the union engine, and the union engine swapped
+down all sit at 2200-2300 tok/s. The budget never binds at that shape.
+
+Prefill-shaped load does, measured A/B/A/B with a unique prefix per run:
+
+| budget | prefill tok/s | p50 latency |
+| --- | --- | --- |
+| decode 2048 | 38222 / 38011 | **0.68 s** |
+| prefill 8192 | 38987 / 39114 | **0.76 s** |
+
+Throughput is flat; p50 moves consistently and reversibly. A smaller budget
+chunks more finely, so concurrent prompts interleave and finish more evenly.
+The setting is honoured.
+
+### A trap that nearly produced a fake result
+
+The first attempt reused one prompt across runs and showed 205k -> 333k tok/s,
+which read as a large budget effect. It was **prefix caching**: runs after the
+first hit cached KV and did almost no prefill. The giveaway was the control --
+returning to the original budget stayed fast instead of slowing down. Every run
+now leads with a unique nonce.
+
 ## What this does NOT show
 
 One model, one GPU, TP=1, and no actual P/D traffic -- no NixlConnector, no
