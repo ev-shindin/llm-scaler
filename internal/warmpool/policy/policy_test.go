@@ -1454,3 +1454,102 @@ func TestAPermanentDeclineIsToldApartFromAFullPod(t *testing.T) {
 		t.Fatalf("a full Pod resolves when something is evicted; it is not permanent: %+v", got.Declined[0])
 	}
 }
+
+// asGroup makes a membership describe a multi-Pod warm unit.
+func asGroup(m pool.Membership, pods, gpusPerPod int) pool.Membership {
+	m.Capacity.PodsPerGroup = pods
+	m.Capacity.GPUs = pods * gpusPerPod
+	return m
+}
+
+// A group is created with a fixed size and cannot be resized -- `size` is the
+// engine's shape, not a scaling knob. So an engine whose ranks are laid out
+// across a different number of Pods cannot start here even when the device
+// totals agree exactly.
+func TestAModelSpanningADifferentNumberOfPodsIsDeclined(t *testing.T) {
+	c := cfg()
+	c.PodMemoryBytes = 400 << 30
+	c.SleepMinSize = 0
+
+	// 16 devices over FOUR Pods, offered a group of TWO holding 8 each.
+	// Same sixteen GPUs, different engine.
+	across4 := VariantDemand{
+		Model: pool.ModelRef{
+			Namespace:     "workload",
+			Variant:       "wide",
+			EngineOptions: "--model Qwen/Qwen3-0.6B --tensor-parallel-size 16 --nnodes 4",
+		},
+		Parked: true,
+	}
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{asGroup(resident("leader", "", pool.Absent), 2, 8)},
+		Variants:    []VariantDemand{across4},
+		Now:         now,
+	}, c)
+
+	if len(got.Admit) != 0 {
+		t.Fatalf("a 4-Pod engine must not be admitted into a 2-Pod group: %+v", got.Admit)
+	}
+	if len(got.Declined) != 1 || !strings.Contains(got.Declined[0].Reason, "Pod") {
+		t.Fatalf("and the reason must name the layout: %+v", got.Declined)
+	}
+	if !got.Declined[0].Permanent {
+		t.Error("a group cannot be resized, so the decline is permanent")
+	}
+}
+
+// The positive half: the same engine fits the group built for its shape.
+func TestAModelIsAdmittedIntoAGroupOfItsOwnShape(t *testing.T) {
+	c := cfg()
+	c.PodMemoryBytes = 400 << 30
+	c.SleepMinSize = 0
+
+	across2 := VariantDemand{
+		Model: pool.ModelRef{
+			Namespace:     "workload",
+			Variant:       "wide",
+			EngineOptions: "--model Qwen/Qwen3-0.6B --tensor-parallel-size 16 --nnodes 2",
+		},
+		Parked: true,
+	}
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{asGroup(resident("leader", "", pool.Absent), 2, 8)},
+		Variants:    []VariantDemand{across2},
+		Now:         now,
+	}, c)
+
+	if len(got.Admit) != 1 {
+		t.Fatalf("a 2-Pod engine belongs in a 2-Pod group: admit=%+v declined=%+v",
+			got.Admit, got.Declined)
+	}
+}
+
+// A single-Pod engine has no business in a group either: it would occupy a warm
+// unit whose other Pods it cannot use, and the group was built for an engine
+// that spans them.
+func TestASinglePodModelIsDeclinedByAGroup(t *testing.T) {
+	c := cfg()
+	c.PodMemoryBytes = 400 << 30
+	c.SleepMinSize = 0
+
+	single := VariantDemand{
+		Model: pool.ModelRef{
+			Namespace:     "workload",
+			Variant:       "small",
+			EngineOptions: "--model Qwen/Qwen3-0.6B",
+		},
+		Parked: true,
+	}
+
+	got := Decide(Input{
+		Memberships: []pool.Membership{asGroup(resident("leader", "", pool.Absent), 2, 8)},
+		Variants:    []VariantDemand{single},
+		Now:         now,
+	}, c)
+
+	if len(got.Admit) != 0 {
+		t.Fatalf("a single-Pod engine must not take a group: %+v", got.Admit)
+	}
+}

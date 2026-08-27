@@ -564,6 +564,20 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) (re
 		return fmt.Sprintf("needs %d GPUs, this Pod holds %d", shape.GPUs, gpus), true
 	}
 
+	// How the devices are DIVIDED matters as much as how many there are. A group
+	// is created with a fixed size and cannot be resized -- `size` is the
+	// engine's shape, not a scaling knob -- so an engine wanting its ranks laid
+	// out across a different number of Pods cannot start here even when the GPU
+	// totals agree. Sixteen devices over two Pods and over four are the same
+	// count and different engines.
+	pods := capacity.PodsPerGroup
+	if pods < 1 {
+		pods = 1
+	}
+	if shape.Pods != pods {
+		return fmt.Sprintf("spans %d Pod(s), this warm unit is %d", shape.Pods, pods), true
+	}
+
 	// The right NUMBER of the wrong GPU is still the wrong GPU. A warm copy is
 	// only reusable on the accelerator it was loaded on, so a pool of one type
 	// cannot serve a model pinned to another: the bridge would place traffic on

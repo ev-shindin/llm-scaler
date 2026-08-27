@@ -227,3 +227,43 @@ func TestTheShapeMemoStaysBounded(t *testing.T) {
 		t.Fatalf("memo grew past its bound: %d", size)
 	}
 }
+
+// --nnodes is what tells the pool an engine spans Pods. vLLM requires it
+// whenever ranks live on more than one machine -- with nnodes > 1 it defaults to
+// the mp backend and rejects ray outright -- so the flag is present exactly when
+// the engine is multi-Pod.
+func TestShapeReadsHowManyPodsAnEngineSpans(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		options string
+		want    int
+	}{
+		{"no flag is a single Pod", "--model m --tensor-parallel-size 8", 1},
+		{"two nodes", "--model m --tensor-parallel-size 16 --nnodes 2", 2},
+		{"four nodes", "--model m --nnodes 4", 4},
+		{"nnodes 1 is still one Pod", "--model m --nnodes 1", 1},
+		{"garbage reads as one", "--model m --nnodes later", 1},
+		{"negative reads as one", "--model m --nnodes -3", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ShapeOf(tc.options).Pods; got != tc.want {
+				t.Errorf("Pods = %d, want %d for %q", got, tc.want, tc.options)
+			}
+		})
+	}
+}
+
+// GPUs and Pods are independent: the same device count laid out across a
+// different number of Pods is a different engine, and a group can only host the
+// shape it was built with.
+func TestGPUsAndPodsAreIndependent(t *testing.T) {
+	across2 := ShapeOf("--model m --tensor-parallel-size 16 --nnodes 2")
+	across4 := ShapeOf("--model m --tensor-parallel-size 16 --nnodes 4")
+
+	if across2.GPUs != across4.GPUs {
+		t.Fatalf("device counts should match: %d vs %d", across2.GPUs, across4.GPUs)
+	}
+	if across2.Pods == across4.Pods {
+		t.Errorf("Pod counts should differ, both are %d", across2.Pods)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	lwsv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
@@ -117,12 +118,30 @@ func (a *Adapter) ListWarm(ctx context.Context) ([]Membership, error) {
 		return nil, fmt.Errorf("list pool pods: %w", err)
 	}
 
+	// Group membership is decided before anything is asked of a supervisor,
+	// because it decides WHICH Pods to ask.
+	ready := readyGroupMembers(pods.Items)
+
 	var out []Membership
 	addressable, unreadable := 0, 0
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Status.PodIP == "" || p.DeletionTimestamp != nil {
 			continue // not addressable, or on its way out
+		}
+		if isLWSWorker(p) {
+			// Only the leader runs the supervisor and serves the API. A worker
+			// is part of the warm unit the leader speaks for, never a unit of
+			// its own.
+			continue
+		}
+		if size := groupSizeOf(p); size > 1 && ready[groupKeyOf(p)] < size {
+			// ALL OR NOTHING. A group missing a Pod is not a degraded engine,
+			// it is no engine: the ranks cannot form, so nothing in it can be
+			// woken or lent. Dropping it from the observation is the same
+			// treatment an unreadable Pod gets, and for the same reason -- the
+			// next pass looks again.
+			continue
 		}
 		addressable++
 		found, err := a.membershipsIn(ctx, p)
@@ -233,6 +252,40 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 		})
 	}
 	return out, nil
+}
+
+// groupKeyOf identifies the group a Pod belongs to. Empty for a Pod that is not
+// in one.
+func groupKeyOf(p *corev1.Pod) string {
+	set, hasSet := p.Labels[lwsv1.SetNameLabelKey]
+	idx, hasIdx := p.Labels[lwsv1.GroupIndexLabelKey]
+	if !hasSet || !hasIdx {
+		return ""
+	}
+	return set + "/" + idx
+}
+
+// readyGroupMembers counts the Pods of each group that are Running and Ready.
+//
+// Ready rather than merely Running: a worker whose container has not started has
+// no rank in the engine's process group, and a leader that reports its engine
+// before every rank has joined would offer a warm unit that cannot serve.
+func readyGroupMembers(pods []corev1.Pod) map[string]int {
+	counts := map[string]int{}
+	for i := range pods {
+		p := &pods[i]
+		key := groupKeyOf(p)
+		if key == "" || p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+				counts[key]++
+				break
+			}
+		}
+	}
+	return counts
 }
 
 // stateOf asks the engine what it is. A Pod label would be cheaper and wrong: it
@@ -450,8 +503,43 @@ func (a *Adapter) Evict(ctx context.Context, pod types.NamespacedName, model Mod
 // a small limit of its own that has nothing to do with how many models can
 // sleep here, and summing the two would overstate the budget by exactly that
 // much.
+// groupSizeOf reports how many Pods this Pod's warm unit spans.
+//
+// LeaderWorkerSet stamps the size onto every Pod in a group, so a leader can
+// answer for its whole group without reading the LeaderWorkerSet object. That
+// matters: the alternative is an API read per Pod per pass, on the hot path, for
+// a number that cannot change while the group exists.
+//
+// 1 for anything that is not part of a group, which is every ordinary pool Pod.
+func groupSizeOf(p *corev1.Pod) int {
+	raw, ok := p.Annotations[lwsv1.SizeAnnotationKey]
+	if !ok {
+		return 1
+	}
+	size, err := strconv.Atoi(raw)
+	if err != nil || size < 1 {
+		// A group whose size cannot be read is not a group we can size a model
+		// against. Treating it as 1 makes the fit check refuse anything larger,
+		// which is the safe direction: a wasted decline, not a wasted load.
+		return 1
+	}
+	return size
+}
+
+// isLWSWorker reports whether this Pod is a follower in a group.
+//
+// Only the leader runs the supervisor and serves the API, so only the leader is
+// a pool member. A worker counted as one would be a Pod the pool believes it can
+// lend, whose engine does not exist -- and a worker LABELLED into an
+// InferencePool takes traffic nothing will answer.
+func isLWSWorker(p *corev1.Pod) bool {
+	idx, ok := p.Labels[lwsv1.WorkerIndexLabelKey]
+	return ok && idx != "0"
+}
+
 func capacityOf(p *corev1.Pod) PodCapacity {
 	var capacity PodCapacity
+	capacity.PodsPerGroup = groupSizeOf(p)
 	for i := range p.Spec.Containers {
 		c := &p.Spec.Containers[i]
 		gpus, hasGPUs := c.Resources.Limits[gpuResource]
@@ -461,8 +549,15 @@ func capacityOf(p *corev1.Pod) PodCapacity {
 		if !hasGPUs {
 			continue // not the container running engines
 		}
-		capacity.GPUs = int(gpus.Value())
+		// GPUs is what the WARM UNIT holds, which for a group is every Pod in
+		// it. The leader's own spec describes one Pod; a model spanning the
+		// group is sized against all of them.
+		capacity.GPUs = int(gpus.Value()) * capacity.PodsPerGroup
 		if limit, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			// Memory stays PER POD. A level-1 sleeper's weights are charged to
+			// each member's own cgroup, so the budget that bounds the warm set
+			// is one Pod's limit -- multiplying it would admit a model that
+			// OOM-kills every member at once.
 			capacity.MemoryLimitBytes = limit.Value()
 		}
 		break

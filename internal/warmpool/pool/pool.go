@@ -133,7 +133,18 @@ type PodCapacity struct {
 	// could not be read -- which is the ordinary case for an install without
 	// cluster-scoped node access, not an error.
 	Accelerator string
+	// PodsPerGroup is how many Pods one warm unit spans: 1 for an ordinary pool
+	// Pod, and the LeaderWorkerSet's size for a pool of groups.
+	//
+	// Needed separately from GPUs because the two do not determine each other. A
+	// model wanting sixteen devices across two Pods and one wanting them across
+	// four are the same GPU count and different engines, and a group can only
+	// host the shape it was created with -- `size` is fixed when the group is.
+	PodsPerGroup int
 }
+
+// Group reports whether this capacity describes a multi-Pod warm unit.
+func (c PodCapacity) Group() bool { return c.PodsPerGroup > 1 }
 
 // Endpoint is an instance's address inside its Pod.
 type Endpoint struct {

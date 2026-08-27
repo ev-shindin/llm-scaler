@@ -16,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/go-logr/logr"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -108,13 +107,14 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 		// pipeline sizes multiply into the GPU count, and a pool whose Pods hold
 		// that many devices warms it like any other model. See
 		// config/warmpool-multi-gpu.
-		if entry.Target.Kind == constants.LeaderWorkerSetKind {
-			logger.V(logging.DEFAULT).Info(
-				"not warming this variant: its engine spans Pods, and a warm pool Pod holds engines. "+
-					"Parallelism within a single Pod is supported; across Pods is a different design",
-				"variant", entry.Name, "namespace", entry.Namespace, "kind", entry.Target.Kind)
-			continue
-		}
+		// An engine that spans Pods needs a pool of GROUPS, not of Pods. That
+		// is a real pool shape now, so this is no longer refused here -- the
+		// fit check decides, against a group's actual size, and says so per
+		// variant when it declines. Refusing at discovery could only repeat
+		// that judgement with less information.
+		//
+		// What the fit check needs is --nnodes in the engine options, which the
+		// flag list above keeps for exactly this reason.
 
 		var workload appsv1.Deployment
 		if err := d.Client.Get(ctx, target, &workload); err != nil {
@@ -412,6 +412,10 @@ var warmableFlags = map[string]bool{
 	"--data-parallel-size":       true,
 	"--data-parallel-size-local": true,
 	"--data-parallel-backend":    true,
+	// How many Pods the engine spans. Kept because it is what tells the pool a
+	// model needs a GROUP rather than a Pod -- and because an engine started
+	// without it, from options that had it, is a different engine.
+	"--nnodes": true,
 	// Expert parallelism does not ask for GPUs of its own -- it shards a
 	// mixture-of-experts model's experts across the ranks tensor and data
 	// parallelism already provide. It still has to be copied: a warm copy

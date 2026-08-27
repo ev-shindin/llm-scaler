@@ -42,6 +42,14 @@ type Shape struct {
 	// GPUs is how many devices the engine needs: the product of the
 	// parallelism sizes, and at least one.
 	GPUs int
+	// Pods is how many Pods the engine spans, from --nnodes. One for every
+	// engine that fits in a single Pod, which is all of them until an
+	// engine is deliberately spread across machines.
+	//
+	// Separate from GPUs because the two do not determine each other: sixteen
+	// devices over two Pods and over four are the same GPU count and different
+	// engines, and a warm group can only host the shape it was built with.
+	Pods int
 }
 
 // Known reports whether the memory estimate means anything.
@@ -125,7 +133,7 @@ func ShapeOf(options string) Shape {
 }
 
 func computeShape(options string) Shape {
-	shape := Shape{GPUs: parallelism(options)}
+	shape := Shape{GPUs: parallelism(options), Pods: nodeCount(options)}
 
 	params, ok := paramsOf(flagValue(options, "--model"))
 	if !ok {
@@ -208,6 +216,21 @@ func bytesPerParam(options string) int {
 // its own devices -- but note that a DP engine is several engine cores, and
 // whether sleeping and waking work across all of them is not something this has
 // been shown to do.
+// nodeCount is how many Pods the engine spans.
+//
+// vLLM takes it as --nnodes, and requires it whenever ranks live on more than
+// one machine: with nnodes > 1 it defaults to the mp backend and REJECTS ray
+// outright. So the flag is present exactly when the engine is multi-Pod, which
+// makes it the honest source for this and avoids inferring it from the shape of
+// the workload's Kubernetes object.
+func nodeCount(options string) int {
+	n, err := strconv.Atoi(flagValue(options, "--nnodes"))
+	if err != nil || n < 1 || n > math.MaxInt32 {
+		return 1
+	}
+	return n
+}
+
 func parallelism(options string) int {
 	gpus := 1
 	for _, flag := range []string{
