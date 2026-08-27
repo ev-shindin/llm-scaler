@@ -46,7 +46,7 @@ Two things follow for the numbers you get:
 - The launcher pool does not grow with the benchmark. It is a declared count per
   matching node, so load does not expand it.
 
-Both are explained in [Autoscale a Fast Model Actuation stack](../fma/).
+Both are explained in [the FMA post-mortem](../../proposals/fma-post-mortem.md).
 
 ## Installation Instructions
 
@@ -152,7 +152,7 @@ trusting any latency number; if the two disagree, see
 
 ## Next
 
-- [Autoscale a Fast Model Actuation stack](../fma/) — if the namespace runs FMA
+- [FMA post-mortem](../../proposals/fma-post-mortem.md) — if the namespace runs FMA
 - [After the install](../../deployment/operations.md) — what the metrics mean
 - [Configuration](../../deployment/configuration.md) — every installer variable
 
@@ -224,7 +224,8 @@ each because it happened.
   the existing object anyway.
 
 The FMA placement check that runs at the top of standup is described in
-[Autoscale a Fast Model Actuation stack](../fma/#placement-decides-warm-or-cold).
+[the FMA post-mortem](../../proposals/fma-post-mortem.md) — placement, not GPU
+alignment, is what decides warm or cold.
 
 **`BENCHMARK_HARNESS_RUN_AS_USER` is 0 because the harness writes to
 `/usr/local/bin` at startup.** llm-d-benchmark stopped forcing that UID in

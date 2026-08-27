@@ -219,7 +219,7 @@ Two things follow for anyone reading these numbers:
   on the grounds that ResourceQuota is the real boundary.
 
 Closing it needs FMA to make the occupancy visible; that is item 1 in
-[Requests to Fast Model Actuation](../proposals/fma-upstream-requests.md).
+[the FMA post-mortem](../proposals/fma-post-mortem.md).
 Operator-facing guidance is in
 [the GPU limiter guide](../deployment/gpu-limiter.md), "FMA namespaces".
 

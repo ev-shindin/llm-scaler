@@ -269,7 +269,8 @@ So: when planning capacity in an FMA namespace, subtract the warm pool by hand.
 Its ceiling is `launcherCount × maxInstances` per matching node, from the
 `LauncherPopulationPolicy` and `LauncherConfig`. `deploy/lib` warns at plan time
 when it detects launchers. The upstream request that would close this is item 1
-in [Requests to Fast Model Actuation](../proposals/fma-upstream-requests.md).
+in [the FMA post-mortem](../proposals/fma-post-mortem.md). Note that none of
+those requests were ever filed upstream.
 
 ## Checking
 

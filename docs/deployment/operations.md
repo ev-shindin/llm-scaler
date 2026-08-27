@@ -649,7 +649,7 @@ while the queue grows.
 
 The whole story — how attribution works, how to size `maxReplicas` from the
 launcher pool, why GPU accounting is a lower bound, and what to check — is in
-[WVA with Fast Model Actuation](../guides/fma/).
+[the FMA post-mortem](../proposals/fma-post-mortem.md).
 
 First stop for any of these:
 

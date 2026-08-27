@@ -195,7 +195,7 @@ not be read is written as `no` with the reason, and never created without one.
 > **Running Fast Model Actuation?** The plan can carry a second entry for the
 > same model — the FMA half — switched off by default, and an entry can arrive as
 > `apply: no` until the launcher pods are scraped. See
-> [WVA with Fast Model Actuation](../fma/).
+> [the FMA post-mortem](../../proposals/fma-post-mortem.md).
 
 ## Verification
 

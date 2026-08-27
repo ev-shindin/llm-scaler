@@ -30,8 +30,6 @@ Instructions → Verification → Cleanup → Configuration*. Index and conventi
 - **[Bound every WVA by real GPUs](guides/admin-gpu-bounding/)** — the GPU limiter
 - **[Test WVA against a full llm-d stack](guides/testing-with-llm-d/)**
 - **[Benchmark WVA](guides/benchmarking/)** — the supported benchmark path
-- **[Autoscale a Fast Model Actuation stack](guides/fma/)** — FMA namespaces:
-  scraping launchers, what the plan targets, sizing from the launcher pool
 
 ## Operations and reference
 
@@ -77,14 +75,14 @@ Instructions → Verification → Cleanup → Configuration*. Index and conventi
 ### Proposals
 
 Design notes for work that is not built yet, or built and still moving. See
-**[proposals/](proposals/)** for the full set; the FMA cluster is the largest:
+**[proposals/](proposals/)** for the full set:
 
-- **[Warm-pool design](proposals/fma-warm-pool-design.md)** — a shared pool of
-  GPU-holding Pods so capacity arrives in seconds instead of ~41 s
-- **[FMA-aware attribution](proposals/fma-aware-attribution.md)** — how WVA
-  measures an FMA variant whose engine runs in a Pod no ScaledObject owns
-- **[Requests to Fast Model Actuation](proposals/fma-upstream-requests.md)** —
-  findings and change requests for the FMA project
+- **[Fast model loading](proposals/fast-model-loading.md)** — the argument for
+  the warm pool that shipped, and **[the implementation
+  design](proposals/fast-model-loading-implementation.md)** for what was built
+- **[FMA post-mortem](proposals/fma-post-mortem.md)** — what Fast Model Actuation
+  was, what was measured, why it was dropped, and what of it is still load-bearing
+  here (the pool runs FMA's launcher)
 
 ## Developing
 
