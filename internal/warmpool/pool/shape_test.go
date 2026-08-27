@@ -109,8 +109,33 @@ func TestDataParallelismMultipliesTheHostCost(t *testing.T) {
 	if dp.HostBytes != 2*one.HostBytes {
 		t.Errorf("DP=2 costs %d, want twice the %d of one rank", dp.HostBytes, one.HostBytes)
 	}
-	if tp.HostBytes != one.HostBytes {
-		t.Errorf("TP=2 costs %d, want the same %d: it shards one copy", tp.HostBytes, one.HostBytes)
+	// TP shards the weights but NOT the processes: a second rank is a second
+	// engine process with its own CUDA context, measured at 3.16 -> 6.75 GiB
+	// awake on an H200. So TP=2 costs one extra overhead and no extra weights,
+	// which puts it strictly between one rank and a DP=2 pair.
+	if got, want := tp.HostBytes, one.HostBytes+sleeperOverheadBytes; got != want {
+		t.Errorf("TP=2 costs %d, want %d: one extra rank of overhead, no extra weights", got, want)
+	}
+	if tp.HostBytes >= dp.HostBytes {
+		t.Errorf("TP=2 (%d) must cost less than DP=2 (%d): it does not copy the weights",
+			tp.HostBytes, dp.HostBytes)
+	}
+}
+
+// A group spanning Pods splits its ranks across them, and memory is a per-Pod
+// limit -- so the overhead each Pod carries is its OWN ranks, not the engine's.
+// Charging all sixteen to each of two Pods would refuse a pool that fits.
+func TestAGroupChargesOverheadPerPodNotPerEngine(t *testing.T) {
+	onePod := ShapeOf("--model Qwen/Qwen3-8B --tensor-parallel-size 8")
+	twoPods := ShapeOf("--model Qwen/Qwen3-8B --tensor-parallel-size 8 --nnodes 2")
+
+	if twoPods.HostBytes >= onePod.HostBytes {
+		t.Errorf("TP=8 over 2 Pods charges %d per Pod, want less than the %d of one Pod",
+			twoPods.HostBytes, onePod.HostBytes)
+	}
+	if got, want := onePod.HostBytes-twoPods.HostBytes, int64(4)*sleeperOverheadBytes; got != want {
+		t.Errorf("difference is %d, want %d: four of the eight ranks moved to the other Pod",
+			got, want)
 	}
 }
 

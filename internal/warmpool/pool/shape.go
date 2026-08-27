@@ -62,8 +62,10 @@ func (s Shape) Known() bool { return s.HostBytes > 0 }
 // direction: too high declines an admission that would have fitted and costs a
 // cold start, too low kills the Pod.
 const (
-	// sleeperOverheadBytes is the part that does not scale: the engine process,
-	// its CUDA context, and the allocator's own structures.
+	// sleeperOverheadBytes is the part that does not scale WITH THE MODEL: the
+	// engine process, its CUDA context, and the allocator's own structures. It
+	// is charged once per RANK, because each rank is its own worker process --
+	// see the ranks term below.
 	sleeperOverheadBytes = 2609 << 20
 	// sleeperWeightFactorNum/Den is how much more than the weights a sleeper
 	// holds -- 1.4x, kept as a ratio so the arithmetic stays in integers.
@@ -141,7 +143,7 @@ func computeShape(options string) Shape {
 	}
 	weights := int64(params * float64(bytesPerParam(options)))
 
-	// DATA parallelism multiplies the host cost; tensor parallelism does not.
+	// DATA parallelism multiplies the WEIGHT cost; tensor parallelism does not.
 	// Measured: a DP=2 sleeper held twice the shmem of a TP=1 one, while a TP=2
 	// sleeper held about the same. Each DP rank is its own engine with its own
 	// copy of the weights, where TP shards one copy across devices.
@@ -150,7 +152,24 @@ func computeShape(options string) Shape {
 		copies = int64(dp)
 	}
 
-	shape.HostBytes = sleeperOverheadBytes*copies +
+	// The OVERHEAD, though, is per rank, and every form of parallelism adds
+	// ranks. Each one is a worker process with its own CUDA context, and they
+	// share the Pod's memory limit. Measured on an H200 with Qwen3-8B, awake:
+	//
+	//	TP=1   3.16 GiB     TP=2   6.75 GiB
+	//
+	// so the second rank cost as much as the first. Charging this once per
+	// ENGINE under-budgeted a TP=2 Pod by ~3.5 GiB and a single-Pod TP=8 by
+	// ~25 GiB, in the direction that OOM-kills the Pod.
+	//
+	// Ranks per POD, not per engine: memory is a container limit, so a group
+	// spanning --nnodes divides its ranks across that many Pods.
+	ranks := int64(shape.GPUs / shape.Pods)
+	if ranks < 1 {
+		ranks = 1
+	}
+
+	shape.HostBytes = sleeperOverheadBytes*ranks +
 		weights*copies*sleeperWeightFactorNum/sleeperWeightFactorDen
 	return shape
 }
