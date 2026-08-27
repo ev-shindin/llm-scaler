@@ -178,7 +178,14 @@ def recommend(node, params_b, dtype, kv_headroom, shared_bw, local_bw, ram_frac)
 
     # 2 + 3. can host RAM hold sleepers, and how many
     usable_ram = node["ram_gib"] * ram_frac
-    per_sleeper = SLEEPER_FIXED_GIB + SLEEPER_FACTOR * (per_node_weights_gb / 1.073741824)
+    # The fixed term is per RANK, not per model: each rank is a worker process
+    # with its own CUDA context, and every rank on this node shares its RAM.
+    # Measured on an H200 with Qwen3-8B awake, 3.16 GiB at TP=1 and 6.75 at
+    # TP=2. Must match shape.go and warmpool.sh, which admit and size against
+    # it -- three copies of one formula, and they have already drifted once.
+    ranks_here = max(1, tp // nodes_needed)
+    per_sleeper = (SLEEPER_FIXED_GIB * ranks_here
+                   + SLEEPER_FACTOR * (per_node_weights_gb / 1.073741824))
     by_ram = int(usable_ram // per_sleeper) if per_sleeper > 0 else 0
     fits = min(by_ram, MAX_INSTANCES_PER_POD)
     capped = by_ram > MAX_INSTANCES_PER_POD
@@ -353,8 +360,8 @@ def main():
     print("The warm-set budget is the POD's memory LIMIT, not the node's RAM: a Pod is\n"
           "admitted against its own limit, so these counts are what the hardware permits,\n"
           "not what a Pod will hold until you set that limit to match.\n")
-    print("Coefficients are MEASURED at 0.6B and extrapolated: a sleeper costs\n"
-          "%.1f GiB + %.1fx weights of host RAM, the fixed startup is ~%.0f s, and the\n"
+    print("Coefficients are MEASURED at 0.6B/8B and extrapolated: a sleeper costs\n"
+          "%.1f GiB PER RANK + %.1fx weights of host RAM, the fixed startup is ~%.0f s, and the\n"
           "load path runs ~%.1f GB/s per rank. Distrust these first if a prediction\n"
           "disagrees with the cluster." % (SLEEPER_FIXED_GIB, SLEEPER_FACTOR,
                                            FIXED_STARTUP_S, PARSE_RATE_GBPS))
