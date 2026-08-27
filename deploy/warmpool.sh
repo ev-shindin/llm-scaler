@@ -33,6 +33,9 @@ RESERVE=1
 MODELS=""
 MODEL_SIZE=""
 GPUS_PER_POD=1
+# The repo this script lives in: config/warmpool is read from it, so the pool
+# Pod is described in exactly one place.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACCELERATOR=""
 GROUP_SIZE=1
 PROXY_IMAGE=""
@@ -171,13 +174,74 @@ cmd_create() {
   log_warning "No NetworkPolicy is created here. The shipped one (config/warmpool) restricts the supervisor ports to WVA, and its namespaceSelector must name ${WVA_NAMESPACE}."
 }
 
+# pool_pod_spec prints the pool Pod's spec, DERIVED from config/warmpool rather
+# than written out again here.
+#
+# It was written out again here, and the two copies diverged completely: this
+# script emitted ONE container -- the proxy image under the name
+# inference-server -- with no command, no ports, no env and no supervisor. The
+# shipped manifest has two, the launcher serving the supervisor API on :8001 and
+# the proxy on :8000/:8002. Every pool this script created therefore held its
+# GPUs and answered nothing, and the controller reported it EMPTY: measured on
+# pokprod, where a pool formed correctly across two nodes and then reported
+# pods=0 while holding both.
+#
+# So there is one source now. The knobs below are the only things this script
+# decides; everything else -- the launcher image, the env that keeps caches off
+# a writable HOME, the probes, the volumes -- comes from the manifest that is
+# reviewed and deployed.
+pool_pod_spec() {
+  local memory="$1" indent="$2"
+  local built
+  # NOTE: this function runs inside $( ). log_error EXITS THE SUBSHELL ONLY, so
+  # every failure here returns non-zero and the CALLER reports it. Getting that
+  # wrong applied a Deployment with no containers at all, after printing the
+  # error that was supposed to have stopped it.
+  if ! built="$(kubectl kustomize "${REPO_ROOT}/config/warmpool" 2>&1)"; then
+    printf "could not build %s/config/warmpool: %s
+" "$REPO_ROOT" "$built" >&2
+    return 1
+  fi
+
+  # Every value this script decides, and nothing else. yq's env() reads the
+  # PROCESS environment, so each one is exported on the call rather than left as
+  # a shell variable -- unexported, they read as empty and the whole spec comes
+  # back without them.
+  local expr='select(.kind == "Deployment") | .spec.template.spec
+      | (.containers[] | select(.name == "inference-server") | .resources.limits["nvidia.com/gpu"]) = env(WP_GPUS)
+      | (.containers[] | select(.name == "inference-server") | .resources.requests["nvidia.com/gpu"]) = env(WP_GPUS)
+      | (.containers[] | select(.name == "inference-server") | .resources.limits.memory) = env(WP_MEMORY)
+      | (.containers[] | select(.name == "inference-server") | .resources.requests.memory) = env(WP_MEMORY)
+      | (.containers[] | select(.name == "proxy") | .image) = env(WP_PROXY_IMAGE)
+      | (.volumes[] | select(.name == "model-cache") | .persistentVolumeClaim.claimName) = env(WP_CACHE_CLAIM)'
+  # Only when one is named. An empty nodeSelector value would pin the Pod to a
+  # product called "" and it would never schedule.
+  if [ -n "$ACCELERATOR" ]; then
+    expr="${expr}
+      | .nodeSelector[\"nvidia.com/gpu.product\"] = env(WP_ACCELERATOR)"
+  fi
+
+  local out
+  if ! out="$(printf '%s' "$built" | WP_GPUS="$GPUS_PER_POD" WP_MEMORY="$memory" \
+      WP_PROXY_IMAGE="$PROXY_IMAGE" WP_CACHE_CLAIM="$CACHE_CLAIM" \
+      WP_ACCELERATOR="$ACCELERATOR" yq eval "$expr" - 2>&1)"; then
+    printf "could not shape the pool Pod spec: %s
+" "$out" >&2
+    return 1
+  fi
+  if [ -z "$out" ]; then
+    printf "the pool Pod spec came out empty; config/warmpool built nothing usable
+" >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | sed "s/^/${indent}/"
+}
+
+
 warmpool_manifest() {
   local memory="$1"
-  local node_selector=""
-  if [ -n "$ACCELERATOR" ]; then
-    node_selector="      nodeSelector:
-        nvidia.com/gpu.product: ${ACCELERATOR}"
-  fi
+  local spec
+  spec="$(pool_pod_spec "$memory" "      ")" || log_error "the pool Pod could not be described, so nothing was applied"
   cat <<YAML
 apiVersion: apps/v1
 kind: Deployment
@@ -203,52 +267,7 @@ spec:
         app.kubernetes.io/component: warm-pool
         llm-d.ai/warm-pool: ${POOL_NAME}
     spec:
-      automountServiceAccountToken: false
-${node_selector}
-      containers:
-        - name: inference-server
-          image: ${PROXY_IMAGE}
-          resources:
-            limits:
-              nvidia.com/gpu: "${GPUS_PER_POD}"
-              memory: ${memory}
-            requests:
-              nvidia.com/gpu: "${GPUS_PER_POD}"
-              memory: ${memory}
-          volumeMounts:
-            - name: model-storage
-              mountPath: /model-cache
-      volumes:
-        - name: model-storage
-          persistentVolumeClaim:
-            claimName: ${CACHE_CLAIM}
----
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: wva-warm-pool-${POOL_NAME}
-  namespace: ${NAMESPACE}
-  labels:
-    app.kubernetes.io/name: workload-variant-autoscaler
-    app.kubernetes.io/component: warm-pool
-spec:
-  scaleTargetRef:
-    name: wva-warm-pool-${POOL_NAME}
-  minReplicaCount: ${POOL_REPLICAS}
-  maxReplicaCount: ${POOL_MAX}
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleUp:
-          stabilizationWindowSeconds: 60
-        scaleDown:
-          stabilizationWindowSeconds: 900
-  triggers:
-    - type: external-push
-      metadata:
-        scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
-        warmPoolName: ${POOL_NAME}
-        warmPoolSleepMinSize: "${RESERVE}"
+${spec}
 YAML
 }
 
@@ -265,15 +284,13 @@ cmd_sizing() {
 # a group missing a Ready Pod as absent -- ranks that cannot form are no engine.
 warmpool_group_manifest() {
   local memory="$1"
-  local node_selector=""
-  if [ -n "$ACCELERATOR" ]; then
-    # EIGHT spaces: in the LWS templates the pod spec sits at six, so its keys
-    # sit at eight. Ten put nodeSelector inside automountServiceAccountToken and
-    # the whole manifest failed to parse -- which nothing caught, because a
-    # group pool had never been created on a cluster.
-    node_selector="        nodeSelector:
-          nvidia.com/gpu.product: ${ACCELERATOR}"
-  fi
+  local spec
+  spec="$(pool_pod_spec "$memory" "        ")" || log_error "the pool Pod could not be described, so nothing was applied"
+  # The worker template is the SAME Pod as the leader, deliberately and for now.
+  # A worker ought to run its own rank of the engine, and nothing does that yet
+  # -- see the decline in policy.doesNotFit. Giving it the leader's shape keeps
+  # the group countable (which is what is tested) without inventing a rank
+  # protocol here that the controller does not implement.
   cat <<YAML
 apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
@@ -288,8 +305,8 @@ spec:
   replicas: ${POOL_REPLICAS}
   leaderWorkerTemplate:
     size: ${GROUP_SIZE}
-    # Any Pod failing rebuilds the group. A vLLM group whose worker restarts is
-    # not a coherent engine, so a partial group must not linger looking usable.
+    # A partial group is not a degraded engine, it is no engine: its ranks
+    # cannot form, so a Pod lost takes the whole group with it.
     restartPolicy: RecreateGroupOnPodRestart
     leaderTemplate:
       metadata:
@@ -298,25 +315,7 @@ spec:
           app.kubernetes.io/component: warm-pool
           llm-d.ai/warm-pool: ${POOL_NAME}
       spec:
-        automountServiceAccountToken: false
-${node_selector}
-        containers:
-          - name: inference-server
-            image: ${PROXY_IMAGE}
-            resources:
-              limits:
-                nvidia.com/gpu: "${GPUS_PER_POD}"
-                memory: ${memory}
-              requests:
-                nvidia.com/gpu: "${GPUS_PER_POD}"
-                memory: ${memory}
-            volumeMounts:
-              - name: model-storage
-                mountPath: /model-cache
-        volumes:
-          - name: model-storage
-            persistentVolumeClaim:
-              claimName: ${CACHE_CLAIM}
+${spec}
     workerTemplate:
       metadata:
         labels:
@@ -324,54 +323,7 @@ ${node_selector}
           app.kubernetes.io/component: warm-pool
           llm-d.ai/warm-pool: ${POOL_NAME}
       spec:
-        automountServiceAccountToken: false
-${node_selector}
-        containers:
-          - name: inference-server
-            image: ${PROXY_IMAGE}
-            resources:
-              limits:
-                nvidia.com/gpu: "${GPUS_PER_POD}"
-                memory: ${memory}
-              requests:
-                nvidia.com/gpu: "${GPUS_PER_POD}"
-                memory: ${memory}
-            volumeMounts:
-              - name: model-storage
-                mountPath: /model-cache
-        volumes:
-          - name: model-storage
-            persistentVolumeClaim:
-              claimName: ${CACHE_CLAIM}
----
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: wva-warm-pool-${POOL_NAME}
-  namespace: ${NAMESPACE}
-  labels:
-    app.kubernetes.io/name: workload-variant-autoscaler
-    app.kubernetes.io/component: warm-pool
-spec:
-  scaleTargetRef:
-    apiVersion: leaderworkerset.x-k8s.io/v1
-    kind: LeaderWorkerSet
-    name: wva-warm-pool-${POOL_NAME}
-  minReplicaCount: ${POOL_REPLICAS}
-  maxReplicaCount: ${POOL_MAX}
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleUp:
-          stabilizationWindowSeconds: 60
-        scaleDown:
-          stabilizationWindowSeconds: 900
-  triggers:
-    - type: external-push
-      metadata:
-        scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
-        warmPoolName: ${POOL_NAME}
-        warmPoolSleepMinSize: "${RESERVE}"
+${spec}
 YAML
 }
 
