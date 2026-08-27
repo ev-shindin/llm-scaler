@@ -107,6 +107,39 @@ must not forget.
 Neither level frees much GPU beyond the other: the ~1.3 GiB residue is context
 and allocator state, not weights.
 
+### The host cost is paid at the FIRST sleep and never given back
+
+Measured 2026-08-27 on an H200 with Qwen3-8B (~15.3 GiB of weights), on Pods
+started fresh for the purpose, reading the container's own cgroup:
+
+| | awake, never slept | after first level-1 sleep | after waking again |
+| --- | --- | --- | --- |
+| TP=1 | 3.16 GiB | **25.22 GiB** | 25.22 GiB |
+| TP=2 | 6.75 GiB | **29.89 GiB** | 29.89 GiB |
+
+Waking gives back the GPU (6.6 GiB -> 75.6 GiB held at TP=2) and returns **none**
+of the host RAM. So a pool Pod's memory high-water mark is not reached at
+startup, it is reached the first time anything sleeps — and sizing a pool by
+watching an awake engine understates it by ~22 GiB, in the direction that
+OOM-kills the Pod one sleep cycle later rather than at start.
+
+Two traps in measuring this:
+
+- **The charge is `shmem`, not `anon`.** Level 1 moves the weights into shared
+  memory, so `ps`, RSS, and anything summing process memory show no change at
+  all. Only the cgroup sees it. It is not `/dev/shm` either — that stayed at
+  66 MiB throughout.
+- **A Pod that has already slept shows nothing.** Re-measuring a used Pod gives
+  identical numbers either side of a sleep, because the buffer is already
+  allocated. The first pass of this measurement read exactly that and concluded,
+  wrongly, that sleeping was free.
+
+The sleep CHARGE itself is TP-invariant — 22.06 GiB at TP=1 against 23.14 GiB at
+TP=2 — which confirms that tensor parallelism shards one copy of the weights
+rather than duplicating it. What does scale with TP is the awake baseline, 3.16
+to 6.75 GiB, because each rank is its own worker process with its own CUDA
+context. `shape.go` charges its overhead term per rank for that reason.
+
 ## 5. Does NVMe help? Less than it looks
 
 Measured with direct I/O, three runs each, on a pokprod GPU node:
