@@ -33,6 +33,8 @@ def shape_of(namespace, target):
         ["kubectl", "get", "deployment", target, "-n", namespace, "-o", "json"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     if proc.returncode != 0:

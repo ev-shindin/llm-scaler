@@ -67,7 +67,8 @@ def gpu_requests_by_node():
     out = subprocess.run(
         ["kubectl", "get", "pods", "--all-namespaces", "--field-selector",
          "status.phase=Running", "-o", "json"],
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=120)
     if out.returncode != 0:
         return None
     used = {}
@@ -90,7 +91,8 @@ def nodes_from_cluster(selector):
     cmd = ["kubectl", "get", "nodes", "-o", "json"]
     if selector:
         cmd += ["-l", selector]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=60)
     if out.returncode != 0:
         raise SystemExit("could not read nodes: %s" % out.stderr.strip())
     nodes = []
