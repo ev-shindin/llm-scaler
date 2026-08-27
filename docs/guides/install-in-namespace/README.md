@@ -197,6 +197,51 @@ not be read is written as `no` with the reason, and never created without one.
 > `apply: no` until the launcher pods are scraped. See
 > [the FMA post-mortem](../../proposals/fma-post-mortem.md).
 
+#### The same file also suggests warm pools
+
+Below the `plan:` entries, `wva-plan.yaml` carries a second section. Every
+workload above was read for the two things a warm copy cannot change — the
+accelerator, and how many devices one replica takes — and the ones that agree on
+both are grouped, because they could share a pool:
+
+```yaml
+warmPools:
+
+  # serves: Deployment/dev-model-decode
+  # serves: Deployment/other-model-decode
+  - apply: "no"           # yes | no -- "yes" creates this pool on apply
+    namespace: llm-d-sim  # where the pool Pods run: with the models they serve
+    name: h200-1gpu       # the pool's name; a model selects it with warmPool: <name>
+    accelerator: NVIDIA-H200  # nvidia.com/gpu.product these Pods must land on
+    gpus: 1               # GPUs per Pod. Must match what one replica takes
+    models: 4             # how many models one Pod must hold at once
+    modelSize: 8B         # the largest of them
+    replicas: 2           # Pods to start, and the floor KEDA holds
+    max: 6                # ceiling KEDA may grow the pool to
+    reserve: 1            # Pods kept free for the next borrow
+```
+
+A warm pool holds engines already loaded on a GPU, so a scale-up serves while
+its own replica is still loading — seconds instead of the minute or more a cold
+model load takes. It holds those accelerators the whole time it exists, which is
+why every suggestion is written `apply: "no"`: turning one to `"yes"` is a
+decision to spend GPUs, and `scaledobjects-apply` then creates it alongside the
+ScaledObjects.
+
+Two of those fields are guesses the tool cannot make for you. `models` and
+`modelSize` together set the Pod's memory limit, which **is** the warm-set
+budget — and that budget has to cover the level-1 sleep charge, which appears
+the first time a model sleeps and is never released. Run
+`deploy/warmpool.sh sizing --params <size>` to see what this cluster's nodes can
+actually hold before trusting the placeholders.
+
+Creating a pool also needs `WARMPOOL_PROXY_IMG`, since the pool Pod runs an
+image this repo builds (`make docker-build-warmpool-proxy`). Without it the
+apply says so and creates nothing.
+
+Full reasoning, the configuration surface, and how to remove a pool are in
+[Bridge a scale-up with a warm pool](../warm-pool/).
+
 ## Verification
 
 ### 1. Check KEDA received the decision
