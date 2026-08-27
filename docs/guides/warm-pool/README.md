@@ -268,6 +268,58 @@ reads one or creates one. Declaring it through a trigger keeps one rule with no
 exceptions — WVA manages what it is called about — and puts the reserve beside
 the ceiling it has to fit inside.
 
+## When the engine spans machines: pools of groups
+
+A model too large for one machine runs as a **LeaderWorkerSet**: several Pods
+holding one engine, with the API on the leader. A pool can hold those too, as
+standing groups rather than standing Pods.
+
+```bash
+deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --proxy-image <your image> --wva-namespace <where WVA runs>
+```
+
+`--group-size` is what makes it a group pool. Everything else means what it did:
+`--gpus` is devices **per Pod**, so the warm unit above holds 2 x 8 = 16.
+
+### A group serves exactly one shape
+
+A group's `size` is fixed when the group is created -- it is the engine's shape,
+not a scaling knob. So a group of 2 serves only models declaring `--nnodes 2`,
+and WVA declines anything else **permanently**, saying which:
+
+```
+spans 4 Pod(s), this warm unit is 2
+```
+
+That holds even when the device totals agree. Sixteen GPUs across two Pods and
+across four are the same count and a different engine. If you run both layouts,
+you need a pool for each -- exactly as two accelerators need two pools.
+
+### What is different once a pool holds groups
+
+- **Only the leader is lent.** It runs the supervisor and serves the API; workers
+  hold devices and join its process group. WVA never labels a worker into an
+  InferencePool, because a labelled worker takes traffic nothing answers.
+- **A group is all-or-nothing.** One Pod not Ready and the whole group drops out
+  of the observation: ranks that cannot form are not a degraded engine, they are
+  no engine. It reappears when the group is whole.
+- **Memory is still per Pod.** `--models`/`--model-size` set each member's limit,
+  because a level-1 sleeper's weights are charged to every member's own cgroup.
+  The warm-set budget is one Pod's limit, not the group's sum.
+- **A whole group is the unit of loss.** `RecreateGroupOnPodRestart` means one
+  evicted worker rebuilds the group, and every model warm in it is gone. A group
+  holds `size x --gpus` accelerators, so this is a far larger blast radius than a
+  single-Pod pool's.
+
+### Whether it is worth it
+
+A group holds many more accelerators per warm unit and saves much more when used,
+for far fewer models. It pays when several large models share the group and are
+individually idle; it does not pay for one model, where an always-on replica
+costs the same accelerators and answers requests.
+
+`deploy/warmpool.sh sizing --params <N>B` will tell you which case you are in.
+
 ## More than one pool
 
 A warm copy is only reusable on the accelerator it was loaded on. A cluster with

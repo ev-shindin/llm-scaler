@@ -1,8 +1,23 @@
 # Warming an engine that spans Pods (LeaderWorkerSet)
 
-Status: proposal. **The gate in §3 has now been run and it passed** -- multi-node
-sleep and wake work, on the fleet's own image, without Ray. Read §3 for what was
-measured before costing the work below.
+Status: **IMPLEMENTED, 2026-08-27.** The gate in §3 passed -- multi-node sleep and
+wake work, on the fleet's own image, without Ray -- and §4a is built.
+
+What shipped, and where:
+
+| rule | code |
+| --- | --- |
+| capacity is the GROUP's devices, memory stays per Pod | `pool/adapter.go` `capacityOf`, `groupSizeOf` |
+| only the leader is a member | `pool/adapter.go` `isLWSWorker` |
+| a group missing a Ready Pod is absent | `pool/adapter.go` `readyGroupMembers` |
+| a group serves one layout, permanently | `policy/policy.go` `doesNotFit`, `pool/shape.go` `nodeCount` |
+| creating one | `deploy/warmpool.sh create --group-size N` |
+| operating one | [the guide](../guides/warm-pool/README.md#when-the-engine-spans-machines-pools-of-groups) |
+
+Unit tests cover each rule and its inverse (`pool/group_test.go`,
+`policy/policy_test.go`). **Not yet run on a cluster**: no e2e exercises a group
+pool, and none has been created on real multi-node hardware. The economics in §5
+are unchanged and are the reason to think before using it.
 
 ## 1. The question
 
@@ -129,10 +144,10 @@ that limit is the warm-set budget.
 
 ## 4. Design
 
-### 4a. A warm pool of GROUPS
+### 4a. A warm pool of GROUPS -- BUILT
 
-A pool for LWS is a set of standing LWS groups, each running the launcher on its
-leader:
+This is what shipped. A pool for LWS is a set of standing LWS groups, each
+running the launcher on its leader:
 
 - the **leader** Pod runs the supervisor; the engine it spawns spans the group
 - **worker** Pods run vLLM headless at their own `node-rank` — they hold GPUs and

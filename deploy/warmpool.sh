@@ -34,6 +34,7 @@ MODELS=""
 MODEL_SIZE=""
 GPUS_PER_POD=1
 ACCELERATOR=""
+GROUP_SIZE=1
 PROXY_IMAGE=""
 WVA_NAMESPACE=""
 CACHE_CLAIM="model-pvc"
@@ -56,6 +57,9 @@ create options:
   --model-size SIZE    largest model it must hold, e.g. 8B or 0.6B
                        With --models, the memory limit is COMPUTED from these.
   --gpus N             GPUs per Pod. Default: 1
+  --group-size N       Pods per warm unit. >1 builds a LeaderWorkerSet pool for
+                       engines that span machines; the models it serves must
+                       declare the same --nnodes. Default: 1
   --accelerator PROD   the nvidia.com/gpu.product this pool must run on.
                        A pool named for one GPU that schedules on another is
                        the silent mismatch this whole design exists to avoid.
@@ -128,8 +132,17 @@ cmd_create() {
     log_warning "No --accelerator given, so these Pods may schedule on ANY GPU node. A warm copy is only reusable on the GPU it was loaded on: WVA will decline every model whose accelerator it can prove differs, and this pool will hold devices while warming nothing."
   fi
 
+  if [ "$GROUP_SIZE" -gt 1 ]; then
+    log_info "Group pool: each warm unit is ${GROUP_SIZE} Pods x ${GPUS_PER_POD} GPU = $((GROUP_SIZE * GPUS_PER_POD)) devices"
+    log_warning "A group serves ONLY models declaring --nnodes ${GROUP_SIZE}. A group's size is fixed when it is created -- an engine laid out across a different number of Pods is a different engine, and WVA declines it permanently."
+  fi
+
   local manifest
-  manifest=$(warmpool_manifest "$memory")
+  if [ "$GROUP_SIZE" -gt 1 ]; then
+    manifest=$(warmpool_group_manifest "$memory")
+  else
+    manifest=$(warmpool_manifest "$memory")
+  fi
 
   if [ "$APPLY" -eq 0 ]; then
     printf '%s\n' "$manifest"
@@ -230,12 +243,127 @@ cmd_sizing() {
   python3 "$HERE/lib/warmpool_sizing.py" "$@"
 }
 
+# A pool of GROUPS. The leader runs the supervisor and serves the API; workers
+# hold devices and join its process group. WVA counts only leaders as members,
+# reads the group's size from the annotation LWS stamps on every Pod, and treats
+# a group missing a Ready Pod as absent -- ranks that cannot form are no engine.
+warmpool_group_manifest() {
+  local memory="$1"
+  local node_selector=""
+  if [ -n "$ACCELERATOR" ]; then
+    node_selector="          nodeSelector:
+            nvidia.com/gpu.product: ${ACCELERATOR}"
+  fi
+  cat <<YAML
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: wva-warm-pool-${POOL_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+    llm-d.ai/warm-pool: ${POOL_NAME}
+spec:
+  replicas: ${POOL_REPLICAS}
+  leaderWorkerTemplate:
+    size: ${GROUP_SIZE}
+    # Any Pod failing rebuilds the group. A vLLM group whose worker restarts is
+    # not a coherent engine, so a partial group must not linger looking usable.
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: workload-variant-autoscaler
+          app.kubernetes.io/component: warm-pool
+          llm-d.ai/warm-pool: ${POOL_NAME}
+      spec:
+        automountServiceAccountToken: false
+${node_selector}
+        containers:
+          - name: inference-server
+            image: ${PROXY_IMAGE}
+            resources:
+              limits:
+                nvidia.com/gpu: "${GPUS_PER_POD}"
+                memory: ${memory}
+              requests:
+                nvidia.com/gpu: "${GPUS_PER_POD}"
+                memory: ${memory}
+            volumeMounts:
+              - name: model-storage
+                mountPath: /model-cache
+        volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: ${CACHE_CLAIM}
+    workerTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: workload-variant-autoscaler
+          app.kubernetes.io/component: warm-pool
+          llm-d.ai/warm-pool: ${POOL_NAME}
+      spec:
+        automountServiceAccountToken: false
+${node_selector}
+        containers:
+          - name: inference-server
+            image: ${PROXY_IMAGE}
+            resources:
+              limits:
+                nvidia.com/gpu: "${GPUS_PER_POD}"
+                memory: ${memory}
+              requests:
+                nvidia.com/gpu: "${GPUS_PER_POD}"
+                memory: ${memory}
+            volumeMounts:
+              - name: model-storage
+                mountPath: /model-cache
+        volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: ${CACHE_CLAIM}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: wva-warm-pool-${POOL_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  scaleTargetRef:
+    apiVersion: leaderworkerset.x-k8s.io/v1
+    kind: LeaderWorkerSet
+    name: wva-warm-pool-${POOL_NAME}
+  minReplicaCount: ${POOL_REPLICAS}
+  maxReplicaCount: ${POOL_MAX}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 900
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
+        warmPoolName: ${POOL_NAME}
+        warmPoolSleepMinSize: "${RESERVE}"
+YAML
+}
+
 cmd_delete() {
   require NAMESPACE namespace
   # BOTH, and the ScaledObject FIRST: it is what declares the pool, so removing
   # it stops WVA lending Pods that are about to disappear.
   kubectl delete scaledobject "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null
-  kubectl delete deployment "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null
+  # Whichever kind it is. A pool is one or the other and never both, so asking
+  # for both costs one NotFound and removes the chance of leaving a group behind.
+  kubectl delete deployment "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete leaderworkerset "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
   log_success "Pool '${POOL_NAME}' removed from ${NAMESPACE}: ScaledObject and Deployment"
 }
 
@@ -258,6 +386,7 @@ while [ $# -gt 0 ]; do
     --model-size)    MODEL_SIZE="$2"; shift 2 ;;
     --gpus)          GPUS_PER_POD="$2"; shift 2 ;;
     --accelerator)   ACCELERATOR="$2"; shift 2 ;;
+    --group-size)    GROUP_SIZE="$2"; shift 2 ;;
     --replicas)      POOL_REPLICAS="$2"; shift 2 ;;
     --max)           POOL_MAX="$2"; shift 2 ;;
     --reserve)       RESERVE="$2"; shift 2 ;;
