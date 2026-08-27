@@ -50,6 +50,8 @@ it is running and idle.
 | Full install guide | [deploy/](deploy/) |
 | Installing WVA | [docs/guides/](docs/guides/) — pick a path |
 | Running it day to day | [operations.md](docs/deployment/operations.md) |
+| Watching what it decides | [monitoring.md](docs/deployment/monitoring.md) |
+| Making a workload scalable | [workload-preparation.md](docs/deployment/workload-preparation.md) |
 
 ## Documentation
 

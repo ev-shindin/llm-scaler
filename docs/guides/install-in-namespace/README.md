@@ -29,7 +29,7 @@ namespace's owner installs and upgrades the controller themselves.
   a download from Hugging Face. llm-d mounts one by default, so this is
   normally already true — `make scaledobjects-plan` says so per workload if it
   is not. See [Weights and the model
-  cache](../../deployment/operations.md#weights-and-the-model-cache), which
+  cache](../../deployment/workload-preparation.md#weights-and-the-model-cache), which
   also covers what it does not buy: the cache removes the download, not the
   load.
 - **a drain hook on those model servers.** Autoscaling also means replicas being
@@ -41,7 +41,7 @@ namespace's owner installs and upgrades the controller themselves.
 `make workload-patch` reports both and writes the fix for whichever is missing.
 It writes a file rather than changing your workloads, because the pod spec
 belongs to your modelservice chart; see [Writing the
-patch](../../deployment/operations.md#writing-the-patch-make-workload-patch).
+patch](../../deployment/workload-preparation.md#writing-the-patch-make-workload-patch).
 
 If you want a model to scale **from zero**, its EPP must run with the
 `flowControl` feature gate: that gate is what publishes the queue depth, and at
@@ -151,7 +151,7 @@ scale-down, and one that downloads its weights outside every volume it mounts
 re-fetches them on every scale-up. Both are pod-spec settings owned by the chart
 that deployed the model server, so this writes a patch rather than applying one.
 See [Writing the
-patch](../../deployment/operations.md#writing-the-patch-make-workload-patch) for
+patch](../../deployment/workload-preparation.md#writing-the-patch-make-workload-patch) for
 what to do with it, including `make model-cache` when the weights half is what is
 missing.
 

@@ -261,7 +261,7 @@ re-downloads on every scale-up anyway. What decides it is where the weights
 *land*, which is what the command above actually looks at.
 
 [Weights and the model
-cache](../../deployment/operations.md#weights-and-the-model-cache) has the
+cache](../../deployment/workload-preparation.md#weights-and-the-model-cache) has the
 detail, including why it makes scale-up cheaper but not faster.
 
 ## Next

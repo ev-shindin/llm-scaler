@@ -36,7 +36,9 @@ source docs/guides/env.sh
 | page | covers |
 | --- | --- |
 | [Configuration](../deployment/configuration.md) | every variable the installer reads |
-| [After the install](../deployment/operations.md) | what to watch, first-line troubleshooting |
+| [After the install](../deployment/operations.md) | verifying the install, first-line troubleshooting |
+| [Watching what WVA decides](../deployment/monitoring.md) | the dashboard, the metrics, the logs |
+| [Preparing a workload](../deployment/workload-preparation.md) | the model cache, draining, `make workload-patch` |
 | [Install methods](../deployment/install-methods.md) | GitOps, direct Kustomize, what the script does |
 | [The GPU limiter](../deployment/gpu-limiter.md) | where policy lives, and the accelerator precondition |
 

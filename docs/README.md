@@ -35,8 +35,12 @@ Instructions → Verification → Cleanup → Configuration*. Index and conventi
 
 - **[Configuration](deployment/configuration.md)** — every variable the installer
   reads
-- **[After the install](deployment/operations.md)** — what to watch, the Grafana
-  dashboard and who owns it, first-line troubleshooting
+- **[After the install](deployment/operations.md)** — verifying the install and
+  first-line troubleshooting
+- **[Watching what WVA decides](deployment/monitoring.md)** — the Grafana
+  dashboard and who owns it, the metrics that answer specific questions, the logs
+- **[Preparing a workload to be scaled](deployment/workload-preparation.md)** —
+  the model cache, draining before scale-down, `make workload-patch`
 - **[Deployment methods](deployment/install-methods.md)** — installer, kustomize,
   and per-platform entry points
 - **[GPU limiter](deployment/gpu-limiter.md)** — bounding WVA by real accelerators

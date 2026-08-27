@@ -186,7 +186,7 @@ Or just use `./deploy/install.sh --undeploy`, which does exactly this.
 Installing WVA does not create a warm pool, and a namespace does not need one to
 autoscale. A pool trades held accelerators for scale-up latency, so it is worth
 it only where a model's load time actually costs something — see [Weights and the
-model cache](operations.md#weights-and-the-model-cache) for why that load is not
+model cache](workload-preparation.md#weights-and-the-model-cache) for why that load is not
 a storage problem.
 
 To see whether this namespace has models that could share one:

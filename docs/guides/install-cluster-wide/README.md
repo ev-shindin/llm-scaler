@@ -85,7 +85,7 @@ With neither, it scans the controller's own namespace and reports
 `SCOPE=cluster` matters most with `WVA_WORKLOAD_PATCH_APPLY=true`, which replaces
 the pods it patches: at this scope that is a rolling restart of every model
 server on the cluster. See [Writing the
-patch](../../deployment/operations.md#writing-the-patch-make-workload-patch).
+patch](../../deployment/workload-preparation.md#writing-the-patch-make-workload-patch).
 
 <!-- guide:deploy.register start -->
 ```bash

@@ -43,7 +43,7 @@ Every option `deploy/install.sh` reads. Verified against the script: each entry 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DEPLOY_PROMETHEUS` | Deploy the Prometheus stack **when the cluster has none of its own**. A Prometheus outside `MONITORING_NAMESPACE` is used as it is, and no monitoring namespace is created. Set `PROMETHEUS_FORCE_INSTALL=true` to deploy alongside one (two operators then contend over the same CRs) | `true` |
-| `DEPLOY_OPERATIONAL_DASHBOARD` | Publish the WVA Grafana dashboard. On Kubernetes also enables Grafana in kube-prometheus-stack. Publishing into a **shared** monitoring namespace is a cluster-admin action; a namespace admin is told so and the install continues ([details](operations.md#if-you-cannot-write-to-the-monitoring-namespace)) | `true` |
+| `DEPLOY_OPERATIONAL_DASHBOARD` | Publish the WVA Grafana dashboard. On Kubernetes also enables Grafana in kube-prometheus-stack. Publishing into a **shared** monitoring namespace is a cluster-admin action; a namespace admin is told so and the install continues ([details](monitoring.md#if-you-cannot-write-to-the-monitoring-namespace)) | `true` |
 | `DEPLOY_WVA` | Deploy WVA controller | `true` |
 | `DEPLOY_LWS` | Deploy LeaderWorkerSet (needed only for full e2e suite; skip for smoke, benchmarks, or pre-installed clusters) | `false` |
 | `DEPLOY_ALERTING_RULES` | Install the PrometheusRule alerts | `false` |
@@ -186,7 +186,7 @@ that land on a mounted volume, so a new replica does not re-download them.
 Neither belongs to WVA — they belong to the chart that owns the pod spec — so
 `make workload-patch` writes a patch and, on request, applies the half that is
 safe to apply. Full description in
-[After the install](operations.md#writing-the-patch-make-workload-patch).
+[After the install](workload-preparation.md#writing-the-patch-make-workload-patch).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
