@@ -279,33 +279,62 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 			Expect(err).NotTo(HaveOccurred())
 			Expect(put.Status).To(BeNumerically("<", 300), "body: %s", put.Body)
 
-			wake, err := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
-				fixtures.WarmPoolBasePort, "POST", "/wake_up", "")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(wake.Status).To(Equal(200), "body: %s", wake.Body)
-
-			up, err := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
-				fixtures.WarmPoolControlPort, "PUT", "/upstream",
-				fmt.Sprintf(`{"address":%q}`, engine))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(up.Status).To(Equal(200), "body: %s", up.Body)
-
-			// The three calls above returned 200, which says the SUPERVISOR
-			// accepted them -- not that the controller has observed the result.
-			// Wait for it to, here, where a failure names the precondition.
+			// Instance creation is ASYNCHRONOUS: the PUT above returns as soon as
+			// the supervisor accepts it, not when the engine exists. Wait for the
+			// controller to see the model resident before touching the engine,
+			// because until then /is_sleeping answers `false` for an engine that
+			// is not there -- indistinguishable from an awake one.
 			//
-			// Without this the wait happens inside the It instead, and a pool
-			// that never became resident fails an assertion about counting
-			// bridges. That is how it read when this spec failed under full-suite
-			// load: both pools reported lent=0, the bug under test was never
-			// exercised, and the message pointed at the accounting.
+			// Measured: waking without this wait confirmed nothing for the second
+			// pool of the two, whose engine then settled asleep, so it reported
+			// lent=0 for the whole spec while the first pool lent correctly.
 			Eventually(func(g Gomega) {
-				logs, err := controllerLog()
-				g.Expect(err).NotTo(HaveOccurred())
+				logs, lErr := controllerLog()
+				g.Expect(lErr).NotTo(HaveOccurred())
 				g.Expect(logs).To(MatchRegexp(
-					`"pool": "`+fixtureName+`", "state": "pods=\d+ free=\d+ resident=[1-9]`),
-					"pool %s never became resident, so nothing was lent from it", fixtureName)
+					`"pool": "`+fixtureName+`", "state": "[^"]*resident=[1-9]`),
+					"the instance PUT into %s never became resident, so there is no "+
+						"engine to wake", fixtureName)
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			// Wake, point, and CHECK in one retried block, because no single
+			// ordering of the two calls is safe on its own:
+			//
+			//   - wake then point leaves the member Waking in between, and
+			//     policy.orphanReturns reclaims every Waking member -- correctly,
+			//     since that is what a half-finished activation looks like. A
+			//     reconcile landing in that gap sleeps the model.
+			//   - point then wake avoids the gap but the proxy will not hold an
+			//     upstream aimed at an engine that does not answer, which is what an
+			//     asleep engine is. It has never produced a bridge.
+			//
+			// So do not try to win the race once. Re-establish the pair every pass
+			// until the controller reports the bridge: waking an awake engine and
+			// re-pointing a correct upstream are both no-ops, so a pass that finds
+			// the state already good simply confirms it, and a pass that finds it
+			// reclaimed rebuilds it. The log is cumulative, so once ANY reconcile
+			// observes Serving the match holds for the rest of the spec.
+			Eventually(func(g Gomega) {
+				wake, wErr := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
+					fixtures.WarmPoolBasePort, "POST", "/wake_up", "")
+				g.Expect(wErr).NotTo(HaveOccurred())
+				g.Expect(wake.Status).To(Equal(200), "body: %s", wake.Body)
+
+				up, uErr := fixtures.PodProxy(ctx, k8sClient, cfg.LLMDNamespace, podName,
+					fixtures.WarmPoolControlPort, "PUT", "/upstream",
+					fmt.Sprintf(`{"address":%q}`, engine))
+				g.Expect(uErr).NotTo(HaveOccurred())
+				g.Expect(up.Status).To(Equal(200), "body: %s", up.Body)
+
+				logs, lErr := controllerLog()
+				g.Expect(lErr).NotTo(HaveOccurred())
+				g.Expect(logs).To(MatchRegexp(
+					`"pool": "`+fixtureName+`", "state": "[^"]*lent=[1-9]`),
+					"pool %s never reported a bridge, so there is nothing for the "+
+						"accounting assertion to count. resident>=1 is NOT enough here: "+
+						"a model that is resident but asleep satisfies it while lent stays 0",
+					fixtureName)
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 		}
 
 		BeforeAll(func() {
