@@ -190,6 +190,53 @@ way, by the same rule, with the same message shape.
 - **Never resize a group.** `size` is the engine's shape; changing it is a
   different model, not a scaled one.
 
+## 4b. What you CANNOT do: swap the configuration and keep the weights
+
+The obvious cheaper idea, asked directly: for a model too big to hold twice --
+GLM-5.2 at TP=8 fills 744 GB of an H200 node's 1128 GiB -- keep the weights
+resident on the GPUs and reload only the engine's CONFIGURATION, turning a
+prefill-shaped engine into a decode-shaped one and back.
+
+**vLLM 0.26 cannot.** Three separate blocks, checked in the shipped code:
+
+- **`sleep` takes no tags.** `entrypoints/serve/dev/sleep/api_router.py` passes
+  only `level` and `mode`. The allocator's tags choose whether weights are
+  offloaded or discarded, not WHICH memory is released -- so there is no way to
+  free the KV cache and keep the weights on the device.
+- **The two-stage wake does not rescue it.** `wake_up(tags=["weights"])` exists,
+  so weights can come back without KV. But the KV block count is computed at
+  engine init from a memory profile, and nothing re-runs that profile for a
+  different configuration at run time.
+- **The scheduler is built at EngineCore init.** `max_num_batched_tokens` and
+  chunked prefill are fixed there, and `/collective_rpc` reaches WORKERS, not
+  the scheduler -- so not even a `worker_extension_cls` can reach it.
+
+A configuration change therefore means a new process, and a new process cannot
+inherit the old one's device memory. That boundary is upstream of this project.
+
+### What to do instead, at that size
+
+1. **Do not reconfigure.** llm-d already gives both roles `kv_role: kv_both`, so
+   one engine with chunked prefill serves both and the P/D split becomes a
+   routing decision. Zero cost, weights never move. What it gives up is the
+   point of disaggregating: independent scaling, and prefill not stalling
+   decode. For a model you can only afford ONE copy of per node, this is
+   usually the honest answer.
+2. **Make the new process cheap.** `--load-format dummy` plus a peer transfer
+   ([weight transfer](warm-pool-weight-transfer.md) §4e) skips the 744 GB read
+   -- about seven minutes on the shared PVC -- and still pays the ~100 s fixed
+   startup.
+3. **A warm group**, per §4a: hold the other role pre-started and level-1 asleep.
+   That costs roughly 1.35x the weights in host RAM per warm role per node --
+   about 1 TB for GLM-5.2 -- which a 2 TB node can carry, for a ~10 s wake.
+
+### The upstream ask, if this matters
+
+Two small API surfaces on machinery that already exists: **`sleep(tags=[...])`**
+so the KV cache can be released while the weights stay resident, and a **runtime
+scheduler reconfigure**. With both, a role swap becomes free for any model that
+fits once, which is exactly the case where holding it twice is impossible.
+
 ## 5. What it costs, and when it pays
 
 The economics invert relative to the single-Pod pool.
