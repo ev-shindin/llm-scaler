@@ -54,18 +54,33 @@ func itoa(i int) string {
 // not the leader's. Reading the leader's own spec would size a two-Pod group at
 // eight GPUs and refuse every engine that needs the sixteen it actually has.
 func TestAGroupsCapacityCountsEveryPodsDevices(t *testing.T) {
-	leader := groupPod("warm-0", 0, 2, 8, true)
+	// Two shapes, so the arithmetic is the multiplication and not a coincidence
+	// with one Pod count.
+	for _, tc := range []struct {
+		name       string
+		size       int
+		gpusPerPod int64
+		wantGPUs   int
+	}{
+		{"two Pods of eight", 2, 8, 16},
+		{"three Pods of four", 3, 4, 12},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leader := groupPod("warm-0", 0, tc.size, tc.gpusPerPod, true)
 
-	got := capacityOf(&leader)
+			got := capacityOf(&leader)
 
-	if got.GPUs != 16 {
-		t.Errorf("group of 2 Pods holding 8 GPUs each: got %d GPUs, want 16", got.GPUs)
-	}
-	if got.PodsPerGroup != 2 {
-		t.Errorf("PodsPerGroup = %d, want 2", got.PodsPerGroup)
-	}
-	if !got.Group() {
-		t.Error("a 2-Pod unit should report Group()")
+			if got.GPUs != tc.wantGPUs {
+				t.Errorf("group of %d Pods holding %d GPUs each: got %d GPUs, want %d",
+					tc.size, tc.gpusPerPod, got.GPUs, tc.wantGPUs)
+			}
+			if got.PodsPerGroup != tc.size {
+				t.Errorf("PodsPerGroup = %d, want %d", got.PodsPerGroup, tc.size)
+			}
+			if !got.Group() {
+				t.Error("a multi-Pod unit should report Group()")
+			}
+		})
 	}
 }
 
