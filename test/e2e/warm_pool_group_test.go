@@ -81,6 +81,28 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 			Skip("LeaderWorkerSet is not served by this cluster, so a unit that spans Pods cannot be built: " + err.Error())
 		}
 
+		// The warm pool is OFF in the e2e install, and the reconciler is simply
+		// not started without it. Nothing about that is visible from outside:
+		// KEDA still calls the external scaler, the ScaledObject still reports
+		// Ready, the Pods still run -- and the controller reports no pool state
+		// at all, which is exactly what a group being refused looks like.
+		//
+		// That cost several runs of chasing the group logic before noticing the
+		// policy specs enable it explicitly and this one did not.
+		By("Restarting the controller with the warm pool enabled")
+		restoreCtl, err := fixtures.EnableWarmPool(ctx, k8sClient, controller, cfg.LLMDNamespace)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = restoreCtl(context.Background())
+			_ = fixtures.WaitForControllerReady(context.Background(), k8sClient, controller)
+		})
+		Eventually(func(g Gomega) {
+			logs, lErr := controllerLog()
+			g.Expect(lErr).NotTo(HaveOccurred())
+			g.Expect(logs).To(ContainSubstring("warm pool enabled"),
+				"the controller never reported the pool as enabled, so nothing reconciles it")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
 		spec = fixtures.WarmPoolSpec{
 			Name:       groupPool,
 			Namespace:  cfg.LLMDNamespace,
@@ -94,14 +116,47 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 			_ = fixtures.DeleteWarmPoolGroup(context.Background(), k8sClient, crClient, spec)
 		})
 
-		// Every Pod of the group Ready first. Without this the assertions below
-		// cannot tell a group correctly held back for being short a rank from
-		// one that simply never formed -- they report identically.
+		// A pool is DECLARED by a ScaledObject trigger, not by the existence of
+		// its Pods: WVA learns about pools through KEDA calling it, so a pool
+		// Deployment nobody declared holds accelerators the controller never
+		// hears about. Without this the group formed correctly and the
+		// controller reported nothing at all about it -- which reads exactly
+		// like a group being refused, and would have been diagnosed as one.
+		Expect(fixtures.EnsureScaledObject(ctx, crClient, cfg.LLMDNamespace,
+			groupPool, groupPool, groupPool, 1, 6, cfg.MonitoringNS,
+			fixtures.WithWarmPoolTrigger(groupPool, nil),
+			// The scale target is a LeaderWorkerSet, and the default is
+			// Deployment. KEDA cannot resolve a target that is not there, so it
+			// never calls WVA's external scaler -- and discovery is KEDA-driven,
+			// so the pool is never learned about at all. The symptom is total
+			// silence from the controller, which reads exactly like a group being
+			// refused.
+			fixtures.WithScaledObjectScaleTargetKind("LeaderWorkerSet"),
+		)).To(Succeed())
+		DeferCleanup(func() {
+			_ = fixtures.DeleteScaledObject(context.Background(), crClient, cfg.LLMDNamespace, groupPool)
+		})
+
+		// Wait for the group to FORM, which is not the same as every Pod being
+		// Ready -- and asserting Ready here is the exact mistake this spec
+		// exists to catch, made in the test instead of the controller.
+		//
+		// The leader carries the pool proxy, which reports Ready only when a
+		// model is awake in the Pod. An idle pool leader is NotReady BY DESIGN,
+		// and idle is the state the whole spec runs in. Waiting for it would
+		// hang for the full timeout against a perfectly healthy pool.
+		//
+		// So: every Pod Running, and every WORKER Ready. That is what "the
+		// ranks have joined" means from outside.
 		Eventually(func(g Gomega) {
-			ready, created := readyGroupPods(ctx, groupPool)
-			g.Expect(ready).To(Equal(groupSize),
-				"the group never became %d Ready Pods (%d Ready of %d created)",
-				groupSize, ready, created)
+			running, workersReady, workers, created := groupFormation(ctx, groupPool)
+			g.Expect(created).To(Equal(groupSize),
+				"the LeaderWorkerSet created %d Pods, want %d", created, groupSize)
+			g.Expect(running).To(Equal(groupSize),
+				"%d of %d group Pods are Running", running, created)
+			g.Expect(workersReady).To(Equal(workers),
+				"%d of %d worker Pods are Ready, so a rank has not joined",
+				workersReady, workers)
 		}, settle, 5*time.Second).Should(Succeed())
 	})
 
@@ -145,20 +200,36 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 	})
 })
 
-// readyGroupPods counts the Ready and the created Pods of a fixture group.
-func readyGroupPods(ctx context.Context, fixtureName string) (ready, created int) {
+// groupFormation reports what a fixture group looks like from outside: how many
+// of its Pods are Running, how many of its WORKERS are Ready, how many workers
+// there are, and how many Pods exist at all.
+//
+// Workers and the leader are counted differently on purpose. A worker's
+// readiness means its rank has joined; the leader's means a model is awake in
+// the pool, which is a different question entirely and is false for every idle
+// pool Pod.
+func groupFormation(ctx context.Context, fixtureName string) (running, workersReady, workers, created int) {
 	pods, err := k8sClient.CoreV1().Pods(cfg.LLMDNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "warm-pool-fixture=" + fixtureName,
 	})
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 	for i := range pods.Items {
-		for _, c := range pods.Items[i].Status.Conditions {
+		p := &pods.Items[i]
+		created++
+		if p.Status.Phase == "Running" {
+			running++
+		}
+		if p.Labels[lwsv1.WorkerIndexLabelKey] == "0" {
+			continue // the leader
+		}
+		workers++
+		for _, c := range p.Status.Conditions {
 			if c.Type == "Ready" && c.Status == "True" {
-				ready++
+				workersReady++
 			}
 		}
 	}
-	return ready, len(pods.Items)
+	return running, workersReady, workers, created
 }
