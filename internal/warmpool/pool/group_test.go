@@ -399,3 +399,40 @@ func TestARankWithoutAnAddressStopsTheGroup(t *testing.T) {
 		t.Errorf("a rank without an address must stop the group, got: %v", err)
 	}
 }
+
+// A resident group instance must be recognised as the SAME engine however its
+// ranks were placed. warmGroup launches with --node-rank, --master-addr and
+// --headless bolted on, and --master-addr carries the LEADER'S POD IP: comparing
+// those strings directly makes idempotency depend on an address, so a leader
+// that came back on a different one would read as "resident with different
+// options" and the model would be refused instead of reused.
+func TestAResidentGroupInstanceIsRecognisedWhateverItsRankFlags(t *testing.T) {
+	const asked = "--model Qwen/Qwen3-8B --tensor-parallel-size 16 --nnodes 2"
+
+	for _, launched := range []string{
+		rankOptions(asked, 0, "10.0.0.1", 9001),
+		rankOptions(asked, 1, "10.0.0.1", 9001),
+		// The same engine, rendezvoused somewhere else entirely.
+		rankOptions(asked, 0, "10.9.9.9", 9002),
+	} {
+		if got := optionsWithoutRank(launched); got != asked {
+			t.Errorf("launched %q recovered %q, want %q", launched, got, asked)
+		}
+	}
+
+	// And a genuinely different engine must still differ, or the check protects
+	// nothing: serving one variant's traffic from another variant's weights is
+	// the failure this guards.
+	other := rankOptions("--model Qwen/Qwen3-0.6B --nnodes 2", 0, "10.0.0.1", 9001)
+	if optionsWithoutRank(other) == asked {
+		t.Error("a different model must not compare equal")
+	}
+}
+
+// Dropping a valueless flag must not swallow the one after it.
+func TestDroppingHeadlessDoesNotEatTheNextFlag(t *testing.T) {
+	got := optionsWithoutRank("--model m --headless --tensor-parallel-size 8")
+	if got != "--model m --tensor-parallel-size 8" {
+		t.Errorf("got %q, want the tensor-parallel flag intact", got)
+	}
+}

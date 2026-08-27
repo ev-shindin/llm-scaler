@@ -419,7 +419,7 @@ func (a *Adapter) warmGroup(ctx context.Context, leader *corev1.Pod, model Model
 		// as the single-Pod path. Only the leader is consulted: its rank is the
 		// one that serves, so a group whose leader holds this model already
 		// holds it.
-		if optionsWithoutPort(inst.Options) != optionsWithoutPort(rankOptions(model.EngineOptions, 0, leader.Status.PodIP, portOf(inst.Options))) {
+		if optionsWithoutRank(inst.Options) != optionsWithoutRank(model.EngineOptions) {
 			return fmt.Errorf(
 				"%s is resident in group %s with different options (%q); refusing to reuse it",
 				model.Variant, ref, inst.Options)
@@ -899,15 +899,45 @@ func isIdentityLabel(key string) bool {
 // removed, which is what makes two instances comparable: the port is the pool's
 // choice and differs between Pods, everything else is the engine's identity.
 func optionsWithoutPort(options string) string {
+	return optionsWithout(options, map[string]bool{"--port": true})
+}
+
+// rankFlags are the flags warmGroup ADDS to place an engine in a process group.
+// They are not part of what the caller asked for, so comparing a resident
+// instance against a requested one has to ignore them.
+var rankFlags = map[string]bool{
+	"--port":        true,
+	"--node-rank":   true,
+	"--master-addr": true,
+	"--headless":    true,
+}
+
+// optionsWithoutRank is what the CALLER asked for, recovered from what was
+// actually launched.
+//
+// Comparing rank-decorated options directly would make idempotency depend on
+// the leader's Pod IP, which --master-addr carries: a leader that came back on
+// a different address would read as "resident with different options" and the
+// model would be refused rather than reused. The engine's identity is its model
+// and its shape, not where its rendezvous happened to be.
+func optionsWithoutRank(options string) string {
+	return optionsWithout(options, rankFlags)
+}
+
+// optionsWithout drops the named flags and their values, handling both
+// `--flag value` and `--flag=value`. A valueless flag (--headless) is simply
+// dropped; the lookahead only consumes a value when the next field is not
+// itself a flag, so dropping one does not eat the flag after it.
+func optionsWithout(options string, drop map[string]bool) string {
 	fields := strings.Fields(options)
 	out := make([]string, 0, len(fields))
 	for i := 0; i < len(fields); i++ {
 		name, _, hasInline := strings.Cut(fields[i], "=")
-		if name != "--port" {
+		if !drop[name] {
 			out = append(out, fields[i])
 			continue
 		}
-		if !hasInline && i+1 < len(fields) {
+		if !hasInline && i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
 			i++
 		}
 	}
