@@ -328,9 +328,15 @@ var _ = Describe("Warm pool - what the pool decides", Label("full"), Label("warm
 				logs, err := controllerLog()
 				g.Expect(err).NotTo(HaveOccurred())
 				for _, name := range []string{poolC, poolD} {
-					g.Expect(logs).To(MatchRegexp(`"pool": "`+name+`", "state": "pods=1 [^"]*lent=1`),
+					// The Pod COUNT is deliberately not asserted. Lending the pool's
+					// only Pod drops free to 0, under the reserve, so the reconcile
+					// grows the pool to 2 -- correctly. Pinning pods=1 here made the
+					// assertion a race against that scale-up: it passed when the log
+					// was read first and failed when the reconcile was, which is how
+					// this spec came to fail intermittently under load.
+					g.Expect(logs).To(MatchRegexp(`"pool": "`+name+`", "state": "[^"]*lent=1[^0-9]`),
 						"pool %s should count one bridge -- its own", name)
-					g.Expect(logs).NotTo(MatchRegexp(`"pool": "`+name+`", "state": "[^"]*lent=2`),
+					g.Expect(logs).NotTo(MatchRegexp(`"pool": "`+name+`", "state": "[^"]*lent=2[^0-9]`),
 						"pool %s must not count the other pool's bridge", name)
 				}
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
