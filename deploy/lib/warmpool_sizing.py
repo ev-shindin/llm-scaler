@@ -21,17 +21,21 @@ import json
 import subprocess
 import sys
 
-# Measured on pokprod 2026-08-26, FITTED TO TWO POINTS -- see
-# docs/proposals/warm-pool-sleep-levels.md.
+# MUST MATCH internal/warmpool/pool/shape.go. The controller is what admits a
+# model; a tool that is more optimistic than the admission logic sizes a Pod the
+# controller then refuses to fill, which is worse than being wrong in the open.
 #
-#   Qwen3-0.6B: 1.11 GiB of weights cost 2.91 GiB of host RAM asleep
-#   Qwen3-8B:   15.27 GiB           cost 22.05 GiB
+# shape.go fits 2.6 GiB + 1.4x weights to 0.6B->4.1 GiB and 8B->23.4 GiB.
+# An independent run on 2026-08-27 measured 0.6B->2.91 GiB and 8B->22.05 GiB,
+# fitting 1.41 + 1.352. The SLOPES agree within 3.5%; the intercepts do not, and
+# the difference is presumably engine configuration (KV budget, max-model-len)
+# charged to the same cgroup. Both are two-point fits.
 #
-# Solving both gives 1.41 GiB + 1.352 x weights. The SLOPE is what matters at any
-# model worth pooling, and it was extrapolated from the 0.6B point alone as 1.4 --
-# confirmed within 3.4% once a real model was measured.
-SLEEPER_FIXED_GIB = 1.41
-SLEEPER_FACTOR = 1.352
+# Follow the controller's, which is the higher one. Over-estimating declines an
+# admission that would have fitted and costs a cold start; under-estimating
+# OOM-kills the Pod and takes every model resident in it with it.
+SLEEPER_FIXED_GIB = 2.6
+SLEEPER_FACTOR = 1.4
 
 # Cold start to serving, cached image, 0.6B: ~100 s, of which the weight read was
 # 0.56 s. So this is the part that does NOT scale with the model.
