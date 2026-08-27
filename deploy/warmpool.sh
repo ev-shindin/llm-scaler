@@ -75,18 +75,26 @@ USAGE
 
 # memory_for computes a Pod's memory limit from what it must hold.
 #
-# A level-1 sleeper is charged roughly 2.6 GiB + 1.4x its weights -- measured on
-# an H100, where a 0.6B costs 4.1 GiB and an 8B costs 23.4 GiB. Operators do not
-# know that number and should not have to: getting it wrong is the expensive
-# direction, because one model too many does not fail its own admission, it
-# OOM-kills the launcher and takes every model already resident with it.
+# A level-1 sleeper is charged roughly 2.6 GiB PER RANK + 1.4x its weights --
+# measured on an H100, where a 0.6B costs 4.1 GiB and an 8B costs 23.4 GiB at
+# TP=1, and on an H200 where a second rank cost as much as the first (3.16 ->
+# 6.75 GiB awake). Operators do not know that number and should not have to:
+# getting it wrong is the expensive direction, because one model too many does
+# not fail its own admission, it OOM-kills the launcher and takes every model
+# already resident with it.
+#
+# The rank term MUST match internal/warmpool/pool/shape.go. That is the estimate
+# the controller admits against, so a Pod sized by a different formula either
+# refuses models it had room for or accepts one it cannot hold. They disagreed by
+# (ranks-1) x 2.6 GiB per model once, which at --gpus 8 is 18 GiB of silent drift.
 memory_for() {
-  local count="$1" size="$2" billions
+  local count="$1" size="$2" ranks="${3:-1}" billions
   billions="$(printf '%s' "$size" | sed 's/[Bb]$//')"
-  awk -v n="$count" -v b="$billions" 'BEGIN {
+  awk -v n="$count" -v b="$billions" -v r="$ranks" 'BEGIN {
     if (b <= 0) { print ""; exit }
+    if (r < 1) r = 1
     weights = b * 2
-    per = 2.6 + 1.4 * weights
+    per = 2.6 * r + 1.4 * weights
     total = per * n
     if (total < 8) total = 8
     printf "%dGi", int(total + 0.999)
@@ -118,11 +126,13 @@ cmd_create() {
 
   local memory
   if [ -n "$MODELS" ] && [ -n "$MODEL_SIZE" ]; then
-    memory="$(memory_for "$MODELS" "$MODEL_SIZE")"
+    # GPUS is ranks per Pod: every device the engine spans is a worker process
+    # with its own CUDA context, and they all share this one memory limit.
+    memory="$(memory_for "$MODELS" "$MODEL_SIZE" "$GPUS")"
     if [ -z "$memory" ]; then
       log_error "--model-size must look like 8B or 0.6B"
     fi
-    log_info "Sizing for ${MODELS} x ${MODEL_SIZE} sleepers -> memory ${memory} (2.6GiB + 1.4x weights each, measured)"
+    log_info "Sizing for ${MODELS} x ${MODEL_SIZE} sleepers at ${GPUS} rank(s) each -> memory ${memory} (${GPUS} x 2.6GiB + 1.4x weights per model, measured)"
   else
     memory="128Gi"
     log_warning "No --models/--model-size given; defaulting memory to ${memory}. That limit IS the warm-set budget: it decides how many models a Pod can hold, and changing it later rolls the pool and reloads every resident model."
