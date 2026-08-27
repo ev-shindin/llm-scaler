@@ -24,6 +24,9 @@ Instructions → Verification → Cleanup → Configuration*. Index and conventi
 ### After installing
 
 - **[Scale a model to zero, and get it back](guides/scale-to-zero/)**
+- **[Bridge a scale-up with a warm pool](guides/warm-pool/)** — hold models
+  loaded and asleep on held GPUs, so a scale-up serves while its own replica
+  is still loading
 - **[Bound every WVA by real GPUs](guides/admin-gpu-bounding/)** — the GPU limiter
 - **[Test WVA against a full llm-d stack](guides/testing-with-llm-d/)**
 - **[Benchmark WVA](guides/benchmarking/)** — the supported benchmark path

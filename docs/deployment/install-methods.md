@@ -181,6 +181,33 @@ kubectl kustomize config/overlays/cluster-scoped/kubernetes \
 Or just use `./deploy/install.sh --undeploy`, which does exactly this.
 
 
+## After the controller: warm pools
+
+Installing WVA does not create a warm pool, and a namespace does not need one to
+autoscale. A pool trades held accelerators for scale-up latency, so it is worth
+it only where a model's load time actually costs something — see [Weights and the
+model cache](operations.md#weights-and-the-model-cache) for why that load is not
+a storage problem.
+
+To see whether this namespace has models that could share one:
+
+```bash
+deploy/warmpool.sh plan -n <namespace>
+```
+
+`plan` reads only. It groups the namespace's models by what a pool would have to
+provide — accelerator, and devices per replica, the two things a warm copy cannot
+change — and prints a `create` command for each group it can serve, plus any pool
+that is declared and unused or selected and missing.
+
+The sizing arguments in what it prints are placeholders: they set the Pod memory
+limit, which *is* the warm-set budget, and only you know how many models of what
+size a pool must hold at once. `deploy/warmpool.sh sizing -n <namespace>` answers
+that against this cluster's actual nodes.
+
+Full reasoning, the configuration surface, and the removal path are in the [warm
+pool guide](../guides/warm-pool/README.md).
+
 ## Platform-specific guides
 
 For platform-specific instructions and considerations:

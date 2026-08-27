@@ -355,6 +355,13 @@ So the cache removes the *download*, not the *load*, and faster storage does not
 remove the load either. Anything aimed at it is a different mechanism — keeping
 a process warm, or snapshotting a loaded engine.
 
+The first of those ships here as the **warm pool**: Pods that hold an engine
+already loaded on a GPU, which a scaling model borrows instead of paying the
+load for. Whether a pool is worth it, and how many models one Pod can hold, are
+cluster questions rather than defaults — see the [warm pool
+guide](../guides/warm-pool/README.md), and run `deploy/warmpool.sh plan -n <ns>`
+to see which of a namespace's models could share one.
+
 (An earlier revision of this section gave ~430 MB/s as the PVC's bandwidth. That
 was an end-to-end weight-load rate, not storage throughput; the conclusion above
 is unchanged, but the reason it gave was wrong.)
