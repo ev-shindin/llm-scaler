@@ -533,19 +533,37 @@ TP rank (it is a collective -- a rank that skips it hangs the others), then only
 sender's TP and the receiver's TP independent. Rank-pairing would require them
 equal and would tie both to a shard layout that is an internal detail.
 
-### Status: designed, and only half tested
+### Status: VERIFIED on a TP=2 engine -- and the first attempt was wrong
 
-- **TP=1 donation: measured twice**, once with the original extension and once
-  with the gathering one, byte-identical both times.
-- **The gather path itself: NOT run.** No node had two free GPUs while this was
-  written -- the fleet went from four free to one between checking and
-  deploying -- so a TP=2 sender never scheduled.
+Run at last on 2026-08-27. All 291 parameters gather, and the checked ones match
+the checkpoint exactly:
 
-The pieces it depends on are verified present rather than assumed, but "the
-shapes come back full from a TP=2 engine" is one `weight_metadata` call and it
-has not been made. **Make it before relying on any of this.** The cost if the
-gather is wrong is the failure mode of §4 again: plausible weights, a 200, and
-nonsense.
+| parameter | kind | gathered | checkpoint |
+| --- | --- | --- | --- |
+| `embed_tokens.weight` | column | `[151936, 4096]` | same |
+| `self_attn.qkv_proj.weight` | column | `[6144, 4096]` | same |
+| `self_attn.o_proj.weight` | **row** | `[4096, 4096]` | same |
+| `mlp.gate_up_proj.weight` | column | `[24576, 4096]` | same |
+| `mlp.down_proj.weight` | **row** | `[4096, 12288]` | same |
+
+**The first implementation was wrong, and only this check found it.** It chose
+the gather axis by reading `output_dim` and falling back to `input_dim`. But vLLM
+sets BOTH on many weights -- `set_weight_attrs(weight, {"input_dim": 1,
+"output_dim": 0})` in `vocab_parallel_embedding.py` -- so their PRESENCE
+disambiguates nothing. Row-parallel weights were gathered along axis 0 and came
+back `[8192, 2048]` where the checkpoint has `[4096, 4096]`.
+
+The sharded axis follows the **layer class**, not the attributes: row-parallel
+splits the input, every column-ish layer splits the output, and a row-parallel
+bias is replicated. `_shard_dims()` walks `named_modules()` and classifies.
+
+Had this gone unchecked, a TP>1 donor would have put correctly-named,
+wrongly-shaped tensors on the wire -- §4's failure again, and this time the
+receiver's `load_weights` might well have accepted the column-parallel majority
+and mangled the rest.
+
+**Still not run end to end from a TP>1 sender.** Shapes are right; a full
+transfer from a TP=2 donor into a live receiver has not been done.
 
 ## 4f. A note on which cluster these numbers came from
 
