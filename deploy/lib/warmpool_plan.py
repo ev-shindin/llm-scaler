@@ -86,6 +86,87 @@ def shape_of(namespace, target, kind="Deployment"):
     return (accelerator or "unknown", gpus or 1)
 
 
+# Cache: one node read per run, however many groups ask.
+_CLUSTER_ACCELERATOR = []
+
+
+def cluster_accelerator():
+    """Return (product, note): the GPU this whole cluster is, if it is only one.
+
+    A HOMOGENEOUS cluster does not need each model to name its accelerator --
+    there is only one to name, and llm-d's modelservice chart does not name it,
+    so on such a cluster every model reads as "undeclared" and no pool is ever
+    suggested. Reading the nodes answers it instead.
+
+    Two refusals that are NOT "there is no accelerator":
+
+    - `nodes` is a CLUSTER-scoped resource and this tool is run by namespace
+      admins. A Forbidden must be reported as "could not check", never folded
+      into "none found" -- that would pin a pool to hardware nobody verified,
+      and a pool on the wrong GPU is the silent mismatch the whole design exists
+      to avoid.
+    - More than one product means the cluster cannot answer for the model. The
+      choice is real and belongs to whoever knows which GPU the model wants.
+    """
+    if _CLUSTER_ACCELERATOR:
+        return _CLUSTER_ACCELERATOR[0]
+
+    result = (None, "")
+    try:
+        proc = subprocess.run(
+            ["kubectl", "get", "nodes", "-o", "json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60,
+        )
+    except Exception as exc:  # kubectl missing, timeout
+        result = (None, "the cluster's nodes could not be read (%s), so its GPU "
+                        "product is unknown -- not absent" % exc)
+        _CLUSTER_ACCELERATOR.append(result)
+        return result
+
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        lowered = err.lower()
+        if "forbidden" in lowered or "cannot list" in lowered:
+            result = (None, "reading nodes is not permitted with these rights, so the "
+                            "cluster's GPU product could not be checked. This is normal "
+                            "for a namespace admin, and it means UNKNOWN rather than none")
+        else:
+            result = (None, "the cluster's nodes could not be read, so its GPU product "
+                            "is unknown -- not absent: %s" % err)
+        _CLUSTER_ACCELERATOR.append(result)
+        return result
+
+    products = set()
+    try:
+        for node in json.loads(proc.stdout).get("items", []):
+            capacity = (node.get("status") or {}).get("capacity") or {}
+            if not capacity.get(GPU_RESOURCE):
+                continue
+            product = ((node.get("metadata") or {}).get("labels") or {}).get(GPU_PRODUCT)
+            if product:
+                products.add(product)
+    except (ValueError, KeyError, TypeError):
+        result = (None, "the node list could not be parsed, so the cluster's GPU "
+                        "product is unknown -- not absent")
+        _CLUSTER_ACCELERATOR.append(result)
+        return result
+
+    if len(products) == 1:
+        only = products.pop()
+        result = (only, "every GPU node on this cluster is %s, so a model that names "
+                        "no accelerator can only mean that one" % only)
+    elif not products:
+        result = (None, "no node advertises %s, so there is no accelerator to infer"
+                  % GPU_PRODUCT)
+    else:
+        result = (None, "this cluster has %d GPU products (%s), so it cannot answer for "
+                        "a model that names none -- pick the one this model wants"
+                  % (len(products), ", ".join(sorted(products))))
+    _CLUSTER_ACCELERATOR.append(result)
+    return result
+
+
 def suggested_name(accelerator, gpus):
     if accelerator == "unknown":
         return "pool-%dgpu" % gpus
@@ -157,19 +238,28 @@ def emit_plan_block(rows):
         for member in sorted(members):
             print("  # serves: %s" % member)
         if accelerator == "unknown":
-            print("  # No accelerator declared on these, so no pool is suggested for")
-            print("  # them: a pool that cannot name its GPU cannot prove a model fits.")
-            print("  #")
-            print("  # This is the COMMON case, not a strange one -- llm-d's modelservice")
-            print("  # chart requests a GPU without naming a product, so most real")
-            print("  # namespaces land here. It is a missing input, not a verdict against")
-            print("  # warming these models.")
-            print("  #")
-            print("  # To warm them, either give the model servers a nodeSelector on")
-            print("  # nvidia.com/gpu.product, or add an entry here by hand with the")
-            print("  # accelerator filled in. `kubectl get nodes -L nvidia.com/gpu.product`")
-            print("  # lists what this cluster has.")
-            continue
+            inferred, why = cluster_accelerator()
+            if not inferred:
+                print("  # No accelerator declared on these, so no pool is suggested for")
+                print("  # them: a pool that cannot name its GPU cannot prove a model fits.")
+                print("  #")
+                print("  # This is the COMMON case, not a strange one -- llm-d's modelservice")
+                print("  # chart requests a GPU without naming a product, so most real")
+                print("  # namespaces land here. It is a missing input, not a verdict")
+                print("  # against warming these models.")
+                print("  #")
+                print("  # %s." % why)
+                print("  #")
+                print("  # To warm them, give the model servers a nodeSelector on")
+                print("  # nvidia.com/gpu.product, or add an entry here by hand with the")
+                print("  # accelerator filled in.")
+                continue
+            # One product on the whole cluster: the model names none because
+            # there is none to choose. Suggest it, and say where it came from --
+            # this value was NOT declared by the workload.
+            accelerator = inferred
+            print("  # accelerator READ FROM THE CLUSTER, not declared by these models:")
+            print("  # %s." % why)
         # Comments aligned to a fixed column so the file reads as a table. The
         # name and accelerator vary in length, so this cannot be done by hand.
         first = True
@@ -306,19 +396,35 @@ def main():
         if name in declared:
             print("    Pool '%s' already exists -- point these at it with  warmPool: %s" % (name, name))
         elif accelerator == "unknown":
-            print(
-                "    Accelerator undeclared, so no pool is suggested: a pool that cannot\n"
-                "    name its GPU cannot prove a model fits it. This is the COMMON case --\n"
-                "    llm-d's modelservice chart requests a GPU without naming a product --\n"
-                "    so it is a missing input, not a verdict against warming these models.\n"
-                "    Either pin the models to one product with a nodeSelector on\n"
-                "    nvidia.com/gpu.product, or name it yourself:\n"
-                "      deploy/warmpool.sh create -n %s --name <pool> --gpus %d \\\n"
-                "        --accelerator <product> --models 4 --model-size 8B \\\n"
-                "        --proxy-image REF --wva-namespace NS\n"
-                "    `kubectl get nodes -L nvidia.com/gpu.product` lists what this cluster has."
-                % (namespace, gpus)
-            )
+            inferred, why = cluster_accelerator()
+            if inferred:
+                # The model names no GPU because there is only one to name.
+                # Pinning the pool to it is still right: it costs nothing on a
+                # cluster of one product and keeps the pool correct if a second
+                # is ever added.
+                print("    No accelerator is declared on these models, but %s." % why)
+                print("    Suggested (accelerator READ FROM THE CLUSTER, not from the model):")
+                print(
+                    "      deploy/warmpool.sh create -n %s --name %s --gpus %d \\\n"
+                    "        --accelerator %s \\\n"
+                    "        --models 4 --model-size 8B --proxy-image REF --wva-namespace NS"
+                    % (namespace, suggested_name(inferred, gpus), gpus, inferred)
+                )
+            else:
+                print(
+                    "    Accelerator undeclared, so no pool is suggested: a pool that cannot\n"
+                    "    name its GPU cannot prove a model fits it. This is the COMMON case --\n"
+                    "    llm-d's modelservice chart requests a GPU without naming a product --\n"
+                    "    so it is a missing input, not a verdict against warming these models."
+                )
+                print("    %s." % why)
+                print(
+                    "    Name it yourself:\n"
+                    "      deploy/warmpool.sh create -n %s --name <pool> --gpus %d \\\n"
+                    "        --accelerator <product> --models 4 --model-size 8B \\\n"
+                    "        --proxy-image REF --wva-namespace NS"
+                    % (namespace, gpus)
+                )
         else:
             print("    Suggested:")
             print(
