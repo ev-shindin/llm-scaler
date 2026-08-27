@@ -23,6 +23,13 @@ RECEIVER = os.environ["RECEIVER"]  # http://ip:8000 of the engine being filled
 MASTER = os.environ["MASTER"]      # address the receiver can reach the sender on
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 29800
 
+# The transfer group is ONE sender rank plus every receiver rank: the sender
+# gathers across its own TP and broadcasts full tensors, and each receiver rank
+# shards what it gets on load. So the sender's TP never enters this number, and
+# the receiver's always does -- a TP=2 receiver makes a group of three, not two.
+RECV_TP = int(os.environ.get("RECV_TP", "1"))
+WORLD = 1 + RECV_TP
+
 
 def post(base, path, payload=None, timeout=900):
     r = requests.post("%s/%s" % (base, path), json=payload, timeout=timeout)
@@ -34,11 +41,11 @@ def post(base, path, payload=None, timeout=900):
 
 meta = post(SENDER, "collective_rpc", {"method": "weight_metadata"}).json()["results"][0]
 names = [m[0] for m in meta]
-print("sender holds %d parameters (fused: %d)"
-      % (len(names), sum(1 for n in names if "qkv" in n or "gate_up" in n)), flush=True)
+print("sender holds %d parameters (fused: %d); transfer group of %d (1 sender + %d receiver rank(s))"
+      % (len(names), sum(1 for n in names if "qkv" in n or "gate_up" in n), WORLD, RECV_TP), flush=True)
 
 init_info = {"master_address": MASTER, "master_port": PORT,
-             "rank_offset": 1, "world_size": 2}
+             "rank_offset": 1, "world_size": WORLD}
 update_info = {"names": names,
                "dtype_names": [m[1] for m in meta],
                "shapes": [m[2] for m in meta],
@@ -68,7 +75,7 @@ try:
     t0 = time.time()
     r = post(SENDER, "collective_rpc",
              {"method": "send_weights_to",
-              "kwargs": {"master_address": MASTER, "master_port": PORT, "world_size": 2}})
+              "kwargs": {"master_address": MASTER, "master_port": PORT, "world_size": WORLD}})
     print("  sender broadcast returned in %.2fs" % (time.time() - t0), flush=True)
 except Exception as e:
     err["send"] = traceback.format_exc()

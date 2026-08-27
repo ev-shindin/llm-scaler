@@ -35,11 +35,36 @@ kubectl exec xfer -- bash -lc 'cd /scripts && CUDA_VISIBLE_DEVICES=1 python3 sen
 Also: on OpenShift set `USER` and `HOME`, or torch's `cache_dir` calls
 `getpass.getuser()` and `import vllm` dies with `KeyError: getpwuid()`.
 
+## TP=2 to TP=2, across nodes
+
+Measured 2026-08-27 on pokprod: Qwen3-8B (bf16, ~16.4 GB) donated by a serving
+TP=2 replica to a TP=2 receiver whose weights a level-2 sleep had discarded.
+Output identical on three prompts, including generative ones, not just
+"capital of France".
+
+    transfer group of 3 (1 sender + 2 receiver ranks)
+    291 parameters, 72 of them fused
+    receiver update_weights returned in 14.67s
+
+The group size is the thing to get right: the protocol is ONE sender rank plus
+EVERY receiver rank, so a TP=2 receiver makes a group of three. The sender's own
+TP never enters it -- `WeightDonor` gathers across the sender's ranks and
+broadcasts full unsharded tensors (`qkv_proj [6144, 4096]`, not a half), and each
+receiver rank shards on load. That is why sender TP and receiver TP need not
+match, and why the TP=2->TP=2 case needed no sharding change at all -- only
+`RECV_TP` on the orchestrator.
+
+14.67 s against ~37 s for the same model off this cluster's PVC. Both numbers are
+LOWER BOUNDS on what the mechanism can do: ~16.4 GB in 14.67 s is ~1.1 GB/s,
+which is an ordinary pod network and not RoCE. The ratio is what transfers to
+better hardware, not the seconds.
+
 ## What this does NOT show
 
-Two GPUs in one Pod, TP=1, 1.4 GiB. It says nothing yet about inter-node RoCE,
-about a live serving replica acting as the sender, about TP>1 where each rank
-needs its own shard, or about a model 500x this size.
+Nothing here covers RoCE or NVLink between the two Pods, a receiver whose TP
+DIFFERS from the sender's under real traffic, or a model 100x this size -- where
+the sender's gather, which materialises each full parameter on rank 0, is the
+step that has to be re-examined.
 
 ## A live replica as the sender
 
