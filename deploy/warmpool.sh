@@ -126,13 +126,13 @@ cmd_create() {
 
   local memory
   if [ -n "$MODELS" ] && [ -n "$MODEL_SIZE" ]; then
-    # GPUS is ranks per Pod: every device the engine spans is a worker process
-    # with its own CUDA context, and they all share this one memory limit.
-    memory="$(memory_for "$MODELS" "$MODEL_SIZE" "$GPUS")"
+    # GPUS_PER_POD is ranks per Pod: every device the engine spans is a worker
+    # process with its own CUDA context, and they all share this one limit.
+    memory="$(memory_for "$MODELS" "$MODEL_SIZE" "$GPUS_PER_POD")"
     if [ -z "$memory" ]; then
       log_error "--model-size must look like 8B or 0.6B"
     fi
-    log_info "Sizing for ${MODELS} x ${MODEL_SIZE} sleepers at ${GPUS} rank(s) each -> memory ${memory} (${GPUS} x 2.6GiB + 1.4x weights per model, measured)"
+    log_info "Sizing for ${MODELS} x ${MODEL_SIZE} sleepers at ${GPUS_PER_POD} rank(s) each -> memory ${memory} (${GPUS_PER_POD} x 2.6GiB + 1.4x weights per model, measured)"
   else
     memory="128Gi"
     log_warning "No --models/--model-size given; defaulting memory to ${memory}. That limit IS the warm-set budget: it decides how many models a Pod can hold, and changing it later rolls the pool and reloads every resident model."
@@ -261,8 +261,12 @@ warmpool_group_manifest() {
   local memory="$1"
   local node_selector=""
   if [ -n "$ACCELERATOR" ]; then
-    node_selector="          nodeSelector:
-            nvidia.com/gpu.product: ${ACCELERATOR}"
+    # EIGHT spaces: in the LWS templates the pod spec sits at six, so its keys
+    # sit at eight. Ten put nodeSelector inside automountServiceAccountToken and
+    # the whole manifest failed to parse -- which nothing caught, because a
+    # group pool had never been created on a cluster.
+    node_selector="        nodeSelector:
+          nvidia.com/gpu.product: ${ACCELERATOR}"
   fi
   cat <<YAML
 apiVersion: leaderworkerset.x-k8s.io/v1
