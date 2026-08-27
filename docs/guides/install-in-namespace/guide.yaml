@@ -40,6 +40,13 @@ visualize:
   smoke:
     run: make benchmark-smoke NAMESPACE=${NAMESPACE}
 
+warmpool:
+  plan:
+    note: |
+      Read-only. Groups this namespace's models by what a warm pool would have to
+      provide, and prints a create command for each group it could serve.
+    run: deploy/warmpool.sh plan -n ${NAMESPACE}
+
 cleanup:
   uninstall:
     run: make undeploy-wva

@@ -172,6 +172,9 @@ Full list: [Configuration reference](../../deployment/configuration.md).
 - `make benchmark-smoke NAMESPACE=<ns>` — drive load at one of the namespaces
   this controller manages and snapshot the dashboard
 - [Bound every WVA by real GPUs](../admin-gpu-bounding/)
+- `deploy/warmpool.sh plan -n <ns>` — read-only: whether a namespace this
+  controller manages has models that could share a [warm pool](../warm-pool/),
+  which holds engines loaded so a scale-up serves while its replica starts
 - [After the install](../../deployment/operations.md)
 - [Install methods](../../deployment/install-methods.md) — GitOps, direct
   Kustomize, and what the script does
