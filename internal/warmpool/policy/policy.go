@@ -578,6 +578,29 @@ func doesNotFit(model pool.ModelRef, resident []pool.Membership, cfg Config) (re
 		return fmt.Sprintf("spans %d Pod(s), this warm unit is %d", shape.Pods, pods), true
 	}
 
+	// A GROUP CANNOT BE WARMED YET, and saying so here is the whole point.
+	//
+	// Group support is currently observation only: ListWarm counts a group as
+	// one lendable unit and capacityOf sizes it by every Pod's devices, but
+	// Warm, Activate, Deactivate and Evict each address a SINGLE Pod and a
+	// single supervisor. Nothing starts the ranks on the workers -- there is no
+	// --node-rank fan-out and no use of the leader's address anywhere in the
+	// adapter.
+	//
+	// Without this check the arithmetic above passes for a model whose --nnodes
+	// matches the group size, the instance is created on the LEADER ALONE, and
+	// the engine waits for ranks that never arrive -- while the group holds
+	// every one of its GPUs. Declining costs a cold start. Admitting costs the
+	// GPUs and the model both, and reports nothing wrong while it does it.
+	//
+	// Permanent, because no amount of waiting adds the fan-out. Remove this the
+	// moment actuation spans the group, and not before.
+	if pods > 1 {
+		return fmt.Sprintf("this pool's warm unit spans %d Pods, and warming one is not "+
+			"implemented: the instance would be created on the leader alone and its "+
+			"ranks would never form", pods), true
+	}
+
 	// The right NUMBER of the wrong GPU is still the wrong GPU. A warm copy is
 	// only reusable on the accelerator it was loaded on, so a pool of one type
 	// cannot serve a model pinned to another: the bridge would place traffic on

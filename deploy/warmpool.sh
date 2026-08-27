@@ -145,6 +145,12 @@ cmd_create() {
   if [ "$GROUP_SIZE" -gt 1 ]; then
     log_info "Group pool: each warm unit is ${GROUP_SIZE} Pods x ${GPUS_PER_POD} GPU = $((GROUP_SIZE * GPUS_PER_POD)) devices"
     log_warning "A group serves ONLY models declaring --nnodes ${GROUP_SIZE}. A group's size is fixed when it is created -- an engine laid out across a different number of Pods is a different engine, and WVA declines it permanently."
+    log_warning "WARMING A GROUP IS NOT IMPLEMENTED YET. WVA counts a group as one"
+    log_warning "  lendable unit, but every actuation path addresses a single Pod: nothing"
+    log_warning "  starts the ranks on the workers. A model matching this group is DECLINED,"
+    log_warning "  with that reason, rather than half-started. This pool will hold its GPUs"
+    log_warning "  and warm nothing until group actuation exists -- create it only to test"
+    log_warning "  the counting, not to serve traffic."
   fi
 
   local manifest

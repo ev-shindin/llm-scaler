@@ -1499,8 +1499,20 @@ func TestAModelSpanningADifferentNumberOfPodsIsDeclined(t *testing.T) {
 	}
 }
 
-// The positive half: the same engine fits the group built for its shape.
-func TestAModelIsAdmittedIntoAGroupOfItsOwnShape(t *testing.T) {
+// The engine whose shape MATCHES the group is declined too, and for a different
+// reason: warming a group is not implemented.
+//
+// This used to assert the opposite -- that a 2-Pod engine belongs in a 2-Pod
+// group -- and the arithmetic behind that is still correct. What is missing is
+// actuation: Warm, Activate, Deactivate and Evict each address a single Pod and
+// a single supervisor, so admitting this model creates the instance on the
+// LEADER ALONE and its ranks never form, while the group holds every one of its
+// GPUs and reports nothing wrong.
+//
+// Restore the original assertion when actuation spans the group. Until then a
+// passing "it is admitted" is a claim that the pool can serve this model, and it
+// cannot.
+func TestAGroupShapedModelIsDeclinedUntilGroupWarmingExists(t *testing.T) {
 	c := cfg()
 	c.PodMemoryBytes = 400 << 30
 	c.SleepMinSize = 0
@@ -1520,9 +1532,22 @@ func TestAModelIsAdmittedIntoAGroupOfItsOwnShape(t *testing.T) {
 		Now:         now,
 	}, c)
 
-	if len(got.Admit) != 1 {
-		t.Fatalf("a 2-Pod engine belongs in a 2-Pod group: admit=%+v declined=%+v",
-			got.Admit, got.Declined)
+	if len(got.Admit) != 0 {
+		t.Fatalf("a group cannot warm anything yet, so nothing may be admitted: %+v",
+			got.Admit)
+	}
+	if len(got.Declined) != 1 {
+		t.Fatalf("the model must be declined, not dropped: %+v", got.Declined)
+	}
+	// The reason has to name the missing capability, not the layout: the layout
+	// MATCHES here, and a reason about Pod counts would send whoever reads it
+	// after a mismatch that does not exist.
+	if !strings.Contains(got.Declined[0].Reason, "not implemented") {
+		t.Errorf("the reason must say group warming is unimplemented, got: %s",
+			got.Declined[0].Reason)
+	}
+	if !got.Declined[0].Permanent {
+		t.Error("no amount of waiting adds the fan-out, so the decline is permanent")
 	}
 }
 
