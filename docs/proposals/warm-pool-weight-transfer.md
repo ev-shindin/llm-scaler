@@ -562,8 +562,37 @@ wrongly-shaped tensors on the wire -- §4's failure again, and this time the
 receiver's `load_weights` might well have accepted the column-parallel majority
 and mangled the rest.
 
-**Still not run end to end from a TP>1 sender.** Shapes are right; a full
-transfer from a TP=2 donor into a live receiver has not been done.
+### Then it was run end to end, and the shapes had been lying
+
+A TP=2 -> TP=1 transfer, with every shape matching the checkpoint, reported
+success at all four routes and served:
+
+```
+'REMABCDEFGHIscpABCDEFGHIlhsABCDEFGHIlhsABCDEFGHIbid Hier涕 Hier'
+```
+
+**Shape verification could not have caught this, and calling the gather
+"verified" on that basis was wrong.** A MERGED layer -- `qkv_proj`,
+`gate_up_proj` -- holds its constituents concatenated INSIDE each rank's shard:
+rank *i* has `[q_i ; k_i ; v_i]`. Gathering along the axis produces
+`[q0;k0;v0;q1;k1;v1]`, where the checkpoint wants `[q0;q1;k0;k1;v0;v1]`. Same
+dimensions. Different tensor. 72 of 291 parameters silently wrong.
+
+The fix reads `output_partition_sizes` -- the per-constituent size within one
+rank's shard -- splits the local shard into its constituents, gathers each
+separately, and concatenates in checkpoint order. Verified by OUTPUT, not shape:
+
+```
+before fix   'REMABCDEFGHIscpABCDEFGHIlhs...'
+after fix    ' Paris. The capital of Italy is Rome. The capital of'
+             ' 4, 4 + 2'      <- identical to the TP=1 -> TP=1 run
+```
+
+**The lesson generalises past this bug.** Every check in this document that
+compares shapes, counts or HTTP status is checking that a transfer HAPPENED, not
+that it was RIGHT. Only a seeded prompt compared against a known answer
+distinguishes them, and this is the second time that distinction has mattered --
+the first was level 2 serving `'!!!!!!!!'` behind four 200s.
 
 ## 4f. A note on which cluster these numbers came from
 
