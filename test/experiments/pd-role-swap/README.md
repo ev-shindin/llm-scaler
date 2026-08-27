@@ -117,6 +117,59 @@ first hit cached KV and did almost no prefill. The giveaway was the control --
 returning to the original budget stayed fast instead of slowing down. Every run
 now leads with a unique nonce.
 
+## What the superset costs, and what it cannot buy
+
+The design above launches at the UNION of both roles. Three objections, checked.
+
+### 1. Memory: measured, and it is negligible
+
+Predicted to hurt -- prefill's larger token budget inflates the model runner's
+input buffers and the encoder cache, decode's larger sequence count captures more
+CUDA graphs, and both come out of KV. Qwen3-8B at `gpu-memory-utilization 0.55`:
+
+| launch | GPU KV cache | CUDA-graph mem | peak activation |
+| --- | --- | --- | --- |
+| decode-tuned 2048/16 | 195,616 tokens | 0.15 GiB | 1.19 GiB |
+| union 8192/64 | 194,928 tokens | 0.23 GiB | 1.29 GiB |
+
+**688 tokens, 0.35%.** The objection was wrong at this size.
+
+### 2. Tensor parallelism: cannot be superset, and it is the point
+
+llm-d's own statement of what distinguishes the roles is not the batching budget:
+
+> using a larger TP for the memory-bound decoding phase while a smaller TP for
+> the computation-bound prefill phase
+
+TP fixes weight sharding at process start. One engine has one TP. If prefill
+wants 4 and decode 8, **no runtime swap expresses that** -- it is two processes
+on different GPU counts. This is the primary axis of specialisation and the swap
+does not touch it.
+
+### 3. Routing, not tuning, is where the benefit comes from
+
+vLLM on why disaggregation exists:
+
+> Without disaggregated prefilling, vLLM may insert some prefill jobs during the
+> decoding of one request. This results in higher tail latency. ... With
+> disaggregation, your decode engine runs exclusively decode batches. No
+> compute-intensive prefill jobs interrupt the step cadence.
+
+That is about what an engine RECEIVES, not how it is tuned. A budget swap cannot
+stop prefill interrupting decode if the router keeps sending both. So the swap is
+useful only alongside the routing change -- llm-d's `llm-d.ai/role` label, whose
+values are `prefill`, `decode` and `prefill-decode`.
+
+**Role is what you are sent; the budget is how you are tuned for it.** The swap
+handles the second cheaply. The first is a label change and matters more.
+
+### Where that leaves the fork
+
+Worth doing if roles are already routed and differ only in batching: it removes a
+process restart from a ratio change, for ~100-200 lines. Not worth doing if the
+roles are meant to differ in tensor parallelism, because nothing in this design
+reaches that.
+
 ## What this does NOT show
 
 One model, one GPU, TP=1, and no actual P/D traffic -- no NixlConnector, no
