@@ -217,7 +217,7 @@ tolerations:
 runtimeClassName: nvidia-legacy
 containers:
 - name: inference-server
-  image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13
+  image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.4@sha256:9df3f3bee8c321c14d5c0265d94ab8ae533cff1899c65eeb2623a5dcd753647e
   imagePullPolicy: IfNotPresent
   command:
   - /bin/bash
@@ -333,7 +333,7 @@ tolerations:
 runtimeClassName: nvidia-legacy
 containers:
 - name: inference-server
-  image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13
+  image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.4@sha256:9df3f3bee8c321c14d5c0265d94ab8ae533cff1899c65eeb2623a5dcd753647e
   imagePullPolicy: IfNotPresent
   command:
   - /bin/bash

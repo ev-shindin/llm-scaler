@@ -97,7 +97,18 @@ spec:
           # supervises vLLM engines inside this container. Copied into
           # warmpool/supervisor/ so the source is readable here; the image is
           # theirs because it is the one proven on this cluster.
-          image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13
+          # PINNED BY DIGEST, and by digest rather than tag because this is the
+          # one image here that somebody else controls. A tag can be moved; this
+          # cannot. The proxy beside it has always been pinned this way, and the
+          # third-party image is the one that needed it more.
+          #
+          # v0.6.4, the latest STABLE release. This ran on an alpha
+          # (v0.6.0-alpha.13) for as long as that was the newest thing measured
+          # here; FMA has since shipped v0.6.1 through v0.6.4, and running a
+          # release rather than a prerelease is the better default for the image
+          # that supervises every warm engine. v0.6.5-alpha.1 exists and is
+          # deliberately not taken.
+          image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.4@sha256:9df3f3bee8c321c14d5c0265d94ab8ae533cff1899c65eeb2623a5dcd753647e
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-c"]
           args:
