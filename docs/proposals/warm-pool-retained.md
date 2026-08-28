@@ -39,17 +39,28 @@ once.
 
 Two things follow immediately, and neither is a cost model:
 
-### 1. The drain wait must be sized to the workload
+### 1. Draining is the engine's job — SETTLED
 
-`Adapter.DrainWait` is **4 seconds**, a constant, with no flag reaching it. The
-return sequence clears the proxy first — the gate shuts and the EPP drains in
-~630 ms — then waits `DrainWait`, then sleeps the engine.
+This started as "make `Adapter.DrainWait` configurable", on the reasoning that 4
+seconds cannot cover a 30-second request. That was the wrong fix for a real bug.
 
-For a big model with 30-second requests that cuts in-flight work on every
-switch. This is a prerequisite, not a refinement: it must be configurable, and
-the pool must not sleep an engine before its longest in-flight request can
-finish. Sizing it from the workload's own latency SLO is better than a number an
-operator has to guess, and either beats 4 seconds.
+`/sleep` takes a mode, `Literal["abort", "wait", "keep"]`, and defaults to
+**abort** — every in-flight request cancelled the moment the call lands. WVA sent
+the default, so returning a borrowed Pod cut the responses it was still writing.
+`mode=wait` is vLLM's own graceful drain: queue new adds, keep stepping until
+what is running has finished, then sleep. It is the engine-level version of a
+preStop hook plus a grace period, and the pool now uses it.
+
+So no fixed wait can be right, and none is needed. Waiting a set number of
+seconds is not the same as waiting for the work to finish; only the engine knows
+when that is. What remains:
+
+- `DrainWait` keeps a narrower job — the ROUTING chain, so no NEW request arrives
+  after the engine is told to stop taking work (kubelet probe, EndpointSlice, EPP
+  stops dispatching, ~630 ms measured). It stays short.
+- The bound on a slow drain is the caller's deadline, because the sleep call
+  blocks while the engine drains. `ActTimeout` is 60 s today, which covers a
+  sub-30-second drain. A workload with longer requests raises that.
 
 ### 2. Both-asleep is a state worth avoiding
 
@@ -122,9 +133,8 @@ What NOT to do meanwhile, for the avoidance of re-litigating:
 
 ## Order of work
 
-1. **Configurable drain wait**, sized to the workload. A prerequisite, and
-   useful on its own: today's 4 seconds is wrong for any model with slow
-   requests, retained pool or not.
+1. ~~Configurable drain wait~~ — **done**, and differently: the engine drains
+   itself on `mode=wait`. See above.
 2. **Switch as an explicit action** in the policy, distinct from borrow and
    return, with the trigger stated in terms of demand rather than idleness.
 3. **Arrival-rate estimate per variant**, which is what both the switch and the
