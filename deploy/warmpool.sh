@@ -42,6 +42,10 @@ PROXY_IMAGE=""
 WVA_NAMESPACE=""
 CACHE_CLAIM="model-pvc"
 APPLY=1
+# On by DEFAULT. The only cluster-specific value the shipped policy needs is the
+# WVA namespace, which is already a required flag, so there is nothing left for
+# an operator to fill in -- and the unprotected state is not a mild one.
+NETWORK_POLICY=1
 
 usage() {
   cat <<'USAGE'
@@ -72,6 +76,11 @@ create options:
   --proxy-image REF    the warm-pool image you built
   --wva-namespace NS   where WVA runs, for scalerAddress
   --cache-claim NAME   RWX model cache PVC. Default: model-pvc
+  --no-network-policy  do not create the ingress boundary. For clusters where
+                       policy is managed centrally -- NOT a convenience: without
+                       one, :8001 accepts caller-supplied argv from anything that
+                       can reach the Pod IP, in a container that mounts the
+                       shared model cache read-write.
   --dry-run            print the manifests instead of applying
 USAGE
 }
@@ -162,6 +171,12 @@ cmd_create() {
     manifest=$(warmpool_manifest "$memory")
   fi
 
+  if [ "$NETWORK_POLICY" -eq 1 ]; then
+    manifest="${manifest}
+---
+$(warmpool_networkpolicy)"
+  fi
+
   if [ "$APPLY" -eq 0 ]; then
     printf '%s\n' "$manifest"
     return 0
@@ -170,7 +185,12 @@ cmd_create() {
   printf '%s\n' "$manifest" | kubectl apply -f - >/dev/null
   log_success "Pool '${POOL_NAME}' created in ${NAMESPACE}: ${POOL_REPLICAS} Pods (max ${POOL_MAX}), reserve ${RESERVE}, ${GPUS_PER_POD} GPU each, ${memory} per Pod"
   log_info "Models join it with:  warmPool: ${POOL_NAME}   in their ScaledObject trigger metadata"
-  log_warning "No NetworkPolicy is created here. The shipped one (config/warmpool) restricts the supervisor ports to WVA, and its namespaceSelector must name ${WVA_NAMESPACE}."
+  if [ "$NETWORK_POLICY" -eq 1 ]; then
+    log_info "NetworkPolicy wva-warm-pool-${POOL_NAME}: :8001/:8002/:9001-9016 admit only WVA in ${WVA_NAMESPACE}; :8000 admits this namespace"
+    log_info "If the pool later reports itself EMPTY while holding accelerators, check this first: a wrong WVA namespace denies the supervisor read, which looks exactly like a pool that is too small."
+  else
+    log_warning "--no-network-policy: nothing restricts :8001, which spawns processes with caller-supplied argv in a container that mounts the model cache read-write. Apply your own boundary."
+  fi
 }
 
 # BEGIN GENERATED POD SPEC -- regenerate with: make warmpool-render
@@ -477,6 +497,71 @@ YAML
 # END GENERATED POD SPEC
 
 
+# warmpool_networkpolicy renders the ingress boundary for these Pods.
+#
+# Emitted by DEFAULT rather than left to the operator, because the shipped
+# manifest needs exactly one substitution -- the namespace WVA runs in -- and
+# that is already a required flag here. Leaving it out was not neutral: without
+# a policy, :8001 is reachable by anything that can route to the Pod IP, and
+# :8001 spawns processes with caller-supplied argv and environment in a
+# container that mounts the shared model cache read-write. That is arbitrary
+# execution plus a write primitive over other tenants' weights, so "apply this
+# separately" is not a safe default to ship.
+#
+# The port range is pool.BasePort..MaxInstancesPerPod, which is all an engine
+# can bind -- the controller calls /is_sleeping and /wake_up on the instances
+# directly, from outside the Pod, so omitting it leaves the pool inert.
+warmpool_networkpolicy() {
+  cat <<YAML
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wva-warm-pool-${POOL_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+    llm-d.ai/warm-pool: ${POOL_NAME}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: warm-pool
+      llm-d.ai/warm-pool: ${POOL_NAME}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Serving traffic, from this namespace: the EPP dispatches to the Pod's
+    # InferencePool target port.
+    - ports:
+        - protocol: TCP
+          port: 8000
+      from:
+        - podSelector: {}
+    # Control, for the controller ONLY. The namespaceSelector is required, not
+    # belt and braces: a bare podSelector matches this policy's own namespace,
+    # which is the tenant's, and would put :8001 one \`kubectl run\` away from
+    # anyone who can create a Pod here.
+    - ports:
+        - protocol: TCP
+          port: 8001
+        - protocol: TCP
+          port: 8002
+        - protocol: TCP
+          port: 9001
+          endPort: 9016
+      from:
+        # kubernetes.io/metadata.name is applied by the API server, so naming a
+        # namespace needs no labelling step.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${WVA_NAMESPACE}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: workload-variant-autoscaler
+              control-plane: controller-manager
+YAML
+}
+
 warmpool_manifest() {
   local memory="$1"
   local spec
@@ -637,7 +722,11 @@ cmd_delete() {
   # for both costs one NotFound and removes the chance of leaving a group behind.
   kubectl delete deployment "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete leaderworkerset "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
-  log_success "Pool '${POOL_NAME}' removed from ${NAMESPACE}: ScaledObject and Deployment"
+  # LAST, and only the one create names. A policy left behind selects Pods that
+  # no longer exist, which is harmless but accumulates; deleting it first would
+  # briefly leave live pool Pods unprotected instead.
+  kubectl delete networkpolicy "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  log_success "Pool '${POOL_NAME}' removed from ${NAMESPACE}: ScaledObject, workload and NetworkPolicy"
 }
 
 if [ $# -lt 1 ]; then
@@ -667,6 +756,7 @@ while [ $# -gt 0 ]; do
     --wva-namespace) WVA_NAMESPACE="$2"; shift 2 ;;
     --cache-claim)   CACHE_CLAIM="$2"; shift 2 ;;
     --dry-run)       APPLY=0; shift ;;
+    --no-network-policy) NETWORK_POLICY=0; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) usage; log_error "unknown option: $1" ;;
   esac

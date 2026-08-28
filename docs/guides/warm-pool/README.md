@@ -137,9 +137,22 @@ without applying, and use `delete` to remove both objects together — removing
 only one leaves either accelerators nobody can borrow, or a trigger pointing at
 nothing.
 
-The script does not create the NetworkPolicy, and it deliberately does not guess
-your accelerator: omit `--accelerator` and the Pods may schedule on any GPU node,
-at which point WVA declines every model whose accelerator it can prove differs.
+`create` also applies the ingress boundary, because the only cluster-specific
+value it needs is the WVA namespace and that is already a flag. It admits
+`:8000` from this namespace and `:8001`, `:8002` and the engine range from WVA
+alone. Pass `--no-network-policy` if your cluster manages policy centrally --
+but not for convenience: without one, `:8001` accepts caller-supplied argv and
+environment from anything that can reach the Pod IP, in a container that mounts
+the shared model cache read-write.
+
+If the pool later reports itself **empty** while holding accelerators, suspect
+this first: a policy naming the wrong WVA namespace denies the supervisor read,
+and the result is indistinguishable from a pool that is merely too small. Look
+for `warm pool Pod could not be read` in the controller log.
+
+It deliberately does not guess your accelerator: omit `--accelerator` and the
+Pods may schedule on any GPU node, at which point WVA declines every model whose
+accelerator it can prove differs.
 
 The rest of this section is the manual path, for when you want to edit the
 manifests directly.
@@ -208,7 +221,8 @@ deploy/warmpool.sh delete -n <namespace> --name <pool>
 ```
 
 It deletes the ScaledObject first, so WVA stops lending Pods that are about to
-disappear, and it is safe to repeat. Models still naming that pool in their
+disappear, then the workload, then the NetworkPolicy `create` made -- in that
+order, so live Pods are never left unprotected. It is safe to repeat. Models still naming that pool in their
 trigger metadata are then warmed by nothing — `plan` lists them.
 
 ## Sizing

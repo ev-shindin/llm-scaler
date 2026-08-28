@@ -2093,6 +2093,12 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# preStop hooks pod-wide, or reporting an unreadable workload as healthy all
 	@# parse perfectly and are all wrong about a running cluster.
 	@bash hack/check-workload-gaps.sh
+	@echo "Checking what warmpool.sh actually emits..."
+	@# Renders the pool manifests and asserts their shape. Every bug this covers
+	@# parses fine: one container with the proxy image under the supervisor's
+	@# name, a missing ScaledObject (so the pool is never discovered), a worker
+	@# template carrying the proxy (so the group never becomes Ready).
+	@bash hack/check-warmpool-manifests.sh
 	@echo "Checking for mangled line continuations..."
 	@# `bash -n` cannot catch this: `cmd \n | grep ...` is SYNTACTICALLY VALID —
 	@# the \n becomes a literal argument. It shipped once, in the limiter path,
