@@ -366,6 +366,14 @@ guides-check: ## Fail if any guide README is out of date with its guide.yaml, or
 	python3 hack/render-guides.py --check
 	python3 hack/check-doc-links.py
 
+.PHONY: warmpool-render
+warmpool-render: ## Regenerate the pool Pod spec in deploy/warmpool.sh from config/warmpool.
+	python3 hack/render-warmpool-spec.py
+
+.PHONY: warmpool-check
+warmpool-check: ## Fail if deploy/warmpool.sh's Pod spec is out of date with config/warmpool (CI).
+	python3 hack/render-warmpool-spec.py --check
+
 .PHONY: docs-links-external
 docs-links-external: ## Resolve every external doc link over the network (not in CI: needs egress).
 	python3 hack/check-doc-links.py --external

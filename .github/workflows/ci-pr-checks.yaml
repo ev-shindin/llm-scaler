@@ -150,6 +150,14 @@ jobs:
       - name: Run make guides-check
         run: make guides-check
 
+      # The pool Pod is described in config/warmpool and COPIED into
+      # deploy/warmpool.sh by a generator, so the script needs no repo, no yq
+      # and no kustomize at run time. The copy is what drifts: it once lost the
+      # supervisor container entirely, and every pool the script created held
+      # its GPUs and answered nothing until it was found on a cluster.
+      - name: Run make warmpool-check
+        run: make warmpool-check
+
       # The dashboards are checked here for the same reason: nine overlapping
       # panel pairs sat in the operational dashboard for months because Grafana
       # repacks a broken layout on load and shows something plausible.

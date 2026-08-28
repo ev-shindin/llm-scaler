@@ -173,78 +173,308 @@ cmd_create() {
   log_warning "No NetworkPolicy is created here. The shipped one (config/warmpool) restricts the supervisor ports to WVA, and its namespaceSelector must name ${WVA_NAMESPACE}."
 }
 
-# pool_pod_spec prints the pool Pod's spec, DERIVED from config/warmpool rather
-# than written out again here.
+# BEGIN GENERATED POD SPEC -- regenerate with: make warmpool-render
 #
-# It was written out again here, and the two copies diverged completely: this
-# script emitted ONE container -- the proxy image under the name
-# inference-server -- with no command, no ports, no env and no supervisor. The
-# shipped manifest has two, the launcher serving the supervisor API on :8001 and
-# the proxy on :8000/:8002. Every pool this script created therefore held its
-# GPUs and answered nothing, and the controller reported it EMPTY: measured on
-# pokprod, where a pool formed correctly across two nodes and then reported
-# pods=0 while holding both.
-#
-# So there is one source now. The knobs below are the only things this script
-# decides; everything else -- the launcher image, the env that keeps caches off
-# a writable HOME, the probes, the volumes -- comes from the manifest that is
-# reviewed and deployed.
+# Generated from config/warmpool/warmpool-deployment.yaml. DO NOT EDIT by
+# hand: run `make warmpool-render` after changing that manifest. CI fails
+# on drift, because a pool Pod that disagrees with the shipped one holds
+# GPUs and answers nothing -- which is what this file exists to prevent.
 pool_pod_spec() {
   local memory="$1" indent="$2" role="${3:-leader}"
-  local built
-  # NOTE: this function runs inside $( ). log_error EXITS THE SUBSHELL ONLY, so
-  # every failure here returns non-zero and the CALLER reports it. Getting that
-  # wrong applied a Deployment with no containers at all, after printing the
-  # error that was supposed to have stopped it.
-  if ! built="$(kubectl kustomize "${REPO_ROOT}/config/warmpool" 2>&1)"; then
-    printf "could not build %s/config/warmpool: %s
-" "$REPO_ROOT" "$built" >&2
-    return 1
-  fi
 
-  # Every value this script decides, and nothing else. yq's env() reads the
-  # PROCESS environment, so each one is exported on the call rather than left as
-  # a shell variable -- unexported, they read as empty and the whole spec comes
-  # back without them.
-  local expr='select(.kind == "Deployment") | .spec.template.spec
-      | (.containers[] | select(.name == "inference-server") | .resources.limits["nvidia.com/gpu"]) = env(WP_GPUS)
-      | (.containers[] | select(.name == "inference-server") | .resources.requests["nvidia.com/gpu"]) = env(WP_GPUS)
-      | (.containers[] | select(.name == "inference-server") | .resources.limits.memory) = env(WP_MEMORY)
-      | (.containers[] | select(.name == "inference-server") | .resources.requests.memory) = env(WP_MEMORY)
-      | (.containers[] | select(.name == "proxy") | .image) = env(WP_PROXY_IMAGE)
-      | (.volumes[] | select(.name == "model-cache") | .persistentVolumeClaim.claimName) = env(WP_CACHE_CLAIM)'
-  # Only when one is named. An empty nodeSelector value would pin the Pod to a
-  # product called "" and it would never schedule.
+  # Conditional: an accelerator nobody named adds no key, rather than an
+  # empty one, which would pin the Pod to a GPU product called "".
+  local WP_NODE_SELECTOR=""
   if [ -n "$ACCELERATOR" ]; then
-    expr="${expr}
-      | .nodeSelector[\"nvidia.com/gpu.product\"] = env(WP_ACCELERATOR)"
+    WP_NODE_SELECTOR="nodeSelector:
+  nvidia.com/gpu.product: ${ACCELERATOR}"
   fi
-  # A WORKER runs no proxy. The proxy is the Pod's traffic gate and reports Ready
-  # only while a model is awake behind it -- but a worker holds a rank and serves
-  # nobody, so its gate would never open, the Pod would never be Ready, and the
-  # controller would never count the group as complete. Measured on pokprod: with
-  # the proxy present both Pods sat at Ready=false and the pool reported pods=0
-  # while holding two GPUs.
-  if [ "$role" = "worker" ]; then
-    expr="${expr}
-      | .containers = [.containers[] | select(.name != \"proxy\")]"
-  fi
+  local WP_MEMORY="$memory"
 
   local out
-  if ! out="$(printf '%s' "$built" | WP_GPUS="$GPUS_PER_POD" WP_MEMORY="$memory" \
-      WP_PROXY_IMAGE="$PROXY_IMAGE" WP_CACHE_CLAIM="$CACHE_CLAIM" \
-      WP_ACCELERATOR="$ACCELERATOR" yq eval "$expr" - 2>&1)"; then
-    printf "could not shape the pool Pod spec: %s
-" "$out" >&2
-    return 1
+  if [ "$role" = "worker" ]; then
+    out=$(cat <<YAML
+${WP_NODE_SELECTOR}
+automountServiceAccountToken: false
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: workload-variant-autoscaler
+            app.kubernetes.io/component: warm-pool
+tolerations:
+- key: nvidia.com/gpu
+  operator: Exists
+  effect: NoSchedule
+runtimeClassName: nvidia-legacy
+containers:
+- name: inference-server
+  image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13
+  imagePullPolicy: IfNotPresent
+  command:
+  - /bin/bash
+  - -c
+  args:
+  - 'exec python3 /app/launcher.py \
+
+    --host 0.0.0.0 \
+
+    --log-level info \
+
+    --port=8001
+
+    '
+  ports:
+  - name: supervisor
+    containerPort: 8001
+    protocol: TCP
+  env:
+  - name: HOME
+    value: /pod-home
+  - name: PYTHONNOUSERSITE
+    value: '1'
+  - name: HF_HOME
+    value: /model-cache
+  - name: VLLM_CACHE_ROOT
+    value: /model-cache/vllm
+  - name: FLASHINFER_WORKSPACE_DIR
+    value: /model-cache/flashinfer
+  - name: TRITON_CACHE_DIR
+    value: /model-cache/triton
+  - name: XDG_CACHE_HOME
+    value: /model-cache
+  - name: XDG_CONFIG_HOME
+    value: /model-cache/config
+  - name: USER
+    value: vllm
+  - name: NODE_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.nodeName
+  - name: NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+  resources:
+    limits:
+      nvidia.com/gpu: ${GPUS_PER_POD}
+      memory: ${WP_MEMORY}
+    requests:
+      nvidia.com/gpu: ${GPUS_PER_POD}
+      memory: ${WP_MEMORY}
+      cpu: '2'
+  volumeMounts:
+  - name: pod-home
+    mountPath: /pod-home
+  - name: model-cache
+    mountPath: /model-cache
+  readinessProbe:
+    exec:
+      command:
+      - python3
+      - -c
+      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
+        , timeout=3)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  livenessProbe:
+    exec:
+      command:
+      - python3
+      - -c
+      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
+        , timeout=5)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    failureThreshold: 3
+volumes:
+- name: pod-home
+  emptyDir: {}
+- name: model-cache
+  persistentVolumeClaim:
+    claimName: ${CACHE_CLAIM}
+YAML
+    )
+  else
+    out=$(cat <<YAML
+${WP_NODE_SELECTOR}
+automountServiceAccountToken: false
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: workload-variant-autoscaler
+            app.kubernetes.io/component: warm-pool
+tolerations:
+- key: nvidia.com/gpu
+  operator: Exists
+  effect: NoSchedule
+runtimeClassName: nvidia-legacy
+containers:
+- name: inference-server
+  image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13
+  imagePullPolicy: IfNotPresent
+  command:
+  - /bin/bash
+  - -c
+  args:
+  - 'exec python3 /app/launcher.py \
+
+    --host 0.0.0.0 \
+
+    --log-level info \
+
+    --port=8001
+
+    '
+  ports:
+  - name: supervisor
+    containerPort: 8001
+    protocol: TCP
+  env:
+  - name: HOME
+    value: /pod-home
+  - name: PYTHONNOUSERSITE
+    value: '1'
+  - name: HF_HOME
+    value: /model-cache
+  - name: VLLM_CACHE_ROOT
+    value: /model-cache/vllm
+  - name: FLASHINFER_WORKSPACE_DIR
+    value: /model-cache/flashinfer
+  - name: TRITON_CACHE_DIR
+    value: /model-cache/triton
+  - name: XDG_CACHE_HOME
+    value: /model-cache
+  - name: XDG_CONFIG_HOME
+    value: /model-cache/config
+  - name: USER
+    value: vllm
+  - name: NODE_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.nodeName
+  - name: NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+  resources:
+    limits:
+      nvidia.com/gpu: ${GPUS_PER_POD}
+      memory: ${WP_MEMORY}
+    requests:
+      nvidia.com/gpu: ${GPUS_PER_POD}
+      memory: ${WP_MEMORY}
+      cpu: '2'
+  volumeMounts:
+  - name: pod-home
+    mountPath: /pod-home
+  - name: model-cache
+    mountPath: /model-cache
+  readinessProbe:
+    exec:
+      command:
+      - python3
+      - -c
+      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
+        , timeout=3)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  livenessProbe:
+    exec:
+      command:
+      - python3
+      - -c
+      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
+        , timeout=5)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    failureThreshold: 3
+- name: proxy
+  image: ${PROXY_IMAGE}
+  imagePullPolicy: IfNotPresent
+  args:
+  - --port=8000
+  - --control-port=8002
+  - --v=2
+  ports:
+  - name: serving
+    containerPort: 8000
+    protocol: TCP
+  - name: proxy-control
+    containerPort: 8002
+    protocol: TCP
+  livenessProbe:
+    exec:
+      command:
+      - /warmpool-proxy
+      - --check=live
+      - --control-port=8002
+    initialDelaySeconds: 3
+    periodSeconds: 10
+  readinessProbe:
+    exec:
+      command:
+      - /warmpool-proxy
+      - --check=ready
+      - --control-port=8002
+    initialDelaySeconds: 3
+    periodSeconds: 1
+    failureThreshold: 1
+    timeoutSeconds: 2
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+volumes:
+- name: pod-home
+  emptyDir: {}
+- name: model-cache
+  persistentVolumeClaim:
+    claimName: ${CACHE_CLAIM}
+YAML
+    )
   fi
-  if [ -z "$out" ]; then
-    printf "the pool Pod spec came out empty; config/warmpool built nothing usable
-" >&2
-    return 1
-  fi
-  printf '%s\n' "$out" | sed "s/^/${indent}/"
+
+  # Blank lines go: an unset nodeSelector leaves one, and a stray blank
+  # line inside a Pod spec is harmless but reads as a mistake.
+  printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | sed "s/^/${indent}/"
 }
+# END GENERATED POD SPEC
 
 
 warmpool_manifest() {
