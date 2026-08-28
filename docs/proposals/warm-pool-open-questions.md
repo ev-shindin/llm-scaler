@@ -44,6 +44,12 @@ Consequences visible today:
   Pods stay free. Whether that is the right number depends on arrival rate and
   ramp time, which the optimizer measures and the pool never sees.
 
+**Where this is going.** [Retained pools](warm-pool-retained.md) is the design
+this question blocks: holding several big models on one set of GPUs, one awake,
+switching between them. Its numbers make one half of the cost model concrete --
+a warm copy costs ~2.7 GiB per rank and removes a 300-second cold start -- and
+leave the other half, the probability of needing a model soon, still unmeasured.
+
 **What a real answer needs.** A cost model where a warm Pod's value is the
 cold-start latency it removes, weighted by the probability of needing it —
 comparable against the value of a serving replica, in units the optimizer already
