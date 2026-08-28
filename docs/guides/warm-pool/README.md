@@ -37,6 +37,45 @@ The pool needs, in its namespace:
 - RBAC allowing WVA to `patch` Pods. The shipped ClusterRole has this. If yours
   was scoped by hand, WVA refuses to start the pool and says so — it will not
   hold accelerators to warm models it could never lend.
+- **Two container images, from two owners.** See below.
+
+### The images a pool Pod runs
+
+Each pool Pod runs two containers, and only one of them is built here:
+
+| container | image | owner |
+| --- | --- | --- |
+| `inference-server` | `ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher` | Fast Model Actuation |
+| `proxy` | whatever you pass to `--proxy-image` | this repo (`make docker-build-warmpool-proxy`) |
+
+The launcher image is **not** ours and is not optional. It is a full vLLM
+runtime — vLLM, torch and CUDA — with FMA's launcher on top, and the pool needs
+both halves of that:
+
+- **vLLM has to be in the Pod.** A warm copy is an engine already loaded on this
+  Pod's GPU. There is nothing to warm unless the engine runs here.
+- **The launcher is the API WVA drives.** It serves `/v2/vllm/instances` on
+  :8001, which is how the controller creates a model in a Pod, lists what is
+  resident, and removes one. Without it a pool Pod holds accelerators and
+  answers nothing — the controller reports the pool EMPTY while its GPUs are
+  gone, which is exactly what happened when a hand-written manifest lost this
+  container.
+
+So a pool node must be able to pull from `ghcr.io/llm-d-incubation`. On an
+air-gapped or mirrored registry, mirror that image too — it is easy to miss,
+because it is the only image in this design that this repo neither builds nor
+names in its own registry.
+
+Substituting your own is possible in principle: the launcher's source is
+vendored at `warmpool/supervisor/` and any image offering the same instance API
+over vLLM would do. FMA's is used because it is the one proven on this cluster.
+Note this repo does not build that image, so the vendored source is there to be
+read, not to be shipped — if FMA publishes a newer launcher, the copy here can
+be a different version from the one actually running.
+
+This is the live FMA dependency the [FMA post-mortem](../../proposals/fma-post-mortem.md)
+warns about: FMA was dropped as an *actuation strategy*, and its launcher is
+still what supervises every warm engine.
 
 ## Should this model be warmed here at all?
 

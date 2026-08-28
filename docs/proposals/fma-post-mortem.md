@@ -68,6 +68,19 @@ things are live:
    in `config/warmpool/warmpool-deployment.yaml`. The pool drives it over the
    launcher's own `/v2/vllm/instances` API. **This is a hard dependency of the
    shipping feature.**
+
+   It is not merely a supervisor: `launcher.py` does
+   `from vllm.entrypoints.openai.api_server import run_server`, so the image is a
+   full vLLM runtime with the launcher on top. The pool needs both halves — vLLM
+   because a warm copy IS an engine loaded on this Pod's GPU, and the launcher
+   because its API is how the controller creates, lists and removes a resident
+   model. This repo builds neither: it publishes the warm-pool PROXY and pulls
+   the launcher. A mirrored or air-gapped registry has to carry
+   `ghcr.io/llm-d-incubation` for the pool to start at all.
+
+   The source is vendored at `warmpool/supervisor/` to be READ, not shipped —
+   nothing checks it against the tag actually pulled, so it can quietly become a
+   different version from the one running.
 2. **Launcher attribution** in `internal/collector/locator` — pairing a launcher
    Pod to its requester's scaler, so a launcher's metrics are charged to the
    right variant instead of dropped. Roughly eight tests cover it.
