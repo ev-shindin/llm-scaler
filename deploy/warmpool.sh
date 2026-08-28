@@ -512,6 +512,32 @@ YAML
 # can bind -- the controller calls /is_sleeping and /wake_up on the instances
 # directly, from outside the Pod, so omitting it leaves the pool inert.
 warmpool_networkpolicy() {
+  # RANK-TO-RANK, and only for a pool whose unit spans Pods.
+  #
+  # An engine laid across several Pods rendezvouses over the network: torch
+  # distributed on its master port, then NCCL on ports it chooses at runtime.
+  # None of that is expressible as a port list, and none of it is admitted by
+  # the rules above -- so with a policy and no peer rule, the ranks start, wait
+  # for each other, and never form. Measured on a real two-node group: both
+  # ranks alive for five minutes, the leader's API never bound, and a connect
+  # from rank 1 to rank 0 TIMED OUT rather than being refused, which is what a
+  # dropped packet looks like.
+  #
+  # Omitted for single-Pod pools, where the Pods have nothing to say to each
+  # other and admitting them would only widen the policy.
+  #
+  # The peer is selected by THIS pool's own label, not by the component label
+  # alone: the ranks of one engine already share its memory and are one trust
+  # domain, but two different pools are not.
+  local PEER_RULE=""
+  if [ "$GROUP_SIZE" -gt 1 ]; then
+    PEER_RULE="
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: warm-pool
+              llm-d.ai/warm-pool: ${POOL_NAME}"
+  fi
   cat <<YAML
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -558,7 +584,7 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: workload-variant-autoscaler
-              control-plane: controller-manager
+              control-plane: controller-manager${PEER_RULE}
 YAML
 }
 

@@ -180,7 +180,21 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 		// like a group being refused, and would have been diagnosed as one.
 		Expect(fixtures.EnsureScaledObject(ctx, crClient, cfg.LLMDNamespace,
 			groupPool, groupPool, groupPool, 1, 6, cfg.MonitoringNS,
-			fixtures.WithWarmPoolTrigger(groupPool, nil),
+			// Reserve ZERO, for two reasons that both bite this suite.
+			//
+			// It is what gives admission a budget at all: the budget is free Pods
+			// minus the reserve, so a one-group pool with a reserve of one can
+			// never take a model, and the fan-out below would have nothing to
+			// actuate.
+			//
+			// And it stops the pool GROWING mid-suite. Lending a unit takes it out
+			// of the reserve, which a pool with a reserve answers by adding
+			// another group -- and the scale-down window is fifteen minutes, so
+			// that second group is still there when the next spec breaks a rank
+			// and waits for the pool to report nothing left to offer.
+			fixtures.WithWarmPoolTrigger(groupPool, map[string]string{
+				"warmPoolSleepMinSize": "0",
+			}),
 			// The scale target is a LeaderWorkerSet, and the default is
 			// Deployment. KEDA cannot resolve a target that is not there, so it
 			// never calls WVA's external scaler -- and discovery is KEDA-driven,
