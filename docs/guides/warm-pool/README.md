@@ -328,11 +328,53 @@ holding one engine, with the API on the leader. A pool can hold those too, as
 standing groups rather than standing Pods.
 
 ```bash
-deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --proxy-image <your image> --wva-namespace <where WVA runs>
+deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --proxy-image <your image> --wva-namespace <where WVA runs>   --launcher-image <a build carrying the follower fix>
 ```
 
 `--group-size` is what makes it a group pool. Everything else means what it did:
 `--gpus` is devices **per Pod**, so the warm unit above holds 2 x 8 = 16.
+
+### A group needs a patched supervisor image
+
+`--launcher-image` is **required** here, and `create` refuses a group pool
+without it.
+
+The stock launcher runs every rank through vLLM's OpenAI API server, which knows
+nothing about multi-node rank — grep it for `headless` or `node_rank_within_dp`
+and you find neither. So the follower parses `--headless`, ignores it, builds a
+full engine core, and dies:
+
+```
+AssertionError: collective_rpc should not be called on follower node
+```
+
+That call sits at the top of engine-core init and is not conditional, so no
+combination of flags avoids it. vLLM's own CLI has always handled this
+(`run_headless` sends `node_rank_within_dp > 0` to a bare `MultiprocExecutor`);
+the launcher simply never reached that branch. The fix is one branch in
+`launcher.py`, carried in the
+[fork](https://github.com/ev-shindin/llm-d-fast-model-actuation) as *Route a
+follower rank to the headless executor, not the API server*. Build that and pass
+the result here.
+
+Refused rather than warned about, because the failure is silent in the worst
+way: the group schedules, goes Ready, holds every one of its accelerators, and
+every admission times out with the engine never answering.
+
+Measured on two H100 nodes with vLLM 0.26.0 once the fix is in place — driven
+through the launcher exactly as the pool drives it:
+
+| | |
+| --- | --- |
+| leader | serves `/v1/completions`, `is_sleeping: false` |
+| one `/sleep?level=1` to the **leader** | 78,015 MiB -> 2,745 MiB on **both** ranks |
+| sleep | 0.71 s |
+| wake | 0.36 s |
+
+The sleep number is the one that makes a multi-node warm pool worth having: a
+single call to rank 0 releases the GPU on every node, so a model that spans
+machines is held warm for about 2.7 GiB per rank rather than a full set of
+cards.
 
 ### A group serves exactly one shape
 

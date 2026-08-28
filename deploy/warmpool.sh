@@ -46,6 +46,11 @@ APPLY=1
 # WVA namespace, which is already a required flag, so there is nothing left for
 # an operator to fill in -- and the unprotected state is not a mild one.
 NETWORK_POLICY=1
+# The supervisor image. Empty keeps the one the manifests pin.
+#
+# A GROUP pool needs one carrying the follower fix -- see the --group-size check
+# in cmd_create for why the stock image cannot serve one.
+LAUNCHER_IMAGE=""
 
 usage() {
   cat <<'USAGE'
@@ -76,6 +81,10 @@ create options:
   --proxy-image REF    the warm-pool image you built
   --wva-namespace NS   where WVA runs, for scalerAddress
   --cache-claim NAME   RWX model cache PVC. Default: model-pvc
+  --launcher-image REF the supervisor image. REQUIRED with --group-size > 1:
+                       the stock launcher sends every rank to vLLM's API server,
+                       which has no follower path, so an engine spanning Pods
+                       cannot start. Build one from the fork carrying that fix.
   --no-network-policy  do not create the ingress boundary. For clusters where
                        policy is managed centrally -- NOT a convenience: without
                        one, :8001 accepts caller-supplied argv from anything that
@@ -154,6 +163,18 @@ cmd_create() {
     log_warning "No --accelerator given, so these Pods may schedule on ANY GPU node. A warm copy is only reusable on the GPU it was loaded on: WVA will decline every model whose accelerator it can prove differs, and this pool will hold devices while warming nothing."
   fi
 
+  if [ "$GROUP_SIZE" -gt 1 ] && [ -z "$LAUNCHER_IMAGE" ]; then
+    # Refused rather than warned. A group pool on the stock launcher schedules,
+    # goes Ready, holds every one of its accelerators, and can never form an
+    # engine: the launcher runs each rank through vLLM's OpenAI API server,
+    # which knows nothing about multi-node rank, so the follower builds a full
+    # engine core and dies asserting "collective_rpc should not be called on
+    # follower node". Nothing about that is visible from outside -- Pods
+    # running, GPUs held, admissions timing out -- which is exactly the failure
+    # this script exists to keep operators out of.
+    log_error "--group-size ${GROUP_SIZE} needs --launcher-image naming a build with the follower fix (llm-d-fast-model-actuation, 'Route a follower rank to the headless executor'). The stock launcher holds the GPUs and never forms the engine"
+  fi
+
   if [ "$GROUP_SIZE" -gt 1 ]; then
     log_info "Group pool: each warm unit is ${GROUP_SIZE} Pods x ${GPUS_PER_POD} GPU = $((GROUP_SIZE * GPUS_PER_POD)) devices"
     log_warning "A group serves ONLY models declaring --nnodes ${GROUP_SIZE}. A group's size is fixed when it is created -- an engine laid out across a different number of Pods is a different engine, and WVA declines it permanently."
@@ -169,6 +190,14 @@ cmd_create() {
     manifest=$(warmpool_group_manifest "$memory")
   else
     manifest=$(warmpool_manifest "$memory")
+  fi
+
+  if [ -n "$LAUNCHER_IMAGE" ]; then
+    # Substituted rather than templated into the generated Pod spec: that block
+    # is rendered from config/warmpool and checked for drift, so the image stays
+    # one fact in one place and this only overrides it.
+    manifest="$(printf '%s\n' "$manifest" | sed "s|image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:[^[:space:]]*|image: ${LAUNCHER_IMAGE}|g")"
+    log_info "Supervisor image: ${LAUNCHER_IMAGE}"
   fi
 
   if [ "$NETWORK_POLICY" -eq 1 ]; then
@@ -782,6 +811,7 @@ while [ $# -gt 0 ]; do
     --wva-namespace) WVA_NAMESPACE="$2"; shift 2 ;;
     --cache-claim)   CACHE_CLAIM="$2"; shift 2 ;;
     --dry-run)       APPLY=0; shift ;;
+    --launcher-image) LAUNCHER_IMAGE="$2"; shift 2 ;;
     --no-network-policy) NETWORK_POLICY=0; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) usage; log_error "unknown option: $1" ;;

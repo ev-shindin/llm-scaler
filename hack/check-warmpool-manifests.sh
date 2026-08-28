@@ -110,7 +110,11 @@ OPTED="$(render --no-network-policy)"
   || fail "--no-network-policy changed more than the policy"
 
 # --- a pool of groups -------------------------------------------------------
-GROUP="$(render --group-size 2)"
+# --launcher-image is REQUIRED for a group: the stock launcher runs every rank
+# through vLLM's API server, which has no follower path, so an engine spanning
+# Pods can never form. Rendering one without it is refused, and that refusal is
+# asserted below.
+GROUP="$(render --group-size 2 --launcher-image example.invalid/launcher:headless)"
 
 [ "$(count_kind "$GROUP" LeaderWorkerSet)" = 1 ] \
   && ok "a group pool is a LeaderWorkerSet" || fail "--group-size did not produce a LeaderWorkerSet"
@@ -138,6 +142,15 @@ WORKER_SECTION="$(printf '%s\n' "$GROUP" | sed -n '/workerTemplate:/,$p')"
 [ "$(printf '%s\n' "$WORKER_SECTION" | grep -c 'name: inference-server')" = 1 ] \
   && ok "workers run the supervisor, which is what the fan-out talks to" \
   || fail "a worker template has no supervisor: warming the group cannot reach its ranks"
+
+# A GROUP on the stock launcher is refused outright. It would schedule, go
+# Ready, hold every accelerator and never form an engine -- the silent failure
+# this script exists to keep operators out of.
+if render --group-size 2 >/dev/null 2>&1; then
+  fail "a group pool was accepted without --launcher-image: it could never form an engine"
+else
+  ok "a group pool without --launcher-image is refused"
+fi
 
 # --- guardrails -------------------------------------------------------------
 # A ceiling at or below the reserve makes the admission budget zero forever: the

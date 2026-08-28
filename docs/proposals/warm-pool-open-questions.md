@@ -93,6 +93,25 @@ shipped, not before. Until then the digest pin plus a registry mirror covers the
 availability risk. Note that building it also answers "what if FMA removes the
 image", so the two motivations converge.
 
+**Update — a group pool already needs our own build.** The choice above is no
+longer purely about versions. The stock launcher runs every rank through vLLM's
+OpenAI API server, which has no multi-node follower path, so a follower builds a
+full engine core and dies on `collective_rpc should not be called on follower
+node`. An engine spanning Pods cannot start on it at all.
+
+The fix is one branch in `launcher.py` mirroring vLLM's own `run_headless`, and
+it lives in the [fork](https://github.com/ev-shindin/llm-d-fast-model-actuation)
+as *Route a follower rank to the headless executor, not the API server*.
+`deploy/warmpool.sh` takes it as `--launcher-image` and REFUSES a group pool
+without one, because the failure is otherwise silent: the group schedules, goes
+Ready, holds its accelerators and never forms an engine.
+
+So for group pools the "when to own the image" question is settled -- we already
+do -- and what remains is the narrower one: whether to carry that fork forward
+per vLLM release, or land the branch upstream in FMA and go back to consuming
+their image. Upstream is clearly better if they will take it; the patch is small
+and mirrors code vLLM already ships.
+
 ---
 
 ## 3. A warm copy is only as good as the engine it was loaded by
