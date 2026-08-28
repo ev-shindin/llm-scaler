@@ -91,6 +91,12 @@ spec:
       # (pokprod uses `nvidia-legacy`); on a cluster without it, admission fails
       # outright, so remove this line rather than guess at a name.
       runtimeClassName: nvidia-legacy
+      # Long enough for the preStop drain below to finish. The default 30s is
+      # sized for a process that can stop immediately; a generation in flight
+      # cannot, and a model whose requests run for tens of seconds needs the
+      # room. SIGKILL at the end of this window cuts whatever is left, so it is
+      # the real bound on how graceful the shutdown can be.
+      terminationGracePeriodSeconds: 120
       containers:
         - name: inference-server
           # The launcher published by Fast Model Actuation: it spawns and
@@ -233,6 +239,54 @@ spec:
               mountPath: /pod-home
             - name: model-cache
               mountPath: /model-cache
+          lifecycle:
+            preStop:
+              # DRAIN BEFORE DYING, the same way a returned bridge drains.
+              #
+              # A pool Pod can be removed while a model is awake and serving --
+              # the pool shrinks, a node is drained, the Deployment rolls. Without
+              # this the launcher takes SIGTERM and every in-flight response is
+              # cut, which is the failure the whole warm pool exists to avoid.
+              #
+              # Kubernetes has already stopped NEW work by the time this runs: a
+              # Pod with a deletion timestamp leaves its EndpointSlice, so the EPP
+              # stops dispatching. What is left is the requests already in
+              # flight, and vLLM knows how to finish those -- mode=wait queues new
+              # adds, keeps stepping until the running ones are done, then sleeps.
+              # It is the same call the pool makes when it hands a Pod back.
+              #
+              # Every awake instance, not just one: a Pod holds several models and
+              # which is awake is not knowable from here.
+              #
+              # Failing quietly is deliberate. preStop cannot save a Pod that is
+              # already broken, and a hook that errors only turns a clean drain
+              # into a hard kill sooner.
+              exec:
+                command:
+                  - python3
+                  - -c
+                  - |
+                    import json, urllib.request
+                    def post(url):
+                        try:
+                            urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=110).read()
+                        except Exception as err:
+                            print("drain:", url, err)
+                    try:
+                        raw = urllib.request.urlopen("http://127.0.0.1:8001/v2/vllm/instances", timeout=5).read()
+                        for inst in json.loads(raw).get("instances", []):
+                            opts = (inst.get("options") or "").split()
+                            port = next((opts[i + 1] for i, f in enumerate(opts) if f == "--port"), None)
+                            if not port:
+                                continue
+                            try:
+                                st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/is_sleeping", timeout=5).read())
+                            except Exception:
+                                continue
+                            if not st.get("is_sleeping", True):
+                                post(f"http://127.0.0.1:{port}/sleep?level=1&mode=wait")
+                    except Exception as err:
+                        print("drain: could not list instances:", err)
           readinessProbe:
             # The supervisor being up says nothing about whether a model is
             # awake -- that is the proxy's /readyz. This probe only reports that

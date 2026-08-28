@@ -264,6 +264,7 @@ tolerations:
   operator: Exists
   effect: NoSchedule
 runtimeClassName: nvidia-legacy
+terminationGracePeriodSeconds: 120
 containers:
 - name: inference-server
   image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.4@sha256:9df3f3bee8c321c14d5c0265d94ab8ae533cff1899c65eeb2623a5dcd753647e
@@ -330,6 +331,25 @@ containers:
     mountPath: /pod-home
   - name: model-cache
     mountPath: /model-cache
+  lifecycle:
+    preStop:
+      exec:
+        command:
+        - python3
+        - -c
+        - "import json, urllib.request\ndef post(url):\n    try:\n        urllib.request.urlopen(urllib.request.Request(url,\
+          \ method=\"POST\"), timeout=110).read()\n    except Exception as err:\n\
+          \        print(\"drain:\", url, err)\ntry:\n    raw = urllib.request.urlopen(\"\
+          http://127.0.0.1:8001/v2/vllm/instances\", timeout=5).read()\n    for inst\
+          \ in json.loads(raw).get(\"instances\", []):\n        opts = (inst.get(\"\
+          options\") or \"\").split()\n        port = next((opts[i + 1] for i, f in\
+          \ enumerate(opts) if f == \"--port\"), None)\n        if not port:\n   \
+          \         continue\n        try:\n            st = json.loads(urllib.request.urlopen(f\"\
+          http://127.0.0.1:{port}/is_sleeping\", timeout=5).read())\n        except\
+          \ Exception:\n            continue\n        if not st.get(\"is_sleeping\"\
+          , True):\n            post(f\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\"\
+          )\nexcept Exception as err:\n    print(\"drain: could not list instances:\"\
+          , err)\n"
   readinessProbe:
     exec:
       command:
@@ -380,6 +400,7 @@ tolerations:
   operator: Exists
   effect: NoSchedule
 runtimeClassName: nvidia-legacy
+terminationGracePeriodSeconds: 120
 containers:
 - name: inference-server
   image: ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.4@sha256:9df3f3bee8c321c14d5c0265d94ab8ae533cff1899c65eeb2623a5dcd753647e
@@ -446,6 +467,25 @@ containers:
     mountPath: /pod-home
   - name: model-cache
     mountPath: /model-cache
+  lifecycle:
+    preStop:
+      exec:
+        command:
+        - python3
+        - -c
+        - "import json, urllib.request\ndef post(url):\n    try:\n        urllib.request.urlopen(urllib.request.Request(url,\
+          \ method=\"POST\"), timeout=110).read()\n    except Exception as err:\n\
+          \        print(\"drain:\", url, err)\ntry:\n    raw = urllib.request.urlopen(\"\
+          http://127.0.0.1:8001/v2/vllm/instances\", timeout=5).read()\n    for inst\
+          \ in json.loads(raw).get(\"instances\", []):\n        opts = (inst.get(\"\
+          options\") or \"\").split()\n        port = next((opts[i + 1] for i, f in\
+          \ enumerate(opts) if f == \"--port\"), None)\n        if not port:\n   \
+          \         continue\n        try:\n            st = json.loads(urllib.request.urlopen(f\"\
+          http://127.0.0.1:{port}/is_sleeping\", timeout=5).read())\n        except\
+          \ Exception:\n            continue\n        if not st.get(\"is_sleeping\"\
+          , True):\n            post(f\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\"\
+          )\nexcept Exception as err:\n    print(\"drain: could not list instances:\"\
+          , err)\n"
   readinessProbe:
     exec:
       command:

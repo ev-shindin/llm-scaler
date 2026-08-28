@@ -91,6 +91,16 @@ else
   ok "the supervisor is not running the proxy image"
 fi
 
+# A pool Pod that dies while a model is awake must DRAIN first. Without the hook
+# the launcher takes SIGTERM and every in-flight response is cut -- the failure
+# the warm pool exists to avoid, arriving by a different route (the pool shrinks,
+# a node is drained, the Deployment rolls).
+printf '%s' "$POOL" | grep -q 'preStop'   && ok "the drain hook" || fail "no preStop hook: a removed Pod cuts its in-flight requests"
+
+# And the grace period has to outlast that drain, or the kubelet SIGKILLs in the
+# middle of it and the hook bought nothing.
+printf '%s' "$POOL" | grep -q 'terminationGracePeriodSeconds'   && ok "a grace period sized for the drain"   || fail "no terminationGracePeriodSeconds: the default 30s cuts a slow generation"
+
 # The boundary. Its absence leaves :8001 -- caller-supplied argv in a container
 # mounting the shared model cache read-write -- open to anything that can route
 # to the Pod IP.
