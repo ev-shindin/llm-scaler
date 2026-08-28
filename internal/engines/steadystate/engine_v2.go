@@ -597,6 +597,12 @@ func gpuUsageViews(requests []allocation.ModelScalingRequest) allocation.GPUUsag
 		ManagedByType:      computeCurrentGPUUsage(requests),
 		ManagedByNamespace: computeCurrentGPUUsageByNamespace(requests),
 	}
+	// The warm pools too, and HERE rather than only where the managed figure is
+	// published. These views are what the constraint providers are given, so a
+	// quota built without them does not bind on the pool at all -- the published
+	// figure would say the pool costs something while the limiter enforcing it
+	// carried on as though it did not.
+	addWarmPoolGPUs(views.ManagedByType, views.ManagedByNamespace)
 	if snap, ok := decision.LatestGPUUsage(); ok {
 		views.PhysicalByType = snap.ByType
 		views.PhysicalByNamespace = withActiveNamespaces(snap.ByNamespace, requests)
