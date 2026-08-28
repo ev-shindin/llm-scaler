@@ -22,10 +22,17 @@ import (
 // Ready Pod is not offered at all. All three are invisible to a Deployment-based
 // pool, which is what every other warm pool spec builds.
 //
-// The workers run a container that does nothing but stay Ready. That is enough,
-// and it is the point: the controller must never talk to a worker. Only the
-// leader runs the supervisor, so a worker that answered anything would be
-// hiding the very mistake these specs are for.
+// The workers run the SUPERVISOR, with no proxy -- which is what
+// deploy/warmpool.sh produces, and what the fan-out requires. Warming a group
+// asks every rank to create its own instance, at that rank's Pod IP, so a worker
+// with nothing listening makes the fan-out unreachable in a test.
+//
+// They used to run `sleep infinity`, under the rule "the controller must never
+// talk to a worker". That rule was true before a unit could span Pods and is not
+// true now: a worker is still not a MEMBER -- it is never counted, lent or
+// labelled into an InferencePool -- but it is asked for its rank, and it must be
+// able to answer. The membership rule is enforced by the worker-index label, not
+// by the worker being deaf.
 
 // CreateWarmPoolGroup creates a LeaderWorkerSet warm pool of spec.GroupSize Pods
 // per group. The leader carries the supervisor and proxy, exactly as a
@@ -95,11 +102,11 @@ func CreateWarmPoolGroup(
 	// The worker carries the pool labels too, because the controller finds pool
 	// Pods by label and must then decline the workers ITSELF. Labelling only the
 	// leader would make the spec pass without the worker-index check existing.
-	workerContainer := corev1.Container{
-		Name:    "rank",
-		Image:   warmPoolEmulatorImage,
-		Command: []string{"sh", "-c", "sleep infinity"},
-	}
+	// The same supervisor the leader runs. A worker's rank is created through it,
+	// so the two must speak the same wire format -- and they do here by being the
+	// same container, which is also how the shipped manifests do it.
+	workerContainer := warmPoolSupervisorContainer()
+	workerContainer.Name = "rank"
 	if spec.GPUs > 0 {
 		workerContainer.Resources = corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
@@ -112,7 +119,20 @@ func CreateWarmPoolGroup(
 		Spec: corev1.PodSpec{
 			AutomountServiceAccountToken: ptr.To(false),
 			NodeName:                     spec.NodeName,
-			Containers:                   []corev1.Container{workerContainer},
+			// The script volume too: the supervisor is mounted from it, and a
+			// worker without it crash-loops on a missing file rather than
+			// failing anywhere near the fan-out that needs it.
+			Volumes: []corev1.Volume{{
+				Name: "script",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: spec.Name + warmPoolScriptSuffix,
+						},
+					},
+				},
+			}},
+			Containers: []corev1.Container{workerContainer},
 		},
 	}
 

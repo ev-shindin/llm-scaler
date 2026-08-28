@@ -124,10 +124,20 @@ printf '%s\n' "$GROUP" | grep -q 'kind: LeaderWorkerSet' \
 # WORKERS DO NOT RUN THE PROXY. A worker with a proxy never passes its readiness
 # probe, so the group never counts as a member and holds its GPUs reporting
 # pods=0 -- which reads as a pool that is simply too small.
-WORKER_PROXIES="$(printf '%s\n' "$GROUP" | sed -n '/workerTemplate:/,$p' | grep -c 'name: proxy')"
-[ "$WORKER_PROXIES" = 0 ] \
+WORKER_SECTION="$(printf '%s\n' "$GROUP" | sed -n '/workerTemplate:/,$p')"
+[ "$(printf '%s\n' "$WORKER_SECTION" | grep -c 'name: proxy')" = 0 ] \
   && ok "workers run no proxy" \
   || fail "a worker template carries the proxy: the group would never become Ready"
+
+# And the other half of the same invariant. Warming a group asks EVERY rank to
+# create its own instance, at that rank's own Pod IP -- so a worker with nothing
+# listening on :8001 makes the fan-out unreachable, and the admission fails
+# half-done while the group holds all its GPUs. The e2e fixture had exactly this
+# shape (workers running `sleep infinity`) and could not exercise the fan-out at
+# all, which is how it went untested.
+[ "$(printf '%s\n' "$WORKER_SECTION" | grep -c 'name: inference-server')" = 1 ] \
+  && ok "workers run the supervisor, which is what the fan-out talks to" \
+  || fail "a worker template has no supervisor: warming the group cannot reach its ranks"
 
 # --- guardrails -------------------------------------------------------------
 # A ceiling at or below the reserve makes the admission budget zero forever: the

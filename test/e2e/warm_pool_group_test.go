@@ -3,6 +3,8 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -40,7 +42,14 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 		groupPool  = "e2e-pool-group"
 		groupSize  = 2
 		gpusPerPod = 1
-		settle     = 3 * time.Minute
+		// A driver Pod is the only way to read a supervisor a NetworkPolicy may
+		// be guarding: the API server's pod proxy arrives from the control plane
+		// and matches no `from:` selector. Another spec in this suite applies the
+		// shipped policy, and spec order is not fixed.
+		groupDriver   = "e2e-pool-group-control"
+		groupModelSvc = "e2e-group-ms"
+		groupScaler   = "e2e-group"
+		settle        = 3 * time.Minute
 		// Bounds every log read to this spec's controller, as the single-Pod
 		// specs do: the suite reuses one controller, and an unbounded read
 		// would accept a line written under a previous configuration.
@@ -52,6 +61,53 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 		controller fixtures.ControllerDeployment
 		spec       fixtures.WarmPoolSpec
 	)
+
+	// supervisorInstances reads what one Pod's supervisor was actually asked to
+	// create. It is the only place the fan-out's output is visible: the
+	// controller logs that it warmed a group, not the argv it sent each rank.
+	supervisorInstances := func(podIP string) string {
+		GinkgoHelper()
+		result, err := fixtures.DriverCall(ctx, k8sClient, cfg.LLMDNamespace, groupDriver,
+			"GET", fmt.Sprintf("http://%s:%d/v2/vllm/instances", podIP, fixtures.WarmPoolSupervisorPort), "")
+		Expect(err).NotTo(HaveOccurred(), "reading instances from %s", podIP)
+		Expect(result.Status).To(Equal(200), "supervisor at %s: %s", podIP, result.Body)
+		return result.Body
+	}
+
+	// podIPsByGroup maps each Pod to its GROUP and its rank within that group.
+	//
+	// BOTH indices are needed, and leaving out the group was a real defect in this
+	// spec: a pool of groups is not one group. Lending a unit takes it out of the
+	// reserve, so the pool grows another -- and with two groups present, rank 0
+	// names two different Pods. Keyed by worker index alone, the spec read the
+	// leader of whichever group came back last in the listing, found an empty
+	// supervisor, and reported that the leader was not rank 0.
+	//
+	// Within a group, the worker index IS the rank: the adapter orders members by
+	// it and hands rank N to the Pod carrying N.
+	podIPsByGroup := func() map[string]map[int]string {
+		GinkgoHelper()
+		pods, err := k8sClient.CoreV1().Pods(cfg.LLMDNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "warm-pool-fixture=" + groupPool,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		out := map[string]map[int]string{}
+		for i := range pods.Items {
+			p := &pods.Items[i]
+			if p.Status.PodIP == "" || p.DeletionTimestamp != nil {
+				continue
+			}
+			rank, convErr := strconv.Atoi(p.Labels[lwsv1.WorkerIndexLabelKey])
+			Expect(convErr).NotTo(HaveOccurred(), "%s carries no readable worker index", p.Name)
+			group := p.Labels[lwsv1.GroupIndexLabelKey]
+			Expect(group).NotTo(BeEmpty(), "%s carries no group index", p.Name)
+			if out[group] == nil {
+				out[group] = map[int]string{}
+			}
+			out[group][rank] = p.Status.PodIP
+		}
+		return out
+	}
 
 	controllerLog := func() (string, error) {
 		_, logs, err := testutils.PodLogsLabelSelectorContain(ctx, k8sClient, controller.Namespace,
@@ -172,6 +228,117 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 			"a worker Pod was counted as a lendable unit")
 	})
 
+	// THE FAN-OUT, actuated. Everything above is accounting -- how the controller
+	// COUNTS a group. This is the only spec that makes it warm one, and the only
+	// place the argv each rank receives is observable.
+	//
+	// Those flags are not cosmetic. A rank not told --headless starts its own API
+	// server; one given the wrong --master-addr waits at a rendezvous nobody
+	// attends; two ranks on different ports never meet. Each failure is a group
+	// that holds its GPUs and never serves, and none is visible in the
+	// controller's own logs, which say only that a group was warmed.
+	//
+	// The supervisor is emulated, so this does NOT prove a real vLLM accepts the
+	// flags. It proves the orchestration around them -- which rank gets what,
+	// from where -- and that is where the code is.
+	It("gives every rank its own place in the engine", func() {
+		By("Creating a driver to read the supervisors through")
+		driver := fixtures.DriverSpec{
+			Name: groupDriver, Namespace: cfg.LLMDNamespace, Labels: fixtures.ControllerDriverLabels(),
+		}
+		Expect(fixtures.CreateHTTPDriver(ctx, k8sClient, driver)).To(Succeed())
+		DeferCleanup(func() { _ = fixtures.DeleteHTTPDriver(context.Background(), k8sClient, driver) })
+
+		By("Creating a model that declares it spans two Pods")
+		// --nnodes is what makes this model a candidate for a group at all: the
+		// fit check compares it against the group's actual size, and a model
+		// without it is warmed into a single Pod like any other.
+		Expect(fixtures.CreateModelServiceWithExtraArgs(
+			ctx, k8sClient, cfg.LLMDNamespace, groupModelSvc, groupPool+"-pool", cfg.ModelID,
+			cfg.UseSimulator, cfg.MaxNumSeqs, []string{"--nnodes", "2"})).To(Succeed())
+		DeferCleanup(func() {
+			_ = fixtures.DeleteModelService(context.Background(), k8sClient, cfg.LLMDNamespace, groupModelSvc)
+		})
+		// Deliberately NOT waiting for it to be Ready. The pool derives a warm
+		// copy from the Deployment's POD SPEC, not from a running process, so a
+		// model that has not started yet is still warmable -- and --nnodes is a
+		// vLLM flag the simulator has no reason to accept, so requiring the pod
+		// to run would make this spec depend on the emulator tolerating an
+		// argument that is only here to be READ.
+
+		By("Asking the pool to hold one copy of it")
+		// By NAME, not by earning it: admission through popularity or repeated
+		// misses depends on what else the suite is running.
+		Expect(fixtures.EnsureScaledObject(ctx, crClient, cfg.LLMDNamespace,
+			groupScaler, groupModelSvc+"-decode", groupModelSvc+"-variant", 1, 2, cfg.MonitoringNS,
+			fixtures.WithWVATriggerMetadata(cfg.ModelID, "10.0"),
+			fixtures.WithWarmPoolSelection(groupPool, 1),
+		)).To(Succeed())
+		DeferCleanup(func() {
+			_ = fixtures.DeleteScaledObject(context.Background(), crClient, cfg.LLMDNamespace, groupScaler)
+		})
+
+		By("Waiting for the group to hold the model")
+		// resident ONLY. The pool's size is not fixed while this runs and must not
+		// be asserted: a variant whose own replicas cannot start is short, so the
+		// group gets LENT, and a lent unit is out of the reserve -- which the pool
+		// answers by growing a second one. Pinning pods=1 made this spec fail on
+		// the pool doing exactly what it exists to do.
+		Eventually(poolReported(`[^"]*resident=[1-9]`), settle, 5*time.Second).Should(Succeed())
+
+		// The group that actually HOLDS the model. With the pool free to grow,
+		// which group was warmed is not knowable in advance -- so it is found by
+		// asking, rather than assumed to be the first.
+		var byRank map[int]string
+		var leaderIP string
+		for _, members := range podIPsByGroup() {
+			if members[0] == "" {
+				continue
+			}
+			if strings.Contains(supervisorInstances(members[0]), "--node-rank") {
+				byRank, leaderIP = members, members[0]
+				break
+			}
+		}
+		Expect(leaderIP).NotTo(BeEmpty(),
+			"no group's leader holds a warmed instance, so the fan-out reached nothing")
+		Expect(byRank).To(HaveLen(groupSize), "the warmed group is short a rank")
+
+		By("Checking the leader was made rank 0, and serves")
+		leader := supervisorInstances(leaderIP)
+		Expect(leader).To(ContainSubstring("--node-rank 0"), "the leader is not rank 0: %s", leader)
+		Expect(leader).To(ContainSubstring("--master-addr "+leaderIP),
+			"the leader must point at itself for the rendezvous: %s", leader)
+		Expect(leader).NotTo(ContainSubstring("--headless"),
+			"a headless leader serves no API, so the group can never take traffic")
+
+		By("Checking every worker was made a HEADLESS rank pointing at the leader")
+		// Each Pod is checked against the rank ITS OWN index says it should hold,
+		// so a fan-out that handed two Pods the same rank -- an engine that can
+		// never form -- fails here rather than passing on a count.
+		for rank := 1; rank < groupSize; rank++ {
+			ip := byRank[rank]
+			Expect(ip).NotTo(BeEmpty(), "the group has no rank %d", rank)
+			worker := supervisorInstances(ip)
+			Expect(worker).To(ContainSubstring(fmt.Sprintf("--node-rank %d", rank)),
+				"the Pod carrying worker index %d was not made rank %d: %s", rank, rank, worker)
+			Expect(worker).To(ContainSubstring("--master-addr "+leaderIP),
+				"rank %d waits at a rendezvous the leader does not hold: %s", rank, worker)
+			Expect(worker).To(ContainSubstring("--headless"),
+				"rank %d started its own API server instead of joining: %s", rank, worker)
+		}
+
+		By("Checking every rank agrees on the port, or they never meet")
+		// Read from the LEADER's own line rather than assumed, so the check still
+		// holds if the port the adapter picks ever changes.
+		port := portFlagIn(leader)
+		Expect(port).NotTo(BeEmpty(), "no --port in the leader's options: %s", leader)
+		for rank := 1; rank < groupSize; rank++ {
+			Expect(supervisorInstances(byRank[rank])).To(ContainSubstring("--port "+port),
+				"rank %d is on a different port, so it never joins the group", rank)
+		}
+	})
+
 	It("stops offering the unit when the group loses a rank", func() {
 		pods, err := k8sClient.CoreV1().Pods(cfg.LLMDNamespace).List(ctx, metav1.ListOptions{
 			LabelSelector: "warm-pool-fixture=" + groupPool,
@@ -232,4 +399,18 @@ func groupFormation(ctx context.Context, fixtureName string) (running, workersRe
 		}
 	}
 	return running, workersReady, workers, created
+}
+
+// portFlagIn returns the value of --port in a supervisor's recorded options, or
+// "" when there is none. Read rather than assumed: the port is chosen by the
+// adapter from what the Pod already holds, so hard-coding one would make the
+// agreement check pass on a coincidence.
+func portFlagIn(body string) string {
+	fields := strings.Fields(body)
+	for i, f := range fields {
+		if f == "--port" && i+1 < len(fields) {
+			return strings.Trim(fields[i+1], "\",")
+		}
+	}
+	return ""
 }
