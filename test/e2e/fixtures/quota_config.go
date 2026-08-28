@@ -11,12 +11,21 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// SaturationConfigMap is where the limiters: list lives. The controller watches
-// it, so a quota declared here takes effect without a restart.
-const SaturationConfigMap = "wva-saturation-scaling-config"
+// defaultEntryKey is the ConfigMap key holding cluster-scope settings. It
+// mirrors config.GlobalDefaultsKey, restated here so the fixtures package does
+// not depend on the controller's internal packages.
+const defaultEntryKey = "default"
 
 // SetNamespaceQuota declares a namespace-scoped GPU quota and returns a restore
 // func.
+//
+// configName is the ConfigMap the CONTROLLER is actually reading, and the caller
+// resolves it rather than this fixture assuming it. There are two names in play
+// -- the current one and a pre-rename one the controller ignores whenever the
+// current one exists -- and writing a quota into the ignored document produces a
+// spec that sets a limit nobody enforces, then fails claiming the limiter is
+// broken. That is not hypothetical: it is how this fixture failed the first time
+// it ran.
 //
 // The quota is what bounds WVA's own consumption, and a warm pool is part of
 // that consumption -- so this is how a spec creates the condition where a pool
@@ -28,15 +37,15 @@ const SaturationConfigMap = "wva-saturation-scaling-config"
 func SetNamespaceQuota(
 	ctx context.Context,
 	clientset *kubernetes.Clientset,
-	configNamespace, targetNamespace, accelerator string,
+	configNamespace, configName, targetNamespace, accelerator string,
 	gpus int,
 ) (func(context.Context) error, error) {
 	cms := clientset.CoreV1().ConfigMaps(configNamespace)
 
-	existing, err := cms.Get(ctx, SaturationConfigMap, metav1.GetOptions{})
+	existing, err := cms.Get(ctx, configName, metav1.GetOptions{})
 	existed := err == nil
 	if err != nil && !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("read %s: %w", SaturationConfigMap, err)
+		return nil, fmt.Errorf("read %s: %w", configName, err)
 	}
 
 	var original *corev1.ConfigMap
@@ -48,13 +57,15 @@ func SetNamespaceQuota(
 		}
 	}
 
-	// Parsed and re-marshalled rather than string-spliced: the document carries
-	// other keys, and appending YAML text to a file whose indentation is not
-	// known is how a config edit silently becomes a parse failure.
+	// The "default" ENTRY, not "config.yaml". A limiter is a cluster-scope
+	// setting the controller reads only from the global default entry: declared
+	// anywhere else it is ignored with a log line and nothing else -- the quota
+	// applies to no one, the pool grows past it, and the spec fails claiming
+	// enforcement is broken. That is exactly how this fixture failed twice.
 	doc := map[string]any{}
-	if raw, ok := data["config.yaml"]; ok && raw != "" {
+	if raw, ok := data[defaultEntryKey]; ok && raw != "" {
 		if err := yaml.Unmarshal([]byte(raw), &doc); err != nil {
-			return nil, fmt.Errorf("parse existing config.yaml: %w", err)
+			return nil, fmt.Errorf("parse existing %s entry: %w", defaultEntryKey, err)
 		}
 	}
 	doc["limiters"] = []any{
@@ -69,39 +80,39 @@ func SetNamespaceQuota(
 	}
 	merged, err := yaml.Marshal(doc)
 	if err != nil {
-		return nil, fmt.Errorf("marshal config.yaml: %w", err)
+		return nil, fmt.Errorf("marshal %s entry: %w", defaultEntryKey, err)
 	}
-	data["config.yaml"] = string(merged)
+	data[defaultEntryKey] = string(merged)
 
 	desired := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: SaturationConfigMap, Namespace: configNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: configNamespace},
 		Data:       data,
 	}
 	if existed {
-		desired.ObjectMeta.ResourceVersion = existing.ResourceVersion
+		desired.ResourceVersion = existing.ResourceVersion
 		if _, err := cms.Update(ctx, desired, metav1.UpdateOptions{}); err != nil {
-			return nil, fmt.Errorf("update %s: %w", SaturationConfigMap, err)
+			return nil, fmt.Errorf("update %s: %w", configName, err)
 		}
 	} else if _, err := cms.Create(ctx, desired, metav1.CreateOptions{}); err != nil {
-		return nil, fmt.Errorf("create %s: %w", SaturationConfigMap, err)
+		return nil, fmt.Errorf("create %s: %w", configName, err)
 	}
 
 	return func(ctx context.Context) error {
 		if !existed {
 			// It was not there before; leaving a quota behind would bound every
 			// later spec in the suite by an allowance none of them declared.
-			if err := cms.Delete(ctx, SaturationConfigMap, metav1.DeleteOptions{}); err != nil &&
+			if err := cms.Delete(ctx, configName, metav1.DeleteOptions{}); err != nil &&
 				!errors.IsNotFound(err) {
 				return err
 			}
 			return nil
 		}
-		current, err := cms.Get(ctx, SaturationConfigMap, metav1.GetOptions{})
+		current, err := cms.Get(ctx, configName, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
 		restored := original.DeepCopy()
-		restored.ObjectMeta.ResourceVersion = current.ResourceVersion
+		restored.ResourceVersion = current.ResourceVersion
 		_, err = cms.Update(ctx, restored, metav1.UpdateOptions{})
 		return err
 	}, nil

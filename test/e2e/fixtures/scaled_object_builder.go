@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -124,7 +125,37 @@ const (
 	pendingVariantCostKey   = "e2e.llm-d.ai/pending-variant-cost"
 	pendingScalingPolicyKey = "e2e.llm-d.ai/pending-scaling-policy"
 	pendingWarmPoolKey      = "e2e.llm-d.ai/pending-warm-pool"
+	pendingBorrowPoolKey    = "e2e.llm-d.ai/pending-borrow-pool"
+	pendingWarmCopiesKey    = "e2e.llm-d.ai/pending-warm-copies"
 )
+
+// WithWarmPoolSelection names the pool this MODEL may borrow from.
+//
+// The mirror image of WithWarmPoolTrigger, and easy to confuse with it: that one
+// declares a pool, this one lets a variant use one. A variant without it is never
+// considered for a borrow however many warm Pods sit next to it, so this is the
+// whole difference between a pool that lends and a pool that merely holds
+// accelerators.
+//
+// Composes with WithWVATriggerMetadata rather than replacing it -- a borrowing
+// workload still scales a model, and still needs its modelID.
+//
+// copies is the number of warm copies to hold, and passing it is what makes a
+// spec DETERMINISTIC. Left out, the variant has to earn its place in the warm
+// set through parking, popularity or repeated misses -- all of which depend on
+// what else the suite happens to be running, so a spec relying on them would
+// pass or fail according to its neighbours. Naming a count admits it outright.
+func WithWarmPoolSelection(poolName string, copies ...int) ScaledObjectOption {
+	return func(so *kedav1alpha1.ScaledObject) {
+		if so.Annotations == nil {
+			so.Annotations = make(map[string]string)
+		}
+		so.Annotations[pendingBorrowPoolKey] = poolName
+		if len(copies) > 0 {
+			so.Annotations[pendingWarmCopiesKey] = strconv.Itoa(copies[0])
+		}
+	}
+}
 
 // WithWarmPoolTrigger makes this ScaledObject DECLARE a warm pool rather than
 // scale a model.
@@ -186,9 +217,13 @@ func applyWVATriggerMetadata(so *kedav1alpha1.ScaledObject) {
 	}
 	cost := so.Annotations[pendingVariantCostKey]
 	policy := so.Annotations[pendingScalingPolicyKey]
+	borrowFrom := so.Annotations[pendingBorrowPoolKey]
+	warmCopies := so.Annotations[pendingWarmCopiesKey]
 	delete(so.Annotations, pendingModelIDKey)
 	delete(so.Annotations, pendingVariantCostKey)
 	delete(so.Annotations, pendingScalingPolicyKey)
+	delete(so.Annotations, pendingBorrowPoolKey)
+	delete(so.Annotations, pendingWarmCopiesKey)
 
 	for i := range so.Spec.Triggers {
 		if so.Spec.Triggers[i].Metadata == nil {
@@ -200,6 +235,12 @@ func applyWVATriggerMetadata(so *kedav1alpha1.ScaledObject) {
 		}
 		if policy != "" {
 			so.Spec.Triggers[i].Metadata[registry.ScalingPolicyKey] = policy
+		}
+		if borrowFrom != "" {
+			so.Spec.Triggers[i].Metadata[registry.WarmPoolKey] = borrowFrom
+		}
+		if warmCopies != "" {
+			so.Spec.Triggers[i].Metadata[registry.WarmPoolCopiesKey] = warmCopies
 		}
 	}
 }

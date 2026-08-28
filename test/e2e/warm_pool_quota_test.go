@@ -73,8 +73,11 @@ var _ = Describe("Warm pool - what it costs its namespace", Label("full"), Label
 		DeferCleanup(func() { _ = restoreLabel(context.Background()) })
 
 		By("Declaring a namespace quota smaller than the pool would like to be")
+		// Resolved from the controller's own env, never assumed: the controller
+		// ignores the pre-rename ConfigMap whenever the current one exists, so a
+		// quota written into the wrong document is a limit nobody enforces.
 		restoreConfig, err = fixtures.SetNamespaceQuota(ctx, k8sClient, cfg.WVANamespace,
-			cfg.LLMDNamespace, heldAccel, quotaGPUs)
+			scalingPolicyConfigMapName(), cfg.LLMDNamespace, heldAccel, quotaGPUs)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() { _ = restoreConfig(context.Background()) })
 
