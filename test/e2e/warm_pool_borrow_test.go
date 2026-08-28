@@ -267,11 +267,27 @@ var _ = Describe("Warm pool - a borrow WVA decides on its own", Label("full"), L
 		// The ConfigMap the controller is READING. There is also a pre-rename one
 		// it ignores whenever this exists, and thresholds written there change
 		// nothing at all.
-		Expect(upsertSaturationConfigEntry(ctx, cfg.WVANamespace,
-			scalingPolicyConfigMapName(), defaultConfigKey,
+		//
+		// RESTORED afterwards, and that is not tidiness. The suite shares one
+		// ConfigMap and one controller, so a scale-up threshold of 0.30 left
+		// behind here is the threshold every later spec scales against -- and a
+		// scale-down boundary of 0.20 makes WVA give up replicas that specs
+		// downstream are asserting it holds. Leaving it caused exactly that: two
+		// unrelated specs failed in the run after this one landed, one watching
+		// its fleet oscillate and one watching it fall below its target.
+		cmName := scalingPolicyConfigMapName()
+		original, err := k8sClient.CoreV1().ConfigMaps(cfg.WVANamespace).Get(ctx, cmName, metav1.GetOptions{})
+		existedBefore := err == nil
+		if existedBefore {
+			original = original.DeepCopy()
+		}
+		Expect(upsertSaturationConfigEntry(ctx, cfg.WVANamespace, cmName, defaultConfigKey,
 			buildSaturationConfigYAMLWithThresholds("saturation",
 				kvCacheThreshold, queueThreshold, scaleUpThreshold, scaleDownBoundary),
 		)).To(Succeed())
+		DeferCleanup(func() {
+			restoreSaturationConfigMap(context.Background(), cfg.WVANamespace, cmName, original, existedBefore)
+		})
 	})
 
 	It("warms the model, lends the Pod, and the woken engine answers the request", func() {
