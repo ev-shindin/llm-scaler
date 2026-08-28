@@ -19,6 +19,11 @@ Read the review first; the implementation design says what was built.
   build it: objects, the supervisor API, how a woken model joins its
   InferencePool, the cache policy, the RBAC increase a readiness gate needs, and
   a three-week breakdown for phase 1.
+- **[Warm pool: open questions](warm-pool-open-questions.md)** — the three
+  things the pool raises that are bigger than a bug fix: the optimizer cannot
+  tell a pool replica from a serving one, the pool's vLLM version belongs to FMA
+  rather than to us, and what either costs to change. Also records what HAS been
+  decided, so it is not re-litigated.
 - **[FMA post-mortem](fma-post-mortem.md)** — Fast Model Actuation was the
   earlier route to the same goal. This records what was tried, the measurements
   that killed it, and the four things in this repo that are still FMA and must
