@@ -54,6 +54,9 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 		// specs do: the suite reuses one controller, and an unbounded read
 		// would accept a line written under a previous configuration.
 		sinceControllerRestart = int64(900)
+		// A whole day: enough to reach a startup line in a controller that has
+		// been up for the length of a full suite run without restarting.
+		sinceControllerStart = int64(86400)
 	)
 
 	var (
@@ -115,6 +118,26 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 		return logs, err
 	}
 
+	// startupLog reads the controller's WHOLE log, for the one assertion that is
+	// about something said once at startup.
+	//
+	// The bounded reader above is right for state lines, which are written
+	// continuously and whose age matters. It is wrong for "warm pool enabled":
+	// EnableWarmPool only restarts the controller when the arguments actually
+	// CHANGE, so when an earlier spec has already set the same flag there is no
+	// restart and no new line -- and running late in a long suite, the line from
+	// the original start is older than the window. The spec then reports that the
+	// pool is not enabled while it is perfectly enabled, which is exactly the
+	// wrong way round.
+	//
+	// Widening costs nothing here: logs are read from the CURRENT pod, so any
+	// such line in them was written by the controller now running.
+	startupLog := func() (string, error) {
+		_, logs, err := testutils.PodLogsLabelSelectorContain(ctx, k8sClient, controller.Namespace,
+			"control-plane=controller-manager", "", sinceControllerStart)
+		return logs, err
+	}
+
 	poolReported := func(match string) func(Gomega) {
 		return func(g Gomega) {
 			logs, err := controllerLog()
@@ -153,7 +176,7 @@ var _ = Describe("Warm pool - a unit that spans Pods", Label("full"), Label("war
 			_ = fixtures.WaitForControllerReady(context.Background(), k8sClient, controller)
 		})
 		Eventually(func(g Gomega) {
-			logs, lErr := controllerLog()
+			logs, lErr := startupLog()
 			g.Expect(lErr).NotTo(HaveOccurred())
 			g.Expect(logs).To(ContainSubstring("warm pool enabled"),
 				"the controller never reported the pool as enabled, so nothing reconciles it")
