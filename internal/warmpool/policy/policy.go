@@ -28,6 +28,22 @@ type Config struct {
 	// returned anyway, because holding indefinitely turns insurance into
 	// capacity for whichever variant spiked first.
 	MaxHold time.Duration
+
+	// Retained turns off the hold timeout: a lent Pod goes back when the variant
+	// stops needing it, and not because it has been lent for a while.
+	//
+	// For a bridge the timeout is the safety net -- the ordinary replicas are
+	// supposed to arrive, and a bridge whose replicas never came is a Pod out of
+	// the reserve forever, which nothing else would notice. For a retained pool
+	// there are no ordinary replicas by design: the model takes 300+ seconds to
+	// start, so the pool IS the capacity. Reclaiming on a timer there means
+	// handing the Pod back every MaxHold and taking it again immediately, paying
+	// a drain, a sleep and a wake for nothing, with a gap in service each time.
+	//
+	// What is given up is the safety net, deliberately: a retained pool can hold
+	// a Pod indefinitely, because that is the point. What still returns it is
+	// the variant no longer wanting it.
+	Retained bool
 	// AdmissionWindow and MinMissesToAdmit are the frequency filter: a model is
 	// admitted on its Nth miss within the window, not its first, so models that
 	// spike once do not evict models that spike often.
@@ -315,7 +331,9 @@ func returnsFor(v VariantDemand, lent []pool.Membership, in Input, cfg Config) [
 
 	var out []Action
 	for i, m := range lent {
-		expired := in.Now.Sub(borrowedAt(in, m)) >= cfg.MaxHold
+		// The hold timeout reclaims a bridge whose ordinary replicas never
+		// arrived. A retained pool has none coming, so this would only churn.
+		expired := !cfg.Retained && in.Now.Sub(borrowedAt(in, m)) >= cfg.MaxHold
 		if i < excess || expired {
 			out = append(out, Action{Pod: m.Pod, Model: m.Model})
 		}

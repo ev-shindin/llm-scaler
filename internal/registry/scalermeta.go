@@ -210,6 +210,20 @@ const (
 	// returned regardless, so a scale-up that never arrives cannot turn the
 	// reserve into permanent capacity for one variant. A Go duration.
 	WarmPoolMaxHoldKey = "warmPoolMaxHold"
+	// WarmPoolRetainedKey makes the pool the workload's SERVING capacity rather
+	// than a bridge over a scale-up.
+	//
+	// The difference is what happens to a Pod that is lent and still wanted. A
+	// bridge is temporary by design: the ordinary replicas are starting, and the
+	// hold timeout reclaims the Pod if they never arrive. A retained pool has no
+	// ordinary replicas coming -- the model is too large to start on demand, at
+	// 300+ seconds -- so the same timeout would hand the Pod back every
+	// warmPoolMaxHold and take it again on the next pass, paying a drain, a
+	// sleep and a wake each time, with a gap in service around each one.
+	//
+	// Set it and the hold timeout no longer applies: a lent Pod goes back when
+	// the variant stops needing it, and not before.
+	WarmPoolRetainedKey = "warmPoolRetained"
 	// WarmPoolPreloadTopKey warms this many of the busiest variants without
 	// waiting for each to miss first.
 	WarmPoolPreloadTopKey = "warmPoolPreloadTop"
@@ -221,9 +235,12 @@ const (
 // PoolMeta is a warm pool's tuning, as its trigger declares it. Every field is
 // optional; an absent one leaves the controller's own default in place.
 type PoolMeta struct {
-	Name                 string
-	SleepMinSize         *int
-	MaxHold              *time.Duration
+	Name         string
+	SleepMinSize *int
+	MaxHold      *time.Duration
+	// Retained makes the pool serving capacity rather than a bridge. See
+	// WarmPoolRetainedKey.
+	Retained             *bool
 	PreloadTop           *int
 	GPUMemoryUtilization float64
 }
@@ -256,6 +273,14 @@ func ParsePoolMeta(metadata map[string]string) (PoolMeta, error) {
 				WarmPoolMaxHoldKey, raw)
 		}
 		out.MaxHold = &d
+	}
+	if raw := metadata[WarmPoolRetainedKey]; raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return PoolMeta{}, fmt.Errorf("trigger metadata %q must be true or false, got %q",
+				WarmPoolRetainedKey, raw)
+		}
+		out.Retained = &v
 	}
 	if raw := metadata[WarmPoolPreloadTopKey]; raw != "" {
 		n, err := strconv.Atoi(raw)
