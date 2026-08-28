@@ -68,16 +68,25 @@ type Adapter struct {
 	namespace string
 	tier      Tier
 
-	// DrainWait is how long to let in-flight work finish after the Pod leaves
-	// service and before the engine sleeps.
+	// DrainWait is how long to wait for the Pod to leave service before asking
+	// the engine to sleep.
 	//
-	// It has to cover the whole chain, not just the drain: the kubelet must
-	// notice /readyz failing (up to one probe period), the Pod must leave its
+	// It covers the ROUTING chain, and only that: the kubelet must notice
+	// /readyz failing (up to one probe period), the Pod must leave its
 	// EndpointSlice, and the EPP must stop dispatching to it (~630 ms measured).
 	// With the manifest's periodSeconds: 1 and failureThreshold: 1 that is
-	// roughly 1.7 s, so the default leaves margin on top. Sleeping early is a
-	// 503 for every request still arriving; sleeping late costs only the
-	// milliseconds a returned Pod spends out of the reserve.
+	// roughly 1.7 s, so the default leaves margin on top. Waiting it out means
+	// no NEW request arrives after the engine has been told to stop taking work.
+	//
+	// It is NOT how in-flight requests finish, and used to be described as
+	// though it were. Finishing them is the engine's own job: Sleep asks vLLM
+	// for mode=wait, which queues new adds, keeps stepping until what is running
+	// has drained, and only then sleeps. See Engine.Sleep.
+	//
+	// So this is short by design and the real bound on a slow drain is the
+	// caller's deadline -- the sleep call blocks for as long as the engine takes
+	// (see Reconciler.ActTimeout). A model whose requests run for tens of
+	// seconds needs that budget raised, not this.
 	DrainWait time.Duration
 
 	// These exist so the protocol halves can be substituted in tests. Each

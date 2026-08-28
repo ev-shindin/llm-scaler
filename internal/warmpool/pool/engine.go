@@ -35,6 +35,10 @@ func NewEngine(ep Endpoint, timeout time.Duration) *Engine {
 	}
 }
 
+// sleepModeDrain is vLLM's PauseMode for "queue new work, finish what is
+// running, then sleep". See the note on Engine.Sleep.
+const sleepModeDrain = "wait"
+
 // SleepLevel is vLLM's own notion, derived from the tier the pool was built for.
 //
 // Level 1 offloads the weights to host memory; level 2 discards them and re-reads
@@ -52,8 +56,30 @@ func SleepLevel(tier Tier) int {
 //
 // The caller must already have taken this instance out of service. Sleeping
 // while traffic can still arrive is the Ready-but-asleep window, which is a 503.
+// sleepModeDrain is how vLLM is asked to STOP TAKING WORK AND FINISH WHAT IT HAS,
+// which is what graceful termination means everywhere else in Kubernetes.
+//
+// /sleep takes a mode, and its default is "abort": every in-flight request is
+// cancelled the moment the call lands. That is the wrong end of the trade for a
+// pool. A borrowed Pod is serving real traffic, and returning it is a routine
+// event -- it happens whenever the ordinary replicas arrive -- so a return that
+// cuts responses makes the pool a source of failed requests rather than a way of
+// avoiding cold starts.
+//
+// "wait" is the engine's own drain, and it is the same shape as a pod being
+// terminated politely: new work is queued rather than accepted, the scheduler
+// keeps stepping until what is in flight has finished, and only then does the
+// engine sleep. vLLM calls it PAUSED_NEW; a preStop hook plus a grace period is
+// the pod-level version of the same idea.
+//
+// The caller still bounds it. The engine drains for as long as its work takes,
+// and the CONTEXT decides how long that may be -- see Adapter.drainFor. Draining
+// is the mechanism; the deadline is the limit.
+//
+// Not "keep", which pauses everything including the requests already running:
+// that stops the work without finishing it, which is abort with extra steps.
 func (e *Engine) Sleep(ctx context.Context, tier Tier) error {
-	path := fmt.Sprintf("/sleep?level=%d", SleepLevel(tier))
+	path := fmt.Sprintf("/sleep?level=%d&mode=%s", SleepLevel(tier), sleepModeDrain)
 	_, err := e.do(ctx, http.MethodPost, path)
 	return err
 }
