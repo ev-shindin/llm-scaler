@@ -161,7 +161,29 @@ type Reconciler struct {
 	// pool logs once rather than every Interval. Guarded by passMu, which
 	// already serialises the whole pass.
 	lastSummary map[string]string
+
+	// MinGap is the floor between passes when the TRIGGER is what woke us.
+	//
+	// The trigger exists so a borrow starts at decision time rather than at the
+	// next tick, and that is worth keeping -- but it says "go round again", not
+	// "go round again immediately, forever". Whenever it is ready the loop runs
+	// Once() back to back, and a pass is cheap: measured on a two-node pool on
+	// H100s, the controller made 19,992 supervisor calls in 64 seconds, roughly
+	// 310 a second against a launcher that is also trying to start an engine.
+	// It buried the engine's own logs, which is what made a real fan-out failure
+	// hard to read.
+	//
+	// A floor bounds that without giving up the latency the trigger buys: a
+	// bridge still starts within MinGap of the decision, which at 250ms is
+	// invisible next to a wake measured in hundreds of milliseconds.
+	//
+	// Zero takes the default. Ticks are NOT gated by this -- Interval is already
+	// a floor of its own, and gating them would silently double it.
+	MinGap time.Duration
 }
+
+// defaultMinGap is the floor between trigger-driven passes. See Reconciler.MinGap.
+const defaultMinGap = 250 * time.Millisecond
 
 // New returns a Reconciler ready to Start.
 func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
@@ -170,6 +192,7 @@ func New(p pool.Pool, demand DemandSource, cfg policy.Config) *Reconciler {
 		Demand:         demand,
 		Config:         cfg,
 		Interval:       5 * time.Second,
+		MinGap:         defaultMinGap,
 		ObserveTimeout: defaultObserveTimeout,
 		ActTimeout:     defaultActTimeout,
 		AdmitTimeout:   defaultAdmitTimeout,
@@ -197,7 +220,13 @@ func (r *Reconciler) Start(ctx context.Context) error {
 		decided = r.Trigger.Notify()
 	}
 
+	gap := r.MinGap
+	if gap <= 0 {
+		gap = defaultMinGap
+	}
+
 	for {
+		started := r.now()
 		if _, err := r.Once(ctx); err != nil {
 			log.FromContext(ctx).V(1).Info("warm pool reconcile failed", "err", err)
 		}
@@ -206,9 +235,20 @@ func (r *Reconciler) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 		case <-decided:
-			// A decision landed: go round immediately rather than waiting out
-			// the tick. This is the whole reason a bridge can be up before the
-			// ordinary replicas have finished being asked for.
+			// A decision landed: go round rather than waiting out the tick.
+			// This is the whole reason a bridge can be up before the ordinary
+			// replicas have finished being asked for.
+			//
+			// Held to MinGap, though. The trigger is ready far more often than
+			// there is new work, and without a floor the loop spins as fast as a
+			// pass completes -- see MinGap for what that measured.
+			if rest := gap - r.now().Sub(started); rest > 0 {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(rest):
+				}
+			}
 		}
 	}
 }
