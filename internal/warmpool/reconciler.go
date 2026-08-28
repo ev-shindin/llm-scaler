@@ -118,6 +118,17 @@ type Reconciler struct {
 	// once rather than every pass.
 	lastUndeclared string
 
+	// Headroom reports how many GPUs of this accelerator the namespace may still
+	// take, and whether that figure is usable at all. Optional; nil means the
+	// pool grows without a capacity check, which is what an install with no
+	// limiter declared should do.
+	//
+	// FALSE means "no answer" -- no limiter bounds this namespace, or none has
+	// published yet -- and must not be read as zero. A pool held down because
+	// nobody has published a limit would never grow on a cluster that has no
+	// limiter at all.
+	Headroom func(namespace, accelerator string) (int, bool)
+
 	// Contended reports whether a model replica in this namespace is being
 	// denied GPUs of a given accelerator. Nil disables the arbitration, which
 	// is what a pool with no optimizer running should do.
@@ -144,6 +155,8 @@ type Reconciler struct {
 	// real value: it is how a recovered pool re-arms, so the next shortfall is
 	// reported instead of being mistaken for the one already logged.
 	lastShort map[string]int
+	// lastCapped dedupes the capacity-capped line, keyed by pool.
+	lastCapped map[string]string
 	// lastSummary is the previous pass's one-line state PER POOL, so a steady
 	// pool logs once rather than every Interval. Guarded by passMu, which
 	// already serialises the whole pass.
@@ -468,7 +481,75 @@ func (r *Reconciler) publishSize(ctx context.Context, spec PoolSpec, memberships
 			want = hold
 		}
 	}
+
+	// DO NOT ASK FOR WHAT THE NAMESPACE CANNOT AFFORD.
+	//
+	// Growth here is a size published to KEDA, which creates Pods. Asking beyond
+	// the allowance does not queue anything useful: the Pods are created and sit
+	// Pending for want of a GPU, or a quota admission refuses them outright, and
+	// the pool reports itself short forever while nothing can ever fill it. A
+	// pool that stops at what it can have is the honest state, and the shortfall
+	// is already reported by reportShort.
+	//
+	// Distinct from the contention hold above. That yields ground while a model
+	// replica is actively being denied; this refuses to ask when the allowance is
+	// spent. A namespace can be uncontended and still have nothing left.
+	if r.Headroom != nil && want > spec.Replicas {
+		if accelerator := soleAccelerator(memberships); accelerator != "" {
+			if free, known := r.Headroom(r.Namespace, accelerator); known {
+				// Headroom is in GPUs; the pool grows in Pods. A Pod costs the
+				// devices one warm unit holds, and a group of two 8-GPU Pods
+				// costs sixteen -- capacityOf already reports the unit's total.
+				perPod := gpusPerUnit(memberships)
+				if perPod > 0 {
+					affordable := spec.Replicas + free/perPod
+					if want > affordable {
+						r.reportCapped(ctx, spec, accelerator, want, affordable, free)
+						want = affordable
+					}
+				}
+			}
+		}
+	}
 	r.PublishSize(r.Namespace, spec.Deployment, int32(want)) //nolint:gosec // small counts
+}
+
+// gpusPerUnit is what one more Pod of this pool would cost in devices.
+//
+// Read from the Pods themselves rather than configured: the pool's own Deployment
+// states it, and a second copy of that fact could only ever agree or silently
+// disagree. Zero when no Pod declares a device count, which switches the capacity
+// check off rather than dividing by it.
+func gpusPerUnit(memberships []pool.Membership) int {
+	for _, m := range memberships {
+		if m.Capacity.GPUs > 0 {
+			return m.Capacity.GPUs
+		}
+	}
+	return 0
+}
+
+// reportCapped says the pool wanted to grow and the namespace could not afford
+// it. Deduplicated like every other pool-state line: this is a STATE that lasts
+// as long as the allowance is spent, and an undeduplicated line would repeat on
+// every pass for exactly as long as somebody is reading the log to find out why
+// the pool is not growing.
+func (r *Reconciler) reportCapped(ctx context.Context, spec PoolSpec, accelerator string, want, capped, free int) {
+	name := r.metricName(spec)
+	summary := fmt.Sprintf("%s want=%d capped=%d free=%d", accelerator, want, capped, free)
+	if r.lastCapped == nil {
+		r.lastCapped = map[string]string{}
+	}
+	if r.lastCapped[name] == summary {
+		return
+	}
+	r.lastCapped[name] = summary
+	log.FromContext(ctx).WithName("warmpool").Info(
+		"warm pool is not growing: the namespace has no GPU allowance left for it. "+
+			"Pods asked for beyond this would stay Pending or be refused, so the pool "+
+			"stops at what it can have",
+		"pool", name, "accelerator", accelerator,
+		"wanted", want, "cappedAt", capped, "gpusFree", free)
 }
 
 // soleAccelerator is the accelerator every Pod in this pool sits on, or "" if

@@ -50,7 +50,16 @@ func applyGPULimitAttribution(
 	// and publishing only the non-empty ones would leave the last contended
 	// reading standing forever, holding warm pools down long after the burst.
 	contended := map[string]map[string]bool{}
-	defer func() { decision.PublishGPUContention(contended, time.Now()) }()
+	// Headroom rides along with contention, from the one place that sees every
+	// constraint provider at once. They answer different questions and the warm
+	// pool needs both: contention says a model replica is being denied RIGHT NOW,
+	// which is a reason to yield ground already held; headroom says the allowance
+	// is spent, which is a reason not to ask for more in the first place.
+	defer func() {
+		now := time.Now()
+		decision.PublishGPUContention(contended, now)
+		decision.PublishHeadroom(namespaceHeadroom(constraints), now)
+	}()
 
 	if len(limited) == 0 {
 		return
@@ -75,6 +84,49 @@ func applyGPULimitAttribution(
 			contended[d.Namespace][d.AcceleratorName] = true
 		}
 	}
+}
+
+// namespaceHeadroom is how many GPUs of each accelerator each namespace may
+// still take, across every provider, tightest bound winning.
+//
+// Only namespaces some provider actually CAPS appear. A namespace nobody bounds
+// is absent rather than present-with-a-large-number, because "unconstrained" and
+// "a lot left" are different answers and a caller has to be able to tell them
+// apart -- a warm pool must grow freely in the first case.
+//
+// Mirrors effectiveAvailable: a negative Limit is the unlimited sentinel and
+// imposes no bound, and an accelerator a namespace's allowlist does not name is
+// a hard deny, which is zero rather than absent.
+func namespaceHeadroom(constraints []*ResourceConstraints) map[string]map[string]int {
+	out := map[string]map[string]int{}
+	for _, c := range constraints {
+		if c == nil {
+			continue
+		}
+		for ns, perType := range c.NamespacePools {
+			free, ok := out[ns]
+			if !ok {
+				free = map[string]int{}
+				out[ns] = free
+			}
+			for accType, rp := range perType {
+				if rp.Limit < 0 {
+					continue // unlimited for this (namespace, type)
+				}
+				avail := rp.Limit - rp.Used
+				if avail < 0 {
+					// Over-committed already. Zero, not negative: the answer a
+					// caller needs is "nothing more", and a negative number
+					// invites arithmetic that accidentally grants some back.
+					avail = 0
+				}
+				if prev, seen := free[accType]; !seen || avail < prev {
+					free[accType] = avail
+				}
+			}
+		}
+	}
+	return out
 }
 
 // bindingProvider names the constraint provider whose pool most tightly bounds

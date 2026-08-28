@@ -839,6 +839,14 @@ func main() {
 			// replica on this pool's accelerator, the pool stops asking for
 			// more. contentionMaxAge keeps a stale reading from holding it
 			// down forever if the optimizer stops running.
+			// The pool must not ask KEDA for Pods the namespace cannot afford:
+			// they would be created and sit Pending, or be refused outright, and
+			// the pool would report itself short forever with nothing able to
+			// fill it. Published by the allocation layer, which is the only
+			// component that sees every constraint provider at once.
+			reconciler.Headroom = func(namespace, accelerator string) (int, bool) {
+				return decision.GPUHeadroom(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
+			}
 			reconciler.Contended = func(namespace, accelerator string) bool {
 				return decision.GPUContended(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
 			}
