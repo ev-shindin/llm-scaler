@@ -32,13 +32,41 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  pull_request:
-    branches:
-      - main
-      - dev
-  # Allow maintainers to trigger tests on fork PRs via /ok-to-test comment
-  issue_comment:
-    types: [created]
+  # DISABLED HERE. The automatic triggers are commented out rather than deleted,
+  # so re-enabling is uncommenting them; workflow_dispatch stays, so anyone with
+  # the prerequisites below can still run this by hand.
+  #
+  # Two prerequisites this repository does not have. build-image logs in to GHCR
+  # with secrets.CR_USER and secrets.CR_TOKEN, which are not set here -- secrets
+  # do not come along when a repository is forked -- so docker/login-action fails
+  # immediately with "Username and password required". That went unnoticed for a
+  # long time because the gate lets NON-FORK maintainer PRs through and nothing
+  # else: every fork PR skips build-image by design, so the job only ran for the
+  # first time on 2026-08-26 and failed on the first attempt.
+  #
+  # Fixing the login alone would only move the failure. e2e-openshift needs
+  # runners labelled [self-hosted, openshift, vllm-d], and since build-image has
+  # never succeeded here that job has never started either. Without those runners
+  # it queues until GitHub times it out -- a slow red instead of a fast one.
+  #
+  # To bring it back: register the runners, and either set CR_USER/CR_TOKEN or
+  # point the login at the built-in token (`username: ${{ github.actor }}`,
+  # `password: ${{ secrets.GITHUB_TOKEN }}`), which needs no secret at all --
+  # this workflow already declares `packages: write` and pushes to
+  # ghcr.io/${{ github.repository }}, which that token can write.
+  #
+  # AND CHECK BRANCH PROTECTION. The gate job says it expects "e2e-openshift" to
+  # be a required status check. A workflow that never triggers never reports, and
+  # a required check that never reports blocks every PR forever -- so if it is
+  # still required, drop it there too, or nothing merges.
+  #
+  # pull_request:
+  #   branches:
+  #     - main
+  #     - dev
+  # # Allow maintainers to trigger tests on fork PRs via /ok-to-test comment
+  # issue_comment:
+  #   types: [created]
   workflow_dispatch:
     inputs:
       model_id:

@@ -2093,6 +2093,12 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# preStop hooks pod-wide, or reporting an unreadable workload as healthy all
 	@# parse perfectly and are all wrong about a running cluster.
 	@bash hack/check-workload-gaps.sh
+	@echo "Checking model identification..."
+	@# Same shape as the check above, on the parsers that name the model every
+	@# ScaledObject is written for. `bash -n` sees none of it: a --served-model-name
+	@# read as the literal $$MODEL_NAME, or an env value whose newline splits one
+	@# workload record into two, both parse perfectly.
+	@bash hack/check-scaledobject-parsers.sh
 	@echo "Checking what warmpool.sh actually emits..."
 	@# Renders the pool manifests and asserts their shape. Every bug this covers
 	@# parses fine: one container with the proxy image under the supervisor's

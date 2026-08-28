@@ -51,6 +51,20 @@ var (
 	cancel        context.CancelFunc
 )
 
+// suiteModelID gives one suite a model of its own, derived from the configured
+// base so a run still honours MODEL_ID.
+//
+// Suites share a namespace, a controller and -- unless they ask otherwise -- a
+// model ID, and the engine keys REAL STATE on that ID: which workloads serve the
+// model, and what it has learned about their capacity. Two suites under one ID
+// are therefore not isolated from each other, and what follows lands on whichever
+// of them ran second. See sfzModelID and the policy-tier suite for the two cases
+// that have forced this so far; a suite whose assertions depend on the engine
+// knowing nothing about its model yet wants one of these.
+func suiteModelID(suffix string) string {
+	return cfg.ModelID + "-" + suffix
+}
+
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "E2E Test Suite")
@@ -216,7 +230,8 @@ var _ = ReportAfterEach(func(report SpecReport) {
 
 	GinkgoWriter.Printf("\n=== Failure diagnostics: %s ===\n", report.FullText())
 	utils.DumpControllerLogs(context.Background(), k8sClient, cfg.WVANamespace, GinkgoWriter)
-	utils.DumpManagedScalers(context.Background(), k8sClient, GinkgoWriter)
+	utils.DumpManagedScalers(context.Background(), k8sClient, dynamicClient, GinkgoWriter)
+	utils.DumpScaledObjects(context.Background(), dynamicClient, GinkgoWriter)
 	// The controller log shows WVA's view of the LAST link in the demand chain, and
 	// "no pending requests" there is equally consistent with every earlier link
 	// having broken. This records the earlier links — see DumpDemandEvidence.

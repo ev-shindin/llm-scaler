@@ -32,6 +32,29 @@ go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
+### Shell checks in `deploy/lib`
+
+The installer decides what to autoscale by parsing pod specs in shell. That
+parsing has no Go test and never touches a cluster, so it is covered by
+fixture-executing checks under `hack/`, all of them run by one target that
+CI runs on every PR:
+
+```bash
+make lint-deploy-scripts
+```
+
+- `check-workload-gaps.sh` -- readiness detection: which container is the
+  engine, whether weights persist, whether a drain hook is present.
+- `check-scaledobject-parsers.sh` -- model identification: `so_model_id`
+  (which token on a command line names the model) and `so_resolve_env_ref`
+  (a model name written as `$MODEL_NAME`, `${MODEL_NAME}` or
+  `$(MODEL_NAME)`). It also lifts the discovery `jq` query out of
+  `deploy/lib/scaledobject.sh` and runs it, to check that one workload still
+  produces one pipe-delimited record on one line.
+
+Both need `jq` (and the first needs `yq`) and fail rather than skip without
+them, because a skip is how a green run comes to mean nothing.
+
 ### Unit Test Structure
 
 Unit tests are co-located with the code they test:

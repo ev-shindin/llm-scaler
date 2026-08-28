@@ -47,8 +47,9 @@ var _ = Describe("Scale-To-Zero Feature (parking a serving model)", Serial, Labe
 		poolName     = "scale-to-zero-pool"
 		scalerBase   = "scale-to-zero"
 		variantName  = "scale-to-zero-so"
-		retention    = "1m"
-		loadRequests = 40
+		// One value, used both to write the policy and to bound the guard below.
+		retentionDuration = time.Minute
+		loadRequests      = 40
 		// retention (1m) + KEDA cooldownPeriod (30s in the fixture) + an optimize
 		// interval, and the two timers are SEQUENTIAL rather than overlapping.
 		//
@@ -64,6 +65,7 @@ var _ = Describe("Scale-To-Zero Feature (parking a serving model)", Serial, Labe
 
 	var (
 		modelID         string
+		loadStarted     time.Time
 		cmName          string
 		cmNamespace     string
 		cmOriginal      *corev1.ConfigMap
@@ -97,7 +99,7 @@ var _ = Describe("Scale-To-Zero Feature (parking a serving model)", Serial, Labe
 		// set, which matters because the entry always wins over the flag.
 		modelEntry := buildSaturationConfigYAMLWithModel(
 			0.80, 1, 0.85, 0.70, modelID, cfg.LLMDNamespace,
-		) + fmt.Sprintf("scaleToZero:\n  enabled: true\n  retentionPeriod: %s\n", retention)
+		) + fmt.Sprintf("scaleToZero:\n  enabled: true\n  retentionPeriod: %s\n", retentionDuration)
 		Expect(upsertSaturationConfigEntry(ctx, cmNamespace, cmName, "scale-to-zero-model", modelEntry)).To(Succeed())
 
 		By("Creating the model service, SERVING (not parked)")
@@ -168,6 +170,10 @@ var _ = Describe("Scale-To-Zero Feature (parking a serving model)", Serial, Labe
 
 	It("serves traffic, so the idle signal exists at all", func() {
 		By("Driving requests through the model service")
+		// Stamped BEFORE the job exists, so it precedes every request this suite
+		// makes. The parking spec needs a lower bound on the last request; the
+		// comment on the guard there says why the obvious anchor is the wrong one.
+		loadStarted = time.Now()
 		// Two things this URL has to get right, and both fail SILENTLY:
 		//
 		//   - EnsureService names the Service "<base>-service". The base name
@@ -207,7 +213,6 @@ var _ = Describe("Scale-To-Zero Feature (parking a serving model)", Serial, Labe
 	It("parks the model once it goes idle", func() {
 		By("Stopping the load")
 		Expect(fixtures.DeleteBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, modelSvcName)).To(Succeed())
-		idleSince := time.Now()
 
 		// After the last request, increase() over the retention window takes that
 		// window to fall to zero; then the enforcer parks on its next cycle and KEDA
@@ -225,19 +230,26 @@ var _ = Describe("Scale-To-Zero Feature (parking a serving model)", Serial, Labe
 
 		// A zero reached too fast is not this feature working. The variant name is
 		// deterministic, so a parked decision left in Prometheus by an earlier run
-		// makes KEDA deactivate the fresh deployment within seconds — the SGLang
-		// sibling of this suite once "passed" that way in 15 seconds. increase() over
-		// the retention window cannot fall to zero before that window has elapsed, so
-		// anything faster is stale state rather than a decision.
+		// makes KEDA deactivate the fresh deployment within seconds -- the SGLang
+		// sibling of this suite once "passed" that way in 15 seconds. increase()
+		// over the retention window cannot fall to zero before that window has
+		// elapsed, so anything faster is stale state rather than a decision.
 		//
-		// The grace is not slack for its own sake. idleSince is stamped when the load
-		// job is DELETED, which is at or after its last request, so the measured
-		// elapsed can undershoot the true window; the round-trip suite once cleared an
-		// exact 1m floor by 44ms. The floor only has to separate a real park from a
-		// leftover decision that lands in seconds, and 45s still does that.
-		Expect(time.Since(idleSince)).To(BeNumerically(">=", 45*time.Second),
-			"parked sooner than the 1m retention window could have elapsed: this is "+
-				"leftover state from an earlier run, not an idle-driven decision")
+		// Measured from when the LOAD JOB WAS CREATED, which is the subtle part.
+		// The obvious anchor -- the moment the job is deleted -- is an UPPER bound
+		// on the last request: the burst sends a fixed number of prompts and then
+		// sits there finished, so by the time this spec deletes it the model may
+		// already have been idle for the whole window. CI measured exactly that:
+		// the enforcer reported an EMPTY request-count window one cycle BEFORE the
+		// load was stopped, parked 14s later, and the spec called a correct park
+		// stale. The window the enforcer measures runs from the LAST REQUEST, so
+		// the guard needs a lower bound on it, and job creation is one -- every
+		// request this suite makes comes after it. No grace is needed for the same
+		// reason, and the floor is the whole window rather than a shaved-down one.
+		Expect(time.Since(loadStarted)).To(BeNumerically(">=", retentionDuration),
+			"parked sooner than the retention window could have elapsed since the first "+
+				"request this suite made: leftover state from an earlier run, not an "+
+				"idle-driven decision")
 	})
 
 	It("reports the parked model as serving nothing", func() {

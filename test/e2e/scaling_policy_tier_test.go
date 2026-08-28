@@ -102,7 +102,24 @@ var _ = Describe("Named scaling policy tier", Label("full"), Ordered, func() {
 				"It uses llm-d-inference-sim's --fake-metrics flag, which real vLLM rejects.")
 		}
 
-		modelID = cfg.ModelID
+		// A model of its own -- same remedy as sfzModelID, a different coupling.
+		//
+		// Every arc here asserts on a REPLICA COUNT that only follows from the
+		// policy while capacity stays memory-bound: k1 is 6, demand is 2, so
+		// utilization is 0.33 and the default entry (0.95) holds at 1 while the
+		// tier (0.30) takes it to 2. A COMPUTE bound learned for the model
+		// replaces that 6 -- seen at k2=2 in a full run -- and utilization becomes
+		// 1.0, which is above every threshold in the file. The workload then
+		// scales under the default entry, arc 1 fails, and the suite can no longer
+		// tell apart the two policies it exists to distinguish.
+		//
+		// It cannot seed that history itself: computeK2 records only under its
+		// Priority 1, which needs queueLen >= queueThreshold, and this suite pins
+		// the threshold at 50 (tierQueueLengthThreshold) while its --fake-metrics
+		// report no waiting requests at all. So every entry that can appear under
+		// the shared key belongs to some other suite, and a key nothing else
+		// writes to is the whole fix.
+		modelID = suiteModelID("tier")
 		cmName = scalingPolicyConfigMapName()
 		cmNamespace = cfg.WVANamespace
 		variantName = scalerBaseName + "-so"

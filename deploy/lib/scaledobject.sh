@@ -504,6 +504,71 @@ so_model_id() {
     return 0
 }
 
+# so_resolve_env_ref answers a so_model_id result that is itself an unexpanded
+# variable reference -- $MODEL_NAME, ${MODEL_NAME}, or Kubernetes' own
+# $(MODEL_NAME) -- rather than a model name. Some guides -- pd-disaggregation
+# among them -- write the engine container's customCommand as a shell script
+# that references $MODEL_NAME rather than the literal model name; Kubernetes
+# stores that script as-is, so $MODEL_NAME only becomes "Qwen/Qwen3-0.6B" when
+# bash runs it inside the container, and so_model_id, reading the pod spec, can
+# only ever see the unresolved reference. The container's own env entries are
+# NOT script -- .value is already the resolved string -- so a variable
+# reference can be answered from there instead of guessed at or left empty.
+#
+# $(MODEL_NAME) is the same problem one layer down, and not a rarer one: that
+# spelling is expanded by the KUBELET rather than by bash, and it is what the
+# scenarios that pass the model as a plain args entry write --
+# config/scenarios/cicd/kind.yaml and examples/sim.yaml both render
+#
+#     args: ["--served-model-name", "$(MODEL_NAME)"]
+#
+# so the running process sees the model while the pod spec, which is all this
+# reads, keeps the literal. It is answered from the same env list.
+#
+# $2 is the engine container's env as NAME=value pairs, space-joined (see the
+# so_discover query, where it is read off the same container $c that args came
+# from -- and note the missing apostrophe there: hack/check-quoted-programs
+# reads a comment line naming jq with an odd apostrophe count as the line that
+# OPENS a quoted program). A token that is not a variable reference is echoed
+# back unchanged. A reference naming an env var this container does not set
+# produces EMPTY, not the raw "$VARNAME" text: that text is never a valid
+# modelID (no metric series is ever named after a shell variable), so
+# returning it would recreate the same bug under a different spelling. Empty
+# joins the caller's existing "model could not be read" handling -- which the
+# caller reports as an UNRESOLVED REFERENCE rather than as a missing flag, and
+# the difference matters: the flag is there in plain sight, it just names a
+# variable nothing here answers, and an operator sent looking for a
+# --served-model-name that is written on the very next line learns nothing.
+#
+# Only a token that is ENTIRELY one reference is resolved. A compound one --
+# ${BASE}-instruct, /model-cache/$MODEL_PATH -- yields empty deliberately:
+# resolving the variable half would produce a plausible-looking modelID that is
+# not the served name, which is the failure this function exists to prevent.
+so_resolve_env_ref() {
+    local tok="$1" envs="$2" name e
+    case "$tok" in
+        # The bracketed forms first, and matched on their CLOSING bracket: the
+        # bare '$'* arm would otherwise take "(MODEL_NAME)" or "{MODEL_NAME}"
+        # for the variable name and answer nothing. A token that opens a
+        # bracket without closing it, or carries anything after the close, is
+        # compound -- it falls through to the bare arm, keeps a bracket in
+        # $name, and so matches no env entry, which is the wanted answer.
+        '$('*')') name="${tok#\$(}"; name="${name%)}" ;;
+        '${'*'}') name="${tok#\$\{}"; name="${name%\}}" ;;
+        '$'*)     name="${tok#\$}" ;;
+        # printf, not echo: a value that begins with -n or -e is eaten by echo
+        # as an option and the model comes back empty. so_model_source takes
+        # the same care for the same reason.
+        *) printf '%s\n' "$tok"; return 0 ;;
+    esac
+    for e in $envs; do
+        case "$e" in
+            "$name="*) printf '%s\n' "${e#*=}"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
 # so_model_source echoes WHERE a serving container gets its weights: the argument
 # of --model, or the positional model of `vllm serve <model>`.
 #
@@ -1732,7 +1797,7 @@ so_existing_name() {
 # then the whole truth about what was found, and turning a "no" into a "yes" is a
 # deliberate act rather than an undiscoverable one.
 so_discover() {
-    local ns name args labels objlabels model pool kind apply note drain weights
+    local ns name args envs labels objlabels model model_ref pool kind apply note drain weights
     local existing existing_name existing_min existing_max existing_cost existing_policy existing_is_wva
     local min max cost policy
     so_plan_preamble
@@ -1749,7 +1814,9 @@ so_discover() {
             # args LAST: a serving container's args can legitimately contain a
             # pipe (a shell string, a chat template), and `read` gives the final
             # variable the whole remainder — so only a trailing field is safe.
-            while IFS='|' read -r name labels objlabels args; do
+            # envs sits right before it for the same reason: it is itself
+            # NAME=value pairs and could not tolerate being split further.
+            while IFS='|' read -r name labels objlabels envs args; do
                 [ -n "$name" ] || continue
                 # The marker, on the pod template or on the object. Kept separate
                 # from $labels, which is POD labels only: so_pool matches those
@@ -1764,9 +1831,23 @@ so_discover() {
                 # object that scales something else entirely.
                 cost="$SO_DEFAULT_VARIANT_COST"; policy=""; existing_name=""
                 model=$(so_model_id "$args")
+                # Remembered BEFORE resolution, because both outcomes are empty
+                # after it and they are not the same problem. A container with
+                # no --served-model-name at all needs the operator to go and
+                # write one; a container whose --served-model-name is
+                # $MODEL_NAME has one in plain sight, and telling that operator
+                # the flag is missing sends them to look at a line that already
+                # says what they are being asked to add.
+                model_ref=""
+                case "$model" in '$'*) model_ref="$model" ;; esac
+                model=$(so_resolve_env_ref "$model" "$envs")
                 if [ -z "$model" ]; then
                     apply=no
-                    note="no --served-model-name, --model, or 'vllm serve <model>' on the container, so the model could not be read. Fill in modelID and set apply: yes to include it."
+                    if [ -n "$model_ref" ]; then
+                        note="the model is written as $model_ref, a reference the engine container env does not answer -- it has a value only inside the running container, so the pod spec cannot be read any further. Fill in modelID with the name the engine actually serves and set apply: yes to include it."
+                    else
+                        note="no --served-model-name, --model, or 'vllm serve <model>' on the container, so the model could not be read. Fill in modelID and set apply: yes to include it."
+                    fi
                 fi
                 # FMA: report it, do NOT retarget.
                 #
@@ -1847,52 +1928,83 @@ so_discover() {
                     .items[]
                     | . as $o
                     | (getpath($p) // {}) as $t
-                    | [ $o.metadata.name,
-                        (($t.metadata.labels // {}) | to_entries
-                         | map(.key + "=" + (.value|tostring)) | join(" ")),
-                        (($o.metadata.labels // {}) | to_entries
-                         | map(.key + "=" + (.value|tostring)) | join(" ")),
-                        # Newlines collapsed to spaces: read below takes one
-                        # record per line, and the llm-d modelservice chart
-                        # wraps vllm serve as a single multi-line args string (a
-                        # bash -c script), which would otherwise split one
-                        # record across many lines and hide its
-                        # --served-model-name past the first line. \r goes with
-                        # it: a chart authored on Windows carries CRLF inside
-                        # the block scalar, and CR is not in bash IFS, so the
-                        # modelID would keep an invisible trailing character and
-                        # match no metric series.
-                        # command AND args: the model of `vllm serve <model>` is
-                        # positional, and the llm-d guides split the two across
-                        # the fields -- command: ["vllm","serve"] with the model
-                        # first in args. Reading args alone leaves no `serve`
-                        # token to anchor on, which is what forced an earlier
-                        # version to fall back to "first non-flag token" and so
-                        # to answer `python` for an SGLang server. With command
-                        # folded in the anchor is always present, and anything
-                        # that is not a `serve` command correctly yields nothing.
-                        #
-                        # The ENGINE container, not containers[0]. Same rule as
-                        # so_workload_gaps, and the same reason: an llm-d
-                        # deployment with a routing proxy lists the proxy first,
-                        # so reading container 0 found no model on exactly the
-                        # layout the chart produces -- the plan then marked the
-                        # workload `apply: no` and asked the operator to type in
-                        # a modelID that was written on the next container down.
-                        # Falls back to containers[0] when nothing identifies as
-                        # an engine, which preserves the answer for a
-                        # single-container workload the image name does not
-                        # match.
-                        ((([ $t.spec.containers[]?
-                             | ((.command // []) + (.args // []) | map(tostring)
-                                | join(" ") | ascii_downcase) as $cmd
-                             | select(((.image // "") | ascii_downcase
-                                       | test("vllm|sglang"))
-                                      or ($cmd | test("vllm serve|sglang\\.launch_server|sglang serve")))
-                           ] | first) // $t.spec.containers[0]) as $c
-                         | (($c.command // []) + ($c.args // []))
-                         | map(tostring | gsub("[\n\r]"; " ")) | join(" "))
-                      ] | join("|")')
+                    # The ENGINE container, not containers[0]. Same rule as
+                    # so_workload_gaps, and the same reason: an llm-d
+                    # deployment with a routing proxy lists the proxy first,
+                    # so reading container 0 found no model on exactly the
+                    # layout the chart produces -- the plan then marked the
+                    # workload `apply: no` and asked the operator to type in
+                    # a modelID that was written on the next container down.
+                    # Falls back to containers[0] when nothing identifies as
+                    # an engine, which preserves the answer for a
+                    # single-container workload the image name does not
+                    # match. Bound here, once, so both the env list and the
+                    # command/args below read the SAME container -- reading
+                    # env off containers[0] while args came from the engine
+                    # container would answer a $VARNAME reference from a
+                    # sidecar that never set it.
+                    | ((([ $t.spec.containers[]?
+                           | ((.command // []) + (.args // []) | map(tostring)
+                              | join(" ") | ascii_downcase) as $cmd
+                           | select(((.image // "") | ascii_downcase
+                                     | test("vllm|sglang"))
+                                    or ($cmd | test("vllm serve|sglang\\.launch_server|sglang serve")))
+                         ] | first) // $t.spec.containers[0]) as $c
+                       | [ $o.metadata.name,
+                           (($t.metadata.labels // {}) | to_entries
+                            | map(.key + "=" + (.value|tostring)) | join(" ")),
+                           (($o.metadata.labels // {}) | to_entries
+                            | map(.key + "=" + (.value|tostring)) | join(" ")),
+                           # The engine containers OWN env, resolved: some
+                           # guides (pd-disaggregation among them) write
+                           # customCommand as a shell script that references
+                           # $MODEL_NAME rather than the literal model name,
+                           # so --served-model-name never appears resolved in
+                           # command/args -- only here, in the env entry
+                           # Kubernetes already stores as a literal value.
+                           # so_resolve_env_ref uses this to answer a variable
+                           # reference so_model_id could not. Vars whose value
+                           # holds WHITESPACE or the record delimiter are
+                           # dropped: this list is itself space-joined and
+                           # pipe-delimited from the fields around it, and no
+                           # served-model-name value legitimately needs either.
+                           #
+                           # The newline half of that is load-bearing, not
+                           # tidiness: read below takes ONE RECORD PER LINE,
+                           # and a YAML block scalar (value: |) ends every
+                           # value it writes with one. A value that kept its
+                           # newline would split a single workload record over
+                           # two lines -- the real entry losing the args field
+                           # that trails it, and so its model, plus a phantom
+                           # entry named after whatever followed the break. A
+                           # test for one literal space let that straight in.
+                           (($c.env // []) | map(
+                               select(.value != null
+                                      and (.value | test("\\s") | not)
+                                      and (.value | test("\\|") | not))
+                               | .name + "=" + .value) | join(" ")),
+                           # Newlines collapsed to spaces: read below takes one
+                           # record per line, and the llm-d modelservice chart
+                           # wraps vllm serve as a single multi-line args string (a
+                           # bash -c script), which would otherwise split one
+                           # record across many lines and hide its
+                           # --served-model-name past the first line. \r goes with
+                           # it: a chart authored on Windows carries CRLF inside
+                           # the block scalar, and CR is not in bash IFS, so the
+                           # modelID would keep an invisible trailing character and
+                           # match no metric series.
+                           # command AND args: the model of `vllm serve <model>` is
+                           # positional, and the llm-d guides split the two across
+                           # the fields -- command: ["vllm","serve"] with the model
+                           # first in args. Reading args alone leaves no `serve`
+                           # token to anchor on, which is what forced an earlier
+                           # version to fall back to "first non-flag token" and so
+                           # to answer `python` for an SGLang server. With command
+                           # folded in the anchor is always present, and anything
+                           # that is not a `serve` command correctly yields nothing.
+                           (($c.command // []) + ($c.args // [])
+                            | map(tostring | gsub("[\n\r]"; " ")) | join(" "))
+                         ] | join("|"))')
         done
         # FMA requesters last, and only where nothing above already covers the
         # model. They carry no serving marker, so the loop above cannot see them.

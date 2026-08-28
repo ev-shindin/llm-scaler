@@ -72,7 +72,7 @@ var _ = Describe("Scale-To-Zero Feature - park and wake the same model", Serial,
 		cmExistedBefore bool
 		gatewayService  string
 		triggerJobName  string
-		idleSince       time.Time
+		loadStarted     time.Time
 	)
 
 	BeforeAll(func() {
@@ -177,6 +177,9 @@ var _ = Describe("Scale-To-Zero Feature - park and wake the same model", Serial,
 
 	It("serves traffic, so the idle signal exists at all", func() {
 		By("Driving requests through the model service")
+		// See the guard in the parking spec: a LOWER bound on the last request is
+		// what the retention window has to be measured against.
+		loadStarted = time.Now()
 		// The path matters and fails silently: the generator POSTs wherever pointed,
 		// discards the body and exit code, and counts requests SENT, so against a bare
 		// host every request 404s while it still reports success.
@@ -204,7 +207,6 @@ var _ = Describe("Scale-To-Zero Feature - park and wake the same model", Serial,
 	It("parks it once it goes idle", func() {
 		By("Stopping the load")
 		Expect(fixtures.DeleteBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, modelSvcName)).To(Succeed())
-		idleSince = time.Now()
 
 		By("Waiting for the deployment to reach zero replicas")
 		Eventually(func(g Gomega) {
@@ -215,21 +217,27 @@ var _ = Describe("Scale-To-Zero Feature - park and wake the same model", Serial,
 					"check wva_model_scaling_blocked for the reason")
 		}, parkingBudget, 10*time.Second).Should(Succeed())
 
-		// A zero reached faster than the retention window could have elapsed is stale
-		// state from an earlier run — KEDA deactivating on a leftover parked decision
-		// — not this feature working. See the SGLang sibling, which once "passed" that
-		// way in 15 seconds.
+		// A zero reached too fast is not this feature working. The variant name is
+		// deterministic, so a parked decision left in Prometheus by an earlier run
+		// makes KEDA deactivate the fresh deployment within seconds -- the SGLang
+		// sibling of this suite once "passed" that way in 15 seconds. increase()
+		// over the retention window cannot fall to zero before that window has
+		// elapsed, so anything faster is stale state rather than a decision.
 		//
-		// The grace is not slack for its own sake. idleSince is stamped when the load
-		// job is DELETED, which is at or after its last request, so the measured
-		// elapsed can undershoot the true idle window; a run once cleared an exact
-		// retentionDuration floor by 44ms. The floor only has to separate a real park
-		// from a leftover decision that lands in seconds, and this still does that by
-		// a wide margin.
-		const graceForLastRequest = 15 * time.Second
-		Expect(time.Since(idleSince)).To(BeNumerically(">=", retentionDuration-graceForLastRequest),
-			"parked sooner than the retention window could have elapsed: leftover state, "+
-				"not an idle-driven decision")
+		// Measured from when the LOAD JOB WAS CREATED, which is the subtle part.
+		// The obvious anchor -- the moment the job is deleted -- is an UPPER bound
+		// on the last request: the burst sends a fixed number of prompts and then
+		// sits there finished, so by the time this spec deletes it the model may
+		// already have been idle for the whole window. CI measured exactly that:
+		// the enforcer reported an EMPTY request-count window one cycle BEFORE the
+		// load was stopped, parked 14s later, and the spec called a correct park
+		// stale. The window the enforcer measures runs from the LAST REQUEST, so
+		// the guard needs a lower bound on it, and job creation is one -- every
+		// request this suite makes comes after it. No grace is needed for the same
+		// reason, and the floor is the whole window rather than a shaved-down one.
+		Expect(time.Since(loadStarted)).To(BeNumerically(">=", retentionDuration),
+			"parked sooner than the retention window could have elapsed since the first "+
+				"request this suite made: leftover state, not an idle-driven decision")
 	})
 
 	It("wakes it again when requests queue at the gateway", func() {

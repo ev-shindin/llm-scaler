@@ -51,7 +51,7 @@ func externalScalerAddress() string {
 // A distinct model per suite removes the coupling rather than ordering around
 // it: no other suite's workload can answer for a model only this suite serves.
 func sfzModelID(suffix string) string {
-	return cfg.ModelID + "-" + suffix
+	return suiteModelID(suffix)
 }
 
 // requireEmptyServingPool blocks until no pod is a ready endpoint of the

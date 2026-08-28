@@ -247,42 +247,105 @@ jobs:
     # The inputs.run_full_tests half is what makes that input real. It has
     # always described itself as 'Run full e2e test suite on Kind' while being
     # referenced by nothing, so ticking the box did nothing whatsoever.
+    #
+    # has_code_changes is deliberately no longer part of this condition. What
+    # this job should skip is now decided INSIDE it, in the first step, because
+    # this one is meant to be a required status check: a job skipped by a
+    # job-level `if` reports no conclusion at all, and GitHub does not read that
+    # as a pass -- the PR waits on a check that never arrives. A docs-only diff
+    # still costs nothing; it returns in under a minute.
     if: >-
-      needs.check-code-changes.outputs.has_code_changes == 'true'
-      && (github.event_name == 'pull_request'
-          || (github.event_name == 'workflow_dispatch' && inputs.run_full_tests))
+      github.event_name == 'pull_request'
+      || (github.event_name == 'workflow_dispatch' && inputs.run_full_tests)
     timeout-minutes: 90
     permissions:
       contents: read
     steps:
+      # fetch-depth: 0, because the step below diffs against the base. The
+      # default shallow checkout has no merge base to diff from.
       - name: Checkout source
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # What this suite adds over e2e-tests-smoke is CONTROLLER behaviour across
+      # more scenarios. Smoke already stands WVA up through `make deploy-wva` --
+      # deploy-e2e-infra says so in its own comment -- so the installer libraries
+      # are executed either way, and a diff that touches none of the compiled
+      # surface has nothing here that smoke did not already cover.
+      #
+      # Decided with git rather than with the paths-filter above, on purpose. The
+      # question is "is EVERY changed file outside this set", the filter answers
+      # "does ANY file match" unless predicate-quantifier is right, and getting
+      # that backwards fails OPEN: a Go change would skip its own tests and the
+      # run would still be green. A grep over the file list is one line and says
+      # what it means. It errs the safe way too -- anything unexpected in the
+      # diff, or an empty file list, runs the suite.
+      - name: Decide whether the full suite is needed
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          if [ "${{ github.event_name }}" != 'pull_request' ]; then
+            echo 'Manual dispatch asked for the full suite.'
+            echo 'run=true' >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)"
+          if [ -z "$changed" ]; then
+            echo 'Could not read the changed-file list; running the suite.'
+            echo 'run=true' >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "$changed" | sed 's/^/  /'
+          # The compiled surface, plus the two things that DRIVE this suite:
+          # test-e2e-full-with-setup lives in the Makefile and the job in the
+          # workflow, so a change to either can break the run it would skip.
+          if echo "$changed" | grep -qE '(\.go|go\.mod|go\.sum|Dockerfile|Makefile)$|^(config|test)/|^\.github/workflows/'; then
+            echo 'Compiled surface touched -- running the full suite.'
+            echo 'run=true' >> $GITHUB_OUTPUT
+          else
+            echo 'Every changed file is outside the compiled surface (shell, hack'
+            echo 'checks, docs). e2e-tests-smoke covers the installer path this'
+            echo 'diff can reach; skipping the full suite.'
+            echo 'run=false' >> $GITHUB_OUTPUT
+          fi
+
 
       - name: Extract Go version from go.mod
+        if: steps.decide.outputs.run == 'true'
         run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
 
       - name: Set up Go with cache
+        if: steps.decide.outputs.run == 'true'
         uses: actions/setup-go@v6
         with:
           go-version: "${{ env.GO_VERSION }}"
           cache-dependency-path: ./go.sum
 
       - name: Install dependencies
+        if: steps.decide.outputs.run == 'true'
         run: go mod download
 
       - name: Install Kind
+        if: steps.decide.outputs.run == 'true'
         run: deploy/ci-pr-checks/install-kind.sh
 
       - name: Set up Docker Buildx
+        if: steps.decide.outputs.run == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Build WVA image locally
+        if: steps.decide.outputs.run == 'true'
         id: build-image
         env:
           CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: deploy/ci-pr-checks/build-wva-image-local.sh
 
       - name: Run e2e tests (full)
+        if: steps.decide.outputs.run == 'true'
         shell: bash
         env:
           ENVIRONMENT: kind-emulator
