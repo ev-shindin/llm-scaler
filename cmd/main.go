@@ -778,106 +778,40 @@ func main() {
 	if warmPoolNS == "" {
 		warmPoolNS = watchNS
 	}
+	// One namespace, named by flag or derived from the watched one.
 	if warmPoolNS != "" {
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			trigger := warmpool.NewDecisionTrigger(decision.Default, nil)
-			defer trigger.Close()
-			// Discovery is call-driven, so the set of scale targets grows during
-			// a run; a trigger built once at startup would never fire for a
-			// workload registered later.
-			go trigger.WatchRegistry(ctx, registry.Default, 30*time.Second)
-
-			reconciler := warmpool.New(
-				warmpoolpool.NewAdapter(mgr.GetClient(), warmPoolNS, warmpoolpool.Ram),
-				&warmpool.Demand{
-					Namespace:            warmPoolNS,
-					GPUMemoryUtilization: *warmPoolGPUUtil,
-					Registry:             registry.Default,
-					Decisions:            decision.Default,
-					Client:               mgr.GetClient(),
-					Datastore:            ds,
-				},
-				warmpoolpolicy.Config{
-					SleepMinSize:       *warmPoolSleepMinSize,
-					MaxHold:            *warmPoolMaxHold,
-					AdmissionWindow:    time.Hour,
-					MinMissesToAdmit:   2,
-					PreloadTop:         *warmPoolPreloadTop,
-					MaxInstancesPerPod: warmpoolpool.MaxInstancesPerPod,
-					PodMemoryBytes:     *warmPoolMemoryBudget,
-				},
-			)
-			// Asked before anything is loaded. Without patch on pods the pool
-			// admits happily, holds GPUs, and then fails at the only moment
-			// that matters -- once per spike, in a path nobody is watching.
-			// An UNANSWERABLE question is not a denial: if the review itself
-			// fails the pool starts, because refusing to run on a broken API
-			// call would be a worse failure than the one being guarded against.
-			switch allowed, err := warmpool.CanBorrow(ctx, mgr.GetClient(), warmPoolNS); {
-			case err != nil:
-				setupLog.Info("could not check whether this controller may patch Pods; "+
-					"starting the warm pool anyway. If borrows fail, check RBAC first",
-					"namespace", warmPoolNS, "err", err.Error())
-			case !allowed:
-				setupLog.Error(nil, warmpool.BorrowDenied, "namespace", warmPoolNS)
-				return nil
-			}
-
-			reconciler.Name = warmPoolNS
-			reconciler.Trigger = trigger
-			// Pools are DISCOVERED from the Deployments that declare them, so a
-			// second pool is a manifest rather than a manifest plus a controller
-			// restart. The flags above become the base every pool's annotations
-			// are layered onto, and are used whole when nothing declares a pool.
-			// The pool is scaled through KEDA like everything else: WVA
-			// publishes a size and the pool's own ScaledObject acts on it. An
-			// install with no pool ScaledObject simply never reads this, and
-			// the pool stays the size its Deployment says.
-			reconciler.Namespace = warmPoolNS
-			reconciler.PublishSize = decision.Set
-			// Arbitration: while the optimizer is denying GPUs to a model
-			// replica on this pool's accelerator, the pool stops asking for
-			// more. contentionMaxAge keeps a stale reading from holding it
-			// down forever if the optimizer stops running.
-			// The pool must not ask KEDA for Pods the namespace cannot afford:
-			// they would be created and sit Pending, or be refused outright, and
-			// the pool would report itself short forever with nothing able to
-			// fill it. Published by the allocation layer, which is the only
-			// component that sees every constraint provider at once.
-			reconciler.Headroom = func(namespace, accelerator string) (int, bool) {
-				return decision.GPUHeadroom(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
-			}
-			reconciler.Contended = func(namespace, accelerator string) bool {
-				return decision.GPUContended(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
-			}
-			// Pools are DECLARED by their ScaledObjects, like everything else
-			// WVA knows about. The flags above are the base each pool's trigger
-			// is layered onto, and the whole config for an install that
-			// declares no pool at all.
-			reconciler.Pools = &warmpool.RegistryPools{
-				Snapshot:  registry.Default.Snapshot,
-				Namespace: warmPoolNS,
-				Fallback:  reconciler.Config,
-			}
-			// Listed only to REPORT a pool Deployment nothing declares. It
-			// holds GPUs and WVA will not use it, which is exactly the silence
-			// moving the declaration to the ScaledObject could have introduced.
-			reconciler.Undeclared = (&warmpool.UndeclaredPools{
-				Client:    mgr.GetClient(),
-				Namespace: warmPoolNS,
-			}).Find
-			setupLog.Info("warm pool enabled",
-				"namespace", warmPoolNS,
-				"sleepMinSize", *warmPoolSleepMinSize,
-				"maxHold", *warmPoolMaxHold,
-				"memoryBudgetBytes", *warmPoolMemoryBudget,
-				"gpuMemoryUtilization", *warmPoolGPUUtil,
-				"preloadTop", *warmPoolPreloadTop)
-			return reconciler.Start(ctx)
+			return runWarmPool(ctx, mgr, ds, warmPoolNS, warmPoolGPUUtil, warmPoolSleepMinSize,
+				warmPoolMaxHold, warmPoolPreloadTop, warmPoolMemoryBudget)
 		})); err != nil {
 			setupLog.Error(err, "unable to add the warm pool to manager")
 			os.Exit(1)
 		}
+	} else if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		// EVERY namespace that declares a pool, discovered as they appear.
+		//
+		// Reached only by a cluster-scoped install that named no namespace,
+		// where the alternative was not a safer default but no warm pool at
+		// all: the operator created the workload and the ScaledObject that
+		// declares it, and WVA ignored both. The opt-in is unchanged -- it is
+		// that declaration -- and this acts on it wherever it appears.
+		mux := &warmpool.Multiplexer{
+			Snapshot: registry.Default.Snapshot,
+			Start: func(ctx context.Context, ns string) context.CancelFunc {
+				nsCtx, cancel := context.WithCancel(ctx)
+				go func() {
+					if err := runWarmPool(nsCtx, mgr, ds, ns, warmPoolGPUUtil, warmPoolSleepMinSize,
+						warmPoolMaxHold, warmPoolPreloadTop, warmPoolMemoryBudget); err != nil {
+						setupLog.Error(err, "warm pool stopped", "namespace", ns)
+					}
+				}()
+				return cancel
+			},
+		}
+		return mux.Run(ctx)
+	})); err != nil {
+		setupLog.Error(err, "unable to add the warm pool multiplexer to manager")
+		os.Exit(1)
 	}
 
 	// +kubebuilder:scaffold:builder
@@ -1022,4 +956,122 @@ func nodeReadProbe(ctx context.Context, c client.Reader) error {
 	err := c.List(ctx, nodes, client.Limit(1))
 	nodeReadProbeAt, nodeReadProbeErr, nodeReadProbeOnce = time.Now(), err, true
 	return err
+}
+
+// runWarmPool reconciles the warm pools of ONE namespace until ctx ends.
+//
+// Hoisted out of main so it can be started per namespace. A cluster-scoped
+// install has no namespace to derive, and naming one by flag serves exactly
+// that namespace: a pool anywhere else is never used, and a pool created after
+// startup needs a restart. Both look the same from outside -- Pods running,
+// accelerators held, WVA silent about them.
+func runWarmPool(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	ds datastore.Datastore,
+	warmPoolNS string,
+	warmPoolGPUUtil *float64,
+	warmPoolSleepMinSize *int,
+	warmPoolMaxHold *time.Duration,
+	warmPoolPreloadTop *int,
+	warmPoolMemoryBudget *int64,
+) error {
+	// Its own, because the original sat in main() as a local. Same name so the
+	// lines this function emits are indistinguishable from before the hoist.
+	setupLog := ctrl.Log.WithName("setup")
+
+	trigger := warmpool.NewDecisionTrigger(decision.Default, nil)
+	defer trigger.Close()
+	// Discovery is call-driven, so the set of scale targets grows during
+	// a run; a trigger built once at startup would never fire for a
+	// workload registered later.
+	go trigger.WatchRegistry(ctx, registry.Default, 30*time.Second)
+
+	reconciler := warmpool.New(
+		warmpoolpool.NewAdapter(mgr.GetClient(), warmPoolNS, warmpoolpool.Ram),
+		&warmpool.Demand{
+			Namespace:            warmPoolNS,
+			GPUMemoryUtilization: *warmPoolGPUUtil,
+			Registry:             registry.Default,
+			Decisions:            decision.Default,
+			Client:               mgr.GetClient(),
+			Datastore:            ds,
+		},
+		warmpoolpolicy.Config{
+			SleepMinSize:       *warmPoolSleepMinSize,
+			MaxHold:            *warmPoolMaxHold,
+			AdmissionWindow:    time.Hour,
+			MinMissesToAdmit:   2,
+			PreloadTop:         *warmPoolPreloadTop,
+			MaxInstancesPerPod: warmpoolpool.MaxInstancesPerPod,
+			PodMemoryBytes:     *warmPoolMemoryBudget,
+		},
+	)
+	// Asked before anything is loaded. Without patch on pods the pool
+	// admits happily, holds GPUs, and then fails at the only moment
+	// that matters -- once per spike, in a path nobody is watching.
+	// An UNANSWERABLE question is not a denial: if the review itself
+	// fails the pool starts, because refusing to run on a broken API
+	// call would be a worse failure than the one being guarded against.
+	switch allowed, err := warmpool.CanBorrow(ctx, mgr.GetClient(), warmPoolNS); {
+	case err != nil:
+		setupLog.Info("could not check whether this controller may patch Pods; "+
+			"starting the warm pool anyway. If borrows fail, check RBAC first",
+			"namespace", warmPoolNS, "err", err.Error())
+	case !allowed:
+		setupLog.Error(nil, warmpool.BorrowDenied, "namespace", warmPoolNS)
+		return nil
+	}
+
+	reconciler.Name = warmPoolNS
+	reconciler.Trigger = trigger
+	// Pools are DISCOVERED from the Deployments that declare them, so a
+	// second pool is a manifest rather than a manifest plus a controller
+	// restart. The flags above become the base every pool's annotations
+	// are layered onto, and are used whole when nothing declares a pool.
+	// The pool is scaled through KEDA like everything else: WVA
+	// publishes a size and the pool's own ScaledObject acts on it. An
+	// install with no pool ScaledObject simply never reads this, and
+	// the pool stays the size its Deployment says.
+	reconciler.Namespace = warmPoolNS
+	reconciler.PublishSize = decision.Set
+	// Arbitration: while the optimizer is denying GPUs to a model
+	// replica on this pool's accelerator, the pool stops asking for
+	// more. contentionMaxAge keeps a stale reading from holding it
+	// down forever if the optimizer stops running.
+	// The pool must not ask KEDA for Pods the namespace cannot afford:
+	// they would be created and sit Pending, or be refused outright, and
+	// the pool would report itself short forever with nothing able to
+	// fill it. Published by the allocation layer, which is the only
+	// component that sees every constraint provider at once.
+	reconciler.Headroom = func(namespace, accelerator string) (int, bool) {
+		return decision.GPUHeadroom(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
+	}
+	reconciler.Contended = func(namespace, accelerator string) bool {
+		return decision.GPUContended(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
+	}
+	// Pools are DECLARED by their ScaledObjects, like everything else
+	// WVA knows about. The flags above are the base each pool's trigger
+	// is layered onto, and the whole config for an install that
+	// declares no pool at all.
+	reconciler.Pools = &warmpool.RegistryPools{
+		Snapshot:  registry.Default.Snapshot,
+		Namespace: warmPoolNS,
+		Fallback:  reconciler.Config,
+	}
+	// Listed only to REPORT a pool Deployment nothing declares. It
+	// holds GPUs and WVA will not use it, which is exactly the silence
+	// moving the declaration to the ScaledObject could have introduced.
+	reconciler.Undeclared = (&warmpool.UndeclaredPools{
+		Client:    mgr.GetClient(),
+		Namespace: warmPoolNS,
+	}).Find
+	setupLog.Info("warm pool enabled",
+		"namespace", warmPoolNS,
+		"sleepMinSize", *warmPoolSleepMinSize,
+		"maxHold", *warmPoolMaxHold,
+		"memoryBudgetBytes", *warmPoolMemoryBudget,
+		"gpuMemoryUtilization", *warmPoolGPUUtil,
+		"preloadTop", *warmPoolPreloadTop)
+	return reconciler.Start(ctx)
 }
