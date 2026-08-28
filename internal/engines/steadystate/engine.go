@@ -290,6 +290,31 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 // registry. Returns an error if called after StartOptimizeLoop or if name
 // is already registered — callers must check the error. The analyzer is
 // appended in registration order.
+
+// addWarmPoolGPUs charges each namespace's warm pools into the managed usage
+// about to be published.
+//
+// Namespaces are ADDED, not merely updated: a namespace whose only WVA
+// consumption is a pool has no scaling requests, so it would otherwise be absent
+// from the managed figure entirely and its quota would read as untouched while
+// the pool holds GPUs inside it.
+func addWarmPoolGPUs(byType map[string]int, byNamespace map[string]map[string]int) {
+	for namespace, pools := range decision.WarmPoolGPUs() {
+		perType, ok := byNamespace[namespace]
+		if !ok {
+			perType = make(map[string]int)
+			byNamespace[namespace] = perType
+		}
+		for accelerator, gpus := range pools {
+			if gpus <= 0 {
+				continue
+			}
+			perType[accelerator] += gpus
+			byType[accelerator] += gpus
+		}
+	}
+}
+
 func (e *Engine) RegisterAnalyzer(name string, a domain.Analyzer) error {
 	if e.started {
 		return errors.New("RegisterAnalyzer: called after StartOptimizeLoop")
@@ -1047,7 +1072,19 @@ func (e *Engine) optimizeV2(
 	// exactly the moment WVA cannot see what it is holding. The genuinely-empty
 	// case is published separately, from the path that can tell the difference.
 	managedByType := computeCurrentGPUUsage(requests)
-	decision.PublishManagedGPUUsage(managedByType, computeCurrentGPUUsageByNamespace(requests))
+	managedByNamespace := computeCurrentGPUUsageByNamespace(requests)
+	// WVA's own warm pools are charged here too. A pool Pod is not a variant, so
+	// it is absent from `requests` -- but a quota is an allowance granted to WVA,
+	// and a pool exists because WVA asked for it and is sized by what WVA
+	// publishes. Left out, a namespace with a 4-GPU quota and a 3-GPU pool placed
+	// four more replicas and consumed seven.
+	//
+	// Folded in HERE rather than published separately, because this store has one
+	// producer on purpose: two components summing "what WVA holds" their own way
+	// is how the optimizer and the wake path come to disagree about the same
+	// cluster.
+	addWarmPoolGPUs(managedByType, managedByNamespace)
+	decision.PublishManagedGPUUsage(managedByType, managedByNamespace)
 
 	// Report unattributed GPUs from the MANAGED view, which is the only one that
 	// can have any: the physical picture attributes usage by the node a pod runs

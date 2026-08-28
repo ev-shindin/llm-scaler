@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/policy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
@@ -223,6 +224,14 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	if err != nil {
 		return policy.Plan{}, err
 	}
+	// What the pools hold, for the quota to charge WVA for. Published on every
+	// pass INCLUDING an empty one: a pool that shrank or was deleted has to stop
+	// being charged, and only a fresh figure says so.
+	//
+	// Not published when observation FAILED -- that returns above -- because an
+	// empty reading there means "could not see", and zero would hand the quota
+	// its allowance back at the moment WVA cannot tell what it is holding.
+	decision.PublishWarmPoolGPUs(r.Namespace, warmPoolGPUsByAccelerator(memberships))
 
 	pools, err := r.poolSpecs(ctx)
 	if err != nil {
@@ -348,6 +357,41 @@ func orDefaultWindow(window time.Duration) time.Duration {
 
 // poolSpecs is the declared pools, or the single unnamed one when nothing
 // declares any.
+
+// warmPoolGPUsByAccelerator sums the devices this namespace's pool Pods hold.
+//
+// PER POD, counted once. Memberships are per model per Pod, so a Pod holding
+// three warm models appears three times and summing memberships would charge its
+// GPUs three times over -- a pool would then read as larger the more useful it
+// was, and the quota would bind on models it was successfully sharing.
+//
+// Capacity.GPUs is already the whole warm unit for a group: capacityOf
+// multiplies the leader's devices by the group size, so a two-Pod group is
+// charged once for both Pods' GPUs, and the worker Pods contribute nothing
+// further because they are not members.
+func warmPoolGPUsByAccelerator(memberships []pool.Membership) map[string]int {
+	seen := make(map[types.NamespacedName]bool, len(memberships))
+	out := map[string]int{}
+	for _, m := range memberships {
+		if seen[m.Pod] {
+			continue
+		}
+		seen[m.Pod] = true
+		if m.Capacity.GPUs <= 0 {
+			continue
+		}
+		accelerator := m.Capacity.Accelerator
+		if accelerator == "" {
+			// Charged under a name that says why it cannot be attributed, rather
+			// than dropped: a pool on an unlabelled node still holds its GPUs,
+			// and silently omitting them is how a quota over-grants.
+			accelerator = "unknown"
+		}
+		out[accelerator] += m.Capacity.GPUs
+	}
+	return out
+}
+
 func (r *Reconciler) poolSpecs(ctx context.Context) ([]PoolSpec, error) {
 	if r.Pools == nil {
 		return []PoolSpec{{Name: "", Config: r.Config}}, nil
