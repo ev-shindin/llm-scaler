@@ -627,6 +627,15 @@ func (e *Engine) optimize(ctx context.Context) (retErr error) {
 		// namespace they are deciding about (see scalefromzero gpuConstraints), which
 		// is what keeps a namespace-scoped quota applying to a parked namespace.
 		decision.PublishManagedGPUUsage(map[string]int{}, map[string]map[string]int{})
+		// And what is LEFT of each allowance, which nothing else here would say.
+		//
+		// Headroom is otherwise published from inside the optimizer, so a
+		// namespace with no models never gets an answer -- and the warm pool,
+		// which is the only reader, treats no answer as unbounded and grows past
+		// the quota it is charged against. A namespace holding only a pool is
+		// exactly that case, and it is not a corner: a shared pool namespace has
+		// no models by construction.
+		e.publishHeadroomForIdleFleet(ctx)
 		return nil
 	}
 

@@ -170,3 +170,20 @@ func bindingProvider(constraints []*ResourceConstraints, namespace, accType stri
 	}
 	return name
 }
+
+// PublishNamespaceHeadroom records what each namespace may still take, from a
+// caller that built constraints outside an optimization pass.
+//
+// Headroom is normally published as a side effect of attribution, which runs
+// only when there is something to optimize. A namespace whose ONLY WVA
+// consumption is a warm pool has no variants and therefore no optimization pass
+// -- so it never got an answer, and "no answer" means unbounded to the pool,
+// which is the one caller that reads it. Measured: a namespace with a one-GPU
+// quota and no models grew its pool to three Pods.
+//
+// Exported rather than exposing namespaceHeadroom itself, so the mapping from
+// constraints to headroom stays in one place and every publisher agrees about
+// what an absent namespace means.
+func PublishNamespaceHeadroom(constraints []*ResourceConstraints, now time.Time) {
+	decision.PublishHeadroom(namespaceHeadroom(constraints), now)
+}

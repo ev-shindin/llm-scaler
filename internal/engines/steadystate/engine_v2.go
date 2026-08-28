@@ -1174,3 +1174,40 @@ func unattributedGPUs(byType map[string]int) (total int, keys []string) {
 	sort.Strings(keys)
 	return total, keys
 }
+
+// publishHeadroomForIdleFleet answers "how many GPUs may this namespace still
+// take" when there is nothing to optimize.
+//
+// The usage it measures against is gpuUsageViews(nil): no variants hold
+// anything, so what remains is whatever the warm pools hold. That is the whole
+// point -- a pool is WVA's own consumption and is charged against the same
+// allowance, so a pool at its quota must read as no headroom left rather than as
+// a namespace nobody bounds.
+//
+// Silent on every failure. Publishing a wrong figure here is worse than
+// publishing none: an absent namespace reads as unbounded, which is the
+// behaviour that existed before this function, while a fabricated one would cap
+// a pool for a reason nobody could find.
+func (e *Engine) publishHeadroomForIdleFleet(ctx context.Context) {
+	providers := gpuConstraintProviders(e.currentGPULimiter())
+	if len(providers) == 0 {
+		return // nothing bounds anything; the pool grows freely, as it should
+	}
+	views := gpuUsageViews(nil)
+	if _, missing := views.MissingBasis(providers); missing {
+		return // no observation on a basis some provider needs
+	}
+	var constraints []*allocation.ResourceConstraints
+	for _, cp := range providers {
+		usageByType, usageByNS := views.For(cp)
+		constraint, err := cp.ComputeConstraints(ctx, usageByType, usageByNS)
+		if err != nil {
+			continue
+		}
+		constraints = append(constraints, constraint)
+	}
+	if len(constraints) == 0 {
+		return
+	}
+	allocation.PublishNamespaceHeadroom(constraints, time.Now())
+}
