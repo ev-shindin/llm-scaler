@@ -134,10 +134,21 @@ What NOT to do meanwhile, for the avoidance of re-litigating:
 ## Order of work
 
 1. ~~Configurable drain wait~~ — **done**, and differently: the engine drains
-   itself on `mode=wait`. See above.
-2. **Switch as an explicit action** in the policy, distinct from borrow and
-   return, with the trigger stated in terms of demand rather than idleness.
-3. **Arrival-rate estimate per variant**, which is what both the switch and the
-   eviction decision are missing.
-4. **Placement rules**, once there is a demand signal to place against. The two
+   itself on `mode=wait`, and a pool Pod drains before it dies.
+2. ~~Turn off the hold timeout for a retained pool~~ — **done**, via
+   `warmPoolRetained: "true"`.
+3. **An explicit switch signal**: sleep this model, wake that one. The demand-led
+   swap already works once the first model stops being wanted; a retained pool
+   needs one that does not wait for that, because nothing is going to relieve it.
+4. **Return on SERVING, not on Ready.** The bridge rule reads
+   `Status.ReadyReplicas`, the kubelet's probe. What matters is a replica taking
+   requests and reporting metrics. The collector already reads per-Pod metrics,
+   so this is a narrow change with a real consequence: today a bridge can be
+   handed back to a replica that has passed a probe and is not yet doing the
+   work.
+5. **Arrival rate into the pool.** Lambda is already estimated per variant
+   (`arrivalFloor.Lambda`, by Little's law) and used for scaling. It does not
+   reach the pool, and nothing turns it into a probability of needing a model
+   soon -- which is what eviction and any demand-led switch are missing.
+6. **Placement rules**, once there is a demand signal to place against. The two
    structural rules above can be enforced before that; the counts cannot.
