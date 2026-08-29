@@ -76,6 +76,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 INSTANCES = {}          # id -> {"instance_id","status","options","env_vars"}
 SLEEPING = {}           # port -> bool
+LAST_SLEEP = {}         # port -> the last /sleep request line, query included
 LOCK = threading.Lock()
 
 
@@ -114,6 +115,10 @@ class Engine(BaseHTTPRequestHandler):
             # /health cannot distinguish the two states. That is exactly why the
             # pool asks /is_sleeping instead of inferring.
             self._send(200, b"{}")
+        elif path == "/last_sleep":
+            with LOCK:
+                asked = LAST_SLEEP.get(self.server.server_address[1], "")
+            self._send(200, json.dumps({"last_sleep": asked}).encode())
         elif path == "/is_sleeping":
             with LOCK:
                 asleep = SLEEPING.get(self.server.server_address[1], True)
@@ -127,6 +132,13 @@ class Engine(BaseHTTPRequestHandler):
         if path == "/sleep":
             with LOCK:
                 SLEEPING[port] = True
+                # The QUERY, kept verbatim. vLLM's /sleep takes a mode and
+                # defaults to "abort", which cancels every in-flight request;
+                # only mode=wait drains them. The emulator has no work to drain,
+                # so the only thing it can prove is what the controller ASKED
+                # for -- and that is worth proving, because the difference
+                # between the two is invisible everywhere else in this suite.
+                LAST_SLEEP[port] = self.path
             self._send(200, b"{}")
         elif path == "/wake_up":
             with LOCK:
