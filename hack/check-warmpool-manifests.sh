@@ -266,6 +266,39 @@ printf '%s
 printf '%s
 ' "$POOL" | grep -q 'kubernetes.io/metadata.name: observability'   && fail "a monitoring namespace was admitted though none was named"   || ok "no monitoring peer without a monitoring namespace"
 
+# The SHIPPED manifests name no monitoring namespace at all.
+#
+# Only the install knows where Prometheus runs, and it passes it -- see
+# so_apply_warmpools. A manifest carrying a default would ship a rule admitting
+# somebody ELSE's namespace on the serving port, and would read as monitoring
+# that is configured while every scrape was dropped.
+#
+# The SERVING rule specifically: the control rule below it names a namespace on
+# purpose, and must go on doing so.
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -c '
+import sys, yaml
+
+POLICY = "config/warmpool/warmpool-networkpolicy.yaml"
+with open(POLICY) as fh:
+    policy = yaml.safe_load(fh)
+
+for rule in policy["spec"]["ingress"]:
+    ports = [p.get("port") for p in rule.get("ports", [])]
+    if 8000 not in ports:
+        continue
+    for peer in rule.get("from", []):
+        if "namespaceSelector" in peer:
+            print("the serving rule admits %r" % peer["namespaceSelector"], file=sys.stderr)
+            sys.exit(1)
+sys.exit(0)
+'; then
+    ok "the shipped NetworkPolicy guesses no monitoring namespace"
+  else
+    fail "the shipped NetworkPolicy admits a namespace on the serving port; only the installer knows which one"
+  fi
+fi
+
 if [ "$FAILED" -eq 0 ]; then
   echo "Warm pool manifest checks passed."
 else

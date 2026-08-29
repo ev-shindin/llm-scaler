@@ -618,15 +618,22 @@ loads a model, and is ready exactly in time for the spike that is already over.
 
 ## Scraping the pool, and why the demand number depends on it
 
-Pass `--monitoring-namespace` when you create a pool:
+The installer does this for you: it passes the namespace it put the monitoring
+stack in (`MONITORING_NAMESPACE`) to every pool it creates. Creating a pool by
+hand, name it yourself:
 
 ```
 deploy/warmpool.sh create -n <namespace> --name <pool> ... --monitoring-namespace <where Prometheus runs>
 ```
 
-It creates a PodMonitor for the pool and admits that namespace to the serving
-port. Both are needed, and leaving them out is quietly wrong rather than
+Either way it creates a PodMonitor for the pool and admits that namespace to the
+serving port. Both are needed, and leaving them out is quietly wrong rather than
 obviously broken.
+
+The shipped `config/warmpool` manifests name no monitoring namespace, because
+they cannot know one — a default there would admit somebody else's namespace and
+read as monitoring that is configured. So `kubectl apply -k config/warmpool`
+gives a pool with no scraping, and the demand caveat below applies to it.
 
 A **lent** pool Pod is serving one model's traffic. WVA sizes a fleet from the
 load it can measure, so if nothing scrapes that Pod, the load moves onto the

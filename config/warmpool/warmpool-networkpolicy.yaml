@@ -44,26 +44,24 @@ spec:
     # Serving traffic: the EPP dispatches to the Pod's InferencePool target port
     # from within the model's own namespace.
     #
-    # The monitoring namespace is admitted on the SAME port, because that is
-    # where a lent Pod's engine metrics are reachable: the proxy forwards
-    # /metrics to whichever engine is awake, and the engine's own ports are
-    # reserved for the controller below. Without this rule Prometheus is dropped,
-    # the bridge's traffic is scraped by nothing, and the load it is carrying is
-    # invisible to the analyzer -- so a variant's measured demand FALLS at the
-    # moment a bridge takes over its shortfall, and reappears when the Pod goes
-    # back.
+    # SCRAPING IS NOT SET UP HERE, and deliberately not. A lent Pod's engine
+    # metrics are reachable on this port -- the proxy forwards /metrics to
+    # whichever engine is awake -- so a scraper needs admitting here and a
+    # PodMonitor pointing at it. Both name the namespace Prometheus runs in,
+    # which this file cannot know, and a manifest that guessed one would ship a
+    # rule admitting somebody else's namespace: worse than no rule, because it
+    # reads as monitoring that is configured.
     #
-    # >>> EDIT THIS <<< The namespace below must be the one Prometheus runs in.
-    # Getting it wrong cannot fail open: the scrape is denied, and the only
-    # symptom is demand that under-reads while a pool is lending.
+    # `deploy/warmpool.sh create --monitoring-namespace <ns>` creates both, and
+    # the installer passes the namespace it already put the monitoring stack in.
+    # Applying THIS directory by hand instead gets a pool with no scraping: the
+    # pool works, the models serve, and every model reads as having LESS demand
+    # than it has for as long as the pool is lending to it.
     - ports:
         - protocol: TCP
           port: 8000
       from:
         - podSelector: {}
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: openshift-user-workload-monitoring
     # Control: the supervisor and the proxy's upstream endpoint, for the
     # controller only.
     #
