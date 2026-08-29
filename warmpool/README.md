@@ -51,9 +51,10 @@ commit **`aa072ef`** (upstream `2c01cf8` plus the port-conflict reclaim fix):
 
 > **Vendored, not maintained here.** These files are a copy taken at fork commit
 > `aa072ef`; edit them upstream and re-copy rather than in place. Note also that
-> the image the pool actually runs
-> (`llm-d-fast-model-actuation/launcher:v0.6.0-alpha.13`) is a DIFFERENT build
-> from this copy -- the copy is here to be read, not to be what executes. The
+> the image the pool actually runs (pinned by digest in
+> `config/warmpool/warmpool-deployment.yaml`, currently `launcher:v0.6.4`) is a
+> DIFFERENT build from this copy -- the copy is here to be read, not to be what
+> executes, and nothing checks that the two stay in step. The
 > tests under `supervisor/tests/` came with the source and are not wired into any
 > make target or CI job.
 | `supervisor/gputranslator.py` | `inference_server/launcher/gputranslator.py` | GPU UUID ↔ index mapping via pynvml, with a mock mode for tests |

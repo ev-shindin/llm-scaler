@@ -91,7 +91,13 @@ spec:
       # (pokprod uses `nvidia-legacy`); on a cluster without it, admission fails
       # outright, so remove this line rather than guess at a name.
       runtimeClassName: nvidia-legacy
-      # Long enough for the preStop drain below to finish. The default 30s is
+      # Long enough for the preStop drain below to finish, which the drain
+      # enforces rather than assumes: it holds ONE deadline for the whole hook
+      # (100s) instead of a timeout per call. Per-call timeouts sum, and for a
+      # Pod holding several models they summed past this window -- so SIGKILL
+      # arrived mid-drain precisely when the engines were unhealthy.
+      #
+      # The default 30s is
       # sized for a process that can stop immediately; a generation in flight
       # cannot, and a model whose requests run for tens of seconds needs the
       # room. SIGKILL at the end of this window cuts whatever is left, so it is
@@ -266,21 +272,34 @@ spec:
                   - python3
                   - -c
                   - |
-                    import json, urllib.request
+                    import json, time, urllib.request
+                    # One deadline for the whole hook, not a timeout per call.
+                    # Per-call timeouts SUM: listing plus one /is_sleeping per
+                    # resident model plus the sleep itself came to 120s or more
+                    # for a Pod holding several, which is the grace period, so
+                    # SIGKILL landed mid-drain exactly when the engines were
+                    # unhealthy and the drain mattered most. 100s leaves the
+                    # interpreter room to start and the kubelet room to act.
+                    deadline = time.monotonic() + 100
+                    def left(cap):
+                        return max(1, min(cap, deadline - time.monotonic()))
                     def post(url):
                         try:
-                            urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=110).read()
+                            urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=left(110)).read()
                         except Exception as err:
                             print("drain:", url, err)
                     try:
-                        raw = urllib.request.urlopen("http://127.0.0.1:8001/v2/vllm/instances", timeout=5).read()
+                        raw = urllib.request.urlopen("http://127.0.0.1:8001/v2/vllm/instances", timeout=left(5)).read()
                         for inst in json.loads(raw).get("instances", []):
+                            if time.monotonic() >= deadline:
+                                print("drain: out of time before every instance was checked")
+                                break
                             opts = (inst.get("options") or "").split()
                             port = next((opts[i + 1] for i, f in enumerate(opts) if f == "--port"), None)
                             if not port:
                                 continue
                             try:
-                                st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/is_sleeping", timeout=5).read())
+                                st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/is_sleeping", timeout=left(5)).read())
                             except Exception:
                                 continue
                             if not st.get("is_sleeping", True):

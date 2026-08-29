@@ -27,8 +27,8 @@ metadata:
 spec:
   scaleTargetRef:
     name: wva-warm-pool
-  # The floor MUST exceed the pool's reserve (llm-d.ai/warm-pool-sleep-min-size
-  # on the Deployment), or the pool spends its quiet periods in the one state
+  # The floor MUST exceed the pool's reserve (warmPoolSleepMinSize in the
+  # trigger metadata below), or the pool spends its quiet periods in the one state
   # where it can never warm anything: every Pod is reserve, so the admission
   # budget is zero. WVA reports that if it happens.
   minReplicaCount: 2

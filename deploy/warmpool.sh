@@ -110,7 +110,27 @@ USAGE
 # (ranks-1) x 2.6 GiB per model once, which at --gpus 8 is 18 GiB of silent drift.
 memory_for() {
   local count="$1" size="$2" ranks="${3:-1}" billions
+  # Both operands checked as TEXT before awk sees them, because awk compares a
+  # non-numeric operand as a string: "large" <= 0 is false, so the b <= 0 guard
+  # below never fired and a typo fell through to the 8Gi floor with a confident
+  # "Sizing for ..." line printed over it. That limit IS the warm-set budget, so
+  # the pool either refused every admission or OOM-killed the launcher and took
+  # every resident model with it.
+  #
+  # A unit suffix is rejected rather than interpreted: --model-size 8Gi means a
+  # size in gibibytes to whoever typed it, and reading it as 8 BILLION
+  # parameters is a factor of six the operator never asked for.
+  case "$count" in
+    ''|*[!0-9]*) printf ''; return ;;
+  esac
+  case "$size" in
+    *[Bb]) : ;;
+    *[!0-9.]*) printf ''; return ;;
+  esac
   billions="$(printf '%s' "$size" | sed 's/[Bb]$//')"
+  case "$billions" in
+    ''|*[!0-9.]*|*.*.*) printf ''; return ;;
+  esac
   awk -v n="$count" -v b="$billions" -v r="$ranks" 'BEGIN {
     if (b <= 0) { print ""; exit }
     if (r < 1) r = 1
@@ -145,18 +165,35 @@ cmd_create() {
     log_error "--max ($POOL_MAX) must EXCEED --reserve ($RESERVE): admission draws on free-minus-reserve, so at or below the reserve the budget is zero forever and the pool holds accelerators while warming nothing"
   fi
 
+  # A pool is a Deployment or a LeaderWorkerSet, never both -- delete assumes it,
+  # and two workloads under one name would both supply Pods carrying the same
+  # pool label. `kubectl apply` cannot notice: it creates the new kind and leaves
+  # the old one running, holding its accelerators, invisible to this script from
+  # then on.
+  #
+  # Refused rather than cleaned up. Removing the other kind would delete a live
+  # workload whose Pods may be lent out and serving, which is not something a
+  # `create` should do without being asked.
+  local other=deployment
+  if [ "$GROUP_SIZE" -le 1 ]; then
+    other=leaderworkerset
+  fi
+  if [ "$APPLY" -eq 1 ] && kubectl get "$other" "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" >/dev/null 2>&1; then
+    log_error "pool '${POOL_NAME}' already exists in ${NAMESPACE} as a ${other}, and --group-size ${GROUP_SIZE} would create the other kind. Both would supply Pods under the same pool label and the old one would go on holding its accelerators unseen. Remove it first: ${0##*/} delete -n ${NAMESPACE} --name ${POOL_NAME}"
+  fi
+
   local memory
   if [ -n "$MODELS" ] && [ -n "$MODEL_SIZE" ]; then
     # GPUS_PER_POD is ranks per Pod: every device the engine spans is a worker
     # process with its own CUDA context, and they all share this one limit.
     memory="$(memory_for "$MODELS" "$MODEL_SIZE" "$GPUS_PER_POD")"
     if [ -z "$memory" ]; then
-      log_error "--model-size must look like 8B or 0.6B"
+      log_error "--models must be a whole number and --model-size must look like 8B or 0.6B (a unit like 8Gi is not a parameter count); got --models '$MODELS' --model-size '$MODEL_SIZE'"
     fi
     log_info "Sizing for ${MODELS} x ${MODEL_SIZE} sleepers at ${GPUS_PER_POD} rank(s) each -> memory ${memory} (${GPUS_PER_POD} x 2.6GiB + 1.4x weights per model, measured)"
   else
     memory="128Gi"
-    log_warning "No --models/--model-size given; defaulting memory to ${memory}. That limit IS the warm-set budget: it decides how many models a Pod can hold, and changing it later rolls the pool and reloads every resident model."
+    log_warning "Sizing needs BOTH --models and --model-size (got --models '${MODELS:-}' --model-size '${MODEL_SIZE:-}'); defaulting memory to ${memory}. That limit IS the warm-set budget: it decides how many models a Pod can hold, and changing it later rolls the pool and reloads every resident model."
   fi
 
   if [ -z "$ACCELERATOR" ]; then
@@ -337,17 +374,26 @@ containers:
         command:
         - python3
         - -c
-        - "import json, urllib.request\\ndef post(url):\\n    try:\\n        urllib.request.urlopen(urllib.request.Request(url,\\
-          \\ method=\\"POST\\"), timeout=110).read()\\n    except Exception as err:\\n\\
-          \\        print(\\"drain:\\", url, err)\\ntry:\\n    raw = urllib.request.urlopen(\\"\\
-          http://127.0.0.1:8001/v2/vllm/instances\\", timeout=5).read()\\n    for inst\\
-          \\ in json.loads(raw).get(\\"instances\\", []):\\n        opts = (inst.get(\\"\\
-          options\\") or \\"\\").split()\\n        port = next((opts[i + 1] for i, f in\\
-          \\ enumerate(opts) if f == \\"--port\\"), None)\\n        if not port:\\n   \\
-          \\         continue\\n        try:\\n            st = json.loads(urllib.request.urlopen(f\\"\\
-          http://127.0.0.1:{port}/is_sleeping\\", timeout=5).read())\\n        except\\
-          \\ Exception:\\n            continue\\n        if not st.get(\\"is_sleeping\\"\\
-          , True):\\n            post(f\\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\\"\\
+        - "import json, time, urllib.request\\n# One deadline for the whole hook, not\\
+          \\ a timeout per call.\\n# Per-call timeouts SUM: listing plus one /is_sleeping\\
+          \\ per\\n# resident model plus the sleep itself came to 120s or more\\n# for\\
+          \\ a Pod holding several, which is the grace period, so\\n# SIGKILL landed\\
+          \\ mid-drain exactly when the engines were\\n# unhealthy and the drain mattered\\
+          \\ most. 100s leaves the\\n# interpreter room to start and the kubelet room\\
+          \\ to act.\\ndeadline = time.monotonic() + 100\\ndef left(cap):\\n    return\\
+          \\ max(1, min(cap, deadline - time.monotonic()))\\ndef post(url):\\n    try:\\n\\
+          \\        urllib.request.urlopen(urllib.request.Request(url, method=\\"POST\\"\\
+          ), timeout=left(110)).read()\\n    except Exception as err:\\n        print(\\"\\
+          drain:\\", url, err)\\ntry:\\n    raw = urllib.request.urlopen(\\"http://127.0.0.1:8001/v2/vllm/instances\\"\\
+          , timeout=left(5)).read()\\n    for inst in json.loads(raw).get(\\"instances\\"\\
+          , []):\\n        if time.monotonic() >= deadline:\\n            print(\\"drain:\\
+          \\ out of time before every instance was checked\\")\\n            break\\n\\
+          \\        opts = (inst.get(\\"options\\") or \\"\\").split()\\n        port =\\
+          \\ next((opts[i + 1] for i, f in enumerate(opts) if f == \\"--port\\"), None)\\n\\
+          \\        if not port:\\n            continue\\n        try:\\n            st\\
+          \\ = json.loads(urllib.request.urlopen(f\\"http://127.0.0.1:{port}/is_sleeping\\"\\
+          , timeout=left(5)).read())\\n        except Exception:\\n            continue\\n\\
+          \\        if not st.get(\\"is_sleeping\\", True):\\n            post(f\\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\\"\\
           )\\nexcept Exception as err:\\n    print(\\"drain: could not list instances:\\"\\
           , err)\\n"
   readinessProbe:
@@ -473,17 +519,26 @@ containers:
         command:
         - python3
         - -c
-        - "import json, urllib.request\\ndef post(url):\\n    try:\\n        urllib.request.urlopen(urllib.request.Request(url,\\
-          \\ method=\\"POST\\"), timeout=110).read()\\n    except Exception as err:\\n\\
-          \\        print(\\"drain:\\", url, err)\\ntry:\\n    raw = urllib.request.urlopen(\\"\\
-          http://127.0.0.1:8001/v2/vllm/instances\\", timeout=5).read()\\n    for inst\\
-          \\ in json.loads(raw).get(\\"instances\\", []):\\n        opts = (inst.get(\\"\\
-          options\\") or \\"\\").split()\\n        port = next((opts[i + 1] for i, f in\\
-          \\ enumerate(opts) if f == \\"--port\\"), None)\\n        if not port:\\n   \\
-          \\         continue\\n        try:\\n            st = json.loads(urllib.request.urlopen(f\\"\\
-          http://127.0.0.1:{port}/is_sleeping\\", timeout=5).read())\\n        except\\
-          \\ Exception:\\n            continue\\n        if not st.get(\\"is_sleeping\\"\\
-          , True):\\n            post(f\\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\\"\\
+        - "import json, time, urllib.request\\n# One deadline for the whole hook, not\\
+          \\ a timeout per call.\\n# Per-call timeouts SUM: listing plus one /is_sleeping\\
+          \\ per\\n# resident model plus the sleep itself came to 120s or more\\n# for\\
+          \\ a Pod holding several, which is the grace period, so\\n# SIGKILL landed\\
+          \\ mid-drain exactly when the engines were\\n# unhealthy and the drain mattered\\
+          \\ most. 100s leaves the\\n# interpreter room to start and the kubelet room\\
+          \\ to act.\\ndeadline = time.monotonic() + 100\\ndef left(cap):\\n    return\\
+          \\ max(1, min(cap, deadline - time.monotonic()))\\ndef post(url):\\n    try:\\n\\
+          \\        urllib.request.urlopen(urllib.request.Request(url, method=\\"POST\\"\\
+          ), timeout=left(110)).read()\\n    except Exception as err:\\n        print(\\"\\
+          drain:\\", url, err)\\ntry:\\n    raw = urllib.request.urlopen(\\"http://127.0.0.1:8001/v2/vllm/instances\\"\\
+          , timeout=left(5)).read()\\n    for inst in json.loads(raw).get(\\"instances\\"\\
+          , []):\\n        if time.monotonic() >= deadline:\\n            print(\\"drain:\\
+          \\ out of time before every instance was checked\\")\\n            break\\n\\
+          \\        opts = (inst.get(\\"options\\") or \\"\\").split()\\n        port =\\
+          \\ next((opts[i + 1] for i, f in enumerate(opts) if f == \\"--port\\"), None)\\n\\
+          \\        if not port:\\n            continue\\n        try:\\n            st\\
+          \\ = json.loads(urllib.request.urlopen(f\\"http://127.0.0.1:{port}/is_sleeping\\"\\
+          , timeout=left(5)).read())\\n        except Exception:\\n            continue\\n\\
+          \\        if not st.get(\\"is_sleeping\\", True):\\n            post(f\\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\\"\\
           )\\nexcept Exception as err:\\n    print(\\"drain: could not list instances:\\"\\
           , err)\\n"
   readinessProbe:
@@ -810,6 +865,13 @@ YAML
 
 cmd_delete() {
   require NAMESPACE namespace
+  # --dry-run means the same thing here as everywhere else: say what would
+  # happen and change nothing. It was accepted and ignored, so the one
+  # subcommand where the flag matters most was the one that deleted anyway.
+  if [ "$APPLY" -eq 0 ]; then
+    log_info "Would delete from ${NAMESPACE}: scaledobject/wva-warm-pool-${POOL_NAME}, deployment or leaderworkerset/wva-warm-pool-${POOL_NAME}, networkpolicy/wva-warm-pool-${POOL_NAME}"
+    return 0
+  fi
   # BOTH, and the ScaledObject FIRST: it is what declares the pool, so removing
   # it stops WVA lending Pods that are about to disappear.
   kubectl delete scaledobject "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null

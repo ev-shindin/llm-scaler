@@ -2328,6 +2328,21 @@ so_apply_warmpools() {
     # The one value a plan cannot know: the pool proxy is an image somebody built
     # and pushed. WARMPOOL_PROXY_IMG is the same variable the Makefile builds it
     # under, so the common case needs no extra input.
+    # The controller's namespace, required rather than defaulted. It names the
+    # peer the pool's NetworkPolicy admits, and the fallback here was the POOL's
+    # own namespace -- so an unset WVA_NS would have written a policy admitting
+    # the tenant instead of the controller. Every supervisor read would then be
+    # denied, and the pool would report itself EMPTY while holding its
+    # accelerators, which is indistinguishable from a pool that is simply too
+    # small. Silence in the wrong direction is worse than not creating the pool.
+    if [ -z "${WVA_NS:-}" ]; then
+        log_warning "Warm pools were requested, but the WVA namespace is unknown, so none were created."
+        log_warning "  Their NetworkPolicy has to name the controller's namespace as the peer allowed"
+        log_warning "  to read the supervisor; guessing it would deny every read and leave the pool"
+        log_warning "  holding accelerators while reporting itself empty. Set WVA_NS and re-apply."
+        return 0
+    fi
+
     local image="${WARMPOOL_PROXY_IMG:-}"
     if [ -z "$image" ]; then
         log_warning "Warm pools were requested, but no proxy image is set, so none were created."
@@ -2351,7 +2366,7 @@ so_apply_warmpools() {
                 -n "$wp_ns" --name "$wp_name" --gpus "$wp_gpus" \
                 --accelerator "$wp_acc" --models "$wp_models" --model-size "$wp_size" \
                 --replicas "$wp_replicas" --max "$wp_max" --reserve "$wp_reserve" \
-                --proxy-image "$image" --wva-namespace "${WVA_NS:-$wp_ns}"; then
+                --proxy-image "$image" --wva-namespace "$WVA_NS"; then
             made=$((made + 1))
         else
             log_warning "  warm pool $wp_name: could not be created."

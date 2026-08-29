@@ -1,6 +1,12 @@
 # Retained pools: holding several big models on one set of GPUs
 
-**Status: design, not built.** What a pool has to do differently when the models
+**Status: partly built.** The pool half is in place -- `warmPoolRetained` is
+read from the trigger, plumbed through the pool spec, and enforced by the policy
+(a retained pool never times a bridge out). What is not built is the half that
+decides: nothing publishes an awake-intent yet, so a retained pool still follows
+demand. See "Order of work" below.
+
+What a pool has to do differently when the models
 in it are large enough that nobody can afford a set of cards each.
 
 ## The case

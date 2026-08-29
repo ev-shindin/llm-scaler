@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -48,9 +49,19 @@ var DefaultContention = NewContentionStore()
 // last pass denied nobody -- and must overwrite a previous non-empty one, or a
 // single contended pass would pin every pool forever.
 func (s *ContentionStore) Publish(limited map[string]map[string]bool, now time.Time) {
+	// COPIED, like the headroom and GPU-usage stores beside it. The caller today
+	// builds a fresh map each pass and lets go of it, so nothing is wrong yet --
+	// but a store that keeps a caller's map is one edit away from reporting
+	// contention that changed under it, from another goroutine, with no lock
+	// held. The other two stores already copy; the one that did not was the
+	// accident.
+	copied := make(map[string]map[string]bool, len(limited))
+	for namespace, perAccelerator := range limited {
+		copied[namespace] = maps.Clone(perAccelerator)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.last = &GPUContention{Limited: limited, UpdatedAt: now}
+	s.last = &GPUContention{Limited: copied, UpdatedAt: now}
 }
 
 // Get returns the snapshot and whether one has ever been published.

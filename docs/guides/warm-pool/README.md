@@ -483,7 +483,7 @@ WVA also declines a model whose accelerator does not match the pool's, or that
 needs more devices than a Pod holds, and says so:
 
 ```
-warm pool will not warm this model {"variant":"...","reason":"needs 4 GPUs, this Pod holds 1"}
+warm pool will never warm this model; it is pointed at a pool that cannot hold it {"variant":"...","reason":"needs 4 GPUs, this Pod holds 1"}
 ```
 
 Said once per reason, not once per cycle.
@@ -534,8 +534,12 @@ worth warming.
 
 The pool is scaled the same way every other workload here is: **WVA computes a
 size, KEDA writes it.** `config/warmpool` ships a ScaledObject for the pool
-alongside its Deployment — delete it and the pool simply stays the size the
-Deployment says, which is what most installs want to begin with.
+alongside its Deployment, and it is not optional: the trigger is what
+**declares** the pool to WVA. Delete it and you do not get a fixed-size pool,
+you get no pool at all — a Deployment holding accelerators that WVA reports as
+undeclared and will never warm anything into. To pin the size, set
+`minReplicaCount` equal to `maxReplicaCount` and leave the ScaledObject in
+place.
 
 ```yaml
 spec:

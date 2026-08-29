@@ -9,11 +9,19 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/pool"
 )
 
+// The two models these tests move between: one serving, one resident and
+// asleep. Named for their state at the start, which is what each assertion is
+// about.
+const (
+	awakeVariant  = "awake"
+	asleepVariant = "asleep"
+)
+
 // twoModelPod is one Pod holding two models, one awake and lent.
 func twoModelPod() (Input, types.NamespacedName) {
 	podRef := types.NamespacedName{Namespace: "tenant", Name: "pool-0"}
-	awake := pool.ModelRef{Namespace: "tenant", Variant: "awake"}
-	asleep := pool.ModelRef{Namespace: "tenant", Variant: "asleep"}
+	awake := pool.ModelRef{Namespace: "tenant", Variant: awakeVariant}
+	asleep := pool.ModelRef{Namespace: "tenant", Variant: asleepVariant}
 	now := time.Now()
 	in := Input{
 		Memberships: []pool.Membership{
@@ -26,7 +34,7 @@ func twoModelPod() (Input, types.NamespacedName) {
 			{Model: awake, Desired: 2, Ready: 1},
 			{Model: asleep, Desired: 2, Ready: 1},
 		},
-		BorrowedAt: map[Borrow]time.Time{{Pod: podRef, Variant: "awake"}: now},
+		BorrowedAt: map[Borrow]time.Time{{Pod: podRef, Variant: awakeVariant}: now},
 		Now:        now,
 	}
 	return in, podRef
@@ -36,14 +44,14 @@ func twoModelPod() (Input, types.NamespacedName) {
 // them -- in ONE pass, so there is no stretch with neither model serving.
 func TestAnIntentSwitchesTheAwakeModel(t *testing.T) {
 	in, podRef := twoModelPod()
-	in.WantAwake = "asleep"
+	in.WantAwake = asleepVariant
 
 	plan := Decide(in, Config{SleepMinSize: 0, MaxHold: time.Hour, Retained: true})
 
-	if len(plan.Return) != 1 || plan.Return[0].Model.Variant != "awake" {
+	if len(plan.Return) != 1 || plan.Return[0].Model.Variant != awakeVariant {
 		t.Fatalf("returns = %+v, want the model in the way handed back", plan.Return)
 	}
-	if len(plan.Borrow) != 1 || plan.Borrow[0].Model.Variant != "asleep" {
+	if len(plan.Borrow) != 1 || plan.Borrow[0].Model.Variant != asleepVariant {
 		t.Fatalf("borrows = %+v, want the chosen model taking the Pod", plan.Borrow)
 	}
 	if plan.Borrow[0].Pod != podRef {
@@ -70,7 +78,7 @@ func TestWithoutAnIntentNothingIsPreempted(t *testing.T) {
 // same model forever.
 func TestAnIntentForTheAwakeModelChangesNothing(t *testing.T) {
 	in, _ := twoModelPod()
-	in.WantAwake = "awake"
+	in.WantAwake = awakeVariant
 
 	plan := Decide(in, Config{SleepMinSize: 0, MaxHold: time.Hour, Retained: true})
 
@@ -107,10 +115,10 @@ func TestAnIntentForAModelNotResidentIsIgnored(t *testing.T) {
 // about it, which is not a reason to preempt a live bridge for it.
 func TestAnIntentForAModelNobodyIsShortOfPreemptsNothing(t *testing.T) {
 	in, _ := twoModelPod()
-	in.WantAwake = "asleep"
+	in.WantAwake = asleepVariant
 	// Its ordinary replicas have arrived, so no borrow will be made for it.
 	for i := range in.Variants {
-		if in.Variants[i].Model.Variant == "asleep" {
+		if in.Variants[i].Model.Variant == asleepVariant {
 			in.Variants[i].Ready = in.Variants[i].Desired
 		}
 	}
@@ -118,7 +126,7 @@ func TestAnIntentForAModelNobodyIsShortOfPreemptsNothing(t *testing.T) {
 	plan := Decide(in, Config{SleepMinSize: 0, MaxHold: time.Hour, Retained: true})
 
 	for _, r := range plan.Return {
-		if r.Model.Variant == "awake" {
+		if r.Model.Variant == awakeVariant {
 			t.Errorf("slept the serving model for an intent that wakes nothing: returns = %+v", plan.Return)
 		}
 	}

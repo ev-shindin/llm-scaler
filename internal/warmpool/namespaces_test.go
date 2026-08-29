@@ -9,6 +9,9 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 )
 
+// tenantA is the namespace most of these tests declare a pool in.
+const tenantA = "tenant-a"
+
 // poolEntry is a registered ScaledObject that DECLARES a pool.
 func poolEntry(namespace, name string) registry.Entry {
 	return registry.Entry{
@@ -77,14 +80,14 @@ func TestAPoolIsReconciledWhereverItIsDeclared(t *testing.T) {
 	rec := &starts{}
 	m := &Multiplexer{
 		Snapshot: func() []registry.Entry {
-			return []registry.Entry{poolEntry("tenant-a", "default"), modelEntry("tenant-b", "some-model")}
+			return []registry.Entry{poolEntry(tenantA, "default"), modelEntry("tenant-b", "some-model")}
 		},
 		Start: rec.start,
 	}
 	m.sync(context.Background())
 
 	started, _ := rec.snapshot()
-	if len(started) != 1 || started[0] != "tenant-a" {
+	if len(started) != 1 || started[0] != tenantA {
 		t.Fatalf("started %v, want exactly [tenant-a]", started)
 	}
 }
@@ -111,7 +114,7 @@ func TestANamespaceIsStartedOnce(t *testing.T) {
 	rec := &starts{}
 	m := &Multiplexer{
 		Snapshot: func() []registry.Entry {
-			return []registry.Entry{poolEntry("tenant-a", "h100"), poolEntry("tenant-a", "a100")}
+			return []registry.Entry{poolEntry(tenantA, "h100"), poolEntry(tenantA, "a100")}
 		},
 		Start: rec.start,
 	}
@@ -162,7 +165,7 @@ func TestAPoolDeclaredLaterIsPickedUp(t *testing.T) {
 func TestTheLastPoolLeavingStopsTheReconciler(t *testing.T) {
 	rec := &starts{}
 	var mu sync.Mutex
-	entries := []registry.Entry{poolEntry("tenant-a", "default")}
+	entries := []registry.Entry{poolEntry(tenantA, "default")}
 	m := &Multiplexer{
 		Snapshot: func() []registry.Entry {
 			mu.Lock()
@@ -179,7 +182,7 @@ func TestTheLastPoolLeavingStopsTheReconciler(t *testing.T) {
 	m.sync(context.Background())
 
 	_, stopped := rec.snapshot()
-	if len(stopped) != 1 || stopped[0] != "tenant-a" {
+	if len(stopped) != 1 || stopped[0] != tenantA {
 		t.Errorf("stopped %v, want [tenant-a]", stopped)
 	}
 }
@@ -189,7 +192,7 @@ func TestTheLastPoolLeavingStopsTheReconciler(t *testing.T) {
 func TestRunStopsEveryReconcilerOnShutdown(t *testing.T) {
 	rec := &starts{}
 	m := &Multiplexer{
-		Snapshot: func() []registry.Entry { return []registry.Entry{poolEntry("tenant-a", "default")} },
+		Snapshot: func() []registry.Entry { return []registry.Entry{poolEntry(tenantA, "default")} },
 		Start:    rec.start,
 		Every:    10 * time.Millisecond,
 	}
@@ -219,7 +222,7 @@ func TestANamespaceWhoseReconcilerExitedIsStartedAgain(t *testing.T) {
 	now := time.Now()
 	m := &Multiplexer{
 		Snapshot: func() []registry.Entry {
-			return []registry.Entry{poolEntry("tenant-a", "default")}
+			return []registry.Entry{poolEntry(tenantA, "default")}
 		},
 		Start:      rec.start,
 		RetryAfter: time.Minute,
@@ -227,7 +230,7 @@ func TestANamespaceWhoseReconcilerExitedIsStartedAgain(t *testing.T) {
 	}
 
 	m.sync(context.Background())
-	rec.finish("tenant-a") // the reconciler returned, e.g. borrows are denied
+	rec.finish(tenantA) // the reconciler returned, e.g. borrows are denied
 
 	// Noticed, but not retried yet: an unfixable complaint restated twice a
 	// minute forever is its own kind of silence.
@@ -239,7 +242,7 @@ func TestANamespaceWhoseReconcilerExitedIsStartedAgain(t *testing.T) {
 	now = now.Add(2 * time.Minute)
 	m.sync(context.Background())
 	started, _ := rec.snapshot()
-	if len(started) != 2 || started[1] != "tenant-a" {
+	if len(started) != 2 || started[1] != tenantA {
 		t.Errorf("started %v, want tenant-a started again once RetryAfter had passed", started)
 	}
 }
@@ -252,7 +255,7 @@ func TestARunningReconcilerIsNeverStartedTwice(t *testing.T) {
 	now := time.Now()
 	m := &Multiplexer{
 		Snapshot: func() []registry.Entry {
-			return []registry.Entry{poolEntry("tenant-a", "default")}
+			return []registry.Entry{poolEntry(tenantA, "default")}
 		},
 		Start:      rec.start,
 		RetryAfter: time.Minute,
