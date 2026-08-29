@@ -870,13 +870,27 @@ func (r *Reconciler) apply(ctx context.Context, spec PoolSpec, plan policy.Plan)
 		}
 		go func(action policy.Action) {
 			defer r.endAdmission(action.Model.Variant, action.Pod)
+			// Said out loud because an admission OCCUPIES the Pod for as long as
+			// it runs -- up to AdmitTimeout, ten minutes by default -- and while
+			// it does, that Pod is out of the reserve, nothing else may be
+			// admitted into it, and the deduplicated state line does not change.
+			// A pool with a stuck load therefore looks exactly like an idle one,
+			// which cost a long investigation on a cluster where the engine
+			// could not start at all.
+			started := r.now()
+			logger.V(1).Info("admitting a model into a pool Pod",
+				"pod", action.Pod, "variant", action.Model.Variant)
 			// From the loop's context, not the tick's: an admission outlives
 			// the pass that decided it by design, and cancelling it at the next
 			// tick would restart a ~35 s load every 5 s forever.
 			admitCtx, cancel := context.WithTimeout(ctx, orDefault(r.AdmitTimeout, defaultAdmitTimeout))
 			defer cancel()
 			if err := r.Pool.Warm(admitCtx, action.Pod, action.Model, r.tierFor(action.Model)); err != nil {
-				logger.V(1).Info("admission failed", "pod", action.Pod, "variant", action.Model.Variant, "err", err)
+				// WITH the elapsed time: a load that fails in a second is a
+				// refusal, one that fails at the timeout is an engine that never
+				// came up, and the two send an operator to different places.
+				logger.V(1).Info("admission failed", "pod", action.Pod, "variant", action.Model.Variant,
+					"after", r.now().Sub(started).Truncate(time.Second).String(), "err", err)
 			}
 		}(action)
 	}
