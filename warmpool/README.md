@@ -43,20 +43,29 @@ should be warm.
 ## What is copied, and from where
 
 Copied from `ev-shindin/llm-d-fast-model-actuation`, branch `feat/reuse-by-model`,
-commit **`aa072ef`** (upstream `2c01cf8` plus the port-conflict reclaim fix):
+commit **`65ba31b`** (upstream `2c01cf8`, plus the port-conflict reclaim fix in
+`aa072ef` and the follower-rank fix in `65ba31b`):
 
 | file | origin | why it earns its place |
 | --- | --- | --- |
 | `supervisor/launcher.py` | `inference_server/launcher/launcher.py` | spawns and supervises vLLM engines inside one container. Proven: every 2-3 s wake measured on pokprod came from an instance it created |
 
 > **Vendored, not maintained here.** These files are a copy taken at fork commit
-> `aa072ef`; edit them upstream and re-copy rather than in place. Note also that
-> the image the pool actually runs (pinned by digest in
-> `config/warmpool/warmpool-deployment.yaml`, currently `launcher:v0.6.4`) is a
-> DIFFERENT build from this copy -- the copy is here to be read, not to be what
-> executes, and nothing checks that the two stay in step. The
-> tests under `supervisor/tests/` came with the source and are not wired into any
-> make target or CI job.
+> `65ba31b`; edit them upstream and re-copy rather than in place.
+>
+> Which image runs depends on the pool. A SINGLE-POD pool runs upstream
+> `launcher:v0.6.4`, pinned by digest in
+> `config/warmpool/warmpool-deployment.yaml` -- a different build from this copy,
+> and it does not need the follower fix because a group of one has no follower. A
+> GROUP pool must be given `--launcher-image` naming a build that carries it:
+> `ghcr.io/ev-shindin/fma-launcher:v0.6.4-headless`, whose `launcher.py` is
+> byte-identical to this copy (verified by extracting it from the published
+> image). Nothing automatic keeps the three in step; this copy fell a commit
+> behind the image once already, which hid the very fix that makes group pools
+> work from anyone reading it here.
+>
+> The tests under `supervisor/tests/` came with the source and are not wired into
+> any make target or CI job.
 | `supervisor/gputranslator.py` | `inference_server/launcher/gputranslator.py` | GPU UUID ↔ index mapping via pynvml, with a mock mode for tests |
 | `supervisor/tests/` | the same tree | the evidence the above works; kept so adaptation is not blind |
 

@@ -328,7 +328,7 @@ holding one engine, with the API on the leader. A pool can hold those too, as
 standing groups rather than standing Pods.
 
 ```bash
-deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --proxy-image <your image> --wva-namespace <where WVA runs>   --launcher-image <a build carrying the follower fix>
+deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --proxy-image <your image> --wva-namespace <where WVA runs>   --launcher-image ghcr.io/ev-shindin/fma-launcher:v0.6.4-headless
 ```
 
 `--group-size` is what makes it a group pool. Everything else means what it did:
@@ -354,8 +354,20 @@ combination of flags avoids it. vLLM's own CLI has always handled this
 the launcher simply never reached that branch. The fix is one branch in
 `launcher.py`, carried in the
 [fork](https://github.com/ev-shindin/llm-d-fast-model-actuation) as *Route a
-follower rank to the headless executor, not the API server*. Build that and pass
-the result here.
+follower rank to the headless executor, not the API server* (`65ba31b`).
+
+A build of it is published, so `--launcher-image` has a working value without
+building anything:
+
+```
+ghcr.io/ev-shindin/fma-launcher:v0.6.4-headless
+sha256:e836bcf5bfa1268b5ec1c8027ba9732e2cafff11ab554dd8dbac67b110c65faf
+```
+
+It is `vllm/vllm-openai:v0.26.0` with the fork's `launcher.py` on top, and that
+file is byte-identical to the readable copy in `warmpool/supervisor/` (checked by
+extracting it from the published image). Pin the digest if you want the image to
+stay put; build your own from the fork if you would rather not depend on it.
 
 Refused rather than warned about, because the failure is silent in the worst
 way: the group schedules, goes Ready, holds every one of its accelerators, and

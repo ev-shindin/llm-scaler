@@ -37,7 +37,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from gputranslator import GpuTranslator
 from pydantic import BaseModel
 from vllm.entrypoints.openai.api_server import run_server
+from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.usage.usage_lib import UsageContext
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -881,6 +884,44 @@ def vllm_kickoff(vllm_config: VllmConfig, log_file_path: str):
     parser = make_arg_parser(parser)
     args = parser.parse_args(receive_args)
     validate_parsed_serve_args(args)
+
+    # A FOLLOWER RANK of a multi-node engine runs neither an API server nor an
+    # engine core -- only the workers that hold its share of the model.
+    #
+    # Every instance used to go through run_server, which is the OpenAI API
+    # server and knows nothing about multi-node rank: grep it for "headless" or
+    # "node_rank_within_dp" and you find neither. So a follower parsed
+    # --headless, ignored it, built a full EngineCore, and died in
+    # _initialize_kv_caches -> get_kv_cache_specs() -> collective_rpc, which
+    # asserts because a follower has no rpc_broadcast_mq. That call is
+    # unconditional at the top of engine-core init, so no combination of flags
+    # avoided it: an engine spanning Pods could not start at all.
+    #
+    # vLLM's own CLI has always had this branch (entrypoints/cli/serve.py,
+    # run_headless); the launcher simply never reached it. This mirrors it.
+    #
+    # Verified on two H100 nodes with vLLM 0.26.0: with the follower on this
+    # path the pair forms, the leader serves, and one /sleep to the LEADER
+    # releases the GPU on BOTH ranks -- 78,015 MiB down to 2,745 MiB each --
+    # waking in 0.36 s.
+    if getattr(args, "headless", False):
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        engine_config = engine_args.create_engine_config(
+            usage_context=UsageContext.OPENAI_API_SERVER, headless=True
+        )
+        if engine_config.parallel_config.node_rank_within_dp > 0:
+            logger.info(
+                "Starting a headless multiproc executor for rank %d, head node %s:%s",
+                engine_config.parallel_config.node_rank_within_dp,
+                engine_config.parallel_config.master_addr,
+                engine_config.parallel_config.master_port,
+            )
+            executor = MultiprocExecutor(engine_config, monitor_workers=False)
+            # Inline: this call IS the process. Returning would end the child and
+            # take the rank with it, leaving the leader waiting at a rendezvous
+            # nobody attends.
+            executor.start_worker_monitor(inline=True)
+            return
 
     uvloop.run(run_server(args))
 
