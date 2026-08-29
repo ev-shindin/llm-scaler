@@ -242,6 +242,30 @@ else
   ok "--max at or below --reserve is refused"
 fi
 
+# --- scraping a lent Pod ----------------------------------------------------
+# A bridge serves a variant's traffic. Unscraped, that load is invisible to the
+# analyzer, so the variant's measured demand FALLS while the pool is covering its
+# shortfall and reappears when the Pod goes back -- which reads as a spike
+# arriving rather than capacity leaving. Nothing about that is visible on the
+# cluster: the pool works, the model serves, and the number is quietly wrong.
+MON="$(render --monitoring-namespace observability)"
+
+[ "$(count_kind "$MON" PodMonitor)" = 1 ]   && ok "a monitoring namespace creates the pool scrape config"   || fail "no PodMonitor: a lent Pod would be scraped by nothing and its load would be invisible"
+
+printf '%s
+' "$MON" | grep -q '__meta_kubernetes_pod_ready'   && ok "only READY pool Pods become scrape targets"   || fail "the PodMonitor targets every pool Pod: a sleeping one has no engine behind its proxy, so an idle pool becomes a wall of DOWN targets"
+
+printf '%s
+' "$MON" | grep -q 'kubernetes.io/metadata.name: observability'   && ok "the monitoring namespace is admitted to the serving port"   || fail "the NetworkPolicy does not admit the scraper: the PodMonitor exists and every scrape is dropped"
+
+# ...and NEITHER appears without one. Guessing a monitoring namespace would open
+# the serving port to the wrong one, which is worse than leaving it shut: it
+# reads as monitoring that is configured.
+[ "$(count_kind "$POOL" PodMonitor)" = 0 ]   && ok "no scrape config without a monitoring namespace"   || fail "a PodMonitor was created for a pool that named no monitoring namespace"
+
+printf '%s
+' "$POOL" | grep -q 'kubernetes.io/metadata.name: observability'   && fail "a monitoring namespace was admitted though none was named"   || ok "no monitoring peer without a monitoring namespace"
+
 if [ "$FAILED" -eq 0 ]; then
   echo "Warm pool manifest checks passed."
 else

@@ -40,6 +40,12 @@ ACCELERATOR=""
 GROUP_SIZE=1
 PROXY_IMAGE=""
 WVA_NAMESPACE=""
+# Where Prometheus runs. Empty means no scrape config is created and no
+# monitoring peer is opened: a bridge's engine metrics are then reachable by
+# nothing, and a variant's demand under-reads for as long as the pool is lending
+# to it. Guessing a namespace would be worse -- a rule admitting the wrong one
+# reads as monitoring that is configured.
+MONITORING_NAMESPACE=""
 CACHE_CLAIM="model-pvc"
 APPLY=1
 # On by DEFAULT. The only cluster-specific value the shipped policy needs is the
@@ -80,6 +86,12 @@ create options:
   --reserve N          warmPoolSleepMinSize. Default: 1
   --proxy-image REF    the warm-pool image you built
   --wva-namespace NS   where WVA runs, for scalerAddress
+  --monitoring-namespace NS
+                       where Prometheus runs. Creates a PodMonitor for the pool
+                       and admits that namespace to the serving port, so a LENT
+                       Pod's engine metrics are scraped. Without it the traffic
+                       a bridge carries is invisible and the variant it is
+                       covering for reads as having LESS demand than it has
   --cache-claim NAME   RWX model cache PVC. Default: model-pvc
   --launcher-image REF the supervisor image. REQUIRED with --group-size > 1:
                        the stock launcher sends every rank to vLLM's API server,
@@ -243,6 +255,12 @@ cmd_create() {
 $(warmpool_networkpolicy)"
   fi
 
+  if [ -n "$MONITORING_NAMESPACE" ]; then
+    manifest="${manifest}
+---
+$(warmpool_podmonitor)"
+  fi
+
   if [ "$APPLY" -eq 0 ]; then
     printf '%s\n' "$manifest"
     return 0
@@ -256,6 +274,11 @@ $(warmpool_networkpolicy)"
     log_info "If the pool later reports itself EMPTY while holding accelerators, check this first: a wrong WVA namespace denies the supervisor read, which looks exactly like a pool that is too small."
   else
     log_warning "--no-network-policy: nothing restricts :8001, which spawns processes with caller-supplied argv in a container that mounts the model cache read-write. Apply your own boundary."
+  fi
+  if [ -n "$MONITORING_NAMESPACE" ]; then
+    log_info "PodMonitor wva-warm-pool-${POOL_NAME}: scrapes :8000/metrics on AWAKE Pods only, and ${MONITORING_NAMESPACE} is admitted to that port"
+  else
+    log_warning "No --monitoring-namespace, so nothing scrapes this pool. A Pod lent to a model serves that model's traffic; unscraped, that load is invisible and the model reads as having LESS demand while the pool is covering for it."
   fi
 }
 
@@ -635,6 +658,47 @@ YAML
 # The port range is pool.BasePort..MaxInstancesPerPod, which is all an engine
 # can bind -- the controller calls /is_sleeping and /wake_up on the instances
 # directly, from outside the Pod, so omitting it leaves the pool inert.
+# warmpool_podmonitor prints the scrape config for this pool.
+#
+# The PROXY's serving port, not the engines' own: the proxy forwards /metrics to
+# whichever engine is awake, so one stable address covers every model the Pod
+# holds, and the engine ports stay reserved for the controller.
+#
+# Only READY Pods become targets, and readiness here means a model is awake --
+# that is exactly what the Pod's readiness probe reports. Dropping the rest
+# before a target is built is what keeps an idle pool from showing as a wall of
+# permanently-DOWN targets, which reads as broken monitoring rather than as a
+# pool with nothing awake.
+warmpool_podmonitor() {
+  cat <<YAML
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: wva-warm-pool-${POOL_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+    llm-d.ai/warm-pool: ${POOL_NAME}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: warm-pool
+      llm-d.ai/warm-pool: ${POOL_NAME}
+  podMetricsEndpoints:
+    - port: serving
+      path: /metrics
+      interval: 30s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_ready]
+          action: keep
+          regex: "true"
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod_name
+          action: replace
+YAML
+}
+
 warmpool_networkpolicy() {
   # RANK-TO-RANK, and only for a pool whose unit spans Pods.
   #
@@ -653,6 +717,24 @@ warmpool_networkpolicy() {
   # The peer is selected by THIS pool's own label, not by the component label
   # alone: the ranks of one engine already share its memory and are one trust
   # domain, but two different pools are not.
+  # SCRAPING, on the serving port. A lent Pod's engine metrics are reachable
+  # there and nowhere else a scraper may go: the proxy forwards /metrics to
+  # whichever engine is awake, and the engine ports are the controller's. Denied,
+  # the bridge is scraped by nothing and the load it carries is invisible to the
+  # analyzer -- so a variant's demand READS LOWER while a bridge is covering its
+  # shortfall, which is the moment it is highest.
+  #
+  # Only when a namespace was named. Guessing one would write a rule admitting
+  # some other namespace, which is worse than no rule: it reads as monitoring
+  # that is configured.
+  local MONITORING_RULE=""
+  if [ -n "$MONITORING_NAMESPACE" ]; then
+    MONITORING_RULE="
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${MONITORING_NAMESPACE}"
+  fi
+
   local PEER_RULE=""
   if [ "$GROUP_SIZE" -gt 1 ]; then
     PEER_RULE="
@@ -681,12 +763,13 @@ spec:
     - Ingress
   ingress:
     # Serving traffic, from this namespace: the EPP dispatches to the Pod's
-    # InferencePool target port.
+    # InferencePool target port. Prometheus is admitted here too, when a
+    # monitoring namespace was named -- see MONITORING_RULE above.
     - ports:
         - protocol: TCP
           port: 8000
       from:
-        - podSelector: {}
+        - podSelector: {}${MONITORING_RULE}
     # Control, for the controller ONLY. The namespaceSelector is required, not
     # belt and braces: a bare podSelector matches this policy's own namespace,
     # which is the tenant's, and would put :8001 one \`kubectl run\` away from
@@ -883,7 +966,10 @@ cmd_delete() {
   # no longer exist, which is harmless but accumulates; deleting it first would
   # briefly leave live pool Pods unprotected instead.
   kubectl delete networkpolicy "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
-  log_success "Pool '${POOL_NAME}' removed from ${NAMESPACE}: ScaledObject, workload and NetworkPolicy"
+  # Whether or not one was created, and tolerating a cluster with no Prometheus
+  # operator: a scrape config left behind selects Pods that no longer exist.
+  kubectl delete podmonitor "wva-warm-pool-${POOL_NAME}" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  log_success "Pool '${POOL_NAME}' removed from ${NAMESPACE}: ScaledObject, workload, NetworkPolicy and PodMonitor"
 }
 
 if [ $# -lt 1 ]; then
@@ -911,6 +997,7 @@ while [ $# -gt 0 ]; do
     --reserve)       RESERVE="$2"; shift 2 ;;
     --proxy-image)   PROXY_IMAGE="$2"; shift 2 ;;
     --wva-namespace) WVA_NAMESPACE="$2"; shift 2 ;;
+    --monitoring-namespace) MONITORING_NAMESPACE="$2"; shift 2 ;;
     --cache-claim)   CACHE_CLAIM="$2"; shift 2 ;;
     --dry-run)       APPLY=0; shift ;;
     --launcher-image) LAUNCHER_IMAGE="$2"; shift 2 ;;

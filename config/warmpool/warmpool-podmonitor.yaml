@@ -1,0 +1,56 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: wva-warm-pool-metrics
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    app.kubernetes.io/component: warm-pool
+spec:
+  # WHY A POOL POD IS SCRAPED AT ALL.
+  #
+  # A lent pool Pod -- a BRIDGE -- serves a variant's traffic while its ordinary
+  # replicas are still starting. That traffic is the variant's load, and the
+  # analyzer sizes the fleet from load it can see. Without this the engine behind
+  # the bridge is scraped by nothing, so the load moves onto the bridge and the
+  # measured demand FALLS, exactly while the shortfall that caused the borrow is
+  # at its worst. It then reappears when the Pod is handed back, which reads as a
+  # spike arriving rather than capacity leaving.
+  #
+  # What is scraped is the PROXY's serving port, not the engine's own. The engine
+  # ports are the controller's -- the NetworkPolicy reserves them, and which port
+  # a model occupies changes as instances come and go. The proxy forwards
+  # /metrics to whichever engine is awake, so this address is stable and needs no
+  # per-instance discovery. It is also the port the EPP already dispatches to, so
+  # scraping it needs no new opening in the policy beyond the monitoring
+  # namespace itself.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workload-variant-autoscaler
+      app.kubernetes.io/component: warm-pool
+  podMetricsEndpoints:
+    - port: serving
+      path: /metrics
+      interval: 30s
+      relabelings:
+        # ONLY POOL PODS WITH SOMETHING AWAKE.
+        #
+        # A pool Pod is Ready only while a model is awake in it: that is exactly
+        # what its readiness probe reports, and what holds a sleeping Pod out of
+        # its InferencePool. So readiness is already the right question here, and
+        # asking it BEFORE a target is built is what keeps a large idle pool from
+        # showing as a wall of permanently-DOWN targets -- the same failure the
+        # launcher PodMonitor beside this one documents, where nine unbound
+        # launchers read as broken monitoring rather than as an idle pool.
+        #
+        # A sleeping Pod has nothing to report either way: the proxy answers 503
+        # because there is no engine behind it.
+        - sourceLabels: [__meta_kubernetes_pod_ready]
+          action: keep
+          regex: "true"
+
+        # The pod label every WVA query joins on. The engine's own series carry
+        # no pod identity through the proxy -- they are the engine's, and the
+        # engine does not know which Pod is forwarding to it.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod_name
+          action: replace

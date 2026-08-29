@@ -616,6 +616,49 @@ Never scale the pool to zero. A pool at zero holds nothing warm, so the first
 spike after a quiet period pays a full cold start — and then the pool grows,
 loads a model, and is ready exactly in time for the spike that is already over.
 
+## Scraping the pool, and why the demand number depends on it
+
+Pass `--monitoring-namespace` when you create a pool:
+
+```
+deploy/warmpool.sh create -n <namespace> --name <pool> ... --monitoring-namespace <where Prometheus runs>
+```
+
+It creates a PodMonitor for the pool and admits that namespace to the serving
+port. Both are needed, and leaving them out is quietly wrong rather than
+obviously broken.
+
+A **lent** pool Pod is serving one model's traffic. WVA sizes a fleet from the
+load it can measure, so if nothing scrapes that Pod, the load moves onto the
+bridge and the model's measured demand *falls* — at the exact moment the
+shortfall that caused the borrow is worst. It then reappears when the bridge is
+handed back, which reads as a spike arriving rather than as capacity leaving.
+Nothing looks wrong from outside: the pool works, the model serves, the number is
+just too small.
+
+Two details worth knowing:
+
+- **What is scraped is the proxy's `:8000`, not the engines' own ports.** The
+  proxy forwards `/metrics` to whichever engine is awake, so one address covers
+  every model the Pod holds and the engine ports stay reserved for the
+  controller.
+- **Only awake Pods become targets.** A pool Pod is Ready only while a model is
+  awake in it, and the PodMonitor keeps Ready targets only. A sleeping Pod has
+  nothing behind its proxy, so scraping it would produce a permanently-DOWN
+  target for every idle Pod — a pool of ten mostly-idle Pods would read as broken
+  monitoring.
+
+What WVA then does with the measurement is deliberately asymmetric:
+
+| | counted? | why |
+| --- | --- | --- |
+| the bridge's **demand** | **yes**, into the model's total | it is the model's traffic, wherever it is being served |
+| the bridge's **capacity** | **no**, never into supply | the Pod is borrowed. Counted as supply it would tell the optimizer the fleet is already big enough and suppress the scale-up the bridge exists to cover — after which the pool holds the Pod indefinitely, because the replicas that would release it are the ones it prevented |
+
+The capacity is still measured, and published per variant for the retained-pool
+switching decision, where there are no ordinary replicas coming and the pool *is*
+the capacity. Look for `warm-pool-bridge-supply` in the controller log.
+
 ## Checking it works
 
 The pool reports its state whenever that state changes:
