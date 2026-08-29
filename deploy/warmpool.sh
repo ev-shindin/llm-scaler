@@ -92,7 +92,8 @@ create options:
   --replicas N         starting Pod count, and minReplicaCount. Default: 2
   --max N              maxReplicaCount. MUST exceed the reserve. Default: 6
   --reserve N          warmPoolSleepMinSize. Default: 1
-  --proxy-image REF    the warm-pool image you built
+  --proxy-image REF    the pool proxy image. Optional: defaults to the one
+                       config/warmpool pins, which is published
   --wva-namespace NS   where WVA runs, for scalerAddress
   --runtime-class NAME the RuntimeClass for the pool Pods (default nvidia-legacy),
                        or `none` to set none. Cluster-specific: a name the
@@ -182,8 +183,22 @@ cmd_plan() {
 
 cmd_create() {
   require NAMESPACE namespace
-  require PROXY_IMAGE proxy-image
   require WVA_NAMESPACE wva-namespace
+
+  # The proxy image defaults to the one config/warmpool pins, which is published
+  # and pullable, so a pool can be created without building anything first.
+  # WARMPOOL_DEFAULT_PROXY_IMAGE is emitted from that manifest by
+  # `make warmpool-render`, so the default cannot drift from what the manifests
+  # say a pool runs.
+  #
+  # Build your own to change the proxy: `make docker-build-warmpool-proxy
+  # docker-push-warmpool-proxy WARMPOOL_PROXY_IMG=<ref>` and pass --proxy-image.
+  if [ -z "$PROXY_IMAGE" ]; then
+    PROXY_IMAGE="$WARMPOOL_DEFAULT_PROXY_IMAGE"
+    log_info "Proxy image: ${PROXY_IMAGE} (the default; --proxy-image overrides)"
+  else
+    log_info "Proxy image: ${PROXY_IMAGE}"
+  fi
 
   if [ "$POOL_MAX" -le "$RESERVE" ]; then
     log_error "--max ($POOL_MAX) must EXCEED --reserve ($RESERVE): admission draws on free-minus-reserve, so at or below the reserve the budget is zero forever and the pool holds accelerators while warming nothing"
@@ -314,6 +329,11 @@ $(warmpool_podmonitor)"
 # hand: run `make warmpool-render` after changing that manifest. CI fails
 # on drift, because a pool Pod that disagrees with the shipped one holds
 # GPUs and answers nothing -- which is what this file exists to prevent.
+# The proxy image config/warmpool pins, which is what --proxy-image
+# defaults to. Emitted here rather than written out again, so the
+# default and the manifest cannot disagree about which image a pool runs.
+WARMPOOL_DEFAULT_PROXY_IMAGE="ghcr.io/ev-shindin/warmpool-proxy:v8@sha256:66e8bb63b985c87db81716b2047f07a5deba2f1729e5397f4476d2415af72093"
+
 pool_pod_spec() {
   local memory="$1" indent="$2" role="${3:-leader}"
 

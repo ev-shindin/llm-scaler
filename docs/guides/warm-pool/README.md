@@ -46,7 +46,7 @@ Each pool Pod runs two containers, and only one of them is built here:
 | container | image | owner |
 | --- | --- | --- |
 | `inference-server` | `ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher` | Fast Model Actuation |
-| `proxy` | whatever you pass to `--proxy-image` | this repo (`make docker-build-warmpool-proxy`) |
+| `proxy` | the image `config/warmpool` pins, or `--proxy-image` | this repo (`make docker-build-warmpool-proxy`) |
 
 The launcher image is **not** ours and is not optional. It is a full vLLM
 runtime — vLLM, torch and CUDA — with FMA's launcher on top, and the pool needs
@@ -130,7 +130,7 @@ the moment it exists, which is a cost decision, so it acts only on an explicit
 yes.
 
 ```bash
-WVA_DEFAULT_SO=edit WARMPOOL_PROXY_IMG=<your proxy image>   deploy/install.sh
+WVA_DEFAULT_SO=edit deploy/install.sh
 ```
 
 `WVA_DEFAULT_SO=edit` discovers what is running, writes a plan, and opens it in
@@ -159,7 +159,7 @@ Three values the plan cannot know, and where they come from:
 
 | value | where it comes from | if it is missing |
 | --- | --- | --- |
-| `WARMPOOL_PROXY_IMG` | you build it: `make docker-build-warmpool-proxy docker-push-warmpool-proxy` | no pools are created, and the installer says so |
+| `WARMPOOL_PROXY_IMG` | optional — defaults to the published image `config/warmpool` pins. Build your own with `make docker-build-warmpool-proxy docker-push-warmpool-proxy` | nothing: the default is used, and the installer says which |
 | `MONITORING_NAMESPACE` | the install already has it — where it put the monitoring stack | the pool is created **unscraped**: it works, and every model it lends to reads as having less demand than it has |
 | `WARMPOOL_RUNTIME_CLASS` | your GPU operator, if it installed one (default `nvidia-legacy`; `none` if it installed none) | `create` refuses rather than making Pods that all fail admission |
 
@@ -172,7 +172,7 @@ The two objects a pool is made of — the Deployment and its ScaledObject — ar
 only meaningful together, so there is one command that makes both:
 
 ```bash
-deploy/warmpool.sh create -n <namespace> --name <pool>   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --proxy-image <your image> --wva-namespace <where WVA runs>
+deploy/warmpool.sh create -n <namespace> --name <pool>   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --wva-namespace <where WVA runs>
 ```
 
 `--models` and `--model-size` are how you size the Pod: they set the memory
@@ -251,7 +251,7 @@ kubectl get deploy,scaledobject,networkpolicy,podmonitor -n <namespace> -l app.k
 **Add one**
 
 ```bash
-deploy/warmpool.sh create -n <namespace> --name <pool>   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --proxy-image <your image> --wva-namespace <where WVA runs>   --monitoring-namespace <where Prometheus runs>
+deploy/warmpool.sh create -n <namespace> --name <pool>   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --wva-namespace <where WVA runs>   --monitoring-namespace <where Prometheus runs>
 ```
 
 Then point models at it, in each one's ScaledObject trigger metadata:
@@ -433,7 +433,7 @@ holding one engine, with the API on the leader. A pool can hold those too, as
 standing groups rather than standing Pods.
 
 ```bash
-deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --proxy-image <your image> --wva-namespace <where WVA runs>   --launcher-image ghcr.io/ev-shindin/fma-launcher:v0.6.4-headless
+deploy/warmpool.sh create -n <namespace> --name h200-2pod   --group-size 2 --gpus 8   --accelerator NVIDIA-H200-141GB   --models 2 --model-size 70B   --wva-namespace <where WVA runs>   --launcher-image ghcr.io/ev-shindin/fma-launcher:v0.6.4-headless
 ```
 
 `--group-size` is what makes it a group pool. Everything else means what it did:
@@ -542,7 +542,7 @@ Each additional pool is another `create`, with its own name and the accelerator
 it is for:
 
 ```bash
-deploy/warmpool.sh create -n <namespace> --name h100   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --proxy-image <your image> --wva-namespace <where WVA runs>
+deploy/warmpool.sh create -n <namespace> --name h100   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --wva-namespace <where WVA runs>
 ```
 
 `plan` will have told you which pools the namespace wants, and which models can

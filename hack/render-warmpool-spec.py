@@ -145,6 +145,21 @@ def as_yaml(role):
     return text.rstrip("\n")
 
 
+def manifest_proxy_image():
+    """The proxy image config/warmpool pins.
+
+    Read from the manifest rather than remembered from pod_spec, so it cannot
+    depend on the order the generated block happens to be assembled in.
+    """
+    for doc in yaml.safe_load_all(MANIFEST.read_text(encoding="utf-8")):
+        if not doc or doc.get("kind") != "Deployment":
+            continue
+        for container in doc["spec"]["template"]["spec"].get("containers", []):
+            if container.get("name") == "proxy":
+                return container["image"]
+    raise SystemExit("no proxy container in %s; the default image would be empty" % MANIFEST)
+
+
 def render():
     """The generated shell function, as lines."""
     lines = [
@@ -154,6 +169,11 @@ def render():
         "# hand: run `make warmpool-render` after changing that manifest. CI fails",
         "# on drift, because a pool Pod that disagrees with the shipped one holds",
         "# GPUs and answers nothing -- which is what this file exists to prevent.",
+        "# The proxy image config/warmpool pins, which is what --proxy-image",
+        "# defaults to. Emitted here rather than written out again, so the",
+        "# default and the manifest cannot disagree about which image a pool runs.",
+        'WARMPOOL_DEFAULT_PROXY_IMAGE="%s"' % manifest_proxy_image(),
+        "",
         "pool_pod_spec() {",
         '  local memory="$1" indent="$2" role="${3:-leader}"',
         "",

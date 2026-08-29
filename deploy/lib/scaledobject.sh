@@ -2343,13 +2343,15 @@ so_apply_warmpools() {
         return 0
     fi
 
+    # Optional now. warmpool.sh defaults to the proxy image config/warmpool pins,
+    # which is published, so an install that builds nothing still gets a working
+    # pool -- refusing to create one over an unset variable was stopping the
+    # common case to protect against a rare one.
     local image="${WARMPOOL_PROXY_IMG:-}"
     if [ -z "$image" ]; then
-        log_warning "Warm pools were requested, but no proxy image is set, so none were created."
-        log_warning "  The pool Pod runs an image this repo builds:"
-        log_warning "    make docker-build-warmpool-proxy docker-push-warmpool-proxy"
-        log_warning "  Then re-apply with WARMPOOL_PROXY_IMG=<ref>."
-        return 0
+        log_info "Warm pools: using the default proxy image. Build your own with"
+        log_info "  make docker-build-warmpool-proxy docker-push-warmpool-proxy"
+        log_info "  and re-apply with WARMPOOL_PROXY_IMG=<ref>."
     fi
 
     local wp_ns wp_name wp_acc wp_gpus wp_models wp_size wp_replicas wp_max wp_reserve
@@ -2377,7 +2379,7 @@ so_apply_warmpools() {
                 -n "$wp_ns" --name "$wp_name" --gpus "$wp_gpus" \
                 --accelerator "$wp_acc" --models "$wp_models" --model-size "$wp_size" \
                 --replicas "$wp_replicas" --max "$wp_max" --reserve "$wp_reserve" \
-                --proxy-image "$image" --wva-namespace "$WVA_NS" \
+                ${image:+--proxy-image "$image"} --wva-namespace "$WVA_NS" \
                 --monitoring-namespace "${MONITORING_NAMESPACE:-}" \
                 --runtime-class "${WARMPOOL_RUNTIME_CLASS:-nvidia-legacy}"; then
             made=$((made + 1))

@@ -73,8 +73,9 @@ Environment Variables:
   MONITORING_NAMESPACE         Namespace for the monitoring stack
 
  Warm pool
-  WARMPOOL_PROXY_IMG           Required to create any pool. The pool Pod runs a proxy image this
-                               repo builds: make docker-build-warmpool-proxy docker-push-warmpool-proxy
+  WARMPOOL_PROXY_IMG           Override the pool proxy image. Optional: defaults to the published
+                               one config/warmpool pins. Build your own with
+                               make docker-build-warmpool-proxy docker-push-warmpool-proxy
   WARMPOOL_RUNTIME_CLASS       RuntimeClass for pool Pods (default: nvidia-legacy), or "none".
                                Cluster-specific: a name the cluster does not have fails admission,
                                and omitting one it needs gives containers with no GPU

@@ -235,9 +235,10 @@ the first time a model sleeps and is never released. Run
 `deploy/warmpool.sh sizing --params <size>` to see what this cluster's nodes can
 actually hold before trusting the placeholders.
 
-Creating a pool also needs `WARMPOOL_PROXY_IMG`, since the pool Pod runs an
-image this repo builds (`make docker-build-warmpool-proxy`). Without it the
-apply says so and creates nothing.
+Creating a pool can take `WARMPOOL_PROXY_IMG`, though it defaults to the
+published image `config/warmpool` pins. Set it to run your own build of an
+image this repo builds (`make docker-build-warmpool-proxy`). The apply says
+which image it used.
 
 Full reasoning, the configuration surface, and how to remove a pool are in
 [Bridge a scale-up with a warm pool](../warm-pool/).
@@ -362,7 +363,8 @@ something.
 grouped from the workloads it found, with every entry `apply: "no"` — so if you
 have applied that plan you have already seen the suggestion, and turning one
 entry to `"yes"` creates the pool on the next `scaledobjects-apply`. That path
-needs `WARMPOOL_PROXY_IMG` set, since the pool Pod runs an image this repo
+takes an optional `WARMPOOL_PROXY_IMG`, defaulting to the published image
+`config/warmpool` pins; set it to run your own build of an image this repo
 builds.
 
 The standalone command below answers the same question for a namespace that is

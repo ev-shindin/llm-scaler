@@ -266,6 +266,26 @@ printf '%s
 printf '%s
 ' "$POOL" | grep -q 'kubernetes.io/metadata.name: observability'   && fail "a monitoring namespace was admitted though none was named"   || ok "no monitoring peer without a monitoring namespace"
 
+# --- the default proxy image ------------------------------------------------
+# --proxy-image is optional: the default comes from config/warmpool, emitted into
+# the script by `make warmpool-render` so the two cannot disagree about which
+# image a pool runs. A default that drifted from the manifest would give the
+# scripted and the hand-applied pool different proxies.
+DEFAULTED="$(bash "$SCRIPT" create -n tenant --name pool --wva-namespace wva-system   --accelerator NVIDIA-H100-80GB-HBM3 --dry-run 2>/dev/null)"
+
+if [ -z "$DEFAULTED" ]; then
+  fail "create without --proxy-image produced nothing: the flag is still required"
+else
+  ok "create works without --proxy-image"
+  MANIFEST_IMG="$(grep -A2 'name: proxy$' "$(dirname "$0")/../config/warmpool/warmpool-deployment.yaml"     | grep -m1 'image:' | sed 's/.*image: //')"
+  if printf '%s
+' "$DEFAULTED" | grep -qF "$MANIFEST_IMG"; then
+    ok "the default proxy image is the one config/warmpool pins"
+  else
+    fail "the default proxy image is not the manifest's ($MANIFEST_IMG): the scripted and hand-applied pools would run different proxies"
+  fi
+fi
+
 # --- the RuntimeClass ------------------------------------------------------
 # Cluster-specific and wrong in both directions: a name the cluster does not have
 # fails ADMISSION, so the Deployment exists and no Pod ever appears; omitting one
