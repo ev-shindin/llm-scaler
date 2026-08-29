@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -46,15 +47,9 @@ func (s *GPUUsageStore) Publish(byType map[string]int, byNamespace map[string]ma
 		ByType:      make(map[string]int, len(byType)),
 		ByNamespace: make(map[string]map[string]int, len(byNamespace)),
 	}
-	for k, v := range byType {
-		snap.ByType[k] = v
-	}
+	maps.Copy(snap.ByType, byType)
 	for ns, perType := range byNamespace {
-		cp := make(map[string]int, len(perType))
-		for k, v := range perType {
-			cp[k] = v
-		}
-		snap.ByNamespace[ns] = cp
+		snap.ByNamespace[ns] = maps.Clone(perType)
 	}
 
 	s.mu.Lock()
@@ -152,11 +147,7 @@ func PublishWarmPoolGPUs(namespace string, byType map[string]int) {
 		delete(warmPoolGPUs, namespace)
 		return
 	}
-	copied := make(map[string]int, len(byType))
-	for k, v := range byType {
-		copied[k] = v
-	}
-	warmPoolGPUs[namespace] = copied
+	warmPoolGPUs[namespace] = maps.Clone(byType)
 }
 
 // WarmPoolGPUs returns a copy of what every namespace's pools hold.
@@ -165,11 +156,7 @@ func WarmPoolGPUs() map[string]map[string]int {
 	defer warmPoolGPUsMu.RUnlock()
 	out := make(map[string]map[string]int, len(warmPoolGPUs))
 	for ns, byType := range warmPoolGPUs {
-		inner := make(map[string]int, len(byType))
-		for k, v := range byType {
-			inner[k] = v
-		}
-		out[ns] = inner
+		out[ns] = maps.Clone(byType)
 	}
 	return out
 }

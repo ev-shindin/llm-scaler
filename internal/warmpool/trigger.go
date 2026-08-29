@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
@@ -100,9 +101,7 @@ func (t *DecisionTrigger) WatchRegistry(ctx context.Context, reg *registry.Regis
 	if every <= 0 {
 		every = 30 * time.Second
 	}
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
+	wait.UntilWithContext(ctx, func(context.Context) {
 		for _, entry := range reg.Snapshot() {
 			if entry.Target.Name == "" {
 				continue // not enriched yet; the decision store is keyed by the
@@ -110,12 +109,7 @@ func (t *DecisionTrigger) WatchRegistry(ctx context.Context, reg *registry.Regis
 			}
 			t.Watch(types.NamespacedName{Namespace: entry.Namespace, Name: entry.Target.Name})
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	}, every)
 }
 
 // Close releases every subscription and stops the goroutines reading them.

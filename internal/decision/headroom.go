@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -42,13 +43,10 @@ func NewHeadroomStore() *HeadroomStore { return &HeadroomStore{} }
 // Publish records a snapshot, replacing any previous one wholesale so an
 // allowance that shrank is not remembered as larger.
 func (s *HeadroomStore) Publish(free map[string]map[string]int, now time.Time) {
+	// The outer map by hand and the inner ones with maps.Clone, which is shallow.
 	copied := make(map[string]map[string]int, len(free))
 	for ns, perType := range free {
-		inner := make(map[string]int, len(perType))
-		for k, v := range perType {
-			inner[k] = v
-		}
-		copied[ns] = inner
+		copied[ns] = maps.Clone(perType)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
