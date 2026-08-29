@@ -134,6 +134,18 @@ type Reconciler struct {
 	// is what a pool with no optimizer running should do.
 	Contended func(namespace, accelerator string) bool
 
+	// WantAwake reports which model the optimizer says should hold a pool's
+	// GPUs, and whether it has said anything at all.
+	//
+	// Optional, and absent means "no opinion" rather than "sleep everything": a
+	// pool without one decides from demand exactly as it did before this
+	// existed, which is what every bridge pool should keep doing.
+	//
+	// Injected rather than read from the package default so a test needs no
+	// global, and so the staleness rule lives with the caller that knows how
+	// often the optimizer runs.
+	WantAwake func(namespace, pool string) (string, bool)
+
 	// lastHeld is the last reason each pool was held at its current size.
 	lastHeld map[string]string
 
@@ -329,6 +341,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 			Memberships: mine,
 			Variants:    theirs,
 			BorrowedAt:  copyBorrows(r.borrowedAt),
+			WantAwake:   r.wantAwake(spec),
 			MissesAt:    copyMisses(r.missesAt),
 			Admitting:   maps.Clone(r.admittingPods),
 			Now:         r.now(),
@@ -1088,4 +1101,19 @@ func (r *Reconciler) Lent() []policy.Borrow {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Collect(maps.Keys(r.borrowedAt))
+}
+
+// wantAwake asks the optimizer which model should hold this pool's GPUs.
+//
+// Empty whenever nothing is wired or nothing has been said, which is the
+// ordinary case: the pool then decides from demand as it always has.
+func (r *Reconciler) wantAwake(spec PoolSpec) string {
+	if r.WantAwake == nil {
+		return ""
+	}
+	variant, ok := r.WantAwake(r.Namespace, r.metricName(spec))
+	if !ok {
+		return ""
+	}
+	return variant
 }

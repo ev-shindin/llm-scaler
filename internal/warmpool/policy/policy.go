@@ -128,6 +128,19 @@ type Input struct {
 	// that budget exists to prevent.
 	Admitting map[types.NamespacedName]bool
 
+	// WantAwake is the variant the optimizer says should hold this pool's GPUs.
+	//
+	// Empty is the ordinary case and means "no opinion": the pool decides from
+	// demand, as it always has. A retained pool is where this matters -- nothing
+	// is coming to relieve it, so waiting for demand to fall is the wrong
+	// trigger, and something has to say which model's turn it is.
+	//
+	// It names one side because the other follows: whatever else is awake in the
+	// Pod that holds this model has to sleep for it to wake, and the pool is the
+	// only thing that knows which Pod that is. The DECISION is still made in one
+	// place -- the optimizer chose the variant -- and the mechanics stay here.
+	WantAwake string
+
 	// MissesAt records recent misses per variant, for the frequency filter.
 	MissesAt map[string][]time.Time
 	Now      time.Time
@@ -218,6 +231,17 @@ func Decide(in Input, cfg Config) Plan {
 	for i, action := range orphans {
 		orphans[i] = withKnownModel(action, known)
 		plan.Return = append(plan.Return, orphans[i])
+		returned[action.Pod] = true
+	}
+
+	// 1b. An intent from the optimizer: this model should be awake.
+	//
+	// Ordered before borrows so the Pod it frees is available to them in the
+	// same pass -- freePods counts a Pod being returned as free, which is what
+	// makes a switch one pass rather than two, and two passes means a stretch
+	// with neither model serving.
+	plan.Return = append(plan.Return, intentReturns(in, byPod, lent, returned)...)
+	for _, action := range plan.Return {
 		returned[action.Pod] = true
 	}
 
@@ -856,4 +880,67 @@ func roomiestFreePod(byPod map[types.NamespacedName][]pool.Membership, free map[
 		}
 	}
 	return best, found
+}
+
+// intentReturns hands back the Pod that stands between the optimizer's chosen
+// model and being awake.
+//
+// The intent names a variant, not a Pod: the optimizer knows which model should
+// hold the pool's GPUs and nothing about where it is resident. So this finds the
+// Pod that holds it, and returns whatever else that Pod currently has awake --
+// which is the "sleep A" half of "sleep A, wake B". The borrow that follows in
+// the same pass is the other half.
+//
+// Nothing happens when the chosen model is already awake, is not resident
+// anywhere, or is resident in a Pod that is already free. The first is the
+// steady state and the common case; the second is a decision about a model this
+// pool cannot serve, which is reported by the ordinary miss path rather than
+// acted on here.
+func intentReturns(
+	in Input,
+	byPod map[types.NamespacedName][]pool.Membership,
+	lent map[string][]pool.Membership,
+	returned map[types.NamespacedName]bool,
+) []Action {
+	if in.WantAwake == "" {
+		return nil
+	}
+	// Already awake: nothing to move. Checked against the LENT set rather than
+	// membership state because a lent Pod is one serving that variant, which is
+	// what "awake" means to everything outside the engine.
+	if len(lent[in.WantAwake]) > 0 {
+		return nil
+	}
+
+	var out []Action
+	for podRef, inPod := range byPod {
+		if returned[podRef] {
+			continue // already going back this pass
+		}
+		holds := false
+		for _, m := range inPod {
+			if m.Model.Variant == in.WantAwake {
+				holds = true
+				break
+			}
+		}
+		if !holds {
+			continue
+		}
+		// Whatever is awake HERE has to go, and only here: a Pod elsewhere
+		// serving a different model is not in this model's way.
+		for _, m := range inPod {
+			if m.Model.Variant == in.WantAwake || m.State != pool.Serving {
+				continue
+			}
+			out = append(out, Action{Pod: podRef, Model: m.Model})
+		}
+		if len(out) > 0 {
+			// One Pod is enough: waking the model in two Pods at once is a
+			// decision about how many copies serve it, which is not this
+			// signal's to make.
+			break
+		}
+	}
+	return out
 }

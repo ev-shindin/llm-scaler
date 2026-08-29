@@ -1047,6 +1047,14 @@ func runWarmPool(
 	reconciler.Headroom = func(namespace, accelerator string) (int, bool) {
 		return decision.GPUHeadroom(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
 	}
+	// Which model the optimizer says should be awake in a pool. Nothing
+	// publishes one yet -- the rule that decides is the open half of this
+	// design -- so today it is always absent and every pool decides from demand
+	// exactly as before. Wired now so the transport is one change rather than
+	// two, and so the pool half can be exercised end to end.
+	reconciler.WantAwake = func(namespace, pool string) (string, bool) {
+		return decision.Awake(namespace, pool, warmpool.ContentionMaxAge, time.Now())
+	}
 	reconciler.Contended = func(namespace, accelerator string) bool {
 		return decision.GPUContended(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
 	}
