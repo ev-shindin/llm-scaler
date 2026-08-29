@@ -58,6 +58,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/inferenceengine"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -1024,6 +1025,27 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			queueLen = 0
 		}
 
+		// A BRIDGE is attributed to the variant it is lent to, not to the pool
+		// that owns it.
+		//
+		// A warm pool Pod's ownerReference walk reaches the POOL's scale target,
+		// because that is what created it -- so the walk either finds nothing
+		// this model drives, or finds the pool. Neither is the answer: while the
+		// Pod is lent it is serving one variant's traffic, and that traffic is
+		// what the analyzer has to see. Checked BEFORE the unattributed path so a
+		// lent Pod is not reported as a mapping miss, and before the FMA hop
+		// because the two cannot both apply.
+		fromWarmPool := false
+		if bridgeFor, lent := decision.BridgeVariant(namespace, podName, warmPoolLendingMaxAge, time.Now()); lent {
+			if vaName != "" && vaName != bridgeFor {
+				logger.V(logging.DEBUG).Info(
+					"a warm pool Pod resolved to a scale target of its own; attributing it to the variant it is lent to",
+					"pod", podName, "resolved", vaName, "lentTo", bridgeFor, "namespace", namespace)
+			}
+			vaName = bridgeFor
+			fromWarmPool = true
+		}
+
 		if vaName == "" {
 			// Neither the ownerReferences walk nor the FMA pairing hop reached a
 			// managed scaler, so this pod's metrics belong to nothing this
@@ -1091,6 +1113,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			ModelID:               modelID,
 			Namespace:             namespace,
 			VariantName:           vaName,
+			FromWarmPool:          fromWarmPool,
 			KvCacheUsage:          kvUsage,
 			QueueLength:           queueLen,
 			NumGpuBlocks:          data.numGpuBlocks,
@@ -1226,6 +1249,15 @@ func (c *ReplicaMetricsCollector) CollectSchedulerQueueMetrics(
 // model with no pod_name/port labels to reconcile against vLLM's per-instance
 // metrics — which is exactly why the per-instance form of this query no longer
 // exists. Returns 0 (not an error) when the metric is unavailable.
+// warmPoolLendingMaxAge is how old the pool's lending map may be before a Pod in
+// it stops being treated as a bridge.
+//
+// The pool republishes every reconcile pass (5s), so anything approaching this
+// means its reconciler has stopped. Attributing a Pod to a variant on a lending
+// that may since have ended would add demand for load nobody is carrying, and
+// keep adding it for as long as the controller ran.
+const warmPoolLendingMaxAge = 2 * time.Minute
+
 func (c *ReplicaMetricsCollector) CollectModelArrivalRate(
 	ctx context.Context,
 	modelID, namespace string,

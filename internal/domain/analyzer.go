@@ -173,7 +173,26 @@ type VariantCapacity struct {
 	// "T2-pinned", "T2-default", "T2-failed".
 	Reason string
 
-	// TotalDemand is the aggregate demand on this variant.
+	// WarmPoolReplicas is how many BRIDGES are serving this variant: warm pool
+	// Pods lent to it while it is short, counted in the same scale-target units
+	// as ReplicaCount but deliberately NOT part of it.
+	//
+	// Their load is in TotalDemand, because it is this variant's load. Their
+	// capacity is not in supply, because the Pods are borrowed: counting them
+	// would tell the optimizer the fleet is already big enough and suppress the
+	// scale-up the bridge exists to cover, leaving the pool holding the Pod
+	// because the replicas that would release it were never created.
+	WarmPoolReplicas int
+
+	// WarmPoolCapacity is what those bridges are worth, in the same units as
+	// supply. Measured and carried for the retained-pool switching decision --
+	// where there are no ordinary replicas coming and the pool IS the capacity,
+	// so choosing which model holds the GPUs needs to compare what each is
+	// getting from the pool against what each is asking for.
+	WarmPoolCapacity float64
+
+	// TotalDemand is the aggregate demand on this variant. It INCLUDES the
+	// demand carried by any bridge above.
 	TotalDemand float64
 
 	// Utilization is TotalDemand / (ReplicaCount × PerReplicaCapacity), 0.0-1.0.

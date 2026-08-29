@@ -292,6 +292,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		K2Priority:            k2Priority,
 		EffectiveCapacity:     effectiveCapacity,
 		ReplicaDemand:         replicaDemand,
+		FromWarmPool:          rm.FromWarmPool,
 	}
 }
 
@@ -379,6 +380,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 		K2Priority:            k2SrcFallback,
 		EffectiveCapacity:     effectiveCapacity,
 		ReplicaDemand:         replicaDemand,
+		FromWarmPool:          rm.FromWarmPool,
 	}
 }
 
@@ -485,6 +487,8 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 
 		var perReplicaCapacity float64
 		var totalDemand float64
+		// Bridges serving this variant, counted apart from its own replicas.
+		var warmPoolReplicas int
 		// accelerator is an analyzer input (discovery-resolved, on VariantReplicaState),
 		// used below for cross-variant capacity lookup. It is NOT emitted on the output;
 		// the capacity builder fills per-variant identity from discovery.
@@ -508,14 +512,42 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 		var capacityLabel string
 		if len(replicas) > 0 {
 			capacities := make([]int64, 0, len(replicas))
+			// BRIDGES count toward demand and not toward supply.
+			//
+			// A bridge is a warm pool Pod lent to this variant while it is short.
+			// The traffic it is serving is this variant's traffic, so its demand
+			// belongs in the total like any replica's -- leave it out and demand
+			// reads lowest exactly while a bridge is covering the shortfall, then
+			// appears from nowhere when the Pod goes back.
+			//
+			// Its capacity is a different matter. The Pod is borrowed and returns
+			// when the ordinary replicas arrive, so counting it as supply would
+			// tell the optimizer the fleet is already big enough and suppress the
+			// scale-up the bridge exists to bridge. The pool would then hold the
+			// Pod indefinitely: the replicas that would release it are the ones
+			// it talked the optimizer out of creating.
+			//
+			// Its capacity IS measured, and carried out separately for the
+			// retained-pool switching decision, where the pool is the capacity
+			// and there are no ordinary replicas coming.
+			ownReplicas := 0
 			for _, rc := range replicas {
+				// Capacity per replica is a property of the model on this
+				// hardware, not of which workload owns the Pod, and a borrow only
+				// happens on a matching accelerator -- so a bridge's measurement
+				// informs the median like any other. Only the COUNTS are split.
 				capacities = append(capacities, rc.EffectiveCapacity)
 				totalDemand += float64(rc.ReplicaDemand)
+				if rc.FromWarmPool {
+					warmPoolReplicas++
+					continue
+				}
+				ownReplicas++
 			}
 			perReplicaCapacity = float64(median(capacities))
 			// Prefer the live count over readyCount: it is what actually reported
 			// capacity this cycle, where readyCount is (lagging) scale-target status.
-			replicaCount = len(replicas)
+			replicaCount = ownReplicas
 			capacityLabel = k2SourceLabel(replicas)
 		} else if rec := a.capacityStore.Get(namespace, modelID, vs.VariantName); rec != nil && rec.EffectiveCapacity > 0 {
 			// No ready replicas — use stored capacity, enhanced with k2 derivation
@@ -549,15 +581,28 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 		// the capacity builder fills it from the discovery step, so the analyzer's
 		// output is the measured capacity signal, not laundered identity.
 		result = append(result, domain.VariantCapacity{
-			VariantName:        vs.VariantName,
-			Role:               vs.Role,
-			ReplicaCount:       replicaCount,
-			PendingReplicas:    pendingCount,
+			VariantName:      vs.VariantName,
+			Role:             vs.Role,
+			ReplicaCount:     replicaCount,
+			PendingReplicas:  pendingCount,
+			WarmPoolReplicas: warmPoolReplicas,
+			// Measured, and kept out of every supply total on purpose. The one
+			// consumer is the retained-pool switching decision; see
+			// domain.VariantCapacity.WarmPoolCapacity.
+			WarmPoolCapacity:   float64(warmPoolReplicas) * perReplicaCapacity,
 			PerReplicaCapacity: perReplicaCapacity,
 			TotalDemand:        totalDemand,
 			Utilization:        utilization,
 			Reason:             capacityLabel,
 		})
+		if warmPoolReplicas > 0 {
+			logger.Info("warm-pool-bridge-supply",
+				"modelID", modelID, "namespace", namespace, "variant", vs.VariantName,
+				"bridges", warmPoolReplicas, "ownReplicas", replicaCount,
+				"bridgeCapacity", float64(warmPoolReplicas)*perReplicaCapacity,
+				"totalDemand", totalDemand,
+				"note", "bridge demand is counted, bridge capacity is not supply")
+		}
 	}
 
 	return result

@@ -152,6 +152,11 @@ func (e *Engine) runAnalyzersAndScore(
 	namedResults := []allocation.NamedAnalyzerResult{
 		buildNamedResult(ctx, domain.SaturationAnalyzerName, baseResult, config, metaByVariant, satUp, satDown),
 	}
+	// What each variant is getting from the pool, for the retained-pool switching
+	// decision. Published from saturation's result because that is the analyzer
+	// that measures per-replica capacity; it is deliberately absent from every
+	// supply total above.
+	publishWarmPoolSupply(namespace, namedResults[0])
 	for _, entry := range e.analyzerRunEntries() {
 		if entry.name == domain.SaturationAnalyzerName {
 			continue
@@ -1210,4 +1215,25 @@ func (e *Engine) publishHeadroomForIdleFleet(ctx context.Context) {
 		return
 	}
 	allocation.PublishNamespaceHeadroom(constraints, time.Now())
+}
+
+// publishWarmPoolSupply records what BRIDGES are contributing to each variant.
+//
+// Zero is published as readily as a positive figure, and for every variant the
+// analyzer saw. A switching decision needs "this variant has no bridge" as much
+// as it needs the number, and publishing only the non-zero ones would leave the
+// last reading standing after the Pod went back -- saying a variant is being
+// carried by a pool that has already reclaimed it.
+func publishWarmPoolSupply(namespace string, nr allocation.NamedAnalyzerResult) {
+	if nr.Result == nil {
+		return
+	}
+	now := time.Now()
+	for _, vc := range nr.Result.VariantCapacities {
+		if vc.VariantName == "" {
+			continue
+		}
+		decision.PublishWarmPoolSupply(namespace, vc.VariantName,
+			vc.WarmPoolReplicas, vc.WarmPoolCapacity, now)
+	}
 }

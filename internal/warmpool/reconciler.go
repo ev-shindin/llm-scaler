@@ -297,6 +297,16 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	// empty reading there means "could not see", and zero would hand the quota
 	// its allowance back at the moment WVA cannot tell what it is holding.
 	decision.PublishWarmPoolGPUs(r.Namespace, warmPoolGPUsByAccelerator(memberships))
+	// Which Pods are LENT, and to which variant, so the collector can attribute
+	// their engine metrics. A bridge is owned by the pool's workload, so the
+	// ownerReference walk that attributes every other Pod reaches the pool's
+	// scale target rather than the model's, and the load it is carrying is
+	// dropped as unattributed -- which makes a variant's demand look smallest
+	// exactly while a bridge is covering its shortfall.
+	//
+	// Published beside the GPU figure and under the same rule: on every pass
+	// that could observe the pool, never on one that could not.
+	decision.PublishBridges(r.Namespace, lentPodsByTarget(memberships, variants), time.Now())
 
 	pools, err := r.poolSpecs(ctx)
 	if err != nil {
@@ -1130,4 +1140,31 @@ func (r *Reconciler) wantAwake(spec PoolSpec) string {
 		return ""
 	}
 	return variant
+}
+
+// lentPodsByTarget maps each LENT pool Pod to the scale target it is serving.
+//
+// Keyed by the scale target rather than by the pool's own name for the variant:
+// this is published for the collector, which knows a variant by the target it
+// scales. A variant the pool is lending to but that no longer appears in the
+// demand -- its ScaledObject deleted mid-flight -- is left out rather than
+// guessed at, because attributing a Pod to a variant nothing is scaling would
+// add demand no optimizer pass could act on.
+func lentPodsByTarget(memberships []pool.Membership, variants []policy.VariantDemand) map[string]string {
+	target := make(map[string]string, len(variants))
+	for _, v := range variants {
+		if v.Target != "" {
+			target[v.Model.Variant] = v.Target
+		}
+	}
+	out := map[string]string{}
+	for _, m := range memberships {
+		if m.State != pool.Serving {
+			continue
+		}
+		if name := target[m.Model.Variant]; name != "" {
+			out[m.Pod.Name] = name
+		}
+	}
+	return out
 }

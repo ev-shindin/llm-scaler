@@ -62,6 +62,22 @@ type ReplicaMetrics struct {
 	VariantName  string  // Name of the variant this replica belongs to
 	Namespace    string
 	ModelID      string // Model ID for grouping variants
+
+	// FromWarmPool marks a record that came from a BRIDGE: a warm pool Pod lent
+	// to this variant while it is short, rather than one of its own replicas.
+	//
+	// Its load is this variant's load and counts toward DEMAND like any other.
+	// Its capacity is not this variant's SUPPLY: the Pod is borrowed and goes
+	// back when the ordinary replicas arrive, so counting it would tell the
+	// optimizer the fleet is already big enough and suppress the scale-up the
+	// bridge exists to cover -- after which the replicas that would release the
+	// Pod are the ones it just prevented.
+	//
+	// So the two aggregations treat it differently, and this flag is what lets
+	// them. What it is worth is measured separately and published for the
+	// retained-pool switching decision; see decision.WarmPoolSupply.
+	FromWarmPool bool
+
 	// Metadata contains freshness information (optional)
 	Metadata *ReplicaMetricsMetadata `json:"metadata,omitempty"`
 

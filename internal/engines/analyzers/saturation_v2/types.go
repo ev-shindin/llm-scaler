@@ -50,6 +50,12 @@ type ReplicaCapacity struct {
 	// prefill replicas, and queueLength * (avgInputTokens + avgOutputTokens) for
 	// decode/"both". See waitingQueueDemand.
 	ReplicaDemand int64
+
+	// FromWarmPool marks a BRIDGE: a warm pool Pod lent to this variant rather
+	// than one of its own replicas. Carried through from the collector so
+	// aggregation can put its demand in and keep its capacity out. See
+	// domain.ReplicaMetrics.FromWarmPool.
+	FromWarmPool bool
 }
 
 // classifyOutputLength returns a workload bucket name based on average

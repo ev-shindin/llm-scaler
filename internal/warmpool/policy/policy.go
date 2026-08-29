@@ -73,6 +73,12 @@ type Config struct {
 // needs to know to serve it.
 type VariantDemand struct {
 	Model pool.ModelRef
+	// Target is the scale target this variant scales, which is the name the
+	// COLLECTOR and the analyzer key a variant by. Model.Variant is the
+	// ScaledObject's name and is what the pool keys its warm set by; the two are
+	// usually the same string and are not required to be, so anything published
+	// for the analyzer to read has to use this one.
+	Target string
 	// Desired and Ready are ORDINARY replicas -- the scale target's, never the
 	// pool's. Counting lent Pods as capacity here is what would let the pool
 	// suppress the scale-up it exists to cover.

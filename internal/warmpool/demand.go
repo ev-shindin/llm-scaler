@@ -183,6 +183,9 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 				// the scheduler will actually enforce for the ordinary replicas.
 				Accelerator: pool.AcceleratorRequiredBy(&workload.Spec.Template.Spec),
 			},
+			// The scale target, carried so anything published for the collector
+			// and the analyzer is keyed the way they key a variant.
+			Target:  entry.Target.Name,
 			Desired: desired,
 			Ready:   ready,
 			// Which pool this variant may borrow from, and how many copies it
