@@ -1501,6 +1501,16 @@ func (e *Engine) prepareModelData(
 		"namespace", namespace,
 		"metricsCount", len(replicaMetrics))
 
+	// How many replicas of each variant are actually SERVING, for the warm pool.
+	//
+	// A bridge is handed back when the ordinary replicas have arrived, and
+	// "arrived" used to mean Status.ReadyReplicas -- the kubelet's probe. A
+	// replica that has passed a probe is not necessarily taking requests yet, and
+	// handing traffic back to one that is not strands it. A replica the collector
+	// can see has registered with the engine and is reporting on its work, which
+	// is a much better answer to the same question.
+	publishServing(namespace, replicaMetrics)
+
 	if len(replicaMetrics) == 0 {
 		// Two very different situations reach this line, and they used to produce
 		// the same message.
@@ -1922,5 +1932,30 @@ func (e *Engine) emitSafetyNetMetrics(
 			"desiredReplicas", desiredReplicas,
 			"accelerator", accelerator,
 			"fallbackSource", fallbackSource)
+	}
+}
+
+// publishServing records, per scale target, how many distinct Pods reported
+// engine metrics.
+//
+// Counted by POD, not by metric: an engine that spans several processes reports
+// more than once for one replica, and the warm pool is comparing this against a
+// replica count. Empty variant names are skipped rather than collapsed into one
+// bucket -- a metric WVA cannot attribute says nothing about any particular
+// variant's readiness to take traffic back.
+func publishServing(namespace string, metrics []domain.ReplicaMetrics) {
+	byVariant := map[string]map[string]bool{}
+	for _, m := range metrics {
+		if m.VariantName == "" || m.PodName == "" {
+			continue
+		}
+		if byVariant[m.VariantName] == nil {
+			byVariant[m.VariantName] = map[string]bool{}
+		}
+		byVariant[m.VariantName][m.PodName] = true
+	}
+	now := time.Now()
+	for variant, pods := range byVariant {
+		decision.PublishServing(namespace, variant, len(pods), now)
 	}
 }

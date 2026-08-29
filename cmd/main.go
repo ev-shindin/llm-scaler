@@ -996,6 +996,12 @@ func runWarmPool(
 			Decisions:            decision.Default,
 			Client:               mgr.GetClient(),
 			Datastore:            ds,
+			// SERVING replicas rather than merely Ready ones, for the return
+			// rule -- see Demand.Serving. Unknown falls back to the Ready count,
+			// which is all a fleet whose collector has not run yet has.
+			Serving: func(namespace, target string) (int, bool) {
+				return decision.Serving(namespace, target, warmpool.ContentionMaxAge, time.Now())
+			},
 		},
 		warmpoolpolicy.Config{
 			SleepMinSize:       *warmPoolSleepMinSize,

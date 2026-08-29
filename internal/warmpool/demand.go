@@ -59,6 +59,21 @@ type Demand struct {
 	// Zero inherits the workload's value, which is the previous behaviour.
 	GPUMemoryUtilization float64
 
+	// Serving reports how many replicas of a scale target are actually taking
+	// traffic -- reporting engine metrics -- and whether that is known.
+	//
+	// Optional. Without it the Ready count is used, which is what this did
+	// before: the kubelet's probe, which a replica passes before it is
+	// necessarily serving. Handing a bridge back on a probe strands the traffic
+	// it was carrying, and the failure looks like a slow model rather than a
+	// pool that let go early.
+	//
+	// NOT KNOWN is different from ZERO and the two must not be conflated: no
+	// answer means the collector has not run for this variant, where the Ready
+	// count is the best available; zero means its replicas are demonstrably not
+	// serving, which is precisely when a bridge must be kept.
+	Serving func(namespace, target string) (int, bool)
+
 	// Namespace is the pool's, and variants outside it are not its business.
 	//
 	// Load-bearing rather than tidy. The registry spans every namespace WVA
@@ -143,7 +158,19 @@ func (d *Demand) Variants(ctx context.Context) ([]policy.VariantDemand, error) {
 		if haveDecision {
 			desired = int(decided.DesiredReplicas)
 		}
+		// READY is the kubelet's probe; SERVING is the engine reporting on its
+		// own work. Prefer the second where it is known -- see Demand.Serving.
 		ready := int(workload.Status.ReadyReplicas)
+		if d.Serving != nil {
+			if serving, known := d.Serving(entry.Namespace, entry.Target.Name); known {
+				if serving != ready {
+					logger.V(logging.DEBUG).Info(
+						"counting SERVING replicas rather than Ready ones for the pool's return rule",
+						"variant", entry.Name, "ready", ready, "serving", serving)
+				}
+				ready = serving
+			}
+		}
 
 		wantedPool, wantedCopies := warmPoolChoices(logger, entry)
 		out = append(out, policy.VariantDemand{
