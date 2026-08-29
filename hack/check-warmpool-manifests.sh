@@ -64,6 +64,77 @@ fi
 [ "$(count_kind "$POOL" Deployment)" = 1 ] \
   && ok "one Deployment" || fail "expected exactly one Deployment"
 
+# THE OTHER ONE THAT SHIPPED BROKEN, and the one nothing else could see. Every
+# embedded Python program -- the preStop drain hook and both probes -- must
+# still be the program the manifest says, after passing through an UNQUOTED
+# heredoc.
+#
+# It was not. PyYAML folds a long double-quoted scalar by ending the line with a
+# backslash, bash read that as a line continuation and swallowed the newline and
+# the next line's indentation, and those spaces landed inside a string literal:
+# `inst.get("          options")`. The hook found no instances, exited 0, and
+# every pool Pod this script created was killed with its engine awake and
+# requests in flight -- the one thing the hook exists to prevent.
+#
+# Nothing caught it. The YAML still parsed, `make warmpool-check` still found
+# the rendered text identical to what the generator produced, the `preStop`
+# assertion below still passed, and a drain that drains nothing says nothing. So
+# this compares the DELIVERED program with the manifest's, character for
+# character, which is the only comparison that could have failed.
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s\n' "$POOL" | python3 -c '
+import ast, sys, yaml
+
+MANIFEST = "config/warmpool/warmpool-deployment.yaml"
+
+
+def programs(spec):
+    """Every python3 -c program in a Pod spec, keyed by where it came from."""
+    found = {}
+    for c in spec.get("containers", []):
+        places = {
+            "preStop": (c.get("lifecycle") or {}).get("preStop") or {},
+            "readinessProbe": c.get("readinessProbe") or {},
+            "livenessProbe": c.get("livenessProbe") or {},
+        }
+        for name, place in places.items():
+            cmd = (place.get("exec") or {}).get("command") or []
+            if "python3" in cmd and "-c" in cmd:
+                found["%s/%s" % (c["name"], name)] = cmd[-1]
+    return found
+
+
+want = {}
+with open(MANIFEST) as fh:
+    for doc in yaml.safe_load_all(fh):
+        if doc and doc.get("kind") == "Deployment":
+            want = programs(doc["spec"]["template"]["spec"])
+
+got = {}
+for doc in yaml.safe_load_all(sys.stdin):
+    if doc and doc.get("kind") == "Deployment":
+        got.update(programs(doc["spec"]["template"]["spec"]))
+
+if not want or not got:
+    print("no embedded programs found to compare", file=sys.stderr)
+    sys.exit(1)
+
+for where, program in sorted(got.items()):
+    try:
+        ast.parse(program)
+    except SyntaxError as err:
+        print("%s does not parse as Python: %s" % (where, err), file=sys.stderr)
+        sys.exit(1)
+    if where in want and program != want[where]:
+        print("%s differs from the manifest" % where, file=sys.stderr)
+        sys.exit(1)
+'; then
+    ok "the drain hook and probes survive the heredoc intact"
+  else
+    fail "an embedded python program was corrupted in rendering, or no longer matches the manifest"
+  fi
+fi
+
 # THE ONE THAT SHIPPED BROKEN. A pool with no ScaledObject is not a pool: it is
 # a Deployment holding accelerators that WVA reports as undeclared.
 [ "$(count_kind "$POOL" ScaledObject)" = 1 ] \

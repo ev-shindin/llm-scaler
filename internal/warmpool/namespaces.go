@@ -2,9 +2,11 @@ package warmpool
 
 import (
 	"context"
-	"sort"
+	"maps"
+	"slices"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -34,16 +36,46 @@ type Multiplexer struct {
 	// from the package default so a test needs no global.
 	Snapshot func() []registry.Entry
 
-	// Start begins reconciling one namespace and returns the func that stops it.
-	// Called once per namespace that declares a pool, and never twice for the
-	// same one while it is running.
-	Start func(ctx context.Context, namespace string) context.CancelFunc
+	// Start begins reconciling one namespace. It returns the func that stops it
+	// and a channel closed when that reconciler has finished, however it
+	// finished. Called once per namespace that declares a pool, and never twice
+	// for the same one while it is running.
+	//
+	// The DONE channel is what keeps a namespace from being written off. A
+	// reconciler can exit on its own -- the clearest case is the RBAC review
+	// refusing borrows, which returns immediately -- and a Multiplexer holding
+	// only the stop func cannot tell that apart from one still running. It would
+	// then skip the namespace on every later pass, so an operator who granted the
+	// missing permission would need a restart before WVA used the pool, which is
+	// the exact silence this type exists to remove.
+	Start func(ctx context.Context, namespace string) (context.CancelFunc, <-chan struct{})
 
 	// Every bounds how often the set is recomputed. Discovery is call-driven, so
 	// a namespace appears when KEDA first asks about a pool in it.
 	Every time.Duration
 
-	running map[string]context.CancelFunc
+	// RetryAfter is how long to leave a namespace alone after its reconciler
+	// exited before starting it again. Defaults to two minutes.
+	//
+	// Retrying is the point, but retrying every tick would restate an unfixable
+	// complaint -- denied RBAC does not resolve itself -- twice a minute forever.
+	// A wait long enough to be quiet and short enough that a granted permission
+	// takes effect on its own is the whole requirement.
+	RetryAfter time.Duration
+
+	// Now is the clock, injectable so a test need not sleep.
+	Now func() time.Time
+
+	running map[string]child
+	// quiet holds, per namespace, the time before which its reconciler is not
+	// started again.
+	quiet map[string]time.Time
+}
+
+// child is one namespace's running reconciler.
+type child struct {
+	stop context.CancelFunc
+	done <-chan struct{}
 }
 
 // Run keeps a reconciler running for every namespace that declares a pool, until
@@ -53,28 +85,57 @@ func (m *Multiplexer) Run(ctx context.Context) error {
 	if every <= 0 {
 		every = 30 * time.Second
 	}
-	m.running = map[string]context.CancelFunc{}
+	m.running = map[string]child{}
+	m.quiet = map[string]time.Time{}
 	// Stopping every child on the way out, rather than relying on ctx alone:
 	// the children are started from ctx, so cancellation does reach them, but a
 	// Multiplexer that leaves its map populated cannot be run twice and would
 	// leak the goroutines on the second Run.
 	defer m.stopAll()
 
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		m.sync(ctx)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-		}
-	}
+	wait.UntilWithContext(ctx, m.sync, every)
+	return nil
 }
 
 // sync starts what is newly declared and stops what no longer is.
 func (m *Multiplexer) sync(ctx context.Context) {
 	logger := log.FromContext(ctx).WithName("warmpool")
+	// Lazily, so sync is callable on a zero Multiplexer -- Run seeds these too,
+	// and a nil map here would panic on the first namespace rather than at the
+	// point the omission was made.
+	if m.running == nil {
+		m.running = map[string]child{}
+	}
+	if m.quiet == nil {
+		m.quiet = map[string]time.Time{}
+	}
+	now := time.Now
+	if m.Now != nil {
+		now = m.Now
+	}
+	retryAfter := m.RetryAfter
+	if retryAfter <= 0 {
+		retryAfter = 2 * time.Minute
+	}
+
+	// Reconcilers that have finished on their own. Forgetting them is what makes
+	// the next pass start them again; keeping them would mark the namespace as
+	// handled by a goroutine that is not there.
+	for _, ns := range sortedKeys(m.running) {
+		c := m.running[ns]
+		select {
+		case <-c.done:
+			logger.V(logging.DEFAULT).Info(
+				"the warm pool reconciler for this namespace exited; it will be started "+
+					"again shortly. If this repeats, the reason is in the lines it logged "+
+					"as it stopped -- denied permission to patch Pods is the usual one",
+				"namespace", ns, "retryAfter", retryAfter)
+			c.stop() // releases the child context; the goroutine is already gone
+			delete(m.running, ns)
+			m.quiet[ns] = now().Add(retryAfter)
+		default:
+		}
+	}
 
 	declared := map[string]bool{}
 	for _, entry := range m.Snapshot() {
@@ -88,13 +149,18 @@ func (m *Multiplexer) sync(ctx context.Context) {
 	// arrive from a map, and an operator comparing two lines should not have to
 	// wonder whether the order means anything.
 	for _, ns := range sortedKeys(declared) {
-		if m.running[ns] != nil {
+		if _, running := m.running[ns]; running {
 			continue
 		}
+		if until, waiting := m.quiet[ns]; waiting && now().Before(until) {
+			continue
+		}
+		delete(m.quiet, ns)
 		logger.V(logging.DEFAULT).Info(
 			"warm pool declared in a namespace this controller was not reconciling; starting one",
 			"namespace", ns)
-		m.running[ns] = m.Start(ctx, ns)
+		stop, done := m.Start(ctx, ns)
+		m.running[ns] = child{stop: stop, done: done}
 	}
 
 	for _, ns := range sortedKeys(m.running) {
@@ -109,23 +175,19 @@ func (m *Multiplexer) sync(ctx context.Context) {
 				"stopping its reconciler. Any pool Pods still running hold their "+
 				"accelerators and WVA will not use them until a trigger declares them again",
 			"namespace", ns)
-		m.running[ns]()
+		m.running[ns].stop()
 		delete(m.running, ns)
+		delete(m.quiet, ns)
 	}
 }
 
 func (m *Multiplexer) stopAll() {
-	for ns, stop := range m.running {
-		stop()
+	for ns, c := range m.running {
+		c.stop()
 		delete(m.running, ns)
 	}
 }
 
 func sortedKeys[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(m))
 }

@@ -93,3 +93,33 @@ func TestAnIntentForAModelNotResidentIsIgnored(t *testing.T) {
 		t.Errorf("returns = %+v, want none: the pool does not hold that model", plan.Return)
 	}
 }
+
+// An intent for a model NOTHING is short of moves nothing.
+//
+// The intent is half a switch: it says which model should hold the pool's GPUs,
+// and the borrow loop -- which acts on a shortfall -- is what actually wakes it.
+// Act on the first half alone and the pool sleeps the model it is currently
+// serving and wakes nothing behind it, so the signal empties the pool instead of
+// switching it, and the requests the sleeping bridge was carrying have nowhere
+// to go.
+//
+// A model with no demand entry is the same case: the pool has been told nothing
+// about it, which is not a reason to preempt a live bridge for it.
+func TestAnIntentForAModelNobodyIsShortOfPreemptsNothing(t *testing.T) {
+	in, _ := twoModelPod()
+	in.WantAwake = "asleep"
+	// Its ordinary replicas have arrived, so no borrow will be made for it.
+	for i := range in.Variants {
+		if in.Variants[i].Model.Variant == "asleep" {
+			in.Variants[i].Ready = in.Variants[i].Desired
+		}
+	}
+
+	plan := Decide(in, Config{SleepMinSize: 0, MaxHold: time.Hour, Retained: true})
+
+	for _, r := range plan.Return {
+		if r.Model.Variant == "awake" {
+			t.Errorf("slept the serving model for an intent that wakes nothing: returns = %+v", plan.Return)
+		}
+	}
+}

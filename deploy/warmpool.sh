@@ -273,11 +273,11 @@ containers:
   - /bin/bash
   - -c
   args:
-  - 'exec python3 /app/launcher.py \
+  - 'exec python3 /app/launcher.py \\
 
-    --host 0.0.0.0 \
+    --host 0.0.0.0 \\
 
-    --log-level info \
+    --log-level info \\
 
     --port=8001
 
@@ -337,26 +337,26 @@ containers:
         command:
         - python3
         - -c
-        - "import json, urllib.request\ndef post(url):\n    try:\n        urllib.request.urlopen(urllib.request.Request(url,\
-          \ method=\"POST\"), timeout=110).read()\n    except Exception as err:\n\
-          \        print(\"drain:\", url, err)\ntry:\n    raw = urllib.request.urlopen(\"\
-          http://127.0.0.1:8001/v2/vllm/instances\", timeout=5).read()\n    for inst\
-          \ in json.loads(raw).get(\"instances\", []):\n        opts = (inst.get(\"\
-          options\") or \"\").split()\n        port = next((opts[i + 1] for i, f in\
-          \ enumerate(opts) if f == \"--port\"), None)\n        if not port:\n   \
-          \         continue\n        try:\n            st = json.loads(urllib.request.urlopen(f\"\
-          http://127.0.0.1:{port}/is_sleeping\", timeout=5).read())\n        except\
-          \ Exception:\n            continue\n        if not st.get(\"is_sleeping\"\
-          , True):\n            post(f\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\"\
-          )\nexcept Exception as err:\n    print(\"drain: could not list instances:\"\
-          , err)\n"
+        - "import json, urllib.request\\ndef post(url):\\n    try:\\n        urllib.request.urlopen(urllib.request.Request(url,\\
+          \\ method=\\"POST\\"), timeout=110).read()\\n    except Exception as err:\\n\\
+          \\        print(\\"drain:\\", url, err)\\ntry:\\n    raw = urllib.request.urlopen(\\"\\
+          http://127.0.0.1:8001/v2/vllm/instances\\", timeout=5).read()\\n    for inst\\
+          \\ in json.loads(raw).get(\\"instances\\", []):\\n        opts = (inst.get(\\"\\
+          options\\") or \\"\\").split()\\n        port = next((opts[i + 1] for i, f in\\
+          \\ enumerate(opts) if f == \\"--port\\"), None)\\n        if not port:\\n   \\
+          \\         continue\\n        try:\\n            st = json.loads(urllib.request.urlopen(f\\"\\
+          http://127.0.0.1:{port}/is_sleeping\\", timeout=5).read())\\n        except\\
+          \\ Exception:\\n            continue\\n        if not st.get(\\"is_sleeping\\"\\
+          , True):\\n            post(f\\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\\"\\
+          )\\nexcept Exception as err:\\n    print(\\"drain: could not list instances:\\"\\
+          , err)\\n"
   readinessProbe:
     exec:
       command:
       - python3
       - -c
-      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
-        , timeout=3)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+      - "import sys, urllib.request\\ntry:\\n    urllib.request.urlopen(\\"http://127.0.0.1:8001/health\\"\\
+        , timeout=3)\\nexcept Exception as err:\\n    print(err); sys.exit(1)\\n"
     initialDelaySeconds: 5
     periodSeconds: 10
   livenessProbe:
@@ -364,8 +364,8 @@ containers:
       command:
       - python3
       - -c
-      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
-        , timeout=5)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+      - "import sys, urllib.request\\ntry:\\n    urllib.request.urlopen(\\"http://127.0.0.1:8001/health\\"\\
+        , timeout=5)\\nexcept Exception as err:\\n    print(err); sys.exit(1)\\n"
     initialDelaySeconds: 30
     periodSeconds: 30
     failureThreshold: 3
@@ -409,11 +409,11 @@ containers:
   - /bin/bash
   - -c
   args:
-  - 'exec python3 /app/launcher.py \
+  - 'exec python3 /app/launcher.py \\
 
-    --host 0.0.0.0 \
+    --host 0.0.0.0 \\
 
-    --log-level info \
+    --log-level info \\
 
     --port=8001
 
@@ -473,26 +473,26 @@ containers:
         command:
         - python3
         - -c
-        - "import json, urllib.request\ndef post(url):\n    try:\n        urllib.request.urlopen(urllib.request.Request(url,\
-          \ method=\"POST\"), timeout=110).read()\n    except Exception as err:\n\
-          \        print(\"drain:\", url, err)\ntry:\n    raw = urllib.request.urlopen(\"\
-          http://127.0.0.1:8001/v2/vllm/instances\", timeout=5).read()\n    for inst\
-          \ in json.loads(raw).get(\"instances\", []):\n        opts = (inst.get(\"\
-          options\") or \"\").split()\n        port = next((opts[i + 1] for i, f in\
-          \ enumerate(opts) if f == \"--port\"), None)\n        if not port:\n   \
-          \         continue\n        try:\n            st = json.loads(urllib.request.urlopen(f\"\
-          http://127.0.0.1:{port}/is_sleeping\", timeout=5).read())\n        except\
-          \ Exception:\n            continue\n        if not st.get(\"is_sleeping\"\
-          , True):\n            post(f\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\"\
-          )\nexcept Exception as err:\n    print(\"drain: could not list instances:\"\
-          , err)\n"
+        - "import json, urllib.request\\ndef post(url):\\n    try:\\n        urllib.request.urlopen(urllib.request.Request(url,\\
+          \\ method=\\"POST\\"), timeout=110).read()\\n    except Exception as err:\\n\\
+          \\        print(\\"drain:\\", url, err)\\ntry:\\n    raw = urllib.request.urlopen(\\"\\
+          http://127.0.0.1:8001/v2/vllm/instances\\", timeout=5).read()\\n    for inst\\
+          \\ in json.loads(raw).get(\\"instances\\", []):\\n        opts = (inst.get(\\"\\
+          options\\") or \\"\\").split()\\n        port = next((opts[i + 1] for i, f in\\
+          \\ enumerate(opts) if f == \\"--port\\"), None)\\n        if not port:\\n   \\
+          \\         continue\\n        try:\\n            st = json.loads(urllib.request.urlopen(f\\"\\
+          http://127.0.0.1:{port}/is_sleeping\\", timeout=5).read())\\n        except\\
+          \\ Exception:\\n            continue\\n        if not st.get(\\"is_sleeping\\"\\
+          , True):\\n            post(f\\"http://127.0.0.1:{port}/sleep?level=1&mode=wait\\"\\
+          )\\nexcept Exception as err:\\n    print(\\"drain: could not list instances:\\"\\
+          , err)\\n"
   readinessProbe:
     exec:
       command:
       - python3
       - -c
-      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
-        , timeout=3)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+      - "import sys, urllib.request\\ntry:\\n    urllib.request.urlopen(\\"http://127.0.0.1:8001/health\\"\\
+        , timeout=3)\\nexcept Exception as err:\\n    print(err); sys.exit(1)\\n"
     initialDelaySeconds: 5
     periodSeconds: 10
   livenessProbe:
@@ -500,8 +500,8 @@ containers:
       command:
       - python3
       - -c
-      - "import sys, urllib.request\ntry:\n    urllib.request.urlopen(\"http://127.0.0.1:8001/health\"\
-        , timeout=5)\nexcept Exception as err:\n    print(err); sys.exit(1)\n"
+      - "import sys, urllib.request\\ntry:\\n    urllib.request.urlopen(\\"http://127.0.0.1:8001/health\\"\\
+        , timeout=5)\\nexcept Exception as err:\\n    print(err); sys.exit(1)\\n"
     initialDelaySeconds: 30
     periodSeconds: 30
     failureThreshold: 3

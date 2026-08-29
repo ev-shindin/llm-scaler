@@ -98,14 +98,34 @@ def pod_spec(role):
 
 
 def as_yaml(role):
-    """One role's Pod spec as YAML, checked for anything the shell would eat."""
+    """One role's Pod spec as YAML, escaped for the shell that will carry it."""
     text = yaml.dump(pod_spec(role), default_flow_style=False, sort_keys=False)
 
-    # The heredoc below is UNQUOTED so the placeholders expand. Anything else the
-    # shell would treat as an expansion has to be caught here rather than
-    # discovered as a malformed manifest on a cluster. The manifest's own $ and
-    # ` live in comments, which yaml.dump drops -- this guard is for the day one
-    # moves into a value.
+    # EVERY backslash doubled, because the heredoc that carries this is unquoted.
+    #
+    # Bash reads a backslash there as an escape only before a newline, another
+    # backslash, a dollar or a backtick, and passes it through untouched
+    # elsewhere. Doubling is exactly cancelled in both cases -- `\\n` gives back
+    # `\n`, and `\<newline>` gives back `\<newline>` -- so what YAML finally
+    # parses is what was dumped here, whatever the value contains.
+    #
+    # This is not tidiness. PyYAML folds a long double-quoted scalar by ending
+    # the line with a backslash; bash ate that newline AND the next line's
+    # indentation, and the spaces landed inside a Python string literal in the
+    # preStop drain hook. It read `inst.get("          options")`, got None for
+    # every instance, and exited 0 having slept nothing -- so a pool Pod created
+    # by this script was killed with its engine awake and requests in flight,
+    # which is the one thing the hook exists to prevent. Nothing caught it: the
+    # YAML still parsed, the rendered text still matched this generator, and a
+    # drain that drains nothing is silent by construction.
+    text = text.replace("\\", "\\\\")
+
+    # The heredoc is UNQUOTED so the placeholders expand. Anything else the shell
+    # would treat as an expansion has to be caught here rather than discovered as
+    # a malformed manifest on a cluster. The manifest's own $ and ` live in
+    # comments, which yaml.dump drops -- this guard is for the day one moves into
+    # a value. Escaping cannot help: a doubled backslash before a dollar still
+    # leaves the dollar to the shell.
     scrubbed = text
     for placeholder in PLACEHOLDERS.values():
         scrubbed = scrubbed.replace(placeholder, "")

@@ -321,7 +321,10 @@ func Decide(in Input, cfg Config) Plan {
 	// Only for a variant that stated a number. Automatic mode never evicts,
 	// because it has no basis to: a model it warmed is a model it judged worth
 	// warming, and the pool holds no more than one copy of each anyway.
-	plan.Evict = evictions(in, byPod, lent)
+	// The claims made by THIS pass, not just the ones that existed before it.
+	// A Pod chosen for a borrow moments ago is about to be serving traffic, and
+	// eviction must not read it as an idle spare.
+	plan.Evict = evictions(in, byPod, lent, claimedThisPass(plan))
 
 	// 4. What the reserve will be once this plan is carried out.
 	//
@@ -380,7 +383,12 @@ func returnsFor(v VariantDemand, lent []pool.Membership, in Input, cfg Config) [
 //
 // Oldest first, so the copy released is the one least likely to be about to be
 // used.
-func evictions(in Input, byPod map[types.NamespacedName][]pool.Membership, lent map[string][]pool.Membership) []Action {
+func evictions(
+	in Input,
+	byPod map[types.NamespacedName][]pool.Membership,
+	lent map[string][]pool.Membership,
+	claimed map[types.NamespacedName]bool,
+) []Action {
 	isLent := map[types.NamespacedName]map[string]bool{}
 	for variant, ms := range lent {
 		for _, m := range ms {
@@ -399,6 +407,16 @@ func evictions(in Input, byPod map[types.NamespacedName][]pool.Membership, lent 
 		}
 		var held []pool.Membership
 		for podRef, inPod := range byPod {
+			if claimed[podRef] {
+				// Spoken for by this same plan -- a borrow that is about to wake
+				// it, or an admission about to load into it. Evicting it here
+				// would destroy the instance the borrow just activated, in the
+				// same pass, leaving the Pod labelled into an InferencePool and
+				// its proxy pointed at an engine that no longer exists. Eviction
+				// only ever releases a SPARE copy, and a Pod this plan has
+				// claimed is not spare.
+				continue
+			}
 			for _, m := range inPod {
 				if m.Model.Variant != v.Model.Variant || m.Model.Variant == "" {
 					continue
@@ -911,6 +929,17 @@ func intentReturns(
 	if len(lent[in.WantAwake]) > 0 {
 		return nil
 	}
+	// Only when the borrow that completes the switch will actually be made.
+	//
+	// This is the "sleep A" half of "sleep A, wake B", and the other half is the
+	// ordinary borrow loop, which acts on a SHORTFALL. If the chosen model is
+	// not short -- no demand entry, or its replicas already cover it -- there is
+	// no borrow to pair with, and preempting anyway would sleep the model this
+	// pool is currently serving and wake nothing in its place. The intent would
+	// have emptied the pool rather than switched it.
+	if !isShort(in, in.WantAwake, lent) {
+		return nil
+	}
 
 	var out []Action
 	for podRef, inPod := range byPod {
@@ -943,4 +972,38 @@ func intentReturns(
 		}
 	}
 	return out
+}
+
+// claimedThisPass is every Pod the plan has already decided to use.
+//
+// Returns and borrows are ordered so a returned Pod can be borrowed in the same
+// pass, which is what makes a model switch take one pass instead of two. That
+// same overlap makes the plan's own decisions invisible to anything reading only
+// the pre-pass state -- so eviction, which runs last, has to be told.
+func claimedThisPass(plan Plan) map[types.NamespacedName]bool {
+	claimed := map[types.NamespacedName]bool{}
+	for _, a := range plan.Borrow {
+		claimed[a.Pod] = true
+	}
+	for _, a := range plan.Admit {
+		claimed[a.Pod] = true
+	}
+	return claimed
+}
+
+// isShort reports whether a variant's ordinary replicas, plus what the pool has
+// already lent it, still fall short of what it wants.
+//
+// The same arithmetic the borrow loop uses, asked ahead of time. A variant with
+// no demand entry at all is not short: the pool has been told nothing about it,
+// which is not the same as being told it needs nothing, but in both cases there
+// is no borrow to be made.
+func isShort(in Input, variant string, lent map[string][]pool.Membership) bool {
+	for _, v := range in.Variants {
+		if v.Model.Variant != variant {
+			continue
+		}
+		return v.Desired-v.Ready-len(lent[variant]) > 0
+	}
+	return false
 }

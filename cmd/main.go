@@ -797,15 +797,22 @@ func main() {
 		// that declaration -- and this acts on it wherever it appears.
 		mux := &warmpool.Multiplexer{
 			Snapshot: registry.Default.Snapshot,
-			Start: func(ctx context.Context, ns string) context.CancelFunc {
+			Start: func(ctx context.Context, ns string) (context.CancelFunc, <-chan struct{}) {
 				nsCtx, cancel := context.WithCancel(ctx)
+				// Closed when this namespace's reconciler has stopped, so the
+				// Multiplexer can start it again. runWarmPool returns on its own
+				// when the RBAC review denies borrows, and without this the
+				// namespace would look permanently handled by a goroutine that
+				// had already returned.
+				done := make(chan struct{})
 				go func() {
+					defer close(done)
 					if err := runWarmPool(nsCtx, mgr, ds, ns, warmPoolGPUUtil, warmPoolSleepMinSize,
 						warmPoolMaxHold, warmPoolPreloadTop, warmPoolMemoryBudget); err != nil {
 						setupLog.Error(err, "warm pool stopped", "namespace", ns)
 					}
 				}()
-				return cancel
+				return cancel, done
 			},
 		}
 		return mux.Run(ctx)
