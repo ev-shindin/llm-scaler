@@ -1,8 +1,20 @@
 # Workload-Variant-Autoscaler (WVA)
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/llm-d/llm-d-workload-variant-autoscaler)](https://goreportcard.com/report/github.com/llm-d/llm-d-workload-variant-autoscaler)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler?ref=badge_shield)
+[![CI](https://github.com/ev-shindin/llm-scaler/actions/workflows/ci-pr-checks.yaml/badge.svg?branch=main)](https://github.com/ev-shindin/llm-scaler/actions/workflows/ci-pr-checks.yaml)
+[![Go](https://img.shields.io/github/go-mod/go-version/ev-shindin/llm-scaler)](go.mod)
+
+> **An advanced fork of [llm-d/llm-d-workload-variant-autoscaler](https://github.com/llm-d/llm-d-workload-variant-autoscaler).**
+>
+> This fork keeps WVA's core idea -- variant-aware autoscaling for LLM inference --
+> and has diverged substantially from it. The largest additions here are a **KEDA
+> external scaler**, which lets WVA answer KEDA directly over gRPC instead of
+> publishing a metric and hoping; the **ScaledObject discovery and install
+> tooling** behind `make scaledobjects-plan`, which writes an editable plan of
+> what would be autoscaled before anything is applied; and **fixture-executing
+> check suites** that run the deploy shell against recorded pod specs in CI.
+>
+> Developed independently. Not affiliated with, nor endorsed by, the llm-d project.
 
 
 The Workload Variant Autoscaler (WVA) is a Kubernetes-based global autoscaler for inference model servers serving LLMs. WVA works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments. The high-level details of the algorithms are documented [here](https://llm-d.ai/docs/architecture/advanced/autoscaling). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
@@ -126,10 +138,9 @@ Join the [llm-d autoscaling community meetings](https://llm-d.ai/slack) to get i
 Apache 2.0 - see [LICENSE](LICENSE) for details.
 
 
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler?ref=badge_large)
-
 ## Related Projects
 
+- [llm-d workload-variant-autoscaler](https://github.com/llm-d/llm-d-workload-variant-autoscaler) - the upstream project this fork derives from
 - [llm-d infrastructure](https://github.com/llm-d/llm-d-infra)
 - [llm-d main repository](https://github.com/llm-d/llm-d)
 
