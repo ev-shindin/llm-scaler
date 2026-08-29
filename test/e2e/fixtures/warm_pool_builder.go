@@ -239,6 +239,26 @@ type WarmPoolSpec struct {
 	// on, so a test about accelerator matching has to decide which node that is.
 	// Nothing else in the suite cares where a pool Pod lands.
 	NodeName string
+	// SupervisorImage replaces the emulated supervisor with a REAL launcher.
+	//
+	// Empty takes the emulator, which is what every spec on a cluster without
+	// GPUs needs: a launcher needs a device and an engine needs a much larger
+	// one. The emulator speaks the launcher's wire format and holds no model, so
+	// it can answer /sleep but has nothing to drain -- which is exactly the
+	// difference a spec about draining cannot ignore, and why one exists that
+	// sets this.
+	//
+	// Setting it also drops the script volume and the emulator's command: a real
+	// launcher is its own entrypoint.
+	SupervisorImage string
+	// CacheClaim is the RWX model cache a REAL launcher reads weights from.
+	//
+	// Only meaningful with SupervisorImage. Empty leaves the Pod without one,
+	// which is right for the emulator -- it holds no model -- and wrong for a
+	// real engine on a cluster with no route to Hugging Face: it would sit
+	// downloading nothing until the spec timed out. That is how this fixture
+	// first failed on a GPU cluster.
+	CacheClaim string
 	// Replicas defaults to 1.
 	Replicas int32
 	// GPUs each Pod requests. Zero requests none, which is what an emulated pool
@@ -280,7 +300,7 @@ func CreateWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 	if replicas == 0 {
 		replicas = 1
 	}
-	supervisor := warmPoolSupervisorContainer()
+	supervisor := warmPoolSupervisorContainerFor(spec.SupervisorImage, spec.CacheClaim)
 	if spec.GPUs > 0 {
 		// On the ENGINE container, which is where capacityOf looks: the proxy
 		// sidecar's own limits have nothing to do with how many models fit.
@@ -311,14 +331,14 @@ func CreateWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 					// no reason to hold a token of its own.
 					AutomountServiceAccountToken: ptr.To(false),
 					NodeName:                     spec.NodeName,
-					Volumes: []corev1.Volume{{
+					Volumes: append([]corev1.Volume{{
 						Name: "script",
 						VolumeSource: corev1.VolumeSource{
 							ConfigMap: &corev1.ConfigMapVolumeSource{
 								LocalObjectReference: corev1.LocalObjectReference{Name: spec.Name + warmPoolScriptSuffix},
 							},
 						},
-					}},
+					}}, poolVolumes(spec)...),
 					Containers: []corev1.Container{
 						supervisor,
 						warmPoolProxyContainer(spec.ProxyImage),
@@ -333,6 +353,81 @@ func CreateWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 		return fmt.Errorf("create warm pool deployment %s: %w", spec.Name, err)
 	}
 	return nil
+}
+
+// warmPoolSupervisorContainerFor builds the supervisor, emulated or real.
+//
+// A real launcher is its own entrypoint and mounts no script: everything the
+// emulator needs from /script it has built in. Both listen on the same port and
+// speak the same wire format, which is the point of the emulator.
+func warmPoolSupervisorContainerFor(image, cacheClaim string) corev1.Container {
+	c := warmPoolSupervisorContainer()
+	if image == "" {
+		return c
+	}
+	c.Image = image
+	c.Command = []string{"python3", "/app/launcher.py", "--host", "0.0.0.0",
+		"--port=" + strconv.Itoa(WarmPoolSupervisorPort)}
+
+	// The script mount goes: a real launcher is its own entrypoint.
+	var kept []corev1.VolumeMount
+	for _, m := range c.VolumeMounts {
+		if m.Name != "script" {
+			kept = append(kept, m)
+		}
+	}
+	kept = append(kept,
+		corev1.VolumeMount{Name: "pod-home", MountPath: "/pod-home"},
+		corev1.VolumeMount{Name: "dshm", MountPath: "/dev/shm"},
+	)
+	c.VolumeMounts = kept
+
+	// The same environment config/warmpool gives it, and for the same reasons:
+	// an arbitrary UID has no home directory, and every cache vLLM writes has to
+	// land somewhere writable. Copied rather than referenced because the fixture
+	// builds its Pod in Go and the manifest is YAML; a real launcher missing any
+	// of it fails at model load, which reads from outside as "the engine never
+	// served".
+	c.Env = append(c.Env,
+		corev1.EnvVar{Name: "HOME", Value: "/pod-home"},
+		corev1.EnvVar{Name: "PYTHONNOUSERSITE", Value: "1"},
+		corev1.EnvVar{Name: "USER", Value: "warmpool"},
+	)
+	if cacheClaim != "" {
+		c.VolumeMounts = append(c.VolumeMounts,
+			corev1.VolumeMount{Name: "model-cache", MountPath: "/model-cache"})
+		c.Env = append(c.Env,
+			corev1.EnvVar{Name: "HF_HOME", Value: "/model-cache"},
+			corev1.EnvVar{Name: "VLLM_CACHE_ROOT", Value: "/model-cache/vllm"},
+			corev1.EnvVar{Name: "FLASHINFER_WORKSPACE_DIR", Value: "/model-cache/flashinfer"},
+			corev1.EnvVar{Name: "TRITON_CACHE_DIR", Value: "/model-cache/triton"},
+			corev1.EnvVar{Name: "XDG_CACHE_HOME", Value: "/model-cache"},
+			corev1.EnvVar{Name: "XDG_CONFIG_HOME", Value: "/model-cache/config"},
+		)
+	}
+	return c
+}
+
+// realSupervisorVolumes are what a real launcher needs and the emulator does
+// not: somewhere to call home, shared memory for the engine's workers, and the
+// weights.
+func realSupervisorVolumes(cacheClaim string) []corev1.Volume {
+	shm := resource.MustParse("16Gi")
+	out := []corev1.Volume{
+		{Name: "pod-home", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "dshm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium: corev1.StorageMediumMemory, SizeLimit: &shm,
+		}}},
+	}
+	if cacheClaim != "" {
+		out = append(out, corev1.Volume{
+			Name: "model-cache",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: cacheClaim},
+			},
+		})
+	}
+	return out
 }
 
 func warmPoolSupervisorContainer() corev1.Container {
@@ -553,4 +648,13 @@ func DeleteWarmPool(ctx context.Context, clientset *kubernetes.Clientset, spec W
 // a workload's own pod spec, reduced to what the emulator reads.
 func WarmPoolInstanceOptions(model string, port int) string {
 	return fmt.Sprintf("--model %s --gpu-memory-utilization 0.95 --enable-sleep-mode --port %d", model, port)
+}
+
+// poolVolumes adds what a REAL launcher needs. The emulator needs none of it, so
+// an emulated pool is unchanged.
+func poolVolumes(spec WarmPoolSpec) []corev1.Volume {
+	if spec.SupervisorImage == "" {
+		return nil
+	}
+	return realSupervisorVolumes(spec.CacheClaim)
 }

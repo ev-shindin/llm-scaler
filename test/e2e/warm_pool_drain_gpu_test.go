@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -60,9 +61,29 @@ var _ = Describe("Warm pool - a returned Pod finishes what it was writing", Labe
 
 	// control relays a call from the driver Pod, which is the only vantage point
 	// the pool's NetworkPolicy admits for the supervisor and engine ports.
-	control := func(method, path string, port int, body string) (fixtures.PodProxyResult, error) {
-		return fixtures.DriverCall(ctx, k8sClient, cfg.LLMDNamespace, controlDriver,
-			method, fmt.Sprintf("http://%s:%d%s", podIP, port, path), body)
+	//
+	// The timeout is the caller's because the calls differ by two orders of
+	// magnitude: a status read answers immediately, a generation of several
+	// hundred tokens does not, and a sleep that DRAINS blocks until the
+	// generation it is waiting for has finished.
+	control := func(method, path string, port int, body string, timeout time.Duration) (fixtures.PodProxyResult, error) {
+		return fixtures.DriverCallTimeout(ctx, k8sClient, cfg.LLMDNamespace, controlDriver,
+			method, fmt.Sprintf("http://%s:%d%s", podIP, port, path), body, timeout)
+	}
+
+	// ok2xx insists on a REAL success.
+	//
+	// The relay reports "could not connect" as status 0 -- a NetworkPolicy
+	// denial, a closed port, a timeout -- and 0 satisfies any "< 300" bound.
+	// This spec was written with that bound and spent a run reporting that a
+	// model had been admitted when the call had never landed: the supervisor
+	// held no instance and no engine was ever spawned. The same trap is called
+	// out in the pool's other suite; it is easy to walk into twice.
+	ok2xx := func(res fixtures.PodProxyResult, err error, what string) {
+		GinkgoHelper()
+		Expect(err).NotTo(HaveOccurred(), "%s: relaying failed", what)
+		Expect(res.Status).To(And(BeNumerically(">=", 200), BeNumerically("<", 300)),
+			"%s: status %d (0 means the call never landed): %s", what, res.Status, truncateBody(res.Body))
 	}
 
 	BeforeAll(func() {
@@ -92,6 +113,15 @@ var _ = Describe("Warm pool - a returned Pod finishes what it was writing", Labe
 			ProxyImage: cfg.WarmPoolProxyImage,
 			PoolName:   drainPool,
 			GPUs:       1,
+			// The REAL launcher. Without this the fixture builds the emulated
+			// supervisor, which answers /sleep from a state flag and holds no
+			// model -- it would pass this spec while proving nothing, because it
+			// has no in-flight work to drain.
+			SupervisorImage: launcherImage(),
+			// The weights. A real engine with no cache on a cluster with no route
+			// to Hugging Face sits downloading nothing until the spec times out,
+			// which is how this first failed on pokprod.
+			CacheClaim: cacheClaim(),
 		}
 		Expect(fixtures.CreateWarmPool(ctx, k8sClient, poolSpec)).To(Succeed())
 		DeferCleanup(func() { _ = fixtures.DeleteWarmPool(context.Background(), k8sClient, poolSpec) })
@@ -119,14 +149,28 @@ var _ = Describe("Warm pool - a returned Pod finishes what it was writing", Labe
 		Eventually(func(g Gomega) {
 			res, err := control("PUT", "/v2/vllm/instances/drain-test", fixtures.WarmPoolSupervisorPort,
 				fmt.Sprintf(`{"options":%q,"env_vars":{"VLLM_SERVER_DEV_MODE":"1"}}`,
-					fixtures.WarmPoolInstanceOptions(cfg.ModelID, enginePort)))
+					fixtures.WarmPoolInstanceOptions(cfg.ModelID, enginePort)), time.Minute)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(res.Status).To(BeNumerically("<", 300), "supervisor refused the instance: %s", res.Body)
+			g.Expect(res.Status).To(And(BeNumerically(">=", 200), BeNumerically("<", 300)),
+				"supervisor refused the instance (status %d, 0 means the call never landed): %s",
+				res.Status, truncateBody(res.Body))
 		}, settle, 10*time.Second).Should(Succeed())
+
+		By("Confirming the supervisor actually holds it")
+		// The PUT returning is not the instance existing. Asserted separately
+		// because a relay that could not connect reports a status this spec
+		// once read as success, and the next thing to fail was the engine
+		// never serving -- which points at the engine rather than at the call.
+		Eventually(func(g Gomega) {
+			res, err := control("GET", "/v2/vllm/instances", fixtures.WarmPoolSupervisorPort, "", 15*time.Second)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(res.Body).To(ContainSubstring("drain-test"),
+				"the supervisor holds no instance: %s", truncateBody(res.Body))
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("Waiting for the engine to serve, which is what a borrow waits for")
 		Eventually(func(g Gomega) {
-			res, err := control("GET", "/health", enginePort, "")
+			res, err := control("GET", "/health", enginePort, "", 15*time.Second)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(res.Status).To(Equal(200))
 		}, settle, 5*time.Second).Should(Succeed())
@@ -143,7 +187,7 @@ var _ = Describe("Warm pool - a returned Pod finishes what it was writing", Labe
 			defer GinkgoRecover()
 			res, err := control("POST", "/v1/completions", enginePort,
 				fmt.Sprintf(`{"model":%q,"prompt":"Write a long story about a warm pool.","max_tokens":%d}`,
-					cfg.ModelID, longGeneration))
+					cfg.ModelID, longGeneration), 5*time.Minute)
 			done <- result{res: res, err: err}
 		}()
 
@@ -151,9 +195,10 @@ var _ = Describe("Warm pool - a returned Pod finishes what it was writing", Labe
 		time.Sleep(underway)
 
 		By("Sleeping the engine underneath it, exactly as returning a bridge does")
-		slept, err := control("POST", "/sleep?level=1&mode=wait", enginePort, "")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(slept.Status).To(Equal(200), "sleep refused: %s", slept.Body)
+		// The sleep BLOCKS while the engine drains, so it needs a window at
+		// least as long as the generation it is waiting for.
+		slept, err := control("POST", "/sleep?level=1&mode=wait", enginePort, "", 5*time.Minute)
+		ok2xx(slept, err, "sleep")
 
 		By("Reading the response that was in flight")
 		var got result
@@ -187,7 +232,7 @@ var _ = Describe("Warm pool - a returned Pod finishes what it was writing", Labe
 		// stayed awake would satisfy the assertion above while still holding its
 		// GPU -- the pool would be paying for capacity it believes it released.
 		Eventually(func(g Gomega) {
-			res, err := control("GET", "/is_sleeping", enginePort, "")
+			res, err := control("GET", "/is_sleeping", enginePort, "", 15*time.Second)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(res.Body).To(ContainSubstring(`"is_sleeping":true`),
 				"the engine drained but never slept: %s", res.Body)
@@ -203,4 +248,23 @@ func truncateBody(s string) string {
 		return s
 	}
 	return strings.TrimSpace(s[:max]) + "..."
+}
+
+// launcherImage is the supervisor this spec needs: a real launcher, not the
+// emulator. Overridable because the fix it depends on -- routing a follower rank
+// to the headless executor, and more importantly a launcher that runs a real
+// engine at all -- ships in a build the operator names.
+func launcherImage() string {
+	if img := os.Getenv("WVA_E2E_LAUNCHER_IMAGE"); img != "" {
+		return img
+	}
+	return "ghcr.io/llm-d-incubation/llm-d-fast-model-actuation/launcher:v0.6.4"
+}
+
+// cacheClaim names the RWX model cache the engine reads weights from.
+func cacheClaim() string {
+	if c := os.Getenv("WVA_E2E_CACHE_CLAIM"); c != "" {
+		return c
+	}
+	return "model-pvc"
 }

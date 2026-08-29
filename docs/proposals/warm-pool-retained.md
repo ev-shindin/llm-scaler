@@ -70,6 +70,80 @@ serves, and the pool's value is entirely in the model that is awake. A retained
 pool should keep one model awake by default and treat "all asleep" as a
 transient, not a resting state.
 
+## When a Pod goes back: two different rules
+
+A bridge and a retained pool answer this differently, and conflating them was the
+first thing this design got wrong.
+
+**A bridge sleeps at `min(the replica is really serving, warmPoolMaxHold)`.**
+`warmPoolMaxHold` is not a lease on the Pod -- it is *how long to wait for the
+ordinary replica*, after which the pool gives up on one that is not coming.
+
+The first term is weaker in the code than in that sentence. The return rule reads
+`Status.ReadyReplicas`, the kubelet's probe, where what matters is a replica
+*serving*: taking requests and reporting metrics WVA can see. A replica that is
+Ready but not yet producing metrics is one the pool has handed traffic back to on
+the strength of a probe. Counting replicas that are Ready **and** reporting is a
+narrow change -- the collector already reads per-Pod metrics -- and it is the
+difference between "Kubernetes says it is up" and "it is doing the work".
+
+**A retained pool has no such timeout.** Nothing is coming to relieve it, so
+there is nothing to wait for and nothing to give up on. `warmPoolRetained: "true"`
+turns the timeout off, and that is built. What still returns a Pod is the variant
+no longer wanting it -- retained removes the timer, not the accounting, or the
+second model would never get a turn.
+
+### Where the switch signal comes from -- DECIDED
+
+Something has to say *sleep this one and wake that one*. **It is WVA's own
+signal, produced by the engine/optimizer and carried internally** -- not an
+annotation, not a CRD field, not an operator action. The component that already
+weighs demand against capacity is the one that knows a switch is worth making.
+
+That settles the shape without settling the logic, which is the right order: the
+decision rule needs the probability term this document keeps returning to, and
+nothing about the transport depends on it. What the shape has to provide:
+
+- **It names both sides.** Sleep A *and* wake B, decided together. A signal that
+  only says "wake B" leaves the pool to work out what to displace -- the same
+  judgement made twice, in two places, from different information.
+- **It is a decision, not a wish.** The optimizer says what should be awake; the
+  pool actuates it and reports what happened. If the pool may overrule it, the
+  model that ends up awake is whichever component ran last.
+- **It is idempotent and re-derivable.** A pool reconciles every few seconds, so
+  "B should be awake" must mean the same thing on the tenth pass as the first,
+  and must survive a controller restart by being recomputed rather than
+  remembered.
+
+The natural carrier is the decision store the pool already reads -- the same
+place a borrow learns a variant is short. Recording what should be AWAKE beside
+what is DESIRED keeps one component deciding and one acting, and puts the new
+fact where the pool already looks.
+
+Deliberately open: what makes the optimizer emit it. That is the cost model, and
+guessing at it would move GPUs on a rule nobody wrote down.
+
+## Graceful termination, at parity with regular replicas
+
+A regular model server gets a drain patch from `make workload-patch`:
+
+```yaml
+preStop: exec: command: ["/bin/sh", "-c", "sleep ${WVA_DRAIN_SLEEP_SECONDS:-45}"]
+terminationGracePeriodSeconds: <grace>
+```
+
+A fixed sleep covering two things at once: the endpoint's removal propagating
+through kube-proxy and the EPP, and whatever is in flight finishing.
+
+A pool Pod now has the same coverage and does the second half properly rather
+than by guessing a duration -- its preStop asks every awake engine to sleep with
+`mode=wait`, which finishes what is running and only then stops. The first half
+needs no cover: a Pod with a deletion timestamp has already left its
+EndpointSlice, so nothing new is arriving.
+
+One honest gap remains, and it is the same for both: the grace period is the real
+bound. 120 seconds here, after which SIGKILL cuts whatever is left.
+
 ## The three decisions, which are not one decision
 
 The current policy has exactly one of these, and only in a hand-driven form.
@@ -137,9 +211,10 @@ What NOT to do meanwhile, for the avoidance of re-litigating:
    itself on `mode=wait`, and a pool Pod drains before it dies.
 2. ~~Turn off the hold timeout for a retained pool~~ — **done**, via
    `warmPoolRetained: "true"`.
-3. **An explicit switch signal**: sleep this model, wake that one. The demand-led
-   swap already works once the first model stops being wanted; a retained pool
-   needs one that does not wait for that, because nothing is going to relieve it.
+3. **An explicit switch signal**: sleep this model, wake that one. Settled as a
+   WVA-internal signal from the engine/optimizer, carried through the decision
+   store the pool already reads -- see above. The decision RULE stays open; the
+   transport does not depend on it.
 4. **Return on SERVING, not on Ready.** The bridge rule reads
    `Status.ReadyReplicas`, the kubelet's probe. What matters is a replica taking
    requests and reporting metrics. The collector already reads per-Pod metrics,
@@ -152,3 +227,64 @@ What NOT to do meanwhile, for the avoidance of re-litigating:
    soon -- which is what eviction and any demand-led switch are missing.
 6. **Placement rules**, once there is a demand signal to place against. The two
    structural rules above can be enforced before that; the counts cannot.
+
+## Two lines of work with measurements already behind them
+
+Both make a switch cheaper still, both were investigated on this branch, and
+neither is finished. The point of this section is that the earlier work should be
+picked up rather than repeated.
+
+### Switching a P/D pair
+
+A disaggregated model is two engines, prefill and decode, and switching one
+without the other serves nothing. The pool has no notion of a pair: it holds
+models, and a P/D variant is two of them that must sleep and wake together.
+
+**What is already known**, from `test/experiments/pd-role-swap/` (measured
+2026-08-27 on Qwen3-8B): the difference between the two roles is *two scheduler
+fields* -- `max_num_batched_tokens` and `max_num_seqs` -- each cached at init
+into `max_num_scheduled_tokens` and `max_num_running_reqs`, and bounded above by
+what the engine launched with. llm-d gives both roles the same `vllmCommon` and
+the same `kv_role: kv_both`, so nothing else distinguishes them.
+
+That matters here because KV geometry must NOT change: llm-d requires prefill and
+decode to agree on layout, page size, dtype and attention variant, which is what
+makes the NixlConnector handoff work. A swap has to preserve geometry rather than
+reconfigure it -- and since geometry follows the model, it already does.
+
+So the vLLM-side change is small and scoped: making those two fields settable
+after init, and the pair's sleep and wake atomic enough that nothing is routed to
+a half-awake pair. Scope it against vLLM before planning it; it is the one item
+here that is not purely a WVA change.
+
+### Filling a Pod from a sibling replica
+
+Waking from level 1 costs 0.36 s because the process still holds its weights. The
+expensive case is the one before it: getting weights into a Pod that has none,
+which is the 300-second load a retained pool exists to avoid paying twice.
+
+**This was measured, and it works** -- see
+[warm-pool-weight-transfer.md](warm-pool-weight-transfer.md), reproduction in
+`test/experiments/weight-transfer/`. On pokprod, Qwen3-0.6B, two H100s: a peer
+broadcast filled a level-2 sleeper with **1.40 GiB in 0.11 s (13.1 GB/s)**
+against **999 ms** for `reload_weights` from storage, and the refilled engine
+produced byte-identical output. It works on a plain scale-up too, with no pool at
+all: a replica started `--load-format dummy` serves nonsense until the broadcast
+makes it correct, which removes the weight-read term from a cold start while
+holding no extra accelerator.
+
+Three prerequisites are already written down there, each of which cost a cycle to
+find -- the receiver must be STARTED with `--weight-transfer-config
+'{"backend":"nccl"}'`, the sender must drive the NCCL engine directly because
+`WeightTransferTrainerFactory` registers none in v0.26.0, and the two halves must
+overlap or they deadlock.
+
+**Why it stopped, and what would restart it.** The interconnect here is the
+limit: this cluster's fabric is slow enough that the transport half cannot be
+measured honestly, and the whole question is whether it stays fast at 70B+ scale.
+That needs a cluster with RDMA. Nothing about this should be designed from the
+numbers this one produces.
+
+P/D is the natural pairing for it, and that is not a coincidence: a P/D
+deployment guarantees a peer holding the *same* weights, which is the hard part
+of choosing a sender.

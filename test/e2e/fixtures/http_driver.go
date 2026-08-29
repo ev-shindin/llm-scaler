@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -183,7 +184,30 @@ func DriverCall(
 	namespace, driver string,
 	method, url, body string,
 ) (PodProxyResult, error) {
-	call, err := json.Marshal(map[string]any{"method": method, "url": url, "body": body})
+	return DriverCallTimeout(ctx, clientset, namespace, driver, method, url, body, 0)
+}
+
+// DriverCallTimeout is DriverCall with a relay timeout of its own.
+//
+// The relay defaults to ten seconds, which is right for the control calls this
+// suite is mostly made of and wrong for two things a warm pool does: a
+// generation of several hundred tokens, and a sleep that DRAINS -- both block
+// for as long as the work takes. Zero keeps the default.
+//
+// Worth having rather than raising the default: a control call that hangs should
+// fail quickly and loudly, and only the caller knows which kind it is making.
+func DriverCallTimeout(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	namespace, driver string,
+	method, url, body string,
+	timeout time.Duration,
+) (PodProxyResult, error) {
+	request := map[string]any{"method": method, "url": url, "body": body}
+	if timeout > 0 {
+		request["timeout"] = timeout.Seconds()
+	}
+	call, err := json.Marshal(request)
 	if err != nil {
 		return PodProxyResult{}, fmt.Errorf("encode relay request: %w", err)
 	}
