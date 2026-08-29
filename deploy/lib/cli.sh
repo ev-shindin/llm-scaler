@@ -72,6 +72,18 @@ Environment Variables:
   DASHBOARD_NS                 Namespace to publish the dashboard into (default: MONITORING_NAMESPACE)
   MONITORING_NAMESPACE         Namespace for the monitoring stack
 
+ Warm pool
+  WARMPOOL_PROXY_IMG           Required to create any pool. The pool Pod runs a proxy image this
+                               repo builds: make docker-build-warmpool-proxy docker-push-warmpool-proxy
+  WARMPOOL_RUNTIME_CLASS       RuntimeClass for pool Pods (default: nvidia-legacy), or "none".
+                               Cluster-specific: a name the cluster does not have fails admission,
+                               and omitting one it needs gives containers with no GPU
+                               (MONITORING_NAMESPACE above is reused to scrape lent pool Pods.
+                               Without a scrape, a model reads as having LESS demand than it has
+                               while a pool Pod is covering for it.)
+                               Pools are only created for plan entries marked apply: yes; see
+                               docs/guides/warm-pool/README.md
+
  Scaler backend and CRDs
   SCALER_BACKEND               keda (default) or none. WVA needs KEDA to actuate.
   KEDA_HELM_INSTALL            Install KEDA via Helm on kubernetes (default: false — assumes cluster KEDA)

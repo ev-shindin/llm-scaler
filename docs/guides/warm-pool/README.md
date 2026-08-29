@@ -122,7 +122,51 @@ could share one pool, and prints a `create` line for each group. It also names
 models that select a pool nobody declared, which is worse than selecting none
 because it reads as configured.
 
-## Turning it on
+## Turning it on during installation
+
+The installer can create pools for you, as part of the same pass that creates
+ScaledObjects. It never does so by default: a pool holds its accelerators from
+the moment it exists, which is a cost decision, so it acts only on an explicit
+yes.
+
+```bash
+WVA_DEFAULT_SO=edit WARMPOOL_PROXY_IMG=<your proxy image>   deploy/install.sh
+```
+
+`WVA_DEFAULT_SO=edit` discovers what is running, writes a plan, and opens it in
+`$EDITOR`. Near the bottom is a `warmPools:` section — one suggestion per group
+of models that could share a pool, every one of them `apply: no`:
+
+```yaml
+warmPools:
+  - namespace: my-models
+    name: h100
+    accelerator: NVIDIA-H100-80GB-HBM3
+    gpus: 1
+    models: 4
+    modelSize: 8B
+    replicas: 2
+    max: 6
+    reserve: 1
+    apply: no        # <- change to yes for the pools you want
+```
+
+Change the ones you want to `yes` and save. Pools are created **after** the
+ScaledObjects, because a pool nothing can borrow from is accelerators held for
+nothing.
+
+Three values the plan cannot know, and where they come from:
+
+| value | where it comes from | if it is missing |
+| --- | --- | --- |
+| `WARMPOOL_PROXY_IMG` | you build it: `make docker-build-warmpool-proxy docker-push-warmpool-proxy` | no pools are created, and the installer says so |
+| `MONITORING_NAMESPACE` | the install already has it — where it put the monitoring stack | the pool is created **unscraped**: it works, and every model it lends to reads as having less demand than it has |
+| `WARMPOOL_RUNTIME_CLASS` | your GPU operator, if it installed one (default `nvidia-legacy`; `none` if it installed none) | `create` refuses rather than making Pods that all fail admission |
+
+`WVA_DEFAULT_SO=plan` writes the plan and stops, if you would rather edit it and
+apply later with `WVA_DEFAULT_SO_PLAN=<file>`.
+
+## Creating a pool by hand
 
 The two objects a pool is made of — the Deployment and its ScaledObject — are
 only meaningful together, so there is one command that makes both:
@@ -190,6 +234,67 @@ kubectl apply -k config/warmpool -n <namespace>
 
 `deploy/warmpool.sh create` renders and applies the same two objects, which is
 why the edits above do not arise on that path: it takes them as flags.
+
+## Adding and removing a pool later
+
+Pools are ordinary day-2 objects. Nothing about adding or removing one needs the
+controller restarted: it discovers pools from the ScaledObjects that declare
+them, on its next pass.
+
+**What exists now**
+
+```bash
+deploy/warmpool.sh plan -n <namespace>       # what this namespace wants, from its triggers
+kubectl get deploy,scaledobject,networkpolicy,podmonitor -n <namespace> -l app.kubernetes.io/component=warm-pool
+```
+
+**Add one**
+
+```bash
+deploy/warmpool.sh create -n <namespace> --name <pool>   --accelerator NVIDIA-H100-80GB-HBM3 --gpus 1   --models 4 --model-size 8B   --proxy-image <your image> --wva-namespace <where WVA runs>   --monitoring-namespace <where Prometheus runs>
+```
+
+Then point models at it, in each one's ScaledObject trigger metadata:
+
+```yaml
+warmPool: <pool>       # which pool this variant may borrow from
+warmPoolCopies: "1"    # optional: how many copies of THIS model to keep warm
+```
+
+A model with no `warmPool` uses the namespace's only pool, if there is exactly
+one. Adding or removing that line is the whole of joining or leaving a pool —
+there is nothing to restart, and the next reconcile acts on it.
+
+**Remove one**
+
+```bash
+deploy/warmpool.sh delete -n <namespace> --name <pool>
+```
+
+That removes all four objects together — ScaledObject first so WVA stops lending
+Pods that are about to disappear, then the workload, then the NetworkPolicy and
+PodMonitor. Pass `--dry-run` to see what it would remove.
+
+Remove the `warmPool:` line from any model still naming it, or WVA will report a
+variant pointed at a pool that does not exist. The models keep serving either
+way; what they lose is the bridge, so their next scale-up pays a full cold start.
+
+> **Do not delete only the ScaledObject.** It is what *declares* the pool. What
+> is left is a Deployment holding accelerators that WVA reports as undeclared and
+> will never use again. To pin a pool's size instead, set `minReplicaCount` equal
+> to `maxReplicaCount` and leave the ScaledObject in place.
+
+**Resize one**
+
+Re-run `create` with different `--replicas`/`--max`/`--reserve`; it is an
+`apply`, so the objects are updated in place. Changing `--models`/`--model-size`
+changes the Pod's memory limit, which **rolls the pool** and reloads every
+resident model — cheap to say and expensive to do, so decide the warm-set budget
+before you fill it.
+
+Changing the pool's KIND — a single-Pod pool to a group pool or back — is
+refused, because `kubectl apply` would leave the old workload running and holding
+its GPUs where nothing would look for it again. Delete the pool first.
 
 ## The pool is its ScaledObject
 

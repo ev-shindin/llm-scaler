@@ -266,6 +266,22 @@ printf '%s
 printf '%s
 ' "$POOL" | grep -q 'kubernetes.io/metadata.name: observability'   && fail "a monitoring namespace was admitted though none was named"   || ok "no monitoring peer without a monitoring namespace"
 
+# --- the RuntimeClass ------------------------------------------------------
+# Cluster-specific and wrong in both directions: a name the cluster does not have
+# fails ADMISSION, so the Deployment exists and no Pod ever appears; omitting one
+# the cluster requires gives containers with no GPU access, which fails later and
+# far more quietly. It was baked in with no way to change it, which meant every
+# pool this script created named one cluster's RuntimeClass.
+printf '%s
+' "$POOL" | grep -q 'runtimeClassName:'   && ok "a pool names a RuntimeClass by default"   || fail "no runtimeClassName: on a cluster whose GPU operator installs one, the containers get no GPU"
+
+NORC="$(render --runtime-class none)"
+printf '%s
+' "$NORC" | grep -q 'runtimeClassName:'   && fail "--runtime-class none still names one, so a cluster without a RuntimeClass cannot create this pool"   || ok "--runtime-class none omits the key entirely"
+
+printf '%s
+' "$(render --runtime-class nvidia)" | grep -q 'runtimeClassName: nvidia$'   && ok "--runtime-class names the one given"   || fail "--runtime-class did not reach the Pod spec"
+
 # The SHIPPED manifests name no monitoring namespace at all.
 #
 # Only the install knows where Prometheus runs, and it passes it -- see

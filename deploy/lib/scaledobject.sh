@@ -2362,6 +2362,11 @@ so_apply_warmpools() {
             log_warning "  warm pool $wp_name: no accelerator, so it was not created."
             continue
         fi
+        # The GPU RuntimeClass, which only the cluster knows. The default is
+        # the name one cluster's GPU operator installed; set
+        # WARMPOOL_RUNTIME_CLASS=none where none is needed. warmpool.sh refuses
+        # a name the cluster does not have rather than creating a Deployment
+        # whose Pods all fail admission.
         # Where Prometheus runs, so a LENT pool Pod is scraped. The install
         # already owns this namespace -- it is where it put the monitoring stack
         # -- and a pool Pod serving a model traffic unscraped makes that model
@@ -2373,7 +2378,8 @@ so_apply_warmpools() {
                 --accelerator "$wp_acc" --models "$wp_models" --model-size "$wp_size" \
                 --replicas "$wp_replicas" --max "$wp_max" --reserve "$wp_reserve" \
                 --proxy-image "$image" --wva-namespace "$WVA_NS" \
-                --monitoring-namespace "${MONITORING_NAMESPACE:-}"; then
+                --monitoring-namespace "${MONITORING_NAMESPACE:-}" \
+                --runtime-class "${WARMPOOL_RUNTIME_CLASS:-nvidia-legacy}"; then
             made=$((made + 1))
         else
             log_warning "  warm pool $wp_name: could not be created."

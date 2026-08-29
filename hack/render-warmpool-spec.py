@@ -94,6 +94,11 @@ def pod_spec(role):
     # Removed here and re-added by the shell, because it is conditional: an
     # accelerator nobody named must add no key at all, not an empty one.
     spec.pop("nodeSelector", None)
+    # Same treatment, and for a stronger reason: a RuntimeClass that does not
+    # exist on the cluster fails ADMISSION, so the Pod is never created at all.
+    # The name is whatever that cluster's GPU operator installed, if it installed
+    # one, so it cannot be a constant here either.
+    spec.pop("runtimeClassName", None)
     return spec
 
 
@@ -159,18 +164,29 @@ def render():
         '    WP_NODE_SELECTOR="nodeSelector:',
         "  nvidia.com/gpu.product: ${ACCELERATOR}\"",
         "  fi",
+        "",
+        "  # Conditional for the same reason and with more at stake: naming a",
+        "  # RuntimeClass the cluster does not have fails ADMISSION, so the Pod is",
+        "  # never created -- and omitting one the cluster DOES require gives a",
+        "  # container with no GPU access, which fails later and much more quietly.",
+        '  local WP_RUNTIME_CLASS=""',
+        '  if [ -n "$RUNTIME_CLASS" ]; then',
+        '    WP_RUNTIME_CLASS="runtimeClassName: ${RUNTIME_CLASS}"',
+        "  fi",
         '  local WP_MEMORY="$memory"',
         "",
         "  local out",
         '  if [ "$role" = "worker" ]; then',
         "    out=$(cat <<YAML",
         "${WP_NODE_SELECTOR}",
+        "${WP_RUNTIME_CLASS}",
         as_yaml("worker"),
         "YAML",
         "    )",
         "  else",
         "    out=$(cat <<YAML",
         "${WP_NODE_SELECTOR}",
+        "${WP_RUNTIME_CLASS}",
         as_yaml("leader"),
         "YAML",
         "    )",

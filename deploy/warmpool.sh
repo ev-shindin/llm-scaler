@@ -46,6 +46,14 @@ WVA_NAMESPACE=""
 # to it. Guessing a namespace would be worse -- a rule admitting the wrong one
 # reads as monitoring that is configured.
 MONITORING_NAMESPACE=""
+# The RuntimeClass the GPU operator installed, if it installed one. CLUSTER
+# SPECIFIC, and wrong in either direction is a failure: naming one the cluster
+# does not have fails ADMISSION, so the Pods are never created; omitting one it
+# requires gives containers with no GPU access, which fails later and far more
+# quietly. So the default is the value the manifests carry, and create REFUSES
+# if the cluster has no such RuntimeClass rather than producing Pods that cannot
+# schedule. Pass --runtime-class none to omit it.
+RUNTIME_CLASS="nvidia-legacy"
 CACHE_CLAIM="model-pvc"
 APPLY=1
 # On by DEFAULT. The only cluster-specific value the shipped policy needs is the
@@ -86,6 +94,10 @@ create options:
   --reserve N          warmPoolSleepMinSize. Default: 1
   --proxy-image REF    the warm-pool image you built
   --wva-namespace NS   where WVA runs, for scalerAddress
+  --runtime-class NAME the RuntimeClass for the pool Pods (default nvidia-legacy),
+                       or `none` to set none. Cluster-specific: a name the
+                       cluster does not have fails admission outright, and
+                       omitting one it needs gives containers with no GPU
   --monitoring-namespace NS
                        where Prometheus runs. Creates a PodMonitor for the pool
                        and admits that namespace to the serving port, so a LENT
@@ -266,6 +278,20 @@ $(warmpool_podmonitor)"
     return 0
   fi
 
+  # The RuntimeClass has to EXIST. Naming one the cluster does not have fails
+  # admission, so the Deployment is created, reports nothing useful, and no Pod
+  # ever appears -- which reads as a scheduling problem rather than as a name
+  # that was wrong from the start. The default is the name ONE cluster's GPU
+  # operator installed, so this is the flag most likely to be wrong on a cluster
+  # nobody has run this on yet.
+  #
+  # Checked rather than guessed away: --runtime-class none is how you say the
+  # cluster needs none, and that is a different statement from not having thought
+  # about it.
+  if [ -n "$RUNTIME_CLASS" ] && ! kubectl get runtimeclass "$RUNTIME_CLASS" >/dev/null 2>&1; then
+    log_error "no RuntimeClass '${RUNTIME_CLASS}' on this cluster, so every pool Pod would fail admission and none would ever be created. Name the one your GPU operator installed with --runtime-class, or pass --runtime-class none if it installed none. Available: $(kubectl get runtimeclass -o name 2>/dev/null | tr '\n' ' ')"
+  fi
+
   printf '%s\n' "$manifest" | kubectl apply -f - >/dev/null
   log_success "Pool '${POOL_NAME}' created in ${NAMESPACE}: ${POOL_REPLICAS} Pods (max ${POOL_MAX}), reserve ${RESERVE}, ${GPUS_PER_POD} GPU each, ${memory} per Pod"
   log_info "Models join it with:  warmPool: ${POOL_NAME}   in their ScaledObject trigger metadata"
@@ -298,12 +324,22 @@ pool_pod_spec() {
     WP_NODE_SELECTOR="nodeSelector:
   nvidia.com/gpu.product: ${ACCELERATOR}"
   fi
+
+  # Conditional for the same reason and with more at stake: naming a
+  # RuntimeClass the cluster does not have fails ADMISSION, so the Pod is
+  # never created -- and omitting one the cluster DOES require gives a
+  # container with no GPU access, which fails later and much more quietly.
+  local WP_RUNTIME_CLASS=""
+  if [ -n "$RUNTIME_CLASS" ]; then
+    WP_RUNTIME_CLASS="runtimeClassName: ${RUNTIME_CLASS}"
+  fi
   local WP_MEMORY="$memory"
 
   local out
   if [ "$role" = "worker" ]; then
     out=$(cat <<YAML
 ${WP_NODE_SELECTOR}
+${WP_RUNTIME_CLASS}
 automountServiceAccountToken: false
 securityContext:
   runAsNonRoot: true
@@ -323,7 +359,6 @@ tolerations:
 - key: nvidia.com/gpu
   operator: Exists
   effect: NoSchedule
-runtimeClassName: nvidia-legacy
 terminationGracePeriodSeconds: 120
 containers:
 - name: inference-server
@@ -449,6 +484,7 @@ YAML
   else
     out=$(cat <<YAML
 ${WP_NODE_SELECTOR}
+${WP_RUNTIME_CLASS}
 automountServiceAccountToken: false
 securityContext:
   runAsNonRoot: true
@@ -468,7 +504,6 @@ tolerations:
 - key: nvidia.com/gpu
   operator: Exists
   effect: NoSchedule
-runtimeClassName: nvidia-legacy
 terminationGracePeriodSeconds: 120
 containers:
 - name: inference-server
@@ -998,6 +1033,11 @@ while [ $# -gt 0 ]; do
     --proxy-image)   PROXY_IMAGE="$2"; shift 2 ;;
     --wva-namespace) WVA_NAMESPACE="$2"; shift 2 ;;
     --monitoring-namespace) MONITORING_NAMESPACE="$2"; shift 2 ;;
+    --runtime-class)
+      # `none` omits the key. An empty string would too, but spelling it makes
+      # the intent unmistakable in a script somebody reads later.
+      if [ "$2" = "none" ]; then RUNTIME_CLASS=""; else RUNTIME_CLASS="$2"; fi
+      shift 2 ;;
     --cache-claim)   CACHE_CLAIM="$2"; shift 2 ;;
     --dry-run)       APPLY=0; shift ;;
     --launcher-image) LAUNCHER_IMAGE="$2"; shift 2 ;;
