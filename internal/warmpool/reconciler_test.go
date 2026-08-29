@@ -30,7 +30,10 @@ type fakePool struct {
 	// recorded so the hold timeout can reclaim the Pod.
 	deactivateErr error
 	warmDelay     time.Duration
-	warmStarted   chan struct{}
+	// warmErr fails every admission, for the question of whether a pool that
+	// cannot load a model keeps trying.
+	warmErr     error
+	warmStarted chan struct{}
 	// activated keeps the WHOLE ModelRef, because a reconciler forwarding an
 	// incomplete one (no PoolLabels, no EngineOptions) is refused deep in the
 	// adapter, where a name-only record would not notice.
@@ -59,7 +62,7 @@ func (f *fakePool) Warm(ctx context.Context, p types.NamespacedName, m pool.Mode
 			return ctx.Err()
 		}
 	}
-	return nil
+	return f.warmErr
 }
 
 func (f *fakePool) Activate(_ context.Context, p types.NamespacedName, m pool.ModelRef) (pool.Endpoint, error) {
