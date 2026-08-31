@@ -9,7 +9,9 @@
 > This fork keeps WVA's core idea -- variant-aware autoscaling for LLM inference --
 > and has diverged substantially from it. The largest additions here are a **KEDA
 > external scaler**, which lets WVA answer KEDA directly over gRPC instead of
-> publishing a metric and hoping; the **ScaledObject discovery and install
+> publishing a metric and hoping; a **warm pool** that bridges a slow scale-up
+> by lending a Pod with the model already loaded and asleep, so the variant
+> serves while its own replica starts; the **ScaledObject discovery and install
 > tooling** behind `make scaledobjects-plan`, which writes an editable plan of
 > what would be autoscaled before anything is applied; and **fixture-executing
 > check suites** that run the deploy shell against recorded pod specs in CI.
@@ -33,6 +35,7 @@ Use cases include:
 
 - **Intelligent Autoscaling**: Optimizes replica count by observing the current state of the system
 - **Cost Optimization**: Minimizes infrastructure costs by picking the correct accelerator variant
+- **Warm-Pool Bridging**: Optionally holds models loaded and asleep, and lends one to a variant while its own replica starts
 
 ## Installing
 
@@ -64,6 +67,7 @@ it is running and idle.
 | Running it day to day | [operations.md](docs/deployment/operations.md) |
 | Watching what it decides | [monitoring.md](docs/deployment/monitoring.md) |
 | Making a workload scalable | [workload-preparation.md](docs/deployment/workload-preparation.md) |
+| Bridging a slow scale-up | [warm-pool/](docs/guides/warm-pool/) — opt-in; a pool holds accelerators |
 
 ## Documentation
 
