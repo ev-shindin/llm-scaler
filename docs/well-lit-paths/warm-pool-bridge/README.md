@@ -36,6 +36,49 @@ you.
 images, the NetworkPolicy, and how the pool is declared. The pool is an ordinary
 Deployment; its knobs are annotations on it.
 
+## Several models in one pool
+
+One pool holds many models, and that is the normal case rather than an advanced
+one. Three decisions come with it:
+
+**Which models can share a pool.** A pool serves exactly one
+**(accelerator, GPUs-per-replica)** shape, because neither is negotiable at run
+time. Every other difference between models — size, traffic, policy — a pool
+absorbs. Two GPU models on the cluster means two pools.
+
+```bash
+deploy/warmpool.sh plan -n <namespace>
+```
+
+`plan` groups the namespace's model ScaledObjects by that pair, says which could
+share a pool, and names models that select a pool nobody declared — worse than
+selecting none, because it reads as configured.
+
+**How many fit in one Pod.** The pod template's memory limit is the warm-set
+budget, not a safety margin: a level-1 sleeper's weights are charged to the
+cgroup in shared memory. Measured on an H100, a resident model costs roughly
+2.6 GiB + 1.4x its weights, so a 128Gi Pod holds about five 8B models and hits
+the hard ceiling of 16 instances long before memory on anything smaller than
+about 3B. Overcommitting does not fail politely: it OOM-kills the launcher and
+takes **every model already resident in that Pod** with it. Changing the limit
+rolls the pool, so size it at deploy time.
+
+**Which of them stay warm.** By default the pool ranks: parked models first,
+then the busiest, then anything that has missed twice — right for almost
+everything. Two things it cannot infer are set per model in the ScaledObject
+trigger:
+
+| `warmPoolCopies` | means |
+| --- | --- |
+| *absent* | automatic — the pool ranks it and holds at most one copy |
+| `"0"` | never warm this model, and release it if it already is |
+| `"1"` | always keep one warm, whatever the ranking thinks |
+| `"N"` | keep N warm, so N scale-ups of this model can bridge at once |
+
+If your models are too large for ordinary replicas to arrive at all, the pool
+stops being a bridge and becomes the capacity itself — that is
+[the retained pool path](../retained-pool/).
+
 ## Verifying it
 
 ```bash
