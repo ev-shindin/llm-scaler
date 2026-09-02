@@ -25,6 +25,8 @@ The Workload Variant Autoscaler (WVA) is a Kubernetes-based global autoscaler fo
 
 WVA introduces the concept of **variants** — multiple model servers in an InferencePool that all serve the same base model but differ in hardware configuration (e.g., GPU type), serving configuration (e.g., tensor parallelism, max batch size, quantization), or both.
 
+Concretely, **a variant is a scaling entity: one KEDA ScaledObject and the workload it scales.** That is the unit WVA discovers, decides for, and reports on — a Pod's variant is the managed scaler its `ownerReferences` lead to, not a label anyone stamps. Variants whose triggers name the same `modelID` are variants of one model, and WVA scales the group rather than each ScaledObject alone. Creating a variant therefore means creating a ScaledObject; there is no other registration.
+
 Use cases include:
 
 - **P/D disaggregation**: prefill is one variant, decode is another — variant = role in a disaggregated pipeline.

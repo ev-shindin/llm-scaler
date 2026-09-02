@@ -12,7 +12,7 @@ WVA uses modeling, benchmarking, and optimization to find the best possible solu
 
 - An **accelerator arrangement** consists of one or more accelerators in parallel (tensor or pipeline parallelism) assigned to a model server.
 
-- A **variant** is a collection of model servers (variant instances or **replicas**) serving a given model, using the same accelerator arrangement.
+- A **variant** is a collection of model servers (variant instances or **replicas**) serving a given model, using the same accelerator arrangement. In the running system it is exactly one KEDA ScaledObject and the workload it scales: variant identity is the managed scaler a replica's `ownerReferences` lead to, and the variant's name is that scaler's name.
 
 - A **model-arrangement performance profile** captures performance characteristics when serving a given model on a given accelerator arrangement. The profile includes:
 

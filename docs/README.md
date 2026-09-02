@@ -4,6 +4,12 @@ WVA decides how many replicas of each model variant should run, and drives KEDA
 to make it so. It reads what your inference engines are doing, computes a target
 per model each cycle, and answers KEDA's external scaler with it.
 
+Three words, used throughout: a **model** is what a client asks for by name; a
+**variant** is one way of serving it — concretely one KEDA ScaledObject and the
+workload it scales, which is the unit WVA decides for; a **replica** is one Pod
+of a variant. Variants whose triggers name the same `modelID` are variants of
+one model, and are scaled as a group.
+
 | You want to | Start here |
 | --- | --- |
 | Solve a specific problem | **[Well-lit paths](well-lit-paths/)** — one page per scenario |
