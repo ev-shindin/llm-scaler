@@ -22,9 +22,47 @@ autoscaler, not the cluster.
   variant's accelerator gives that variant no budget and then never scales it
   up — a failure with no natural symptom, which is why the guide checks
   `reason=AcceleratorNotResolved` first.
-- A decision about which limiter: `gpu-inventory` caps at discovered hardware;
-  `quota` enforces per-accelerator-type caps you declare, at cluster or
-  namespace scope.
+- A decision about which limiter, below.
+
+## Which limiter
+
+They answer different questions, and a deployment that needs both answers
+declares both — each is then fed the measure it is asking about.
+
+| | `gpu-inventory` (the default) | `quota` |
+| --- | --- | --- |
+| Question | is the hardware there? | is this tenant within its allowance? |
+| Counts | every GPU-holding Pod on the cluster | only what **WVA's own variants** hold |
+| Declared | nothing to declare — discovered | per accelerator type, at cluster or namespace scope |
+
+Three things about a quota surprise people, and all three are consequences of
+that middle row:
+
+**A quota does not bound the cluster.** It is an allowance granted to WVA and
+spendable only by WVA, so it can hand out capacity that non-WVA workloads have
+already taken. Charging it the physical figure instead would be worse — a
+namespace with a 4-GPU allowance sharing space with an unrelated 4-GPU training
+job would read as fully spent while WVA had placed nothing, and every scale-up
+would be refused against an untouched allowance. If you need both guarantees,
+declare both limiters.
+
+**Ceilings, not reservations.** A finite cap guarantees a tenant never *exceeds*
+it. It does not guarantee the tenant can *reach* it: the cluster aggregate is the
+sum of the finite caps, so a namespace that is unlimited (`-1`) or excluded draws
+from that shared aggregate without contributing to it, and can consume budget a
+capped peer would otherwise have used. Nobody exceeds their own authorization —
+but it is a real fairness gap, and worth knowing before you promise a team its
+number.
+
+**A missing entry denies.** `0` or no entry for an accelerator type means no
+allocation at all, not "unbounded" — `-1` is unbounded. A typo in a type name is
+therefore a denial, which is the safe direction and a confusing one.
+
+Fairness is per **model**, not per namespace: two models in one namespace each
+get their own fair-share slot, and the namespace cap bounds each of them and
+their running sum rather than pooling one model's allowance for the other. The
+quota clamps after the fair-share split is computed — it is a ceiling on the
+outcome, not an input to it.
 
 ## Setting it up
 
