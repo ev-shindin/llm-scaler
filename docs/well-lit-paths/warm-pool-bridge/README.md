@@ -18,15 +18,22 @@ you.
 
 ## What it needs
 
-- Accelerators free for the pool itself, **on the same GPU model** as the
-  workloads it will warm. A warm copy is only reusable on the accelerator it was
-  loaded on, so one pool cannot serve two GPU types.
+- Accelerators free for the pool itself, matching the shape of the models it
+  will warm in **three** ways: GPUs per Pod, how those GPUs are divided (16
+  over two Pods and over four are the same count and different engines), and
+  the accelerator, since a warm copy is only reusable on the one it was loaded
+  on. Nothing *refuses* a mixed pool and it does not fail loudly — the reserve
+  is counted pool-wide, so part of it cannot serve the model you are holding it
+  for. A model that fails any of the three is never warmed by that pool: it is
+  a configuration error, not something to wait out.
 - A shared model cache the pool can read, so a warm copy loads from local
   storage rather than a download.
 - RBAC letting WVA `patch` Pods. The shipped ClusterRole has it; a hand-scoped
   one may not, and WVA refuses to start a pool it could never lend from.
-- Two container images from two owners — the FMA launcher, which is not ours,
-  and this repo's pool proxy.
+- Two container images. The pool proxy is ours; the launcher depends on the
+  pool shape — a pool of Pods runs upstream Fast Model Actuation's launcher,
+  and a pool of **groups** runs our fork (`ghcr.io/ev-shindin/fma-launcher`),
+  where `--launcher-image` is required and `create` refuses without it.
 - A pool whose replica count **exceeds** its reserve. A pool that does not can
   never warm anything at all.
 
@@ -41,10 +48,12 @@ Deployment; its knobs are annotations on it.
 One pool holds many models, and that is the normal case rather than an advanced
 one. Three decisions come with it:
 
-**Which models can share a pool.** A pool serves exactly one
-**(accelerator, GPUs-per-replica)** shape, because neither is negotiable at run
-time. Every other difference between models — size, traffic, policy — a pool
-absorbs. Two GPU models on the cluster means two pools.
+**Which models can share a pool.** A pool serves one **(accelerator,
+GPUs-per-replica)** shape, because neither is negotiable at run time. Every
+other difference between models — size, traffic, policy — a pool absorbs. Two
+GPU models on the cluster therefore want two pools: one pool can be pointed at
+both, but the reserve is counted pool-wide, so part of it would be held for a
+model it cannot serve.
 
 ```bash
 deploy/warmpool.sh plan -n <namespace>

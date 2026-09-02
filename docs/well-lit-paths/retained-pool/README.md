@@ -29,8 +29,9 @@ gap and hands the work back.
 
 ## What it needs
 
-- A pool sized for the largest model, on one **(accelerator, GPUs-per-replica)**
-  shape — a warm copy is only reusable on the GPU it was loaded on.
+- A pool sized for the largest model, matching one shape: GPUs per Pod, how
+  they are divided, and the accelerator — a warm copy is only reusable on the
+  one it was loaded on.
 - Memory limits that hold the whole warm set. A level-1 sleeper is charged for
   its weights in shared memory, so the pod template's memory limit is the budget
   and one model too many OOM-kills the launcher, taking **every resident model**
