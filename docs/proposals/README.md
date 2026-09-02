@@ -48,4 +48,3 @@ Read the review first; the implementation design says what was built.
 
 - **[Capacity-planner positioning](capacity-planner-positioning.md)** — where a
   cluster capacity planner sits relative to WVA.
-- **[Deprecate the VariantAutoscaling CRD](deprecate-va-crd.md)**

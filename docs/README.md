@@ -68,13 +68,9 @@ Instructions → Verification → Cleanup → Configuration*. Index and conventi
 - **[Saturation engine (v2)](user-guide/v2-saturation-engine.md)** — the analyzer
   that decides saturation
 - **[Throughput analyzer](developer-guide/throughput-analyzer.md)**
-- **[Queue-model analyzer](developer-guide/slo-queuemodel.md)** — SLO-aware
-  queueing model
 - **[Pod scraping source](developer-guide/pod-scraping-source.md)** — direct pod
   metric scraping
 - **[Multi-analyzer pipeline](developer-guide/multi-analyzer-pipeline.md)**
-- **[Controller behavior](design/controller-behavior.md)** — event handling and
-  reconciliation. **Outdated**; read the external-scaler design first.
 
 ### Proposals
 

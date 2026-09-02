@@ -217,12 +217,11 @@ Verify all commands and examples work:
 
 - Use the `logger` package from `internal/logger`
 - Always use backoff retries for Kubernetes API calls (see `internal/utils`)
-- Update Kubernetes conditions for status visibility
 - Emit metrics for observability
 
-### Performance Modeling
+### Analyzers
 
-When modifying queue models in `internal/queueing/analyzer/`:
+When modifying an analyzer in `internal/engines/analyzers/`:
 
 - Ensure mathematical correctness
 - Add comprehensive unit tests

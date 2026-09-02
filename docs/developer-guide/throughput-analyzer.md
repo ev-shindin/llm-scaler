@@ -109,15 +109,15 @@ for the full `analyzers:` field reference and combine algorithm.
 
 `RegisterThroughputAnalyzerQueries` (in `internal/collector/registration/throughput_analyzer.go`)
 registers three queries that are genuinely new and not covered by other analyzer registrations.
-All other TA inputs are read from `interfaces.ReplicaMetrics` fields populated by the saturation
-and queueing model registrations.
+All other TA inputs are read from `interfaces.ReplicaMetrics` fields populated by the other
+registrations in `internal/collector/registration/`.
 
 ### Throughput Analyzer Queries
 
 #### QueryGenerationTokenRate (`generation_token_rate`)
 
 ```promql
-sum by (instance, pod, llm_d_ai_variant) (rate(vllm:request_generation_tokens_sum{namespace="...",model_name="..."}[1m]))
+sum by (model_name, instance, pod) (rate(vllm:request_generation_tokens_sum{namespace="..."}[1m]))
 ```
 
 **What it measures:** Observed generation (decode) token rate per pod in tokens/sec.
@@ -134,7 +134,7 @@ replica. A deviation > 15% at k* ≥ 0.30 suppresses SpareCapacity for the cycle
 #### QueryKvUsageInstant (`kv_usage_instant`)
 
 ```promql
-max by (instance, pod, llm_d_ai_variant) (vllm:kv_cache_usage_perc{namespace="...",model_name="..."})
+max by (model_name, instance, pod) (vllm:kv_cache_usage_perc{namespace="..."})
 ```
 
 **What it measures:** Instantaneous KV cache utilization fraction per pod (0.0–1.0).
@@ -150,7 +150,7 @@ Throughput Analyzer sees the current operating point k*, not a high-water mark f
 spike that has since subsided. Using the peak would overestimate load and cause premature
 scale-up. Both fields coexist on `ReplicaMetrics` for their respective purposes.
 
-**Why `max by (instance, pod, llm_d_ai_variant)` and not `avg by (...)`:** `vllm:kv_cache_usage_perc`
+**Why `max by (model_name, instance, pod)` and not `avg by (...)`:** `vllm:kv_cache_usage_perc`
 is a scalar gauge per vLLM process, so there is one Prometheus series per pod in normal
 deployment. The `max by (...)` clause is purely deduplication: if the same pod is scraped by
 multiple targets (e.g., a PodMonitor and a ServiceMonitor), duplicate series with identical
@@ -158,31 +158,24 @@ values appear under the same pod label. `max` collapses them. Since duplicates c
 value, `max = avg` — the choice has no effect on correctness. This follows the convention used
 by every other per-pod query in this codebase.
 
-**`llm_d_ai_variant` is usually absent.** It appears in the grouping clause of every per-pod
-query in this codebase, but it is not a label vLLM or SGLang emit. It exists only when the
-operator has configured a `ServiceMonitor`/`PodMonitor` relabel that copies the pod label
-`llm-d.ai/variant` onto the scraped series — a WVA operator contract, not something llm-d
-stamps. In this repo only the simulator samples under `config/samples/simulator/` set it up.
+**There is no `llm_d_ai_variant` in the grouping.** The label was dropped from every
+per-pod query (issue #1263) and is read by no code: `internal/constants/labels.go` still
+defines `VariantLabelKey`, but nothing consumes it. vLLM and SGLang never emitted it — it
+existed only where an operator configured a `ServiceMonitor`/`PodMonitor` relabel to copy
+the pod label `llm-d.ai/variant` onto the scraped series.
 
-Grouping by a label that is not present is harmless in PromQL: every series simply carries an
-empty value for it, and the `(instance, pod)` pair already identifies an engine instance
-uniquely. What changes is how the collector attributes a series to a variant. With the label,
-`buildInstanceKey` reads the variant name straight off the series. Without it, the collector
-falls back to `PodLocator`, which walks the pod's `ownerReferences` up to the managed
-HPA/ScaledObject — a cached Kubernetes lookup per instance rather than a free label read.
-
-The label therefore cannot be removed from these queries, even though it is normally empty:
-for *shadow-pod* layouts — where the vLLM pod is not in the scaled target's `ownerReferences`
-chain — the ownerReference walk cannot work, and the label is the only linkage available. See
-"Prerequisites" in `docs/design/controller-behavior.md`. Pods that resolve by neither route are
-counted by `wva_pod_mapping_miss_total`.
+Attribution runs one way now. The collector resolves a series to a variant through
+`PodLocator` (`internal/collector/locator/`), which walks the pod's `ownerReferences` up to
+the managed HPA/ScaledObject — a cached Kubernetes lookup per instance. That route works
+for every layout, shadow pods included, so stamping the label buys nothing. Pods the
+locator cannot resolve are counted by `wva_pod_mapping_miss_total`.
 
 ---
 
 #### QueryRequestRate (`request_rate`)
 
 ```promql
-sum by (instance, pod, llm_d_ai_variant) (rate(vllm:request_generation_tokens_count{namespace="...",model_name="..."}[1m]))
+sum by (model_name, instance, pod) (rate(vllm:request_generation_tokens_count{namespace="..."}[1m]))
 ```
 
 **What it measures:** Engine-side request completion rate per pod (req/s), derived from the
@@ -244,14 +237,14 @@ only: the stale-metrics sanity issue is reported but not currently used to gate 
 
 | Query / Field | Source | Aggregation | Window | Purpose in TA |
 |---|---|---|---|---|
-| `QueryGenerationTokenRate` | vLLM | `sum by (instance, pod, llm_d_ai_variant)` | 1m rate | μ_dec^obs per pod (observability) |
-| `QueryKvUsageInstant` | vLLM | `max by (instance, pod, llm_d_ai_variant)` | instant | k* (no max_over_time) |
-| `QueryRequestRate` | vLLM | `sum by (instance, pod, llm_d_ai_variant)` | 1m rate | Fallback λ_req; histogram weight |
+| `QueryGenerationTokenRate` | vLLM | `sum by (model_name, instance, pod)` | 1m rate | μ_dec^obs per pod (observability) |
+| `QueryKvUsageInstant` | vLLM | `max by (model_name, instance, pod)` | instant | k* (no max_over_time) |
+| `QueryRequestRate` | vLLM | `sum by (model_name, instance, pod)` | 1m rate | Fallback λ_req; histogram weight |
 | `TotalKvCapacityTokens` | `KvCacheConfigInfo` labels | derived | static | KV_max = blocks × block_size |
-| `AvgITL` | `QueryAvgITL` | `max by (instance, pod, llm_d_ai_variant)` | 1m rate | ITL_obs for OLS calibration |
-| `AvgOutputTokens` | `QueryAvgOutputTokens` | `max by (instance, pod, llm_d_ai_variant)` | 5m rate | OL for KV_req and λ_dec |
-| `AvgInputTokens` | `QueryAvgInputTokens` | `max by (instance, pod, llm_d_ai_variant)` | 5m rate | IL for IL_eff = IL × (1−H％) |
-| `PrefixCacheHitRate` | `QueryPrefixCacheHitRate` | `max by (instance, pod, llm_d_ai_variant)` | 5m rate | H％ for IL_eff |
+| `AvgITL` | `QueryAvgITL` | `max by (model_name, instance, pod)` | 1m rate | ITL_obs for OLS calibration |
+| `AvgOutputTokens` | `QueryAvgOutputTokens` | `max by (model_name, instance, pod)` | 5m rate | OL for KV_req and λ_dec |
+| `AvgInputTokens` | `QueryAvgInputTokens` | `max by (model_name, instance, pod)` | 5m rate | IL for IL_eff = IL × (1−H％) |
+| `PrefixCacheHitRate` | `QueryPrefixCacheHitRate` | `max by (model_name, instance, pod)` | 5m rate | H％ for IL_eff |
 | `ArrivalRate` | `QuerySchedulerDispatchRate` | `sum by (pod_name, port, namespace)` | 1m rate | λ_req per pod (primary) |
 
 ## Architecture
@@ -284,7 +277,8 @@ Populates all `interfaces.ReplicaMetrics` fields in a single `Refresh()` call co
 12 registered queries. The three TA-exclusive fields are:
 `GenerationTokenRate`, `KvUsageInstant`, `RequestRate`.
 The remaining TA fields (`TotalKvCapacityTokens`, `AvgITL`, `AvgOutputTokens`, `AvgInputTokens`,
-`PrefixCacheHitRate`, `ArrivalRate`) are populated by saturation and queueing model queries.
+`PrefixCacheHitRate`, `ArrivalRate`) are populated by the other registrations in
+`internal/collector/registration/`.
 
 **ShapeTracker (`shape_tracker.go`)**  
 Maintains the current workload shape bucket `(IL, OL, IL_eff, KVreq)`. Detects shape changes

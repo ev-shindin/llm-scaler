@@ -373,11 +373,11 @@ With WVA metrics, the value for the label `namespace` is the WVA controller name
 
 ### `wva_pod_mapping_miss_total`
 - **Type**: Counter
-- **Description**: Total number of pods whose metrics could not be attributed to a managed scaler — neither the `llm-d.ai/variant` label nor the pod locator (ownerReference walk) resolved an owning HPA/ScaledObject. Makes the otherwise-silent skip observable.
+- **Description**: Total number of pods whose metrics could not be attributed to a managed scaler — the pod locator's `ownerReferences` walk reached no owning HPA/ScaledObject. Makes the otherwise-silent skip observable.
 - **Labels**:
   - `namespace`: Kubernetes namespace of the unattributed pod
   - `reason`: Why the pod was unattributed (currently always `unresolved`)
-- **Use Case**: Alert on a rising rate of unattributed pods — usually a missing `llm-d.ai/variant` label, a scaler missing the `llm-d.ai/managed` annotation, or a shadow-pod layout without the label
+- **Use Case**: Alert on a rising rate of unattributed pods — usually a scaler missing the `llm-d.ai/managed` annotation, or a pod whose `ownerReferences` chain does not reach one
 - **Example**:
   ```json
   {
