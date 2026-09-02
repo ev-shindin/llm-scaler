@@ -13,7 +13,8 @@ Start from the problem you have.
 | A model sits idle for hours holding accelerators | [Scale to zero, and get back](scale-to-zero/) | Stable |
 | Scale-ups are too slow: by the time a replica loads, the spike is over | [Bridge a scale-up with a warm pool](warm-pool-bridge/) | Stable |
 | Several models are too large to start on demand, and there are not GPUs for all of them | [Hold several large models on one set of GPUs](retained-pool/) | **Experimental** |
-| Autoscaling can ask for more GPUs than the cluster has, or than a tenant is allowed | [Bound a fleet by real GPUs](bound-by-gpus/) | Stable |
+| Autoscaling can ask for more GPUs than the cluster has | [Bound a fleet by real GPUs](bound-by-gpus/) | Stable |
+| Several teams share accelerators and each has been promised a number | [Cap what each tenant may take](tenant-gpu-quotas/) | Stable |
 | Interactive and batch workloads need different urgency, without per-model config | [Give classes of workloads different scaling behaviour](workload-classes/) | Stable |
 | One model, two accelerator types, and you want the cost-efficient one first | [Serve one model on two accelerator variants](accelerator-variants/) | Stable |
 | Prefill and decode have different shapes and you want them scaled apart | [Scale a P/D-disaggregated model](pd-disaggregation/) | **Experimental** |
@@ -32,7 +33,9 @@ them.
 
 ## What "experimental" means
 
-The path works and is exercised, but at least one of the three legs is missing
-or moving: the recipe may change shape, the coverage may be narrower than the
-scenario, or the defaults are not yet settled. Each experimental page says which
-leg is short.
+The recipe may still change shape: the defaults are not settled, or the design
+is still moving. Each experimental page says which leg is short.
+
+**Stable** does not mean fully covered by CI. Every page's *How it is tested*
+section names its suites and states what is **not** covered, and two stable
+paths do carry a gap there — read it before depending on one.

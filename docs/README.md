@@ -29,7 +29,8 @@ benchmark scenario behind it, and says which leg is short when one is.
 | [Scale to zero, and get back](well-lit-paths/scale-to-zero/) | releasing an idle model's accelerators, and waking it |
 | [Bridge a scale-up with a warm pool](well-lit-paths/warm-pool-bridge/) | spikes that arrive faster than a replica loads |
 | [Hold several large models on one set of GPUs](well-lit-paths/retained-pool/) | more large models than hardware to run them — **experimental** |
-| [Bound a fleet by real GPUs](well-lit-paths/bound-by-gpus/) | capping at the hardware that exists, or at a declared per-tenant allowance |
+| [Bound a fleet by real GPUs](well-lit-paths/bound-by-gpus/) | a shared cluster where `maxReplicaCount` is not a real ceiling |
+| [Cap what each tenant may take](well-lit-paths/tenant-gpu-quotas/) | per-namespace or cluster-wide GPU allowances |
 | [Different behaviour per workload class](well-lit-paths/workload-classes/) | interactive and batch, tuned as classes rather than per model |
 | [One model, two accelerator variants](well-lit-paths/accelerator-variants/) | letting the optimizer pick the cost-efficient hardware |
 | [A P/D-disaggregated model](well-lit-paths/pd-disaggregation/) | prefill and decode scaled apart — **experimental** |
