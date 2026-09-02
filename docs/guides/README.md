@@ -3,6 +3,9 @@
 Each guide takes one reader from nothing to a working install. Follow one; they
 do not need to be combined.
 
+For the decision above the steps — what a scenario buys, what it costs, and the
+evidence that it works — see **[the well-lit paths](../well-lit-paths/)**.
+
 ```bash
 source docs/guides/env.sh
 ```

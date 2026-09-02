@@ -67,6 +67,7 @@ it is running and idle.
 | Running it day to day | [operations.md](docs/reference/operations.md) |
 | Watching what it decides | [monitoring.md](docs/reference/monitoring.md) |
 | Making a workload scalable | [workload-preparation.md](docs/reference/workload-preparation.md) |
+| Choosing what to run | [well-lit paths](docs/well-lit-paths/) — one page per scenario |
 | Bridging a slow scale-up | [warm-pool/](docs/guides/warm-pool/) — opt-in; a pool holds accelerators |
 
 ## Documentation

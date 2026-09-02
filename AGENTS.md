@@ -53,21 +53,24 @@ a page is written for them.
 
 **User-facing** - someone running WVA, not changing it:
 
-1. **Guides** - one task, from nothing to working, in `docs/guides/<task>/`.
+1. **Well-lit paths** - one scenario, in `docs/well-lit-paths/<scenario>/`: what
+   it buys, what it costs, when not to take it, and which suites and benchmark
+   scenario back it. Paths link down into guides; they never repeat the steps.
+2. **Guides** - one task, from nothing to working, in `docs/guides/<task>/`.
    Bash blocks between `guide:` markers are generated from `guide.yaml`; edit the
    YAML and run `make guides-render`, never the block.
-2. **Reference** - what an operator sets and reads, in `docs/reference/`:
+3. **Reference** - what an operator sets and reads, in `docs/reference/`:
    configuration, scaling policy, metrics, troubleshooting.
-3. **Concepts** - how WVA decides, in an operator's terms, in `docs/concepts/`.
+4. **Concepts** - how WVA decides, in an operator's terms, in `docs/concepts/`.
 
 **Developer-facing** - contributors and maintainers:
 
-4. **Developer documentation** - development setup and workflow, and component
+5. **Developer documentation** - development setup and workflow, and component
    internals written in package paths and struct fields, in
    `docs/developer-guide/`.
-5. **Proposals** - design notes for work that is not built yet, or built and
+6. **Proposals** - design notes for work that is not built yet, or built and
    still moving, in `docs/proposals/`.
-6. **Agent plans and specs** - in `docs/plans/<area>/`, where `<area>` is the
+7. **Agent plans and specs** - in `docs/plans/<area>/`, where `<area>` is the
    part of the project (e.g. `engine`, `installation`, `monitoring`). Superpowers
    specs go here too, beside the plan that implements them.
 

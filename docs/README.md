@@ -7,6 +7,10 @@ guides, reference and design notes.
 New here? Start with **[Install WVA in a namespace](guides/install-in-namespace/)**,
 then **[After the install](reference/operations.md)**.
 
+Know the problem but not the mechanism? Start from
+**[the well-lit paths](well-lit-paths/)** — one page per scenario, each naming
+the suites and the benchmark scenario that back it.
+
 ## Guides — the task-shaped path
 
 Every guide follows the same shape: *Overview → Prerequisites → Installation
