@@ -1541,7 +1541,7 @@ func (e *Engine) prepareModelData(
 				"modelID", modelID,
 				"namespace", namespace,
 				"queuedRequests", queued,
-				"hint", "check that the serving pods are scraped and that their ownerReferences reach a scale target; for FMA, that the launcher pods have a PodMonitor (see docs/deployment/operations.md, 'FMA launcher pods')")
+				"hint", "check that the serving pods are scraped and that their ownerReferences reach a scale target; for FMA, that the launcher pods have a PodMonitor (see docs/reference/operations.md, 'FMA launcher pods')")
 		} else {
 			logger.Info("No saturation metrics available for model, skipping analysis",
 				"modelID", modelID,

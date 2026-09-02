@@ -5,8 +5,8 @@
 #
 # Productizes what a local `config/grafana-private/` experiment proved by hand. That
 # directory has never been in this repository, so the measurements it rests on are
-# recorded in docs/developer-guide/guide-review-install-in-namespace.md and inline
-# below, not behind a path you cannot open. Three decisions carry over unchanged:
+# recorded inline below rather than behind a path you cannot open. Three decisions
+# carry over unchanged:
 #
 #   grafana-operator, not the shared cluster Grafana   a shared instance's
 #     dashboards are read-only, and its sidecar was measured watching only its own

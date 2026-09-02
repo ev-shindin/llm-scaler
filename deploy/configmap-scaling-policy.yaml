@@ -21,9 +21,10 @@ metadata:
 data:
   # Global defaults applied to all variants unless overridden.
   #
-  # The `analyzers` section selects the V2 (token/capacity-based) saturation
-  # analyzer — the default since v0.9.0. Remove the `analyzers` section (and the
-  # V2-only thresholds) to opt out to the legacy V1 (percentage-based) analyzer.
+  # The `analyzers` section selects the token/capacity-based saturation analyzer,
+  # which is also what an empty `analyzerName` gets. It is the only one there is:
+  # the percentage-based analyzer this used to choose between was removed, so
+  # deleting the section opts out of nothing and only drops your thresholds.
   # See docs/reference/scaling-policy.md.
   #
   # Each analyzer accepts the ScalingPolicy plugin envelope (proposal #1245):

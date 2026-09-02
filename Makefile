@@ -1278,7 +1278,7 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 		echo "         launchers stop being scraped -- silently. Metrics for most of the traffic then vanish."; \
 		echo "         Either use a scenario with fma.enabled, or stand this up in a clean namespace, or"; \
 		echo "         re-apply scraping afterwards:  kubectl apply -k config/fma-launcher-metrics -n $(BENCHMARK_NAMESPACE)"; \
-		echo "         See docs/deployment/operations.md, 'FMA launcher pods'."; \
+		echo "         See docs/reference/operations.md, 'FMA launcher pods'."; \
 		echo ""; \
 	fi
 	@# An EPP already serving in this namespace is a stack somebody is using. The

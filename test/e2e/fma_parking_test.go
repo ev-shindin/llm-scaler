@@ -19,7 +19,7 @@ import (
 // answering /metrics — a sleeping launcher reports vllm:num_requests_running 0
 // and vllm:kv_cache_usage_perc 0 rather than nothing at all. That is FMA working
 // as designed; those sleepers are the warm pool a later wake reuses in seconds
-// instead of ~80 (docs/proposals/fma-warm-pool-wva.md).
+// instead of ~80 (docs/proposals/fma-post-mortem.md).
 //
 // It is also the one state where scale-to-zero and FMA combine into an outage. If
 // a parked model's leftover launchers were still attributed to its scale target,

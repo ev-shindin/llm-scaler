@@ -35,7 +35,7 @@ const (
 	// GPU budget and a scale-from-zero wake is published without a capacity check.
 	//
 	// This is the ScalingPolicy schema's own semantics, where limiters is "zero or
-	// more" (docs/proposals/design-scalingpolicy-crd.md §3). Declaring a limiter is
+	// more" (docs/reference/scaling-policy.md). Declaring a limiter is
 	// what turns limiting on; there is no separate enable flag, and no implicit
 	// default limiter for an operator who declared none.
 	LimiterTypeNone LimiterType = "none"
