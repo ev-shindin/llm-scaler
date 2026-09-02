@@ -35,9 +35,9 @@
 | **Type** | Global SLO/cost autoscaler | SLA-driven autoscaler (2 modes) | Scheduler + admission control | Engine + router (no autoscaler) |
 | **What it scales** | Replicas per model×variant | Prefill/decode replicas (independent) | Nothing (P:D ratio **preset**) | Nothing native (external scales replicas) |
 | **Scope** | **Multi-model, multi-tenant, global** | **Single DGD** (GlobalPlanner = same model only) | Single cluster, fixed | Per-deployment (external) |
-| **Signals** | Prometheus: queue depth, KV util, request rate (v2: token supply/demand) | Prometheus (rate, ISL/OSL, KV-hit) **+** event-plane ForwardPassMetrics | KV reuse, P/D load, TTFT/TBT, predicted decode load | Engine Prometheus (`num_queue_reqs`, `token_usage`, TTFT/TPOT) → external |
+| **Signals** | Prometheus: queue depth, KV util, request rate, token supply/demand | Prometheus (rate, ISL/OSL, KV-hit) **+** event-plane ForwardPassMetrics | KV reuse, P/D load, TTFT/TBT, predicted decode load | Engine Prometheus (`num_queue_reqs`, `token_usage`, TTFT/TPOT) → external |
 | **Forecasting** | **None** (reactive; EWMA/rate-anchored smoothing only) | **Yes** — Constant/ARIMA(default)/Kalman/Prophet, 1-interval look-ahead | For **admission** only (predict decode load to reject early), not capacity | None |
-| **SLA→capacity** | Saturation optimizer (v2); greedy-by-saturation; learns online, **no profiling needed** | Interpolated perf model from **pre-deployment profiling** (AIC rapid / AIPerf thorough) | No (SLA → which requests to admit/reject) | None (thresholds live in external KEDA rules) |
+| **SLA→capacity** | Saturation optimizer; greedy-by-saturation; learns online, **no profiling needed** | Interpolated perf model from **pre-deployment profiling** (AIC rapid / AIPerf thorough) | No (SLA → which requests to admit/reject) | None (thresholds live in external KEDA rules) |
 | **Cost / heterogeneity** | **Yes** — heterogeneous accelerators first-class; cost-aware optimizer (relative `variant-cost`); **GPU quota/fair-share limiter** | **No** — homogeneous single GPU type, cost-blind; only a GPU-count cap (`max_gpu_budget=8`) | No (reuses idle CPU/DRAM/SSD on fixed HW) | No (only heterogeneous-TP KV transfer, a data-plane opt) |
 | **Actuation** | **Metrics-first** → Prometheus Adapter → **HPA/KEDA** → `scale` (opt-in `llm-d.ai/managed`); optional direct scale for scale-from-zero | **Own controller** patches DGD CRD via operator (`DynamoGraphDeploymentScalingAdapter`); **VirtualConnector** publishes decisions without managing infra (suggest-only) | Actuates on **requests** (route/reject/replicate KV); no fleet actuation | Dynamic worker register/deregister + K8s service discovery (membership, not scaling) |
 | **P/D disaggregation** | Roles first-class (`llm-d.ai/role`), role-aware demand | **Independent prefill/decode scaling** (core feature) | Separate P/D pools, **preset ratio** | Separate pools, **manual** scaling |
@@ -96,7 +96,7 @@ Both sell **dedicated/on-demand endpoints**: you pick a model and a GPU SKU, set
 | Dimension | **Fireworks AI** | **Together AI** | **WVA** (for reference) |
 |---|---|---|---|
 | **Control law** | Threshold per load target; with several targets, **max replica count across all** wins | **Proportional**: `ceil(N × observed/target)`, dampened by windows, clamped to bounds | Saturation optimizer; multi-analyzer ballot with per-analyzer scores |
-| **Signals** | `default` (0–1 load fraction), `tokens_generated_per_second`, `prompt_tokens_per_second` (added Feb 2026, prefill-heavy), `requests_per_second`, `concurrent_requests` — all **per replica** | Exactly 8: `inflight_requests` (default), `ttft`, `e2e_latency`, `gpu_utilization`, **`token_utilization` (= KV-cache utilization, 0–100)**, `throughput_per_replica`, `decoding_speed`, `cache_hit_rate` (prompt-cache, 0–100). No custom/Prometheus metric support | Queue depth, KV utilization, request rate; v2 token supply/demand |
+| **Signals** | `default` (0–1 load fraction), `tokens_generated_per_second`, `prompt_tokens_per_second` (added Feb 2026, prefill-heavy), `requests_per_second`, `concurrent_requests` — all **per replica** | Exactly 8: `inflight_requests` (default), `ttft`, `e2e_latency`, `gpu_utilization`, **`token_utilization` (= KV-cache utilization, 0–100)**, `throughput_per_replica`, `decoding_speed`, `cache_hit_rate` (prompt-cache, 0–100). No custom/Prometheus metric support | Queue depth, KV utilization, request rate; token supply/demand |
 | **Multi-signal** | **Yes** — several targets, max wins | **No** — *"A deployment scales on a single metric, so you set exactly one"* | **Yes** — weighted combine across analyzers |
 | **Latency/SLO scaling** | **None** | `ttft` / `e2e_latency` with `p50/p90/p95/p99` (default `p95`) — **but see below** | Saturation-derived, not latency-triggered |
 | **Forecasting** | None | None | None |
@@ -172,7 +172,7 @@ Two consequences. First, a **~2-minute** provisioning latency is the real-world 
 
 **WVA (baseline)**
 - Repo: https://github.com/llm-d/llm-d-workload-variant-autoscaler
-- KEDA integration: [docs/design/wva-external-scaler-proposal.md](../design/wva-external-scaler-proposal.md)
+- KEDA integration: [docs/proposals/wva-external-scaler-proposal.md](../proposals/wva-external-scaler-proposal.md)
 - Component doc: https://llm-d.ai/docs/architecture/Components/workload-variant-autoscaler
 - Paper (WVA global optimization control plane): https://arxiv.org/abs/2603.09730
 

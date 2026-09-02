@@ -25,7 +25,7 @@ needs and hands that to KEDA, which owns the HPA and does the scaling.
 
 `SCOPE=namespace` (default) or `cluster`. `ENVIRONMENT` is detected; set
 `kubernetes` or `openshift` to force it. Everything else is optional —
-[Configuration reference](../docs/deployment/configuration.md).
+[Configuration reference](../docs/reference/configuration.md).
 
 ## Two things every path shares
 

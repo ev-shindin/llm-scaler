@@ -64,9 +64,9 @@ it is running and idle.
 | --- | --- |
 | Full install guide | [deploy/](deploy/) |
 | Installing WVA | [docs/guides/](docs/guides/) — pick a path |
-| Running it day to day | [operations.md](docs/deployment/operations.md) |
-| Watching what it decides | [monitoring.md](docs/deployment/monitoring.md) |
-| Making a workload scalable | [workload-preparation.md](docs/deployment/workload-preparation.md) |
+| Running it day to day | [operations.md](docs/reference/operations.md) |
+| Watching what it decides | [monitoring.md](docs/reference/monitoring.md) |
+| Making a workload scalable | [workload-preparation.md](docs/reference/workload-preparation.md) |
 | Bridging a slow scale-up | [warm-pool/](docs/guides/warm-pool/) — opt-in; a pool holds accelerators |
 
 ## Documentation

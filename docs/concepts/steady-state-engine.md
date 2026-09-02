@@ -1,17 +1,17 @@
-# V2 Saturation Engine (Token-Based Scaling)
+# The steady-state engine
 
 The Workload Variant Autoscaler (WVA) is a **global optimizer**: each cycle it builds a
 capacity model for your inference workloads and computes how many replicas each one should
 have. It does not patch replica counts directly — it emits a target that HPA or KEDA actuate.
-This guide explains, at a high level, the **V2 saturation engine**: the terms it uses, the
+This guide explains, at a high level, the **steady-state engine**: the terms it uses, the
 metrics it reads, the thresholds that govern it, and the algorithm that turns those into replica
 targets.
 
 It is aimed at operators tuning and observing WVA. For the full configuration field reference and
 the EPP coordination workflow, see
-[Saturation Scaling Configuration](../developer-guide/scaling-policy-config.md); for the
+[Saturation Scaling Configuration](../reference/scaling-policy.md); for the
 complete metrics catalog see
-[Metrics & Health Monitoring](../developer-guide/metrics-health-monitoring.md).
+[Metrics & Health Monitoring](../reference/metrics.md).
 
 ## Terminology
 
@@ -60,7 +60,7 @@ per-namespace entries can override *thresholds*.
 
 ## How it works
 
-Each cycle, for every model, V2 runs four core steps (plus an optional fifth when the GPU
+Each cycle, for every model, the engine runs four core steps (plus an optional fifth when the GPU
 limiter is enabled).
 
 ### 1. Per-replica capacity = the tighter of two ceilings
@@ -75,13 +75,13 @@ usable capacity is the **smaller** of two ceilings, both in KV-cache tokens:
   cache is treated as usable.
 - **Compute ceiling** = how many concurrent tokens the GPU can actually *process* before
   scheduling throughput — not memory — becomes the bottleneck (common for long-generation
-  workloads). V2 estimates it from live queue behavior when a replica is queue-saturated,
+  workloads). The engine estimates it from live queue behavior when a replica is queue-saturated,
   otherwise from recent history, otherwise from the deployment's batch/sequence limits. *(The
-  detailed estimation chain is in the [developer guide](../developer-guide/scaling-policy-config.md).)*
+  detailed estimation chain is in the [developer guide](../reference/scaling-policy.md).)*
 
 A variant's per-replica capacity is the **median** of its ready replicas' capacities (median so
 one outlier pod doesn't skew it). A variant with no ready replicas borrows capacity derived from
-its deployment args or from a compatible sibling variant — this is what lets V2 size a
+its deployment args or from a compatible sibling variant — this is what lets the engine size a
 zero-replica variant.
 
 ### 2. Demand — the tokens the model needs to serve
@@ -100,7 +100,7 @@ input-token portion is discounted by the observed prefix-cache hit rate when ava
 
 ### 3. The scaling signal
 
-V2 aggregates to model level:
+The engine aggregates to model level:
 
 - **`TotalSupply`** = Σ (ready replicas × per-replica capacity)
 - **`TotalAnticipatedSupply`** = Σ ((ready + **pending**) replicas × per-replica capacity)
@@ -124,7 +124,7 @@ SpareCapacity     = max(0, TotalSupply  − TotalDemand / scaleDownBoundary)    
   note WVA has no time-based stabilization window yet, so keeping the band wide is what reduces
   flapping.
 
-> V2 also reports a model `utilization = TotalDemand / TotalSupply` for observability, but the
+> The engine also reports a model `utilization = TotalDemand / TotalSupply` for observability, but the
 > decision is driven by `RequiredCapacity`/`SpareCapacity` above — **not** by comparing that
 > ratio to the thresholds. (This `SpareCapacity` token signal is distinct from the
 > `wva_spare_capacity` *metric*, which is a 0–1 headroom fraction — see [Metrics](#metrics).)
@@ -149,10 +149,10 @@ scale-up is unconstrained and the optimizer simply minimizes cost. Priority weig
 ## Thresholds
 
 Set these in the saturation-scaling ConfigMap (see the
-[configuration reference](../developer-guide/scaling-policy-config.md) for structure and
+[configuration reference](../reference/scaling-policy.md) for structure and
 per-model/per-namespace overrides).
 
-| Key | Default | Range | Effect on V2 |
+| Key | Default | Range | Effect |
 |---|---|---|---|
 | `kvCacheThreshold` | `0.80` | 0–1 | Fraction of physical KV cache treated as usable → sets the **memory ceiling**. Lower = more headroom. **Agree with EPP — [see below](#aligning-thresholds-with-epp).** |
 | `queueLengthThreshold` | `5` | ≥ 0 | Local waiting-queue depth at/above which a replica is "queue-saturated," letting its current token load set the **compute ceiling**. **Agree with EPP — [see below](#aligning-thresholds-with-epp).** |
@@ -160,7 +160,7 @@ per-model/per-namespace overrides).
 | `scaleDownBoundary` | `0.70` | (0, 1], `< scaleUpThreshold` | Utilization floor for safe scale-down. Drives **`SpareCapacity`**. The gap to `scaleUpThreshold` is the no-change band. |
 | `limiters` | `[]` | list | Zero or more `{type: gpu-inventory\|quota, ...}` entries. Declaring one turns on step 5 (GPU-constrained fair-share) and arms the scale-from-zero capacity check; declaring none leaves both off. |
 | `priority` | `1.0` | ≥ 0 | Relative weight when fair-sharing scarce GPUs (**limiter mode only**). |
-| `analyzerName` / `analyzers` | `""` / — | — | Selects V2 (`"saturation"`) and, via the `analyzers` list, per-analyzer scores and threshold overrides. |
+| `analyzerName` / `analyzers` | `""` / — | — | Selects the saturation analyzer (`"saturation"`) and, via the `analyzers` list, per-analyzer scores and threshold overrides. |
 
 
 
@@ -179,7 +179,7 @@ different layers: EPP routes and, under load, queues/sheds requests as endpoints
 saturation; WVA decides when the pool is saturated and adds replicas. EPP's Saturation Detector
 exposes two thresholds that map one-to-one to WVA's:
 
-| EPP (`saturationDetector` / `utilization-detector`) | Default | WVA V2 | Default |
+| EPP (`saturationDetector` / `utilization-detector`) | Default | WVA | Default |
 |---|---|---|---|
 | `kvCacheUtilThreshold` | `0.8` | `kvCacheThreshold` | `0.80` |
 | `queueDepthThreshold` | `5` | `queueLengthThreshold` | `5` |
@@ -193,7 +193,7 @@ If the two disagree, routing and scaling fight each other:
 = EPP's `queueDepthThreshold`, and mirror any change on both sides. This repo configures EPP's
 scorers (`queue-scorer`, `kv-cache-utilization-scorer`) in `deploy/lib/epp-flow-control.values.yaml`.
 See the developer guide's
-[Coordinating with InferenceScheduler (EPP)](../developer-guide/scaling-policy-config.md#best-practices-coordinating-with-inferencescheduler-end-point-picker)
+[Coordinating with InferenceScheduler (EPP)](../reference/scaling-policy.md#best-practices-coordinating-with-inferencescheduler-end-point-picker)
 for the full apply/verify workflow.
 
 **References**
@@ -202,12 +202,12 @@ for the full apply/verify workflow.
 
 ## Metrics
 
-### Input — what V2 reads from your inference engines
+### Input — what the engine reads from your inference engines
 
-Scraped from vLLM and the EPP scheduler. If these are missing or stale, V2 degrades or skips the
+Scraped from vLLM and the EPP scheduler. If these are missing or stale, the engine degrades or skips the
 model — check the health metrics below.
 
-| Metric | Type | V2 uses it for |
+| Metric | Type | Used for |
 |---|---|---|
 | `vllm:cache_config_info` (`num_gpu_blocks`, `block_size`) | info gauge | KV token capacity → **memory ceiling** |
 | `vllm:kv_cache_usage_perc` | gauge | live tokens-in-use → **demand** |
@@ -221,34 +221,34 @@ Deployment engine args (`--max-num-seqs`, `--gpu-memory-utilization`, `--block-s
 `--max-model-len`, `--max-num-batched-tokens`, `--num-gpu-blocks-override`, …) are read from the
 Deployment/LeaderWorkerSet — **not** Prometheus — and feed the derived-capacity path.
 
-### Output — WVA metrics to observe V2 decisions
+### Output — WVA metrics to observe the engine's decisions
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `wva_saturation_utilization` | gauge | Utilization = demand / capacity (0–1). |
-| `wva_required_capacity` | gauge | > 0 ⇒ scale-up needed; V2 value is the KV-cache **token** deficit (per-role for P/D-disaggregated models). `unit=continuous`. |
-| `wva_spare_capacity` | gauge | > 0 ⇒ safe scale-down headroom; V2 value is the KV-cache **token** surplus — the companion to `wva_required_capacity`. |
+| `wva_required_capacity` | gauge | > 0 ⇒ scale-up needed; the value is the KV-cache **token** deficit (per-role for P/D-disaggregated models). `unit=continuous`. |
+| `wva_spare_capacity` | gauge | > 0 ⇒ safe scale-down headroom; the value is the KV-cache **token** surplus — the companion to `wva_required_capacity`. |
 | `wva_kv_cache_tokens_used` / `_capacity` | gauges | Total KV tokens in use vs. total capacity across replicas. |
-| `wva_desired_replicas` / `wva_current_replicas` | gauges | What V2 wants vs. what's running. |
+| `wva_desired_replicas` / `wva_current_replicas` | gauges | What the engine wants vs. what is running. |
 | `wva_desired_ratio` | gauge | desired / current — the value HPA/KEDA actuate on. |
 | `wva_replica_scaling_total` | counter | Scale actions, labeled by `direction` and `reason`. |
-| `wva_config_info` | gauge | Active `analyzer_name` + feature flags — confirm V2 is selected. |
+| `wva_config_info` | gauge | Active `analyzer_name` + feature flags — confirm the saturation analyzer is selected. |
 | `wva_config_optimization_interval_seconds` | gauge | Decision cadence. |
 | `wva_models_processed` | gauge | Models handled last cycle. |
 | `wva_available_gpus` | gauge | GPUs available (limiter input). |
 | `wva_metrics_freshness_status`, `wva_metrics_pods_discovered`, `wva_metrics_collection_errors_total` | gauges / counter | **Input health** — check these first when scaling looks stuck. |
 
-## Operating V2
+## Operating the engine
 
-### Verify V2 is active
+### Verify the engine is active
 
 Check `wva_config_info` — the active engine appears in the `analyzer_name` label:
 
 ```promql
-wva_config_info{analyzer_name="saturation"}   # == 1 when V2 is running
+wva_config_info{analyzer_name="saturation"}   # == 1 when the saturation analyzer is running
 ```
 
-If it shows a different `analyzer_name` (or the metric is absent), V2 is not selected — confirm
+If it shows a different `analyzer_name` (or the metric is absent), it is not selected — confirm
 the ConfigMap's `default` entry sets `analyzerName: "saturation"`.
 
 ### Why isn't it scaling?
@@ -272,7 +272,7 @@ metadata:
   namespace: workload-variant-autoscaler-system   # WVA controller namespace
 data:
   default: |
-    analyzerName: "saturation"   # enable V2
+    analyzerName: "saturation"   # select the saturation analyzer
     kvCacheThreshold: 0.80
     queueLengthThreshold: 5
     scaleUpThreshold: 0.85
@@ -292,7 +292,7 @@ data:
 
 ## See also
 
-- [Saturation Scaling Configuration](../developer-guide/scaling-policy-config.md) — full field reference, per-model/namespace resolution, and the EPP coordination workflow.
-- [Metrics & Health Monitoring](../developer-guide/metrics-health-monitoring.md) — complete metrics catalog and health endpoints.
-- [Monitoring](monitoring.md) — dashboards and observing WVA.
-- [Quota Limiter](../developer-guide/quota-limiter.md) — per-accelerator GPU caps used by the fair-share step.
+- [Saturation Scaling Configuration](../reference/scaling-policy.md) — full field reference, per-model/namespace resolution, and the EPP coordination workflow.
+- [Metrics & Health Monitoring](../reference/metrics.md) — complete metrics catalog and health endpoints.
+- [Monitoring](../reference/monitoring.md) — dashboards and observing WVA.
+- [Quota Limiter](../reference/quota-limiter.md) — per-accelerator GPU caps used by the fair-share step.

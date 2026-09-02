@@ -164,7 +164,7 @@ when any of these hold:
 > accelerator is charged to no pool, and the physical `Limit` counts every
 > *installed* GPU rather than what is actually available. Both are described,
 > with their fixes and current status, in
-> [GPU Capacity Accounting](gpu-capacity-accounting.md). The short version: make
+> [GPU Capacity Accounting](../concepts/gpu-capacity-accounting.md). The short version: make
 > the accelerator resolvable with a `nodeSelector`/`nodeAffinity` GPU key — WVA
 > emits an `AcceleratorNotResolved` event otherwise, and resolves a RUNNING
 > variant by observing the nodes its pods landed on — and declare an explicit

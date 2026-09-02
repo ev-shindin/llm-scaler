@@ -14,7 +14,7 @@ data:
   # Precedence: CLI flags > environment variables > config file > defaults
   #
   # For more information see:
-  # https://github.com/llm-d/llm-d-workload-variant-autoscaler/blob/main/docs/user-guide/configuration.md
+  # docs/reference/configuration.md
   config.yaml: |
     # Prometheus Configuration (REQUIRED)
     # Base URL for Prometheus API (must use HTTPS). The default points at a

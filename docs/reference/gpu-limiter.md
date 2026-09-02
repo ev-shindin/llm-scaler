@@ -278,5 +278,5 @@ The install warns too: enabling `WVA_LIMITER=gpu-inventory` counts the distinct 
 products the cluster advertises and tells you whether pinning is needed. An
 unresolved variant is logged once per change and counted in
 `wva_unattributed_gpus`. See
-[GPU Capacity Accounting](../developer-guide/gpu-capacity-accounting.md).
+[GPU Capacity Accounting](../concepts/gpu-capacity-accounting.md).
 

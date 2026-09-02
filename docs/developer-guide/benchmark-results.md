@@ -1,4 +1,10 @@
-# Benchmark Results
+# Benchmark results
+
+> **These are historical baselines.** Every run below was measured on WVA
+> v0.6.0, whose saturation engine was the one now called v1 in these tables.
+> That engine no longer exists — the steady-state engine replaced it — so
+> these numbers are the record a new analyzer is compared against, not a
+> description of what WVA does today. The `_TBD_` cells were never filled.
 
 Summary of WVA benchmark runs with configuration details. 
 

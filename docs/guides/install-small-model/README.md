@@ -261,7 +261,7 @@ re-downloads on every scale-up anyway. What decides it is where the weights
 *land*, which is what the command above actually looks at.
 
 [Weights and the model
-cache](../../deployment/workload-preparation.md#weights-and-the-model-cache) has the
+cache](../../reference/workload-preparation.md#weights-and-the-model-cache) has the
 detail, including why it makes scale-up cheaper but not faster.
 
 ## Next
@@ -275,6 +275,6 @@ In order:
 2. `make benchmark-smoke NAMESPACE=<ns>` — drive load at it and snapshot the
    dashboard. Run it **last**, once everything is deployed.
 3. [Benchmark WVA](../benchmarking/) — when you want numbers to compare
-4. [After the install](../../deployment/operations.md) — what the metrics mean
+4. [After the install](../../reference/operations.md) — what the metrics mean
 
 [ob]: https://github.com/llm-d/llm-d/tree/main/guides/optimized-baseline

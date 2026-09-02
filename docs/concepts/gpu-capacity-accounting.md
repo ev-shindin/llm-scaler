@@ -10,7 +10,7 @@ Two consumers read these budgets:
   see the caveat below; and
 - the **scale-from-zero placement check**, which refuses to wake a variant onto
   an accelerator with no room (see
-  [`scaleFromZero`](scaling-policy-config.md#scalefromzero)).
+  [`scaleFromZero`](../reference/scaling-policy.md#scalefromzero)).
 
 Both over-allocate when the budget over-states availability: pods land in
 `Pending`, and for scale-from-zero the queued request that triggered the wake
@@ -73,7 +73,7 @@ snapshot as-is. The scale-from-zero engine
 instead calls `EnsureFresh` at the moment it decides a wake, so its capacity check
 is unaffected by the timer being off, and it only asks when a physical provider
 exists. A quota-only deployment therefore never walks the cluster for a number
-nothing reads. See [quota limiter](quota-limiter.md#resource-access-in-quota-mode).
+nothing reads. See [quota limiter](../reference/quota-limiter.md#resource-access-in-quota-mode).
 
 **A missing view is not zero.** Absent means "unknown", which both engines treat
 as permissive; an empty map is a confident claim that nothing is in use, and a
@@ -221,7 +221,7 @@ Two things follow for anyone reading these numbers:
 Closing it needs FMA to make the occupancy visible; that is item 1 in
 [the FMA post-mortem](../proposals/fma-post-mortem.md).
 Operator-facing guidance is in
-[the GPU limiter guide](../deployment/gpu-limiter.md), "FMA namespaces".
+[the GPU limiter guide](../reference/gpu-limiter.md), "FMA namespaces".
 
 ## Testing the placement check end-to-end
 

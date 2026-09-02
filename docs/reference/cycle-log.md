@@ -42,7 +42,7 @@ optimizer actually receives.
 | `namespace` | Kubernetes namespace |
 | `analyzer` | Analyzer name, e.g. `"saturation"`, `"throughput"` |
 | `supply` | Total token supply across ready replicas (readyCount × perReplicaCapacity) |
-| `demand` | Total token demand. Not purely observed: for saturation V2 it is the sum of three terms — resident KV tokens, a role-aware projection of requests waiting in each replica's local engine queue, and a model-level, prefix-cache-discounted projection of requests still queued upstream in llm-d flow control (`SchedulerQueue`, not attributed to any variant). See [scaling-policy-config.md](scaling-policy-config.md) |
+| `demand` | Total token demand. Not purely observed: for saturation V2 it is the sum of three terms — resident KV tokens, a role-aware projection of requests waiting in each replica's local engine queue, and a model-level, prefix-cache-discounted projection of requests still queued upstream in llm-d flow control (`SchedulerQueue`, not attributed to any variant). See [scaling-policy-config.md](scaling-policy.md) |
 | `util` | `demand / supply`; > 1.0 means the model is over capacity |
 | `rc` | Required capacity signal (post-threshold): > 0 triggers scale-up |
 | `sc` | Spare capacity signal (post-threshold): > 0 permits scale-down |

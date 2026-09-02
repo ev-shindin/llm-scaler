@@ -101,7 +101,7 @@ simulator and the e2e suites, are in [Testing](../developer-guide/testing.md).
 | "Metrics unavailable" in the logs | the ServiceMonitor does not select your model pods, so the series never reach Prometheus | `make verify-deployment`, then `kubectl get servicemonitor -A` and Prometheus `/targets` |
 | HPA exists but `CurrentMetrics` is empty | KEDA never got an answer — usually the trigger's `scalerAddress` or a missing `modelID` | `kubectl describe hpa -n <ns> keda-hpa-<so-name>` |
 | nothing scales, no errors | a limiter is declared and the workload's accelerator does not resolve, so it gets no GPU budget | `kubectl logs -n $NS -l app.kubernetes.io/name=workload-variant-autoscaler \| grep -i accelerator` |
-| a model never wakes from zero | the EPP flow-control queue is not reaching WVA | see [Troubleshooting](../developer-guide/troubleshooting.md) |
+| a model never wakes from zero | the EPP flow-control queue is not reaching WVA | see [Troubleshooting](troubleshooting.md) |
 | `READY False` on the ScaledObject, and the HPA's `TARGETS` reads `cpu: <unknown>/80%` | KEDA could not fetch the metric spec from WVA, so it fell back to a CPU metric. The trigger names a scaler it cannot reach — most often a `scalerAddress` naming a **different install's namespace** than the controller actually runs in. `make scaledobjects-repoint` fixes exactly this: it rewrites `scalerAddress` on objects that ask for WVA but name a namespace where no scaler runs, and leaves one pointing at a second live install alone | `kubectl get scaledobject -A -o custom-columns=NAME:.metadata.name,ADDR:.spec.triggers[0].metadata.scalerAddress` then `kubectl get svc -A \| grep external-scaler` |
 | demand looks far too low for the load you are driving, and `has N ready pod(s) but none attributed` appears each cycle | FMA is in the namespace and nothing is scraping its launcher pods, so the traffic they serve is invisible | `make verify-fma`, see also [FMA launcher pods](#fma-launcher-pods) |
 | WVA applies no decisions for a workload, silently, though the HPA reads a healthy ratio the whole time | the ScaledObject's `modelID` no longer matches what the container actually serves — a hand-changed model that nothing re-syncs | `make verify-scaledobjects` |
@@ -154,7 +154,7 @@ kubectl logs -n "$NS"   -l app.kubernetes.io/name=workload-variant-autoscaler --
 ```
 
 Deeper diagnosis — EPP metrics, scale-from-zero, slow scale-up — is in
-[Troubleshooting](../developer-guide/troubleshooting.md).
+[Troubleshooting](troubleshooting.md).
 
 ## Command cheatsheet
 

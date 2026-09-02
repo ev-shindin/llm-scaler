@@ -164,10 +164,47 @@ viewer may read, so "All" already means "all of mine". Pinning a default never
 provided isolation — it only hid names from the dropdown while every query still
 ran with the datasource's own permissions.
 
+### How the dashboard is organised
+
+The panels sit in three rows, and the row says what a panel is scoped to:
+
+| row | scope | what it answers |
+| --- | --- | --- |
+| **Fleet health — all namespaces** | every namespace WVA manages | Is WVA itself working? Installs present, controllers reporting, scrape targets down, collection and optimization timings. |
+| **Selected namespace: `$namespace`** | the **Namespace** variable | What did WVA do here? Replicas, capacity, saturation, scaling decisions, limiters, wake-from-zero. |
+| **Serving** (collapsed) | the **Namespace** variable | What the workload experienced: TTFT, inter-token latency, router and per-replica queues, KV utilization. Mostly from the EPP, so it reads the same for vLLM and SGLang. |
+
+The split exists because the two audiences differ. A panel in the fleet row does
+not change when you pick a namespace, and one in either lower row does — before
+the rows, that was invisible, and a "Models blocked from scaling" stat counting
+the whole cluster sat beside a chart of the same thing counting one namespace.
+`make dashboards-check` fails if a panel's query disagrees with the row it sits
+under.
+
+### When the dashboard shows nothing
+
+- **No Grafana at all** — `services "kube-prometheus-stack-grafana" not found`
+  means the install ran with `DEPLOY_OPERATIONAL_DASHBOARD=false`, or against a
+  cluster whose Grafana it did not deploy. Point the port-forward at your own.
+- **Panels render but say No Data** — hover the panel's `i` icon first; several
+  say which metric is missing and why. Then test the Prometheus datasource under
+  *Connections / Data sources*.
+- **The dashboard is not in the picker** — it lives in the `wva-operation-dashboard`
+  ConfigMap. If that object exists in a namespace your Grafana's sidecar does not
+  watch, nothing reads it: see [If you cannot write to the monitoring
+  namespace](#if-you-cannot-write-to-the-monitoring-namespace).
+- **Every variant shows the controller's namespace** — toggle the
+  `$namespace_label` variable at the top of the dashboard between
+  `exported_namespace` (the default, correct when Prometheus scrapes with
+  `honorLabels: false`) and `namespace`.
+- **You want an editable copy** — the shipped dashboard is read-only. Import
+  `deploy/grafana/operational-dashboard.json` under a name of your own, or
+  publish a private copy with `DASHBOARD_NS=<your-namespace>`.
+
 ### The metrics that answer specific questions
 
 All are exposed by the controller and scraped by the ServiceMonitor the install
-creates. Full list: [Prometheus metrics](../developer-guide/prometheus.md).
+creates. Full list: [Prometheus metrics](prometheus.md).
 
 **Is WVA working at all?**
 
@@ -232,5 +269,5 @@ kubectl logs -n $NS -l app.kubernetes.io/name=workload-variant-autoscaler -f
 ```
 
 WVA writes no custom resource, so its decisions are visible only in these logs, in
-the metrics it publishes ([Prometheus metrics](../developer-guide/prometheus.md)),
+the metrics it publishes ([Prometheus metrics](prometheus.md)),
 and in the HPA state KEDA derives from them.

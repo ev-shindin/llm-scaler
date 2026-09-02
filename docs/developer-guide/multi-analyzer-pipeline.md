@@ -37,7 +37,7 @@ over it via shared free functions in `internal/engines/allocation/`.
                            ▼
 ┌──────────────────────────────────────────────────────────┐
 │ Engine: run analyzers, build per-analyzer slice          │
-│ Saturation V2 (always first), then each registered       │
+│ Saturation (always first), then each registered          │
 │ non-saturation analyzer in registration order:           │
 │   • skip if Enabled:false                                │
 │   • Analyze(ctx, input) → *AnalyzerResult                │
@@ -80,7 +80,7 @@ over it via shared free functions in `internal/engines/allocation/`.
 
 | Concept | Definition |
 |---|---|
-| **Analyzer** | Implementation of `interfaces.Analyzer`. Examples: saturation V2 (kv-token capacity), throughput (RPS/ITL-derived), queueing-model. |
+| **Analyzer** | Implementation of `interfaces.Analyzer`. Examples: saturation (kv-token capacity, package `saturation_v2`), throughput (RPS/ITL-derived). |
 | **`VariantCapacity`** | Per-variant primitives: `ReplicaCount`, `PendingReplicas`, `PerReplicaCapacity` (analyzer-specific units), `Role`, `TotalDemand`, and the warm-pool trio `WarmPoolReplicas` / `WarmPoolPerReplicaCapacity` / `WarmPoolCapacity`. `Cost` and `AcceleratorName` are **not** on this struct — the optimizer reads them from `VariantMetadata`. |
 | **`AnalyzerResult`** | Per-(model, analyzer) output: the pure (D, P) signal — `VariantCapacities[]`, `TotalDemand`, `RoleDemand`. It has **no** supply or scaling-signal fields; those live on `NamedAnalyzerResult` and are the builder's. |
 | **`RoleCapacity`** | Per-role aggregate within an `AnalyzerResult`: `TotalSupply`, `TotalDemand`, `TotalAnticipatedSupply`, `RequiredCapacity` / `SpareCapacity` (engine-written). Used for P/D disaggregated models only. |
@@ -172,7 +172,7 @@ type.
 
 - **Registration** — `internal/engines/steadystate/engine.go`:
   `RegisterAnalyzer(name, analyzer) error`. `cmd/main.go` registers external
-  analyzers (e.g., throughput) before `StartOptimizeLoop`. Saturation V2 is
+  analyzers (e.g., throughput) before `StartOptimizeLoop`. The saturation analyzer is
   pre-registered at slot 0. The registry is snapshotted at `StartOptimizeLoop`;
   late registration returns an error.
 - **Engine post-step** — `internal/engines/steadystate/engine_v2.go`:
@@ -304,12 +304,12 @@ analyzer's; an analyzer normally has no reason to call them.
 ## Pipeline flow
 
 1. `cmd/main.go` calls `engine.RegisterAnalyzer(name, a)` for each external
-   analyzer before `StartOptimizeLoop`. Saturation V2 is pre-registered at
+   analyzer before `StartOptimizeLoop`. The saturation analyzer is pre-registered at
    slot 0.
 2. `StartOptimizeLoop` snapshots the registry into `analyzersSnapshot`
    (frozen, race-safe). The snapshot is the ordered set of analyzers that
    every optimize cycle iterates.
-3. Per cycle, for each model: `runAnalyzersAndScore` runs the saturation V2
+3. Per cycle, for each model: `runAnalyzersAndScore` runs the saturation
    analyzer unconditionally (it drives variant metadata), then iterates
    `analyzersSnapshot` in registration order for non-saturation analyzers.
 4. Analyzers with `Enabled: false` are skipped entirely — neither called nor
@@ -558,5 +558,5 @@ Both optimizers are stateless and selected per-cycle from the engine's
 
 The engine emits two structured INFO log lines per reconcile cycle per model —
 one per analyzer (after the threshold post-step) and one after the optimizer
-returns. See [cycle-log.md](cycle-log.md) for field schemas, grep patterns,
+returns. See [cycle-log.md](../reference/cycle-log.md) for field schemas, grep patterns,
 and an explanation of the `reason` values set by each analyzer.

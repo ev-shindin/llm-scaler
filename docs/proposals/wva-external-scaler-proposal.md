@@ -1,7 +1,7 @@
 # WVA as a KEDA external scaler: compute the target, let KEDA actuate
 
 > **Status:** Draft for discussion · **Audience:** WVA maintainers, llm-d SIG-Autoscaling
-> **Companions:** detailed design [`../proposals/wva-keda-external-scaler.md`](../proposals/wva-keda-external-scaler.md) · evidence [`../../comparison/wva-vs-keda-scaling-study.md`](../../comparison/wva-vs-keda-scaling-study.md) · alternative-framing note [`./wva-external-scaler-alternative.md`](./wva-external-scaler-alternative.md)
+> **Companions:** detailed design [`../proposals/wva-keda-external-scaler.md`](wva-keda-external-scaler.md) · evidence [`../../comparison/wva-vs-keda-scaling-study.md`](../../comparison/wva-vs-keda-scaling-study.md) · alternative-framing note [`./wva-external-scaler-alternative.md`](wva-external-scaler-alternative.md)
 
 ---
 
@@ -42,7 +42,7 @@ A raw metric plus a **static threshold** cannot track a moving capacity → you 
 
 ### WVA computes the target; KEDA actuates
 
-WVA implements KEDA's `ExternalScaler` gRPC service. A `ScaledObject` references it with an `external` trigger and passes per-target facts in the trigger metadata. Everything else (identity, discovery, config) is covered in the [detailed design](../proposals/wva-keda-external-scaler.md); the shape is:
+WVA implements KEDA's `ExternalScaler` gRPC service. A `ScaledObject` references it with an `external` trigger and passes per-target facts in the trigger metadata. Everything else (identity, discovery, config) is covered in the [detailed design](wva-keda-external-scaler.md); the shape is:
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -127,7 +127,7 @@ The [comparison study](../../comparison/wva-vs-keda-scaling-study.md) runs the *
 
 ## What this doc does not cover (non-goals)
 
-- The gRPC contract, discovery/registry, managed-mode ownership, and collector internals — see the [detailed design](../proposals/wva-keda-external-scaler.md).
+- The gRPC contract, discovery/registry, managed-mode ownership, and collector internals — see the [detailed design](wva-keda-external-scaler.md).
 - The multi-model / heterogeneous-GPU / mixed-priority claims are **argued, not yet measured** (see the study's open items).
 - Migration from the current `wva_desired_replicas` external-metrics path.
 - The internal capacity-model math (token supply/demand, rate anchoring) — unchanged; this doc is about *delivery*, not the model.
@@ -135,8 +135,8 @@ The [comparison study](../../comparison/wva-vs-keda-scaling-study.md) runs the *
 ## References
 
 - Evidence: [`comparison/wva-vs-keda-scaling-study.md`](../../comparison/wva-vs-keda-scaling-study.md)
-- Detailed design: [`docs/proposals/wva-keda-external-scaler.md`](../proposals/wva-keda-external-scaler.md)
-- Alternative-framing note (why a metric alone is not enough): [`./wva-external-scaler-alternative.md`](./wva-external-scaler-alternative.md)
+- Detailed design: [`docs/proposals/wva-keda-external-scaler.md`](wva-keda-external-scaler.md)
+- Alternative-framing note (why a metric alone is not enough): [`./wva-external-scaler-alternative.md`](wva-external-scaler-alternative.md)
 - The "metric shop" optimizer proposal this responds to: https://github.com/lionelvillard/llm-d-workload-variant-autoscaler/blob/worktree-optimizer-proposal/docs/design/wva-optimizer-proposal.md
 - KEDA external scalers: https://keda.sh/docs/latest/concepts/external-scalers/
 - KEDA Prometheus scaler (the escape hatch): https://keda.sh/docs/latest/scalers/prometheus/

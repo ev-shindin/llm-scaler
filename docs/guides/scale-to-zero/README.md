@@ -238,7 +238,7 @@ causes nobody has enumerated, including ones not in the table above. Start from
 `wva_model_scaling_blocked` for that model — if a reason is present, it is
 probably the cause.
 
-Two panels on the [operational dashboard](../../user-guide/monitoring.md) carry
+Two panels on the [operational dashboard](../../reference/monitoring.md) carry
 the same data: *Models that will not scale, by reason* and *Models at zero
 replicas*.
 
@@ -285,9 +285,9 @@ may be woken alone.
 
 ## Next
 
-- [After the install](../../deployment/operations.md) — what to watch, first-line
+- [After the install](../../reference/operations.md) — what to watch, first-line
   troubleshooting
-- [Scaling policy configuration](../../developer-guide/scaling-policy-config.md) —
+- [Scaling policy configuration](../../reference/scaling-policy.md) —
   every field of an entry, and how tiers resolve
-- [Monitoring](../../user-guide/monitoring.md) — the dashboard and the full metric
+- [Monitoring](../../reference/monitoring.md) — the dashboard and the full metric
   surface

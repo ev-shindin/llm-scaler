@@ -85,7 +85,7 @@ With neither, it scans the controller's own namespace and reports
 `SCOPE=cluster` matters most with `WVA_WORKLOAD_PATCH_APPLY=true`, which replaces
 the pods it patches: at this scope that is a rolling restart of every model
 server on the cluster. See [Writing the
-patch](../../deployment/workload-preparation.md#writing-the-patch-make-workload-patch).
+patch](../../reference/workload-preparation.md#writing-the-patch-make-workload-patch).
 
 <!-- guide:deploy.register start -->
 ```bash
@@ -165,7 +165,7 @@ Optional.
 | `WVA_NS` | `workload-variant-autoscaler-system` | `wva-system` |
 | `IMG` | the image CI builds from main | `ghcr.io/you/wva:dev` |
 
-Full list: [Configuration reference](../../deployment/configuration.md).
+Full list: [Configuration reference](../../reference/configuration.md).
 
 ## Next
 
@@ -175,6 +175,6 @@ Full list: [Configuration reference](../../deployment/configuration.md).
 - `deploy/warmpool.sh plan -n <ns>` — read-only: whether a namespace this
   controller manages has models that could share a [warm pool](../warm-pool/),
   which holds engines loaded so a scale-up serves while its replica starts
-- [After the install](../../deployment/operations.md)
-- [Install methods](../../deployment/install-methods.md) — GitOps, direct
+- [After the install](../../reference/operations.md)
+- [Install methods](../../reference/install-methods.md) — GitOps, direct
   Kustomize, and what the script does

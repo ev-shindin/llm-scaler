@@ -278,7 +278,7 @@ wva_report_modelserver_metrics() {
 # better answer and a bigger change; refusing is the honest interim.
 wva_require_modelserver_metrics() {
     wva_report_modelserver_metrics && return 0
-    log_error "Refusing to continue — fix monitoring above, or SKIP_CHECKS=true (see docs/deployment/operations.md#first-line-troubleshooting)."
+    log_error "Refusing to continue — fix monitoring above, or SKIP_CHECKS=true (see docs/reference/operations.md#first-line-troubleshooting)."
 }
 
 # There is deliberately no wva_ensure_modelserver_metrics — the installer does not
@@ -1039,5 +1039,5 @@ wva_report_epp_flowcontrol() {
 # only place anybody is looking.
 wva_require_epp_metrics() {
     wva_report_epp_flowcontrol && return 0
-    log_error "Refusing to continue — fix the EPP above, or SKIP_CHECKS=true (see docs/deployment/operations.md#first-line-troubleshooting)."
+    log_error "Refusing to continue — fix the EPP above, or SKIP_CHECKS=true (see docs/reference/operations.md#first-line-troubleshooting)."
 }

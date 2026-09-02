@@ -92,7 +92,7 @@ That's it! The script will:
 
 ## Configuration Options
 
-For a complete list of environment variables and configuration options, see the [Configuration Reference](../../docs/deployment/configuration.md) in the main deployment guide.
+For a complete list of environment variables and configuration options, see the [Configuration Reference](../../docs/reference/configuration.md) in the main deployment guide.
 
 **Key environment variables for Kubernetes**:
 
@@ -136,7 +136,7 @@ make deploy-wva-on-k8s
 The model is not chosen here. WVA does not deploy models — it scales the ones
 already running, and it learns which ones from the ScaledObjects that name its
 external scaler. Deploy models with the llm-d guides, then see
-[Default ScaledObjects](../../docs/deployment/configuration.md#default-scaledobjects).
+[Default ScaledObjects](../../docs/reference/configuration.md#default-scaledobjects).
 
 ### Example 3: CI-style stack (WVA + llm-d)
 

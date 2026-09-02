@@ -102,7 +102,7 @@ analyzers:
     score: 1.0
 ```
 
-See [scaling-policy-config.md — Multi-Analyzer Pipeline](./scaling-policy-config.md#multi-analyzer-registration)
+See [scaling-policy-config.md — Multi-Analyzer Pipeline](../reference/scaling-policy.md#multi-analyzer-registration)
 for the full `analyzers:` field reference and combine algorithm.
 
 ## Metrics
@@ -604,7 +604,7 @@ RC = max(0, TotalDemand / scaleUpThreshold  − TotalAnticipatedSupply)
 SC = max(0, TotalSupply  − TotalDemand / scaleDownBoundary)
 ```
 
-See [`scaling-policy-config.md`](./scaling-policy-config.md) § Universal Threshold Post-Step
+See [`scaling-policy-config.md`](../reference/scaling-policy.md) § Universal Threshold Post-Step
 for the authoritative formula and per-analyzer threshold override configuration.
 
 ### Known Regression
@@ -706,5 +706,5 @@ use the same decode-rate framework.
 
 ## References
 
-- Related: [V2 Saturation Engine](../user-guide/v2-saturation-engine.md)
+- Related: [The steady-state engine](../concepts/steady-state-engine.md)
 - Design: `plans/planning/TA-Plan.md`, `plans/planning/TA-PR4-plan.md`

@@ -113,5 +113,5 @@ that install's owner can then edit.
 
 ## Next
 
-- [The GPU limiter](../../deployment/gpu-limiter.md) — why policy lives where it
+- [The GPU limiter](../../reference/gpu-limiter.md) — why policy lives where it
   does, and the quota form

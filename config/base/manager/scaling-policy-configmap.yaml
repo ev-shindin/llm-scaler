@@ -20,7 +20,7 @@ data:
   # The `analyzers` section selects the V2 (token/capacity-based) saturation
   # analyzer — the default since v0.9.0. Remove the `analyzers` section (and the
   # V2-only thresholds) to opt out to the legacy V1 (percentage-based) analyzer.
-  # See docs/developer-guide/scaling-policy-config.md.
+  # See docs/reference/scaling-policy.md.
   #
   # Each analyzer accepts the ScalingPolicy plugin envelope (proposal #1245):
   #   analyzers:
@@ -158,7 +158,7 @@ data:
   #
   #   # (b) operator-declared quota limiter (same schema as QuotaLimiterConfig).
   #   # A quota is charged ONLY for the GPUs WVA's own variants hold, so it does
-  #   # not bound the cluster — see docs/developer-guide/quota-limiter.md.
+  #   # not bound the cluster — see docs/reference/quota-limiter.md.
   #   limiters:
   #     - type: quota
   #       name: cluster-h100

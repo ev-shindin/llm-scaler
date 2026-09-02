@@ -5,7 +5,7 @@ variant should run, and drives KEDA to make it so. This directory holds the
 guides, reference and design notes.
 
 New here? Start with **[Install WVA in a namespace](guides/install-in-namespace/)**,
-then **[After the install](deployment/operations.md)**.
+then **[After the install](reference/operations.md)**.
 
 ## Guides — the task-shaped path
 
@@ -33,40 +33,38 @@ Instructions → Verification → Cleanup → Configuration*. Index and conventi
 
 ## Operations and reference
 
-- **[Configuration](deployment/configuration.md)** — every variable the installer
+- **[Configuration](reference/configuration.md)** — every variable the installer
   reads
-- **[After the install](deployment/operations.md)** — verifying the install and
+- **[After the install](reference/operations.md)** — verifying the install and
   first-line troubleshooting
-- **[Watching what WVA decides](deployment/monitoring.md)** — the Grafana
+- **[Watching what WVA decides](reference/monitoring.md)** — the Grafana
   dashboard and who owns it, the metrics that answer specific questions, the logs
-- **[Preparing a workload to be scaled](deployment/workload-preparation.md)** —
+- **[Preparing a workload to be scaled](reference/workload-preparation.md)** —
   the model cache, draining before scale-down, `make workload-patch`
-- **[Deployment methods](deployment/install-methods.md)** — installer, kustomize,
+- **[Deployment methods](reference/install-methods.md)** — installer, kustomize,
   and per-platform entry points
-- **[GPU limiter](deployment/gpu-limiter.md)** — bounding WVA by real accelerators
-- **[Scaling policy configuration](developer-guide/scaling-policy-config.md)** —
+- **[GPU limiter](reference/gpu-limiter.md)** — bounding WVA by real accelerators
+- **[Scaling policy configuration](reference/scaling-policy.md)** —
   thresholds, tiers, scale-to-zero, limiters
-- **[Unified configuration system](developer-guide/configuration.md)** —
-  configuration reference for all components
-- **[Metrics and health](developer-guide/metrics-health-monitoring.md)** — exposed
+- **[Metrics and health](reference/metrics.md)** — exposed
   metrics and health endpoints
-- **[Prometheus integration](developer-guide/prometheus.md)**
-- **[Quota limiter](developer-guide/quota-limiter.md)** — operator-declared
+- **[Prometheus integration](reference/prometheus.md)**
+- **[Quota limiter](reference/quota-limiter.md)** — operator-declared
   per-accelerator GPU caps
-- **[GPU capacity accounting](developer-guide/gpu-capacity-accounting.md)** — what
+- **[GPU capacity accounting](concepts/gpu-capacity-accounting.md)** — what
   the GPU budget means, and three ways it over-states free capacity
-- **[Troubleshooting](developer-guide/troubleshooting.md)**
+- **[Troubleshooting](reference/troubleshooting.md)**
 
 ## Concepts and design
 
 - **[Architecture](https://llm-d.ai/docs/architecture/advanced/autoscaling)** —
   where WVA sits among llm-d's autoscaling paths
-- **[Modeling and optimization](design/modeling-optimization.md)** — queueing
+- **[Modeling and optimization](concepts/modeling-and-optimization.md)** — queueing
   models and the optimization algorithm
-- **[External scaler design](design/wva-external-scaler-proposal.md)** — how WVA
+- **[External scaler design](proposals/wva-external-scaler-proposal.md)** — how WVA
   drives KEDA, and why
-- **[Saturation engine (v2)](user-guide/v2-saturation-engine.md)** — the analyzer
-  that decides saturation
+- **[The steady-state engine](concepts/steady-state-engine.md)** — what it
+  measures, and how a measurement becomes a replica count
 - **[Throughput analyzer](developer-guide/throughput-analyzer.md)**
 - **[Pod scraping source](developer-guide/pod-scraping-source.md)** — direct pod
   metric scraping
@@ -92,8 +90,9 @@ Design notes for work that is not built yet, or built and still moving. See
 - **[Benchmark internals](developer-guide/benchmark-guide.md)** — the OpenShift
   step-by-step for single- and multi-model benchmark runs. For the normal path use
   the **[Benchmark WVA guide](guides/benchmarking/)**
-- **[Benchmark reference](benchmark.md)** — harness options and what each knob does
-- **[Example k2 decision report](benchmark-k2-decisions-example.md)** — what the
+- **[Benchmark results](developer-guide/benchmark-results.md)** — the recorded
+  runs a new analyzer is measured against
+- **[Example k2 decision report](developer-guide/benchmark-k2-decisions-example.md)** — what the
   capacity-decision log looks like on a real run
 - **[Contributing](../CONTRIBUTING.md)**
 
@@ -106,6 +105,6 @@ Design notes for work that is not built yet, or built and still moving. See
 
 ## Need help?
 
-- [Troubleshooting](developer-guide/troubleshooting.md)
+- [Troubleshooting](reference/troubleshooting.md)
 - [Open an issue](https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues)
 - Community meetings

@@ -202,7 +202,7 @@ global default CM      (cluster: fallback thresholds, GPU budget, defaultPolicy)
 - **Priority** = tier default in the policy + **optional per-SO metadata override** (metadata > policy). Priority tracks the tier, so sharing across a tier's models is correct.
 - **Budget-scope knobs** (`limiters`, `enableRescale`, GPU budget) live in the **default/namespace layer**, not the reusable policy — they are cluster/namespace-scoped (the code already reads `EnableRescale` "only from the default entry"; this formalizes it). A tenant must not be able to grant themselves capacity by naming a policy, so a `limiters:` block anywhere but the cluster layer is ignored and reported.
 
-  > **Update (2026-08-11):** the `enableLimiter` flag no longer exists. The `limiters:` list is the sole switch — declaring a limiter is what turns limiting on, and declaring none means nothing is limited. Two knobs meant a quota could be declared and silently not enforced. See `docs/developer-guide/quota-limiter.md`.
+  > **Update (2026-08-11):** the `enableLimiter` flag no longer exists. The `limiters:` list is the sole switch — declaring a limiter is what turns limiting on, and declaring none means nothing is limited. Two knobs meant a quota could be declared and silently not enforced. See `docs/reference/quota-limiter.md`.
 - **Emit the resolved effective policy** per SO (`wva_effective_policy_*` metric / structured log) — layered config is hard to debug without a "which value won" readout; annotations are disallowed, so use a metric/log.
 - **Start with two layers** (global default + named policy); add the namespace layer only when multi-tenancy demands it.
 

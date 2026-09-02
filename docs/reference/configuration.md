@@ -389,3 +389,28 @@ which is also why there is no supported way to run two.
 
 If `SCALE_UP_THRESHOLD` and/or `SCALE_DOWN_BOUNDARY` are set in the environment, the Makefile patches the `wva-scaling-policy-config` ConfigMap after install. Note the patch replaces the whole `default` entry, so it writes `analyzerName: saturation` alongside the band.
 
+## What a change needs: a restart, or not
+
+The controller loads one `Config`, and it has two halves. Which half a setting
+lives in decides whether editing it costs a restart.
+
+**Static** — read once at startup, so a change needs the controller restarted:
+the metrics and probe addresses, leader election, the Prometheus URL and its TLS
+material, and the feature flags.
+
+**Dynamic** — re-read when the ConfigMap changes, so a change applies in place:
+the optimization interval, the scaling thresholds, scale-to-zero, the Prometheus
+cache settings, and the limiter.
+
+The limiter is the one people expect to be a flag and it is not. It is selected
+by the `limiters:` list on the scaling-policy ConfigMap's `default` entry — there
+is no CLI flag and no environment variable:
+
+- no `limiters:` list, or `{type: gpu-inventory}` — cap scaling at the GPU
+  inventory actually discovered on the cluster. This is the default.
+- `{type: quota, ...}` — enforce operator-declared per-accelerator caps, at
+  cluster or namespace scope, declared inline.
+
+Because it is dynamic, the engine rebuilds the limiter when the ConfigMap
+changes and no restart is involved. The schema, the scopes and the validation
+rules are in the [quota limiter reference](quota-limiter.md).

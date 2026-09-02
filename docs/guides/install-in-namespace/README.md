@@ -29,7 +29,7 @@ namespace's owner installs and upgrades the controller themselves.
   a download from Hugging Face. llm-d mounts one by default, so this is
   normally already true — `make scaledobjects-plan` says so per workload if it
   is not. See [Weights and the model
-  cache](../../deployment/workload-preparation.md#weights-and-the-model-cache), which
+  cache](../../reference/workload-preparation.md#weights-and-the-model-cache), which
   also covers what it does not buy: the cache removes the download, not the
   load.
 - **a drain hook on those model servers.** Autoscaling also means replicas being
@@ -41,7 +41,7 @@ namespace's owner installs and upgrades the controller themselves.
 `make workload-patch` reports both and writes the fix for whichever is missing.
 It writes a file rather than changing your workloads, because the pod spec
 belongs to your modelservice chart; see [Writing the
-patch](../../deployment/workload-preparation.md#writing-the-patch-make-workload-patch).
+patch](../../reference/workload-preparation.md#writing-the-patch-make-workload-patch).
 
 If you want a model to scale **from zero**, its EPP must run with the
 `flowControl` feature gate: that gate is what publishes the queue depth, and at
@@ -54,7 +54,7 @@ it. Without the gate, neither path has anything to read, and scale-from-zero
 never fires while ordinary scaling works.
 
 Every install/preflight check that can refuse below is described, with why and
-the fix, in [First-line troubleshooting](../../deployment/operations.md#first-line-troubleshooting).
+the fix, in [First-line troubleshooting](../../reference/operations.md#first-line-troubleshooting).
 `SKIP_CHECKS=true` bypasses all of them and installs anyway; the controller
 then sizes from whatever signals do exist, and stays silent about the rest.
 
@@ -151,7 +151,7 @@ scale-down, and one that downloads its weights outside every volume it mounts
 re-fetches them on every scale-up. Both are pod-spec settings owned by the chart
 that deployed the model server, so this writes a patch rather than applying one.
 See [Writing the
-patch](../../deployment/workload-preparation.md#writing-the-patch-make-workload-patch) for
+patch](../../reference/workload-preparation.md#writing-the-patch-make-workload-patch) for
 what to do with it, including `make model-cache` when the weights half is what is
 missing.
 
@@ -286,7 +286,7 @@ make scaledobjects-repoint
 It takes no arguments — it finds the install that is running and points the
 object at it. It rewrites `scalerAddress` only, leaves your `modelID`,
 `variantCost` and bounds untouched, and is idempotent. See
-[First-line troubleshooting](../../deployment/operations.md#first-line-troubleshooting)
+[First-line troubleshooting](../../reference/operations.md#first-line-troubleshooting)
 for the other causes.
 
 ### 2. Read the decisions
@@ -455,13 +455,13 @@ preflight reported.
 | `PROMETHEUS_URL` | detected; Thanos on OpenShift | `https://prom.monitoring.svc:9090` |
 | `KEDA_HELM_INSTALL` | `false` on Kubernetes — assumes cluster KEDA | `true`, to install one with Helm |
 
-Full list: [Configuration reference](../../deployment/configuration.md).
+Full list: [Configuration reference](../../reference/configuration.md).
 
 ## Next
 
-- [After the install](../../deployment/operations.md)
+- [After the install](../../reference/operations.md)
 - [Bound every WVA by real GPUs](../admin-gpu-bounding/) — otherwise
   scaling is bounded only by each workload's `maxReplicaCount`
 - [Bridge a scale-up with a warm pool](../warm-pool/) — hold models loaded and
   asleep so a scale-up serves while its replica is still loading
-- [Scaling policy](../../developer-guide/scaling-policy-config.md)
+- [Scaling policy](../../reference/scaling-policy.md)

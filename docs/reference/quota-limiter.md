@@ -28,7 +28,7 @@ optimizer budget nor the scale-from-zero capacity check.
 
 The quota entries use the same schema described below; place them inline under the
 saturation `default` entry's `limiters:` list (see
-[scaling-policy-config.md](scaling-policy-config.md#limiters-cluster-default-only-live)).
+[scaling-policy-config.md](scaling-policy.md#limiters-cluster-default-only-live)).
 
 ## Scope
 
@@ -197,7 +197,7 @@ source.
 is fed counts only what WVA's own variants hold — summed from the saturation
 engine's population, not from the cluster-wide pod walk that feeds a physical
 inventory. Both figures are assembled per cycle and routed per provider; see
-[GPU capacity accounting](gpu-capacity-accounting.md) for the two bases.
+[GPU capacity accounting](../concepts/gpu-capacity-accounting.md) for the two bases.
 
 This is not a detail. A quota is an allowance granted to WVA and may only be spent
 by WVA. Charged the physical figure, a namespace with a 4-GPU WVA quota sharing

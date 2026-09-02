@@ -2,7 +2,7 @@
 
 > **Status:** Draft for discussion (untracked working doc) · **Date:** 2026-08-04
 > **Responds to:** [`wva-optimizer-proposal.md`](https://github.com/lionelvillard/llm-d-workload-variant-autoscaler/blob/worktree-optimizer-proposal/docs/design/wva-optimizer-proposal.md) ("WVA as a metric shop")
-> **Companion:** [`docs/proposals/wva-keda-external-scaler.md`](../proposals/wva-keda-external-scaler.md)
+> **Companion:** [`docs/proposals/wva-keda-external-scaler.md`](wva-keda-external-scaler.md)
 
 ---
 
@@ -60,7 +60,7 @@ Every run is **one model, one accelerator, one variant.** Results:
 
 ## 6. The alternative: WVA as a KEDA external scaler
 
-Keep the capacity model in WVA; deliver its decision through KEDA's **external-scaler gRPC contract** (full design in [`docs/proposals/wva-keda-external-scaler.md`](../proposals/wva-keda-external-scaler.md)):
+Keep the capacity model in WVA; deliver its decision through KEDA's **external-scaler gRPC contract** (full design in [`docs/proposals/wva-keda-external-scaler.md`](wva-keda-external-scaler.md)):
 
 - WVA computes the full target — `demand ÷ measured per-variant capacity` → a replica count — and returns it to KEDA; **KEDA/HPA actuate.** (Satisfies "KEDA is the actuator.")
 - The scaler is **opt-in per ScaledObject** and off the critical path: if WVA is unavailable, KEDA `fallback` / a plain `prometheus` trigger keeps scaling. (Satisfies "WVA optional, failure-tolerant.")

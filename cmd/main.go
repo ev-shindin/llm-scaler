@@ -213,7 +213,7 @@ func main() {
 	// Load unified configuration (fail-fast if invalid)
 	// Viper resolves precedence: flags > env > config file > defaults
 	// For more information see:
-	// https://github.com/llm-d/llm-d-workload-variant-autoscaler/blob/main/docs/user-guide/configuration.md
+	// docs/reference/configuration.md
 	cfg, err := config.Load(flag.CommandLine, *configFilePath)
 	if err != nil {
 		setupLog.Error(err, "failed to load configuration - this is a fatal error")

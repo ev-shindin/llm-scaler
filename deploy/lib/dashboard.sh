@@ -338,7 +338,7 @@ Grafana and point it at the Prometheus WVA already uses:
 # install this resolves to the controller's own namespace and pins the view to it.
 # The dashboard compares that against exported_namespace -- the WORKLOAD's
 # namespace, equal to the controller's only for a namespace-scoped install (see
-# docs/deployment/operations.md) -- so it can never match. The result is a
+# docs/reference/operations.md) -- so it can never match. The result is a
 # correctly built, permanently empty dashboard.
 #
 # So ask the question that actually decides it: are the model servers here? That

@@ -106,4 +106,4 @@ needs its own decision.
 - **GPU quota does not bound FMA's real consumption**, because a `LauncherConfig`
   does not express a warm pool. When planning capacity in an FMA namespace,
   subtract the launcher pool by hand — see
-  [`../deployment/gpu-limiter.md`](../deployment/gpu-limiter.md).
+  [`../deployment/gpu-limiter.md`](../reference/gpu-limiter.md).

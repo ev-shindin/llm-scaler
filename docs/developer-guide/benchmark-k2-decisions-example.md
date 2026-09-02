@@ -1,6 +1,6 @@
 # Example: K1/K2 Capacity Decision Report
 
-Sample output of [`hack/benchmark/dump_k2_decisions.py`](../hack/benchmark/dump_k2_decisions.py),
+Sample output of [`hack/benchmark/dump_k2_decisions.py`](../../hack/benchmark/dump_k2_decisions.py),
 run against a `prefill_heavy` benchmark (`Qwen/Qwen3-0.6B`, single variant, TP=1) on a real
 OpenShift cluster, with `GLOBAL_OPT_INTERVAL=15s` and the EPP `flowControl` gate enabled. Kept
 here as a worked example of what the report looks like; run the script yourself against a fresh

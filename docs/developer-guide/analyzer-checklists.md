@@ -1,6 +1,6 @@
 # Analyzer checklists
 
-This document defines the benchmark-based checklists that will enable a analyzer to be graduated. The new analyzer could be expected to work with existing analyzers in turn provide value to WVA by improving latency or cost or both. the **current default analyzer's** results recorded in [`docs/benchmark.md`](../benchmark.md) in general the expectation is that the new analyzer(s) should improve over the reported baselines for specific scenario(s) that the analyzer targets.
+This document defines the benchmark-based checklists that will enable a analyzer to be graduated. The new analyzer could be expected to work with existing analyzers in turn provide value to WVA by improving latency or cost or both. the **current default analyzer's** results recorded in [`docs/developer-guide/benchmark-results.md`](benchmark-results.md) in general the expectation is that the new analyzer(s) should improve over the reported baselines for specific scenario(s) that the analyzer targets.
 
 ## Reference Workloads
 
@@ -17,9 +17,9 @@ Every candidate analyzer in WVA must be periodically benchmarked against scenari
 Benchmark results are comparable when run under identical conditions, we currently run benchmark on below profile, for comparison it is better to use the same hardware profile:
 
 - **Hardware**: NVIDIA H100 (OpenShift cluster)
-- **Model**: The model specified in `docs/benchmark.md` (currently Qwen/Qwen3-32B)
+- **Model**: The model specified in `docs/developer-guide/benchmark-results.md` (currently Qwen/Qwen3-32B)
 - **Load generator**: GuideLLM or inference-perf 
-- **HPA settings**: As documented in the HPA Configuration section of `docs/benchmark.md`
+- **HPA settings**: As documented in the HPA Configuration section of `docs/developer-guide/benchmark-results.md`
 
 
 ## Measured Metrics
@@ -39,7 +39,7 @@ The following metrics are collected for each benchmark run:
 
 ## Recording Results
 
-All benchmark results must be added to [`docs/benchmark.md`](../benchmark.md) in a new section following the existing format:
+All benchmark results must be added to [`docs/developer-guide/benchmark-results.md`](benchmark-results.md) in a new section following the existing format:
 
 ```markdown
 <Scenario Name>
