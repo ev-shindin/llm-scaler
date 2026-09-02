@@ -396,11 +396,14 @@ lives in decides whether editing it costs a restart.
 
 **Static** — read once at startup, so a change needs the controller restarted:
 the metrics and probe addresses, leader election, the Prometheus URL and its TLS
-material, and the feature flags.
+material, the feature flags, **the optimization interval** (`GLOBAL_OPT_INTERVAL`)
+and **the Prometheus cache settings**. The last two read as though they were
+dynamic and are not: the interval is fixed at load and only a test helper writes
+it afterwards, and nothing outside tests calls the cache updater.
 
 **Dynamic** — re-read when the ConfigMap changes, so a change applies in place:
-the optimization interval, the scaling thresholds, scale-to-zero, the Prometheus
-cache settings, and the limiter.
+the scaling thresholds, the analyzer selection and tiers, scale-to-zero, and the
+limiter.
 
 The limiter is the one people expect to be a flag and it is not. It is selected
 by the `limiters:` list on the scaling-policy ConfigMap's `default` entry — there

@@ -19,7 +19,7 @@ WVA uses modeling, benchmarking, and optimization to find the best possible solu
   1. functional description of the token generation time (ITL) as a function of batch size, and
   2. characterization of conditions under which the server is saturated.
 
-    The performance profile may be generated through offline benchmarking and/or dynamically updated based on online observations.
+    The performance profile may be generated through offline benchmarking and/or dynamically updated based on online observations. **WVA does the latter only.** There is no profile store and no offline profiling step in this repository: every parameter it uses is learned from live metrics, which is why a variant WVA has never observed under load gets a conservative estimate rather than a looked-up one.
 
 - The **model SLOs** define target values for two metrics:
 
@@ -85,35 +85,32 @@ As such, one can estimate these parameters using either a model tuner that uses 
 
 ## Optimization
 
-The optimizer considers all variants in the system to determine optimal allocations.
-Its objective is to minimize total cost while satisfying the SLOs for all variants.
-The optimizer uses the model analyzer to estimate the minimum number of replicas needed for each variant to satisfy its SLOs, given the observed load statistics.
+The optimizer turns each analyzer's per-variant demand into a replica count for
+every variant of every model, inside whatever accelerator budget the limiter
+declares. Two things decide the outcome.
 
-### Current Mode: Unlimited
+**Cost, when there is room.** Variants are ranked by serving capacity per unit
+of cost — the relative scalar each carries as `llm-d.ai/variant-cost` — so the
+*most efficient* variant grows first, which is not always the cheapest one. A
+TP=2 variant at twice the cost of a TP=1 variant is the better buy whenever it
+serves more than twice as much. See `cost_aware_optimizer.go` and
+`greedy_score_optimizer.go`.
 
-**The WVA currently operates exclusively in unlimited mode.** In this mode, each variant receives its optimal allocation independently, without cluster capacity constraints. If total resource demand exceeds cluster capacity, some pods will be in a Pending state, which may trigger a cluster autoscaler in cloud environments.
+**Priority, when there is not.** When the budget cannot meet every model's
+demand, allocation is a priority-weighted fair share: a variant's `priority`,
+which normally comes from its [policy tier](../well-lit-paths/workload-classes/),
+is the weight in that split (`fairShareValue`). The optimizer records what it
+could not give — which variant was limited, by what, and how many GPUs it did
+get — and that surfaces as `wva_model_scaling_blocked` with a reason rather than
+as silence.
 
-The optimizer specifications are configured as:
-
-```bash
-infernoConfig.OptimizerSpec{
-  Unlimited: true,
-  // SaturationPolicy defaults to "None" (not relevant in unlimited mode)
-}
-```
-
-### Future Work: Limited Mode
-
-Limited mode support is planned for future releases. In limited mode, the optimizer would respect cluster capacity constraints and implement resource accounting. However, operating in limited mode introduces challenges around degraded mode operations and potential SLO violations under resource pressure. More design work is needed to integrate limited mode with the llm-d stack before it can be enabled.
-
-When implemented, limited mode will support the following parameters:
-
-1. **Unlimited**: Set to `false` for limited mode operation with capacity constraints
-2. **SaturationPolicy**: Allocation policy under saturated conditions:
-   - ***None***: no additional allocation beyond satisfying SLOs
-   - ***PriorityExhaustive***: allocating exhaustively to variants in priority ordering
-   - ***PriorityRoundRobin***: allocating in round-robin fashion within priority groups (preferred for limited mode)
-   - ***RoundRobin***: allocating in round-robin fashion across all variants
+**Constraints, not modes.** An earlier version of this page described an
+"unlimited mode" with capacity-aware allocation as future work. That is now
+backwards. Limiters are ordinary constraints on the optimizer — GPU inventory,
+declared quota, or none — chosen by the `limiters:` list on the scaling policy,
+with no mode switch anywhere: see
+[bounding a fleet by real GPUs](../well-lit-paths/bound-by-gpus/) and
+[GPU capacity accounting](gpu-capacity-accounting.md).
 
 ## References
 
