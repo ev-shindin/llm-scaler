@@ -31,6 +31,23 @@ Read the review first; the implementation design says what was built.
   launcher. It replaces eight documents removed on 2026-08-27; they are in git
   history.
 
+- **[Warm pool: configuration surface](warm-pool-configuration.md)** — which
+  knobs the pool needs and where they live. The pool is a Deployment and its
+  settings are annotations on it; three flags were deleted as facts the cluster
+  already states.
+- **[Retained pools](warm-pool-retained.md)** — built. Holding several large
+  models on one set of GPUs, and the rule deciding which one stays awake: the
+  model under more pressure, never a coin-flip between two that both want to
+  scale.
+- **[Warming an engine that spans Pods](warm-pool-lws.md)** — implemented.
+  Multi-node sleep and wake on a LeaderWorkerSet, demonstrated without Ray.
+- **[Sleep level 1 or 2](warm-pool-sleep-levels.md)** — measured. The pool
+  implements level 1 only; this is the case for that, and what level 2 would
+  cost if host RAM ever becomes the binding constraint.
+- **[Transferring weights instead of reading them](warm-pool-weight-transfer.md)**
+  — investigated, nothing built. What the shipped machinery can and cannot do,
+  and which of it is worth building.
+
 ## Scaling and actuation
 
 - **[WVA as a KEDA external scaler](wva-keda-external-scaler.md)** — the actuation
@@ -39,10 +56,20 @@ Read the review first; the implementation design says what was built.
   why a parked model needs a push, and where it comes from.
 - **[Priority scoping](priority-scoping.md)** — parked. Read before redesigning.
 
+- **[WVA as a KEDA external scaler: the argument](wva-external-scaler-proposal.md)**
+  — the shorter framing of the same design: compute the target, let KEDA
+  actuate, and why that beats publishing a metric.
+- **[The alternative framing](wva-external-scaler-alternative.md)** — the reply
+  to "WVA as a metric shop", keeping the capacity model in WVA.
+
 ## Engine and analyzers
 
 - **[Analyzer metric interface](analyzer-metric-interface.md)**
 - **[SGLang backend](sglang-backend.md)**
+- **[What counts as a serving replica](what-counts-as-a-serving-replica.md)** —
+  the count WVA derives capacity from means "Pods that reported metrics", is
+  used as though it meant "Pods taking traffic", and the gap produced three
+  symptoms investigated as unrelated bugs.
 
 ## Product and lifecycle
 
