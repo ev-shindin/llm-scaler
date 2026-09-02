@@ -24,6 +24,7 @@ benchmark scenario behind it, and says which leg is short when one is.
 | [Bridge a scale-up with a warm pool](well-lit-paths/warm-pool-bridge/) | spikes that arrive faster than a replica loads |
 | [Hold several large models on one set of GPUs](well-lit-paths/retained-pool/) | more large models than hardware to run them — **experimental** |
 | [Bound a fleet by real GPUs](well-lit-paths/bound-by-gpus/) | a shared cluster where `maxReplicaCount` is not a real ceiling |
+| [Different behaviour per workload class](well-lit-paths/workload-classes/) | interactive and batch, tuned as classes rather than per model |
 | [One model, two accelerator variants](well-lit-paths/accelerator-variants/) | letting the optimizer pick the cost-efficient hardware |
 | [A P/D-disaggregated model](well-lit-paths/pd-disaggregation/) | prefill and decode scaled apart — **experimental** |
 

@@ -14,6 +14,7 @@ Start from the problem you have.
 | Scale-ups are too slow: by the time a replica loads, the spike is over | [Bridge a scale-up with a warm pool](warm-pool-bridge/) | Stable |
 | Several models are too large to start on demand, and there are not GPUs for all of them | [Hold several large models on one set of GPUs](retained-pool/) | **Experimental** |
 | Autoscaling can ask for more GPUs than the cluster has | [Bound a fleet by real GPUs](bound-by-gpus/) | Stable |
+| Interactive and batch workloads need different urgency, without per-model config | [Give classes of workloads different scaling behaviour](workload-classes/) | Stable |
 | One model, two accelerator types, and you want the cost-efficient one first | [Serve one model on two accelerator variants](accelerator-variants/) | Stable |
 | Prefill and decode have different shapes and you want them scaled apart | [Scale a P/D-disaggregated model](pd-disaggregation/) | **Experimental** |
 

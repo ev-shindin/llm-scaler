@@ -48,6 +48,11 @@ kubectl logs -n <wva-namespace> deploy/<wva> | grep analyzer-result
 kubectl get scaledobject,hpa -n <your-namespace>
 ```
 
+A target lower than the demand implies is usually not a bug: a limiter clamps
+what the optimizer may ask for, and the reason is reported — see [bounding a
+fleet by real GPUs](../bound-by-gpus/). Different thresholds per class of
+workload are [tiers](../workload-classes/).
+
 The log line's fields are described in [the cycle log](../../reference/cycle-log.md);
 `exported_namespace` is the workload's namespace and plain `namespace` is the
 controller's, which is [why alerts group by the former](../../reference/monitoring.md).
