@@ -480,7 +480,7 @@ wva_reconcile_prometheus_scheme() {
     # only allocate to a variant whose accelerator it resolves, so turning it on
     # by default would silently freeze every workload that sets no GPU
     # nodeSelector. It is an install-time CHOICE for a fleet that is ready for it —
-    # see docs/developer-guide/gpu-capacity-accounting.md.
+    # see docs/concepts/gpu-capacity-accounting.md.
     #
     # Patches the "default" entry rather than shipping a second copy of it: the
     # entry carries every other default too, and a duplicate would drift.

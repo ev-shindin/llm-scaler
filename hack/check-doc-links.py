@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check every relative markdown link and heading anchor under docs/ and the READMEs.
+"""Check every relative markdown link and heading anchor under docs/ and the READMEs,
+and every docs/ path named from outside markdown.
 
 Fenced code blocks are skipped: Go generics like `lru.New[podKey, chainNode](size)`
 read as a markdown link to any regex that does not know where the fences are, and
@@ -74,6 +75,42 @@ def check_external(links):
     return bad
 
 
+def check_doc_mentions():
+    """Check docs/ paths named from OUTSIDE markdown: shell, Go, YAML, the Makefile.
+
+    These are the pointers an operator follows out of a log line or an installer
+    error, and nothing else checks them. A docs restructure moves the file, every
+    markdown link is rewritten because this script insists on it, and the shell
+    keeps printing a path that 404s -- which is exactly what happened when
+    docs/deployment/ became docs/reference/.
+
+    Only repo-relative mentions count. A docs/ path inside a URL belongs to
+    somebody else's repository.
+    """
+    import subprocess
+    listing = subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=ROOT)
+    files = [f for f in listing.stdout.splitlines() if f and not f.endswith(".md")]
+    if not files:
+        print("ERROR: no tracked files found, so no doc mentions were checked.",
+              file=sys.stderr)
+        return 1
+    url = re.compile(r"https?://\S+")
+    mention = re.compile(r"(?<![\w/.-])docs/[\w./-]+\.(?:md|yaml|yml|py|sh)")
+    bad = 0
+    for rel in files:
+        f = ROOT / rel
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for target in sorted(set(mention.findall(url.sub("", text)))):
+            if not (ROOT / target).exists():
+                print(f"BROKEN MENTION {rel} -> {target}")
+                bad += 1
+    print(f"{len(files)} non-markdown files scanned for docs/ mentions, {bad} broken")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--external", action="store_true",
@@ -138,6 +175,8 @@ def main():
             elif anchor and anchor not in own:
                 print(f"BROKEN ANCHOR {p.relative_to(ROOT)} -> #{anchor}"); bad += 1
     print(f"{len(files)} files checked, {bad} broken")
+
+    bad += check_doc_mentions()
 
     if args.external:
         bad += check_external(external)

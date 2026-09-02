@@ -3,6 +3,9 @@
 Each guide takes one reader from nothing to a working install. Follow one; they
 do not need to be combined.
 
+For the decision above the steps — what a scenario buys, what it costs, and the
+evidence that it works — see **[the well-lit paths](../well-lit-paths/)**.
+
 ```bash
 source docs/guides/env.sh
 ```
@@ -35,12 +38,12 @@ source docs/guides/env.sh
 
 | page | covers |
 | --- | --- |
-| [Configuration](../deployment/configuration.md) | every variable the installer reads |
-| [After the install](../deployment/operations.md) | verifying the install, first-line troubleshooting |
-| [Watching what WVA decides](../deployment/monitoring.md) | the dashboard, the metrics, the logs |
-| [Preparing a workload](../deployment/workload-preparation.md) | the model cache, draining, `make workload-patch` |
-| [Install methods](../deployment/install-methods.md) | GitOps, direct Kustomize, what the script does |
-| [The GPU limiter](../deployment/gpu-limiter.md) | where policy lives, and the accelerator precondition |
+| [Configuration](../reference/configuration.md) | every variable the installer reads |
+| [After the install](../reference/operations.md) | verifying the install, first-line troubleshooting |
+| [Watching what WVA decides](../reference/monitoring.md) | the dashboard, the metrics, the logs |
+| [Preparing a workload](../reference/workload-preparation.md) | the model cache, draining, `make workload-patch` |
+| [Install methods](../reference/install-methods.md) | GitOps, direct Kustomize, what the script does |
+| [The GPU limiter](../reference/gpu-limiter.md) | where policy lives, and the accelerator precondition |
 
 ## Checking it works, last
 

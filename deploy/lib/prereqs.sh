@@ -536,7 +536,7 @@ almost certainly wrong: a typo, a stale NAMESPACE export, or the wrong cluster.
         # cluster-scoped controller manages namespaces that need not exist yet.
         if [ "${ENVIRONMENT:-}" != "kind-emulator" ] && [ "${SKIP_CHECKS:-false}" != "true" ]; then
             log_error "  No llm-d found in $managed. Please install llm-d on $managed."
-            log_error "    SKIP_CHECKS=true to continue anyway — see docs/deployment/operations.md#first-line-troubleshooting"
+            log_error "    SKIP_CHECKS=true to continue anyway — see docs/reference/operations.md#first-line-troubleshooting"
         fi
         # As above: say it even when the gate is skipped.
         if [ "${SKIP_CHECKS:-false}" = "true" ]; then

@@ -2,7 +2,7 @@
 """
 Post-process llm-d-benchmark results into a markdown table.
 
-Produces the exact table format used in docs/benchmark.md.
+Produces the exact table format used in docs/developer-guide/benchmark-results.md.
 
 Usage:
     # Single run:

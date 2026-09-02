@@ -1,7 +1,7 @@
 // Package locator resolves a pod to the managed scaler (HPA or KEDA
 // ScaledObject) that controls its replica count, via ownerReferences walking
 // for Deployment / LWS layouts and via the variant name for shadow-pod
-// layouts. See docs/superpowers/specs/2026-06-11-pod-to-managed-scaler-locator-design.md.
+// layouts.
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
@@ -187,8 +187,8 @@ func (l *podLocator) locateViaPairing(ctx context.Context, namespace, podName st
 	// already covered. Parked, unwakeable, and reported healthy.
 	//
 	// This costs one GET per bound launcher per cycle, which is exactly what this
-	// hop's cost was specified to be (docs/proposals/fma-aware-attribution.md,
-	// "the traversal we add", step 4). Pods that are not FMA launchers never
+	// hop's cost was specified to be when this traversal was designed: one
+	// extra GET. Pods that are not FMA launchers never
 	// reach here, so the common path is untouched.
 	l.cache.remove(podKey{Namespace: namespace, Name: partner})
 	partnerTarget, err := l.resolveTarget(ctx, namespace, partner)

@@ -35,10 +35,9 @@ import "strings"
 // all, for any model, which is why no shipped ConfigMap or e2e ever carried one.
 //
 // The fields were always there for this: ScalingPolicy.ModelID and .Namespace are
-// documented as "only used in override entries". It is also the pattern the
-// queueing-model ConfigMap in this repo already uses — "the key name is
-// arbitrary; model_id + namespace identify the model" — so an operator writing
-// both files meets one rule, and every key they choose is legal.
+// documented as "only used in override entries". The key name is arbitrary and
+// model_id + namespace identify the model, so every key an operator chooses is
+// legal.
 func PolicyEntryKey(key string, entry ScalingPolicy) bool {
 	return key != GlobalDefaultsKey && entry.ModelID == ""
 }

@@ -148,13 +148,13 @@ error count of **0**, and a replica timeline that moves — a variant flat at on
 replica through a deep queue means WVA never saw the load, not that it decided
 not to scale. Check the queue-depth column against the replica column before
 trusting any latency number; if the two disagree, see
-[After the install](../../deployment/operations.md) before re-running.
+[After the install](../../reference/operations.md) before re-running.
 
 ## Next
 
 - [FMA post-mortem](../../proposals/fma-post-mortem.md) — if the namespace runs FMA
-- [After the install](../../deployment/operations.md) — what the metrics mean
-- [Configuration](../../deployment/configuration.md) — every installer variable
+- [After the install](../../reference/operations.md) — what the metrics mean
+- [Configuration](../../reference/configuration.md) — every installer variable
 
 ## Cleanup
 

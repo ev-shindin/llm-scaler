@@ -83,7 +83,7 @@ If you run several WVA installs it will not guess between them — pass
 
 ## Configuration Options
 
-For a complete list of environment variables and configuration options, see the [Configuration Reference](../../docs/deployment/configuration.md) in the main deployment guide.
+For a complete list of environment variables and configuration options, see the [Configuration Reference](../../docs/reference/configuration.md) in the main deployment guide.
 
 **Key environment variables for Kind emulator**:
 

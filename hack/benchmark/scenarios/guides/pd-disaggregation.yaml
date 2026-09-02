@@ -168,7 +168,7 @@ scenario:
     #   patches / overlayPath           -> modelserver (the workload pods)
     #   extraHelmValues / extraHelmSets -> router / GAIE helm release
     #   guideVariableOverrides          -> override the guide README's ${VAR}
-    # See docs/kustomize.md for the full reference and worked examples.
+    # The benchmark harness owns these keys; see its own kustomize reference.
     #
     # NOT SUPPORTED with kustomize: multi-model / multi-stack scenarios
     # (the deploy is keyed on guideName with no per-stack uniquification --

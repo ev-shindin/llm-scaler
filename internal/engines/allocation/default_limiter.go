@@ -64,7 +64,7 @@ func (l *DefaultLimiter) UsageBasis() UsageBasis {
 //
 // Remaining gap (tracked by the limiter chain, sub-issue #1003): composing a
 // physical-inventory limiter with a quota limiter as min(physical, quota) within
-// a single ComputeConstraints. See docs/developer-guide/quota-limiter.md.
+// a single ComputeConstraints. See docs/reference/quota-limiter.md.
 func (l *DefaultLimiter) ComputeConstraints(ctx context.Context, usageByType map[string]int, usageByNamespace map[string]map[string]int) (*ResourceConstraints, error) {
 	// Step 1: Refresh inventory to get latest limits from the cluster
 	//
@@ -74,7 +74,7 @@ func (l *DefaultLimiter) ComputeConstraints(ctx context.Context, usageByType map
 	// the nodes — including by workloads WVA does not manage, which used to be
 	// invisible here and made free capacity over-stated — while a quota is fed
 	// only what WVA's own variants hold, since that is what the allowance
-	// governs. See docs/developer-guide/gpu-capacity-accounting.md.
+	// governs. See docs/concepts/gpu-capacity-accounting.md.
 	//
 	// Remaining gap: a node that is cordoned or NotReady still contributes its
 	// GPUs to Limit.

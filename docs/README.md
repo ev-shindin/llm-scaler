@@ -1,115 +1,100 @@
 # Workload-Variant-Autoscaler documentation
 
-WVA is llm-d's variant autoscaler: it decides how many replicas of each model
-variant should run, and drives KEDA to make it so. This directory holds the
-guides, reference and design notes.
+WVA decides how many replicas of each model variant should run, and drives KEDA
+to make it so. It reads what your inference engines are doing, computes a target
+per model each cycle, and answers KEDA's external scaler with it.
 
-New here? Start with **[Install WVA in a namespace](guides/install-in-namespace/)**,
-then **[After the install](deployment/operations.md)**.
+Three words, used throughout: a **model** is what a client asks for by name; a
+**variant** is one way of serving it — concretely one KEDA ScaledObject and the
+workload it scales, which is the unit WVA decides for; a **replica** is one Pod
+of a variant. Variants whose triggers name the same `modelID` are variants of
+one model, and are scaled as a group.
 
-## Guides — the task-shaped path
+| You want to | Start here |
+| --- | --- |
+| Solve a specific problem | **[Well-lit paths](well-lit-paths/)** — one page per scenario |
+| Get it installed | **[Install WVA in a namespace](guides/install-in-namespace/)** |
+| Look something up | **[Reference](#reference--what-you-set-and-read)** |
+| Understand a decision it made | **[Concepts](#concepts--how-wva-decides)** |
+| Change WVA itself | **[Developing WVA](#developing-wva)** |
 
-Every guide follows the same shape: *Overview → Prerequisites → Installation
-Instructions → Verification → Cleanup → Configuration*. Index and conventions in
-**[guides/](guides/)**.
+## Well-lit paths — start from the problem
 
-### Installing
+Documented, tested and benchmarked recipes. Each page names the suites and the
+benchmark scenario behind it, and says which leg is short when one is.
 
-- **[Install WVA in a namespace](guides/install-in-namespace/)** — the common case
-- **[Install WVA for the whole cluster](guides/install-cluster-wide/)** — one
-  controller watching every namespace
-- **[Cluster-admin setup for a namespace](guides/admin-cluster-setup/)** — what an
-  admin does once, so a tenant can install without cluster rights
+| Path | For |
+| --- | --- |
+| [Scale a model on saturation](well-lit-paths/scale-on-saturation/) | the default: replica counts that follow real serving load |
+| [Scale to zero, and get back](well-lit-paths/scale-to-zero/) | releasing an idle model's accelerators, and waking it |
+| [Bridge a scale-up with a warm pool](well-lit-paths/warm-pool-bridge/) | spikes that arrive faster than a replica loads |
+| [Hold several large models on one set of GPUs](well-lit-paths/retained-pool/) | more large models than hardware to run them — **experimental** |
+| [Bound a fleet by real GPUs](well-lit-paths/bound-by-gpus/) | a shared cluster where `maxReplicaCount` is not a real ceiling |
+| [Cap what each tenant may take](well-lit-paths/tenant-gpu-quotas/) | per-namespace or cluster-wide GPU allowances |
+| [Different behaviour per workload class](well-lit-paths/workload-classes/) | interactive and batch, tuned as classes rather than per model |
+| [One model, two accelerator variants](well-lit-paths/accelerator-variants/) | letting the optimizer pick the cost-efficient hardware |
+| [A P/D-disaggregated model](well-lit-paths/pd-disaggregation/) | prefill and decode scaled apart — **experimental** |
 
-### After installing
+## Guides — the steps
 
-- **[Scale a model to zero, and get it back](guides/scale-to-zero/)**
-- **[Bridge a scale-up with a warm pool](guides/warm-pool/)** — hold models
-  loaded and asleep on held GPUs, so a scale-up serves while its own replica
-  is still loading
-- **[Bound every WVA by real GPUs](guides/admin-gpu-bounding/)** — the GPU limiter
-- **[Test WVA against a full llm-d stack](guides/testing-with-llm-d/)**
-- **[Benchmark WVA](guides/benchmarking/)** — the supported benchmark path
+Every guide runs one task from nothing to working, in the same shape: *Overview →
+Prerequisites → Installation → Verification → Cleanup → Configuration*. The
+commands are generated from each guide's `guide.yaml`, so they cannot drift from
+what they document. Index and conventions: **[guides/](guides/)**.
 
-## Operations and reference
+**Installing** — [in a namespace](guides/install-in-namespace/) (the common
+case) · [cluster-wide](guides/install-cluster-wide/) · [a small llm-d model
+first](guides/install-small-model/), if nothing is serving yet
 
-- **[Configuration](deployment/configuration.md)** — every variable the installer
-  reads
-- **[After the install](deployment/operations.md)** — verifying the install and
-  first-line troubleshooting
-- **[Watching what WVA decides](deployment/monitoring.md)** — the Grafana
-  dashboard and who owns it, the metrics that answer specific questions, the logs
-- **[Preparing a workload to be scaled](deployment/workload-preparation.md)** —
-  the model cache, draining before scale-down, `make workload-patch`
-- **[Deployment methods](deployment/install-methods.md)** — installer, kustomize,
-  and per-platform entry points
-- **[GPU limiter](deployment/gpu-limiter.md)** — bounding WVA by real accelerators
-- **[Scaling policy configuration](developer-guide/scaling-policy-config.md)** —
-  thresholds, tiers, scale-to-zero, limiters
-- **[Unified configuration system](developer-guide/configuration.md)** —
-  configuration reference for all components
-- **[Metrics and health](developer-guide/metrics-health-monitoring.md)** — exposed
-  metrics and health endpoints
-- **[Prometheus integration](developer-guide/prometheus.md)**
-- **[Quota limiter](developer-guide/quota-limiter.md)** — operator-declared
-  per-accelerator GPU caps
-- **[GPU capacity accounting](developer-guide/gpu-capacity-accounting.md)** — what
-  the GPU budget means, and three ways it over-states free capacity
-- **[Troubleshooting](developer-guide/troubleshooting.md)**
+**Administering** — [cluster-admin setup for a
+namespace](guides/admin-cluster-setup/) · [bound every WVA by real
+GPUs](guides/admin-gpu-bounding/)
 
-## Concepts and design
+**Exercising** — [scale to zero](guides/scale-to-zero/) · [warm
+pool](guides/warm-pool/) · [test against a full llm-d
+stack](guides/testing-with-llm-d/) · [benchmark WVA](guides/benchmarking/)
 
-- **[Architecture](https://llm-d.ai/docs/architecture/advanced/autoscaling)** —
-  where WVA sits among llm-d's autoscaling paths
-- **[Modeling and optimization](design/modeling-optimization.md)** — queueing
-  models and the optimization algorithm
-- **[External scaler design](design/wva-external-scaler-proposal.md)** — how WVA
-  drives KEDA, and why
-- **[Saturation engine (v2)](user-guide/v2-saturation-engine.md)** — the analyzer
-  that decides saturation
-- **[Throughput analyzer](developer-guide/throughput-analyzer.md)**
-- **[Queue-model analyzer](developer-guide/slo-queuemodel.md)** — SLO-aware
-  queueing model
-- **[Pod scraping source](developer-guide/pod-scraping-source.md)** — direct pod
-  metric scraping
-- **[Multi-analyzer pipeline](developer-guide/multi-analyzer-pipeline.md)**
-- **[Controller behavior](design/controller-behavior.md)** — event handling and
-  reconciliation. **Outdated**; read the external-scaler design first.
+## Reference — what you set and read
 
-### Proposals
+- **[Configuration](reference/configuration.md)** — every variable the installer reads, and which settings need a restart
+- **[After the install](reference/operations.md)** — verifying it worked, and first-line troubleshooting
+- **[Watching what WVA decides](reference/monitoring.md)** — the dashboard, who owns it, and the metrics that answer specific questions
+- **[The cycle log](reference/cycle-log.md)** — the two lines WVA emits per cycle, their fields and reason codes: the page that answers "why did it scale?"
+- **[Scaling policy](reference/scaling-policy.md)** — thresholds, tiers, scale-to-zero, limiters
+- **[Preparing a workload](reference/workload-preparation.md)** — the model cache, draining before scale-down, `make workload-patch`
+- **[Install methods](reference/install-methods.md)** — installer, kustomize, and per-platform entry points
+- **[The GPU limiter](reference/gpu-limiter.md)** and **[the quota limiter](reference/quota-limiter.md)** — bounding WVA by real accelerators, and by declared caps
+- **[Metrics and health](reference/metrics.md)** · **[Prometheus integration](reference/prometheus.md)**
+- **[SGLang backend](reference/sglang-backend.md)** — auto-detected per variant; nothing to configure
+- **[Troubleshooting](reference/troubleshooting.md)**
 
-Design notes for work that is not built yet, or built and still moving. See
-**[proposals/](proposals/)** for the full set:
+## Concepts — how WVA decides
 
-- **[Fast model loading](proposals/fast-model-loading.md)** — the argument for
-  the warm pool that shipped, and **[the implementation
-  design](proposals/fast-model-loading-implementation.md)** for what was built
-- **[FMA post-mortem](proposals/fma-post-mortem.md)** — what Fast Model Actuation
-  was, what was measured, why it was dropped, and what of it is still load-bearing
-  here (the pool runs FMA's launcher)
+- **[The steady-state engine](concepts/steady-state-engine.md)** — what it measures, and how a measurement becomes a replica count
+- **[GPU capacity accounting](concepts/gpu-capacity-accounting.md)** — what the GPU budget means, and three ways it over-states free capacity
+- **[Modeling and optimization](concepts/modeling-and-optimization.md)** — the queueing model and the optimization algorithm
+- **[Architecture](https://llm-d.ai/docs/architecture/advanced/autoscaling)** — where WVA sits among llm-d's autoscaling paths
 
-## Developing
+## Developing WVA
 
-- **[Development setup](developer-guide/development.md)**
-- **[Testing](developer-guide/testing.md)** — unit, envtest and e2e
-- **[Debugging](developer-guide/debugging.md)**
-- **[Benchmark internals](developer-guide/benchmark-guide.md)** — the OpenShift
-  step-by-step for single- and multi-model benchmark runs. For the normal path use
-  the **[Benchmark WVA guide](guides/benchmarking/)**
-- **[Benchmark reference](benchmark.md)** — harness options and what each knob does
-- **[Example k2 decision report](benchmark-k2-decisions-example.md)** — what the
-  capacity-decision log looks like on a real run
-- **[Contributing](../CONTRIBUTING.md)**
+- **[Development setup](developer-guide/development.md)** · **[Testing](developer-guide/testing.md)** · **[Debugging](developer-guide/debugging.md)**
+- **[Multi-analyzer pipeline](developer-guide/multi-analyzer-pipeline.md)** — how analyzers are registered, run and scored
+- **[Throughput analyzer](developer-guide/throughput-analyzer.md)** · **[saturation demand floor](developer-guide/saturation-demand-floor.md)** · **[pod scraping source](developer-guide/pod-scraping-source.md)**
+- **[Analyzer checklists](developer-guide/analyzer-checklists.md)** — what a new analyzer must show before it graduates
+- **[Benchmark internals](developer-guide/benchmark-guide.md)** · **[two-variant benchmark](developer-guide/two-variant-wva-benchmark.md)** · **[recorded results](developer-guide/benchmark-results.md)** · **[an example k2 decision report](developer-guide/benchmark-k2-decisions-example.md)**
+- **[Release process](developer-guide/release-process.md)** · **[Contributing](../CONTRIBUTING.md)**
+
+## Design notes
+
+- **[proposals/](proposals/)** — work not built yet, or built and still moving. The warm pool's argument and implementation design live here, as does the [FMA post-mortem](proposals/fma-post-mortem.md) explaining what the pool inherited.
+- **[comparison/](comparison/)** — how WVA's autoscaling compares with Dynamo, Mooncake, SGLang and the hosted platforms.
+- **[plans/](plans/)** — agent plans and the specs behind them.
 
 ## Elsewhere in the repo
 
-- [Main README](../)
-- [Kubernetes deployment](../deploy/kubernetes/)
-- [OpenShift deployment](../deploy/openshift/)
-- [Local development with the kind emulator](../deploy/kind-emulator/)
+- [Main README](../) · [Kubernetes deployment](../deploy/kubernetes/) · [OpenShift deployment](../deploy/openshift/) · [kind emulator, for local development](../deploy/kind-emulator/)
 
 ## Need help?
 
-- [Troubleshooting](developer-guide/troubleshooting.md)
-- [Open an issue](https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues)
-- Community meetings
+- [Troubleshooting](reference/troubleshooting.md) first, then [after the install](reference/operations.md)
+- [Open an issue](https://github.com/ev-shindin/llm-scaler/issues)

@@ -2,7 +2,7 @@
 
 End-to-end guide for the **two-variant efficiency-aware scaling** benchmark: a
 single model deployed as two variants of differing `variantCost` under one
-shared `InferencePool` / EPP, used to exercise the WVA saturation V2 cost-aware
+shared `InferencePool` / EPP, used to exercise the steady-state engine's cost-aware
 optimizer. The optimizer scales the **most efficient** variant — the one with
 the best serving-capacity per unit cost — up first, not simply the cheapest.
 With the shipped pricing (primary cost 10 / TP=2, secondary cost 5 / TP=1, so
@@ -20,7 +20,7 @@ up after those.
 
 One `InferencePool` and one EPP front two `vLLM` `Deployment`s of the same
 model. Each `Deployment` has its own KEDA `ScaledObject`, and both carry the
-same `modelID` in their trigger metadata, so the WVA saturation engine groups
+same `modelID` in their trigger metadata, so the steady-state engine groups
 them and applies cost-weighted scaling.
 
 ```text
@@ -325,12 +325,12 @@ bash hack/benchmark/post_run_analyze.sh <results-dir> $NS
 #   biran-20260704-135514-081/results/guidellm-1783162554-04wm0f_1 biran
 ```
 
-This runs five steps: dumps WVA controller decisions + V2 saturation analysis
+This runs five steps: dumps WVA controller decisions + saturation analysis
 numbers from pod logs, computes capacity/demand estimates from raw vLLM/EPP
 scrapes, extracts EPP throughput and WVA Prometheus timeseries, and renders the
 full-pipeline PNG plot into `<results-dir>/metrics/graphs/`.
 
-**Markdown table** (printed to stdout, copy-paste into `docs/benchmark.md`):
+**Markdown table** (printed to stdout, copy-paste into `docs/developer-guide/benchmark-results.md`):
 
 ```text
 | Metric                                | Run 1 |
@@ -440,11 +440,11 @@ to the per-step batch budget: check the model server emits
 | `hack/benchmark/add_variant.py` | Creates the secondary `Deployment` and clones the primary's `ScaledObject` onto it, with the kebab-label trick. |
 | `deploy/lib/scaledobject.sh` | Discovers llm-d model servers and renders their `ScaledObject`s. Driven by `make scaledobjects-apply`, which `benchmark-deploy-wva` calls. |
 | `hack/benchmark/post_run_analyze.sh` | Wraps the five post-run dump+plot steps. Must run promptly after `benchmark-run` — the WVA controller log buffer rotates. Usage: `bash hack/benchmark/post_run_analyze.sh <results-dir> [namespace]`. |
-| `hack/benchmark/dump_wva_target_timeseries.py` | Extracts WVA controller decisions and V2 saturation analysis numbers (supply, demand, utilization, required/spare capacity) from pod logs into `metrics/processed/wva_target_timeseries.json`. |
+| `hack/benchmark/dump_wva_target_timeseries.py` | Extracts WVA controller decisions and saturation analysis numbers (supply, demand, utilization, required/spare capacity) from pod logs into `metrics/processed/wva_target_timeseries.json`. |
 | `hack/benchmark/dump_capacity_demand_estimate.py` | Computes per-variant capacity/demand estimate from raw vLLM/EPP scrapes into `metrics/processed/capacity_demand_estimate.json`. |
 | `hack/benchmark/dump_epp_throughput.py` | Derives request rate from EPP counters into `metrics/processed/epp_throughput.json`. |
 | `hack/benchmark/dump_wva_full_timeseries.py` | Extracts WVA Prometheus metrics timeseries into `metrics/processed/wva_metrics_timeseries.json`. |
-| `hack/benchmark/postprocess.py` | Generates a markdown results table (matching `docs/benchmark.md`) from a results directory. Called automatically by `make benchmark-report`. Pass `--secondary-suffix v2` for per-variant replica rows and weighted cost. |
+| `hack/benchmark/postprocess.py` | Generates a markdown results table (matching `docs/developer-guide/benchmark-results.md`) from a results directory. Called automatically by `make benchmark-report`. Pass `--secondary-suffix v2` for per-variant replica rows and weighted cost. |
 | `hack/benchmark/plot_two_variant_pipeline.py` | Generates the full-pipeline PNG (up to 7 panels: replicas, capacity/demand, KV cache, requests running/waiting, EPP queue, gateway throughput, WVA saturation utilization). Called automatically by `make benchmark-plot-two-variant`. |
 | `hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml` | The `wva-scaling-policy-config` ConfigMap for the run: `analyzerName: saturation` plus the thresholds. Applied by `make benchmark-enable-v2-saturation`. |
 | `test/benchmark/scenarios/prefill_heavy.yaml.in` | Default workload for `make benchmark-run`. Edit `rate`/`max_seconds` here — `make benchmark-run` copies this file at run-time, overriding any stale defaults in the benchmark repo. |

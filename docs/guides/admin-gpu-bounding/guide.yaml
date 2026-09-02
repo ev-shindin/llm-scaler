@@ -19,7 +19,7 @@ prerequisites:
     # the ScaledObject's namespace (utils.variant), which is where the model servers
     # are, NOT where WVA runs. `kubectl describe scaledobject` shows them too.
     # The prose in the grep is what reportUnresolvedAccelerator actually logs;
-    # docs/deployment/gpu-limiter.md greps the same form.
+    # docs/reference/gpu-limiter.md greps the same form.
     run: |
       kubectl get events -A --field-selector reason=AcceleratorNotResolved
       # Corroborates, never clears: this line is logged once per change.

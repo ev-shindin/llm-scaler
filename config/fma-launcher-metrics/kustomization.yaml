@@ -36,6 +36,6 @@ kind: Kustomization
 # and WVA's additive `sum by` queries would double-count throughput while the
 # `max by` ones still looked correct.
 #
-# See docs/deployment/operations.md, "FMA launcher pods".
+# See docs/reference/operations.md, "FMA launcher pods".
 resources:
 - fma-launcher-podmonitor.yaml

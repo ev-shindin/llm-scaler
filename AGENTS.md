@@ -47,21 +47,35 @@
 
 ## Documentation
 
-Prefer placing documentation in the `docs/` directory.
+Prefer placing documentation in the `docs/` directory. It is split by audience,
+and that split is the point: a reader must be able to tell from the path whether
+a page is written for them.
 
-There are 3 main types of documentation targeting different audiences:
+**User-facing** - someone running WVA, not changing it:
 
-1. **Developer Documentation** - For contributors and maintainers of this project
-   - Architecture decisions
-   - Development setup and workflow
-   - Contributing guidelines
-   - usually in the `docs/developer-guide/` subdirectory
+1. **Well-lit paths** - one scenario, in `docs/well-lit-paths/<scenario>/`: what
+   it buys, what it costs, when not to take it, and which suites and benchmark
+   scenario back it. Paths link down into guides; they never repeat the steps.
+2. **Guides** - one task, from nothing to working, in `docs/guides/<task>/`.
+   Bash blocks between `guide:` markers are generated from `guide.yaml`; edit the
+   YAML and run `make guides-render`, never the block.
+3. **Reference** - what an operator sets and reads, in `docs/reference/`:
+   configuration, scaling policy, metrics, troubleshooting.
+4. **Concepts** - how WVA decides, in an operator's terms, in `docs/concepts/`.
 
-2. **Agents plans** - For AI agent plans.
-   - in the `docs/plans/<area>/` subdirectory, where `<area>` is the specific area of the project (e.g., `engine`, `installation`, `monitoring`, etc.)
+**Developer-facing** - contributors and maintainers:
 
-3. **Superpowers specs** - For superpowers specification
-   - in the `docs/superpowers/<area>/` subdirectory, where `<area>` is the specific area of the project (e.g., `engine`, `installation`, `monitoring`, etc.)
+5. **Developer documentation** - development setup and workflow, and component
+   internals written in package paths and struct fields, in
+   `docs/developer-guide/`.
+6. **Proposals** - design notes for work that is not built yet, or built and
+   still moving, in `docs/proposals/`.
+7. **Agent plans and specs** - in `docs/plans/<area>/`, where `<area>` is the
+   part of the project (e.g. `engine`, `installation`, `monitoring`). Superpowers
+   specs go here too, beside the plan that implements them.
+
+Every page belongs to exactly one of these. A page useful to both audiences is
+user-facing, and links down to the developer page rather than absorbing it.
 
 
 ## Kustomize / Config File Naming

@@ -99,7 +99,7 @@ func GetProductKeys() []string {
 // type outright (TypeInventory.SetUsed), and the placement check asks whether ANY
 // pool has room rather than guessing one (FitsGPUBudget). Deriving the type from
 // the node a running variant's pods landed on would resolve it exactly, and is
-// not implemented — see docs/developer-guide/gpu-capacity-accounting.md.
+// not implemented — see docs/concepts/gpu-capacity-accounting.md.
 func GetAcceleratorNameFromScaleTarget(_ *llmdVariantAutoscalingV1alpha1.VariantAutoscaling, scaleTarget scaletarget.ScaleTargetAccessor) string {
 	// Check scaleTarget for accelerator name if it's not nil
 	if scaleTarget != nil {

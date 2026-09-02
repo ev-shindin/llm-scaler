@@ -321,7 +321,7 @@ EOF
 #
 # Consequence for anyone reading a plan: in a namespace where FMA is present, WVA
 # measures only the decode Deployment, and the GPUs behind the launchers are
-# counted nowhere. See docs/deployment/operations.md, "FMA launcher pods".
+# counted nowhere. See docs/reference/operations.md, "FMA launcher pods".
 #
 # The requester is not found by SO_SERVING_MARKER: it carries the hyphenated
 # llm-d.ai/inference-serving, not the camelCase llm-d.ai/inferenceServing that
@@ -742,7 +742,7 @@ so_weights_note() {
         ""|/*) return 0 ;;
     esac
 
-    printf '%s' "Weights do not persist: ${engine} downloads outside any volume it has mounted, so every scale-up re-fetches ${model} from Hugging Face. That is a per-replica cost on the path this ScaledObject is about to start exercising, and a dependency on the Hub being reachable. llm-d's modelservice chart mounts a model cache by default (uriProtocol: pvc at /model-cache); see docs/deployment/operations.md#weights-and-the-model-cache."
+    printf '%s' "Weights do not persist: ${engine} downloads outside any volume it has mounted, so every scale-up re-fetches ${model} from Hugging Face. That is a per-replica cost on the path this ScaledObject is about to start exercising, and a dependency on the Hub being reachable. llm-d's modelservice chart mounts a model cache by default (uriProtocol: pvc at /model-cache); see docs/reference/operations.md#weights-and-the-model-cache."
     return 0
 }
 
@@ -1673,7 +1673,7 @@ so_drain_note() {
     # operator's judgement, and guessing at a threshold would produce a warning
     # nobody can act on.
     [ "${prestop:-0}" -gt 0 ] && return 0
-    printf '%s' "Scale-down will cut in-flight requests: ${engine} declares no preStop hook, and terminationGracePeriodSeconds is ${grace:-30}. A replica removed mid-stream terminates the responses it is still writing. The pod spec belongs to the model server's chart rather than to WVA -- see docs/deployment/operations.md#draining-before-scale-down."
+    printf '%s' "Scale-down will cut in-flight requests: ${engine} declares no preStop hook, and terminationGracePeriodSeconds is ${grace:-30}. A replica removed mid-stream terminates the responses it is still writing. The pod spec belongs to the model server's chart rather than to WVA -- see docs/reference/operations.md#draining-before-scale-down."
     return 0
 }
 
@@ -1880,8 +1880,8 @@ so_discover() {
                             -l app.kubernetes.io/component=launcher \
                             --no-headers 2>/dev/null | wc -l | tr -d ' ')
                         log_info "FMA detected in $ns for model '$model_label' (requester: $fma_requester). Targeting $name by default; the requester is written below as a second variant with apply: no — set it to yes to autoscale both halves of this model."
-                        log_warning "FMA launcher pods (${fma_launchers:-?} in $ns) run vLLM and serve traffic. WVA follows the dual-pods pairing to attribute a BOUND launcher's metrics, but only if something scrapes them — launchers declare no container ports, so a port-name PodMonitor generates no target. Check with: kubectl get podmonitor -n $ns. See docs/deployment/operations.md, 'FMA launcher pods'."
-                        log_warning "GPU accounting in $ns is a LOWER BOUND: a launcher keeps its vLLM instance resident after unbinding, holding a real GPU while requesting none, and the annotations naming that GPU are stripped at unbind — so neither ResourceQuota nor the WVA limiter can see it. Subtract the warm pool by hand when planning capacity. See docs/deployment/gpu-limiter.md, 'FMA namespaces'."
+                        log_warning "FMA launcher pods (${fma_launchers:-?} in $ns) run vLLM and serve traffic. WVA follows the dual-pods pairing to attribute a BOUND launcher's metrics, but only if something scrapes them — launchers declare no container ports, so a port-name PodMonitor generates no target. Check with: kubectl get podmonitor -n $ns. See docs/reference/operations.md, 'FMA launcher pods'."
+                        log_warning "GPU accounting in $ns is a LOWER BOUND: a launcher keeps its vLLM instance resident after unbinding, holding a real GPU while requesting none, and the annotations naming that GPU are stripped at unbind — so neither ResourceQuota nor the WVA limiter can see it. Subtract the warm pool by hand when planning capacity. See docs/reference/gpu-limiter.md, 'FMA namespaces'."
                         note="${note:+$note}FMA topology: requester $fma_requester and ${fma_launchers:-?} launcher pod(s) also serve this model. This entry is the modelservice half and is the default target. The FMA half is written below as a second variant with apply: no — turn it on to have WVA size both."
                     fi
                 fi

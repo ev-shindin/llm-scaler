@@ -5,8 +5,8 @@
 #
 # Productizes what a local `config/grafana-private/` experiment proved by hand. That
 # directory has never been in this repository, so the measurements it rests on are
-# recorded in docs/developer-guide/guide-review-install-in-namespace.md and inline
-# below, not behind a path you cannot open. Three decisions carry over unchanged:
+# recorded inline below rather than behind a path you cannot open. Three decisions
+# carry over unchanged:
 #
 #   grafana-operator, not the shared cluster Grafana   a shared instance's
 #     dashboards are read-only, and its sidecar was measured watching only its own
@@ -338,7 +338,7 @@ Grafana and point it at the Prometheus WVA already uses:
 # install this resolves to the controller's own namespace and pins the view to it.
 # The dashboard compares that against exported_namespace -- the WORKLOAD's
 # namespace, equal to the controller's only for a namespace-scoped install (see
-# docs/deployment/operations.md) -- so it can never match. The result is a
+# docs/reference/operations.md) -- so it can never match. The result is a
 # correctly built, permanently empty dashboard.
 #
 # So ask the question that actually decides it: are the model servers here? That

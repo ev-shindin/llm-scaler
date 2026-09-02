@@ -195,11 +195,20 @@ make deploy-e2e-infra IMG=<your-registry>/wva-controller:tag
 
 When making code changes, update relevant documentation in:
 
-- `docs/user-guide/` - User-facing changes (CRD changes, new features)
-- `docs/developer-guide/` - Development workflow changes
-- `docs/integrations/` - Integration guide updates
-- `docs/design/` - Architecture or design changes
-- `README.md` - High-level feature changes
+User-facing:
+
+- `docs/guides/<task>/` - a task someone runs, start to finish
+- `docs/reference/` - what an operator sets and reads: configuration, policy,
+  metrics, troubleshooting
+- `docs/concepts/` - how WVA decides, in an operator's terms
+- `README.md` - high-level feature changes
+
+Developer-facing:
+
+- `docs/developer-guide/` - development workflow, and component internals
+  written in package paths and struct fields
+- `docs/proposals/` - design notes for work not built yet, or still moving
+- `docs/plans/<area>/` - agent plans and the specs behind them
 
 ### Testing Documentation
 
@@ -217,12 +226,11 @@ Verify all commands and examples work:
 
 - Use the `logger` package from `internal/logger`
 - Always use backoff retries for Kubernetes API calls (see `internal/utils`)
-- Update Kubernetes conditions for status visibility
 - Emit metrics for observability
 
-### Performance Modeling
+### Analyzers
 
-When modifying queue models in `internal/queueing/analyzer/`:
+When modifying an analyzer in `internal/engines/analyzers/`:
 
 - Ensure mathematical correctness
 - Add comprehensive unit tests

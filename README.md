@@ -1,8 +1,22 @@
 # Workload-Variant-Autoscaler (WVA)
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/llm-d/llm-d-workload-variant-autoscaler)](https://goreportcard.com/report/github.com/llm-d/llm-d-workload-variant-autoscaler)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler?ref=badge_shield)
+[![CI](https://github.com/ev-shindin/llm-scaler/actions/workflows/ci-pr-checks.yaml/badge.svg?branch=main)](https://github.com/ev-shindin/llm-scaler/actions/workflows/ci-pr-checks.yaml)
+[![Go](https://img.shields.io/github/go-mod/go-version/ev-shindin/llm-scaler)](go.mod)
+
+> **An advanced fork of [llm-d/llm-d-workload-variant-autoscaler](https://github.com/llm-d/llm-d-workload-variant-autoscaler).**
+>
+> This fork keeps WVA's core idea -- variant-aware autoscaling for LLM inference --
+> and has diverged substantially from it. The largest additions here are a **KEDA
+> external scaler**, which lets WVA answer KEDA directly over gRPC instead of
+> publishing a metric and hoping; a **warm pool** that bridges a slow scale-up
+> by lending a Pod with the model already loaded and asleep, so the variant
+> serves while its own replica starts; the **ScaledObject discovery and install
+> tooling** behind `make scaledobjects-plan`, which writes an editable plan of
+> what would be autoscaled before anything is applied; and **fixture-executing
+> check suites** that run the deploy shell against recorded pod specs in CI.
+>
+> Developed independently. Not affiliated with, nor endorsed by, the llm-d project.
 
 
 The Workload Variant Autoscaler (WVA) is a Kubernetes-based global autoscaler for inference model servers serving LLMs. WVA works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments. The high-level details of the algorithms are documented [here](https://llm-d.ai/docs/architecture/advanced/autoscaling). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
@@ -10,6 +24,8 @@ The Workload Variant Autoscaler (WVA) is a Kubernetes-based global autoscaler fo
 ### What is a Variant?
 
 WVA introduces the concept of **variants** — multiple model servers in an InferencePool that all serve the same base model but differ in hardware configuration (e.g., GPU type), serving configuration (e.g., tensor parallelism, max batch size, quantization), or both.
+
+Concretely, **a variant is a scaling entity: one KEDA ScaledObject and the workload it scales.** That is the unit WVA discovers, decides for, and reports on — a Pod's variant is the managed scaler its `ownerReferences` lead to, not a label anyone stamps. Variants whose triggers name the same `modelID` are variants of one model, and WVA scales the group rather than each ScaledObject alone. Creating a variant therefore means creating a ScaledObject; there is no other registration.
 
 Use cases include:
 
@@ -21,6 +37,7 @@ Use cases include:
 
 - **Intelligent Autoscaling**: Optimizes replica count by observing the current state of the system
 - **Cost Optimization**: Minimizes infrastructure costs by picking the correct accelerator variant
+- **Warm-Pool Bridging**: Optionally holds models loaded and asleep, and lends one to a variant while its own replica starts
 
 ## Installing
 
@@ -49,9 +66,11 @@ it is running and idle.
 | --- | --- |
 | Full install guide | [deploy/](deploy/) |
 | Installing WVA | [docs/guides/](docs/guides/) — pick a path |
-| Running it day to day | [operations.md](docs/deployment/operations.md) |
-| Watching what it decides | [monitoring.md](docs/deployment/monitoring.md) |
-| Making a workload scalable | [workload-preparation.md](docs/deployment/workload-preparation.md) |
+| Running it day to day | [operations.md](docs/reference/operations.md) |
+| Watching what it decides | [monitoring.md](docs/reference/monitoring.md) |
+| Making a workload scalable | [workload-preparation.md](docs/reference/workload-preparation.md) |
+| Choosing what to run | [well-lit paths](docs/well-lit-paths/) — one page per scenario |
+| Bridging a slow scale-up | [warm-pool/](docs/guides/warm-pool/) — opt-in; a pool holds accelerators |
 
 ## Documentation
 
@@ -126,10 +145,9 @@ Join the [llm-d autoscaling community meetings](https://llm-d.ai/slack) to get i
 Apache 2.0 - see [LICENSE](LICENSE) for details.
 
 
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-workload-variant-autoscaler?ref=badge_large)
-
 ## Related Projects
 
+- [llm-d workload-variant-autoscaler](https://github.com/llm-d/llm-d-workload-variant-autoscaler) - the upstream project this fork derives from
 - [llm-d infrastructure](https://github.com/llm-d/llm-d-infra)
 - [llm-d main repository](https://github.com/llm-d/llm-d)
 
