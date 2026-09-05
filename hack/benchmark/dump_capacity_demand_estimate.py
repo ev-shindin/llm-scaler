@@ -104,7 +104,11 @@ def parse_epp_log(path: Path):
 
 
 def is_v2(pod_name: str) -> bool:
-    return "-decode-v2-" in pod_name
+    # "prefill" buckets as "v2": same deliberately simple stand-in used
+    # elsewhere in this pipeline for a P/D run's second role, in place of a
+    # real third variant kind. Output keys downstream still read
+    # Primary/V2; only the underlying data differs.
+    return "-decode-v2-" in pod_name or "prefill" in pod_name
 
 
 def main():
@@ -132,7 +136,7 @@ def main():
             ed = parse_epp_log(f)
             if ed:
                 epp_by_ts[ts] = ed["eppQueueSize"]
-        elif "decode" in pod:
+        elif "decode" in pod or "prefill" in pod:
             d = parse_pod_log(f)
             if d:
                 decode_by_ts[ts].append((pod, d))

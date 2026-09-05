@@ -315,6 +315,57 @@ io.open(path, "w", encoding="utf-8", newline="\n").write(src)
 print("  fix 3 (fma warmAffinity): applied")
 PYEOF
 
+# ---------------------------------------------------------------------------
+# Fix 6 -- defaults.yaml: harness.resources.memory is hardcoded 32Gi in the clone.
+#
+# This is the memory limit actually applied to the inference-perf harness pod
+# for every `make benchmark-run` invocation. A separate override existed
+# (BENCHMARK_HARNESS_MEMORY, sed'd into this same file) but only inside the
+# benchmark-run-bursty target, which patches the value, runs, then restores
+# the .bak -- a one-off for that target alone. benchmark-run itself never
+# touched this file, so every run through it -- including staged/bursty
+# profiles run via benchmark-run rather than benchmark-run-bursty -- got the
+# clone's stock 32Gi regardless.
+#
+# Measured on pokprod001: a 60-minute, 5-stage, 33120-request inference-perf
+# run (per_request logging disabled) was OOMKilled (exit 137) at 3358s of an
+# expected 3600s. The harness accumulates per-request lifecycle records for
+# summary/per_stage percentile computation for the whole run even with
+# per_request off, and 32Gi was not enough at this request count.
+#
+# Patched HERE, unconditionally, so it applies regardless of which run target
+# is used -- the same reason fix 4 lives here rather than in a scenario file.
+HARNESS_MEMORY="${HARNESS_MEMORY:-64Gi}"
+DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
+if [ ! -f "$DEFAULTS" ]; then
+    note "fix 6 (harness memory): no defaults.yaml, skipped"
+else
+    "$PY" - "$DEFAULTS" "$HARNESS_MEMORY" <<'PYEOF' || fail "fix 6 (harness memory) failed"
+import io, re, sys
+
+path, want = sys.argv[1], sys.argv[2]
+src = io.open(path, encoding="utf-8").read()
+
+# Anchored on the harness resources block itself (cpu line included), not
+# just on the number: memory: 32Gi appears in the file body only once today,
+# but anchoring on context rather than the bare value is what makes this
+# survive both a value change (this fix already made) and an upstream
+# reformat.
+pat = re.compile(
+    r"(harness:\n(?:.*\n)*?  resources:\n    cpu:\s*\d+\n    memory:\s*)([0-9A-Za-z.]+)(\s*\n)"
+)
+m = pat.search(src)
+if not m:
+    sys.exit("anchor missing (upstream shape changed): harness.resources.memory")
+if m.group(2) == want:
+    print("  fix 6 (harness memory): already %s" % want)
+    sys.exit(0)
+src = pat.sub(lambda mm: mm.group(1) + want + mm.group(3), src, count=1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 6 (harness memory): %s -> %s" % (m.group(2), want))
+PYEOF
+fi
+
 echo "patch_harness: done ($REPO_DIR)"
 
 # ---------------------------------------------------------------------------

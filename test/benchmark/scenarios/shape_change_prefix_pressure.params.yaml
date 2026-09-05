@@ -1,0 +1,66 @@
+# Parameters for the (not-yet-written) trace generator script.
+#
+# Produces a GuideLLM `trace_synthetic` file (JSONL: timestamp, input_length,
+# output_length) by concatenating phases, each with its own request rate and
+# token-length shape. Both RPS *and* shape live in the resulting trace file --
+# GuideLLM's `--profile kind=replay` schedules purely from these timestamps
+# (see docs/guides/trace_replay.md), so there is no separate --rate flag to
+# set; this file IS the schedule.
+#
+# Applies to every phase (one setting for the whole file, not per-phase):
+#
+# arrival_distribution
+#   poisson  -- inter-arrival times drawn i.i.d. from Exponential(1/rate_rps),
+#               cumulative-summed into timestamps: genuine Poisson arrivals at
+#               that phase's rate. Realistic; arrivals cluster and gap randomly
+#               even though the average matches rate_rps exactly. (default)
+#   constant -- inter-arrival times fixed at exactly 1/rate_rps: perfectly
+#               even spacing, no randomness. Useful when you want the
+#               timing itself to be a controlled variable, not noise.
+#
+# length_distribution
+#   uniform  -- each request's length drawn uniformly from [min, max].
+#               `mean` is informational only. Matches GuideLLM's own default
+#               for min/max-specified synthetic data. (default; this is what
+#               I'd assumed before you asked -- now explicit rather than
+#               implicit)
+#   normal   -- drawn from Normal(mean, std_dev), clipped to [min, max].
+#               Requires std_dev on each input_tokens/output_tokens block.
+#   constant -- always exactly `mean` (min/max ignored).
+#
+# Phases are concatenated so each one continues from where the previous
+# left off.
+#
+# Example experiment: baseline short-prompt traffic, a sustained jump to
+# heavy prefill pressure at the SAME rate (isolating shape as the variable,
+# not load), then back to baseline -- to see how WVA reacts to a shape-driven
+# demand change rather than a rate-driven one.
+
+seed: 42
+arrival_distribution: poisson   # poisson | constant
+length_distribution: uniform    # uniform | normal | constant
+
+output:
+  path: shape_change_prefix_pressure.jsonl
+  timestamp_column: timestamp
+  prompt_tokens_column: input_length
+  output_tokens_column: output_length
+
+phases:
+  - name: baseline-short
+    duration_s: 240
+    rate_rps: 6
+    input_tokens:  { min: 400,  max: 600,  mean: 500 }
+    output_tokens: { min: 400,  max: 600,  mean: 500 }
+
+  - name: prefix-pressure-long
+    duration_s: 240
+    rate_rps: 6                        # unchanged -- isolates shape, not load
+    input_tokens:  { min: 7000, max: 9000, mean: 8000 }
+    output_tokens: { min: 900,  max: 1100, mean: 1000 }
+
+  - name: recovery-short
+    duration_s: 240
+    rate_rps: 6
+    input_tokens:  { min: 400,  max: 600,  mean: 500 }
+    output_tokens: { min: 400,  max: 600,  mean: 500 }

@@ -151,6 +151,19 @@ def format_bound(bound_by):
     return {"k1-memory": "k1", "k2-compute": "k2"}.get(bound_by, bound_by)
 
 
+def variant_role(variant):
+    """"decode" or "prefill" from a variant name like
+    "qwen-qwe-...-decode-wva", or None if neither appears (e.g. an
+    aggregated/non-disaggregated deployment). Used to pick this variant's own
+    figure out of scheduler-queue-demand's per-role breakdown rather than the
+    pool-wide one, which is always the decode leg's number (see build_cycle_row)."""
+    if "decode" in variant:
+        return "decode"
+    if "prefill" in variant:
+        return "prefill"
+    return None
+
+
 def parse_iso(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -263,7 +276,18 @@ def build_cycle_row(cycle, variant):
     k2_common = Counter(r.get("k2ComputeBound") for r in rcs).most_common(1)
     bound_counts = Counter(format_bound(r.get("boundBy", "?")) for r in rcs)
 
-    epp_queue = (sq.get("estimatedTokens") if sq else 0) or 0
+    # scheduler-queue-demand's top-level estimatedTokens is the whole model's
+    # flow-control queue, which in a P/D split is dominated by one leg (in
+    # practice always equal to byRole.decode) -- applying it to BOTH the
+    # prefill and decode tables silently double-counts the same tokens into
+    # each variant's own EPPq/TotalDemand as if each owned that backlog
+    # independently. byRole carries the real per-leg split when present.
+    role = variant_role(variant)
+    by_role = (sq.get("byRole") or {}) if sq else {}
+    if role is not None and role in by_role:
+        epp_queue = by_role[role] or 0
+    else:
+        epp_queue = (sq.get("estimatedTokens") if sq else 0) or 0
     replica_demand_total = sum(r.get("replicaDemand", 0) or 0 for r in rcs)
     ts = min(e["_ts"] for e in rcs + k2s)
     target = decision.get("target") if decision else None
@@ -284,11 +308,111 @@ def build_cycle_row(cycle, variant):
     }
 
 
-def fetch_logs(namespace, since_seconds):
-    """Returns the controller's logs, or exits non-zero. A kubectl failure —
-    expired token, wrong namespace, no matching pods — must not reach the
-    report as an empty log window; that reads as "the controller never logged
-    anything" and sends whoever holds the report off to check the image."""
+def load_workload_shape_line(results_dir, run_meta):
+    """One-line workload summary ("6000/1000 → 1000/4000 in/out tokens   |
+    12m/phase   |   RPS 4 throughout") for a trace-replay shape-swap run, or
+    None for anything else (this repo's other scenario shapes, or a replay
+    run whose *.params.yaml can't be found).
+
+    Mirrors plot_two_variant_pipeline.py's _load_experiment_metadata /
+    _format_workload_line -- kept as an independent copy rather than a
+    shared import, matching this directory's existing convention of
+    self-contained dump/plot scripts. If you change one, change the other.
+    """
+    workload_name = run_meta.get("harness_workload")
+    if not workload_name:
+        return None
+    # guidellm doesn't copy its rendered profile into results/<treatment>_<i>/
+    # (only inference-perf does) -- it stays at
+    # <run_dir>/workload/profiles/<harness>/<name>, one level above results_dir.
+    candidates = [results_dir / workload_name]
+    harness_name = run_meta.get("harness_name")
+    if harness_name:
+        candidates.append(
+            results_dir.parent.parent / "workload" / "profiles" / harness_name / workload_name
+        )
+    workload = None
+    for wp in candidates:
+        if wp.is_file():
+            try:
+                workload = yaml.safe_load(wp.read_text()) or {}
+            except Exception:
+                workload = None
+            break
+    if not workload or "spec" not in workload:
+        return None
+    profile = (workload["spec"].get("profile") or {})
+    if profile.get("kind") != "replay":
+        return None
+
+    data0 = (workload["spec"].get("data") or [{}])[0]
+    stem = Path(data0.get("path", "")).stem
+    if not stem:
+        return None
+    params_path = (
+        Path(__file__).resolve().parent / ".." / ".." /
+        "test" / "benchmark" / "scenarios" / f"{stem}.params.yaml"
+    ).resolve()
+    if not params_path.is_file():
+        return None
+    try:
+        params = yaml.safe_load(params_path.read_text()) or {}
+    except Exception:
+        return None
+
+    phases = [{
+        "rate": p.get("rate_rps"),
+        "duration": p.get("duration_s"),
+        "input_tokens": (p.get("input_tokens") or {}).get("mean"),
+        "output_tokens": (p.get("output_tokens") or {}).get("mean"),
+    } for p in params.get("phases") or []]
+    if not phases:
+        return None
+
+    parts = []
+    shape_str = " → ".join(
+        f"{p['input_tokens']:g}/{p['output_tokens']:g}"
+        for p in phases if p.get("input_tokens") is not None
+    )
+    if shape_str:
+        parts.append(f"{shape_str} in/out tokens")
+    durations = {p["duration"] for p in phases if p.get("duration")}
+    if len(durations) == 1:
+        d = durations.pop()
+        parts.append(f"{d / 60:g}m/phase" if d >= 60 else f"{d:g}s/phase")
+    rates = {p["rate"] for p in phases if p.get("rate") is not None}
+    if len(rates) == 1:
+        parts.append(f"RPS {rates.pop():g} throughout")
+    elif rates:
+        parts.append("RPS " + " → ".join(f"{p.get('rate'):g}" for p in phases))
+    return "   |   ".join(parts) if parts else None
+
+
+def fetch_logs(namespace, since_seconds, results_dir=None):
+    """Returns the controller's logs, or exits non-zero.
+
+    Prefers a captured tail file (metrics/../wva_controller.log, written by
+    `make benchmark-run` via tail_wva_logs.sh from the moment the run
+    started) over a live `kubectl logs` call: the controller's own log
+    buffer is bounded by kubelet's fixed per-container rotation size, not by
+    run length, so anything past the first few minutes is commonly gone by
+    the time this runs after the fact. The captured file has no such limit.
+
+    A kubectl failure — expired token, wrong namespace, no matching pods —
+    must not reach the report as an empty log window; that reads as "the
+    controller never logged anything" and sends whoever holds the report off
+    to check the image.
+    """
+    if results_dir is not None:
+        captured = Path(results_dir) / "wva_controller.log"
+        if captured.is_file():
+            text = captured.read_text()
+            if text.strip():
+                print(f"Using captured log tail: {captured}", file=sys.stderr)
+                return text
+            print(f"{captured} exists but is empty — falling back to live kubectl logs.",
+                  file=sys.stderr)
+
     cmd = ["kubectl", "logs", "-n", namespace,
            "-l", "app.kubernetes.io/name=workload-variant-autoscaler",
            f"--since={since_seconds}s", "--tail=200000"]
@@ -334,7 +458,7 @@ def main():
     now = datetime.now(timezone.utc)
     since_seconds = int((now - start).total_seconds()) + 90
 
-    logs = fetch_logs(args.namespace, since_seconds)
+    logs = fetch_logs(args.namespace, since_seconds, results_dir=rd)
 
     events = []
     for line in logs.splitlines():
@@ -359,7 +483,8 @@ def main():
     json_out = processed_dir / "k2_decisions.json"
     json_out.write_text(json.dumps({"events": events}, indent=2))
 
-    report = render_report(events, start, stop, args.cycle_gap)
+    workload_line = load_workload_shape_line(rd, meta)
+    report = render_report(events, start, stop, args.cycle_gap, workload_line)
     reports_dir = rd / "metrics" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     md_out = reports_dir / "k2_decision_report.md"
@@ -369,10 +494,12 @@ def main():
     print(f"Wrote {md_out}")
 
 
-def render_report(events, start, stop, cycle_gap):
+def render_report(events, start, stop, cycle_gap, workload_line=None):
     lines = []
     lines.append("# K1/K2 Capacity Decision Report")
     lines.append("")
+    if workload_line:
+        lines.append(workload_line)
     lines.append(f"Window: {start.isoformat()} -> {stop.isoformat()}")
     lines.append(f"Total events captured: {len(events)}")
     lines.append("")

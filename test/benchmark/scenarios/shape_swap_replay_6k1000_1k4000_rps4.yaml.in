@@ -1,0 +1,28 @@
+metadata:
+  labels:
+    name: shape-swap-6k1000-1k4000-rps4
+    description: |
+      Two-stage shape swap replayed from a pre-generated trace
+      (hack/benchmark/gen_shape_trace.py): 6000/1000 tokens for 12m, then
+      1000/4000 tokens for 12m, both RPS=4 via Poisson arrivals, fixed
+      lengths. Rate never changes -- isolates shape as the variable driving
+      any change in WVA's behavior.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: replay
+    time_scale: 1.0
+  # See shape_swap_replay.yaml.in for the full rationale on why this must be
+  # a local file bundled via the guidellm-profiles ConfigMap (no URL support
+  # in guidellm's trace_synthetic loader) at the harness-name-parameterized
+  # mount path /workspace/profiles/guidellm/.
+  data:
+    - kind: trace_synthetic
+      path: /workspace/profiles/guidellm/shape_6k1000_1k4000_rps4_12m.jsonl
+  constraints:
+    - kind: max_duration
+      seconds: 1500

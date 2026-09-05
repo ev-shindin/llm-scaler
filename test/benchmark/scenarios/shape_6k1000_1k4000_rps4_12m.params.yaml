@@ -1,0 +1,26 @@
+# Two-stage shape-swap experiment: same RPS throughout (4 req/s), request
+# shape flips from prefill-heavy (6000/1000) to decode-heavy (1000/4000)
+# halfway through. Isolates shape as the variable, since load never changes.
+
+seed: 42
+arrival_distribution: poisson
+length_distribution: constant   # min=max per phase -- fixed lengths, no spread
+
+output:
+  path: shape_6k1000_1k4000_rps4_12m.jsonl
+  timestamp_column: timestamp
+  prompt_tokens_column: input_length
+  output_tokens_column: output_length
+
+phases:
+  - name: 6k1000-rps4
+    duration_s: 720
+    rate_rps: 4
+    input_tokens:  { mean: 6000 }
+    output_tokens: { mean: 1000 }
+
+  - name: 1k4000-rps4
+    duration_s: 720
+    rate_rps: 4
+    input_tokens:  { mean: 1000 }
+    output_tokens: { mean: 4000 }

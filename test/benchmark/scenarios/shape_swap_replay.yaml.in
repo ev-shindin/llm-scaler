@@ -1,0 +1,37 @@
+metadata:
+  labels:
+    name: shape-swap-4k1000-1k4000-rps2
+    description: |
+      Two-stage shape swap replayed from a pre-generated trace
+      (hack/benchmark/gen_shape_trace.py): 4000/1000 tokens for 12m, then
+      1000/4000 tokens for 12m, both RPS=2 via Poisson arrivals, fixed
+      lengths. Rate never changes -- isolates shape as the variable driving
+      any change in WVA's behavior.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: replay
+    time_scale: 1.0
+  # guidellm's trace_synthetic loader requires a genuine local file
+  # (guidellm/data/deserializers/trace_common.py: _validate_path calls
+  # Path.exists() unconditionally before any dataset loading -- confirmed by
+  # a real failed run, "Trace file not found: https:/..." -- a URL is NOT
+  # supported here despite the underlying loader using HuggingFace
+  # `datasets`, which normally does support them). The file has to be on the
+  # harness pod's filesystem, which happens automatically if it sits
+  # alongside this profile in workload/profiles/guidellm/: step_06 in
+  # llmdbenchmark bundles every file in that directory (not just this one)
+  # into the same ConfigMap. Mount path confirmed against the actually-applied
+  # pod spec (run/guidellm-<id>.yaml) -- NOT the pre-render template in
+  # plan/.../20_harness_pod.yaml, which shows a stale "vllm-benchmark"
+  # placeholder rather than the real, harness-name-parameterized path.
+  data:
+    - kind: trace_synthetic
+      path: /workspace/profiles/guidellm/shape_4k1000_1k4000_rps2_12m.jsonl
+  constraints:
+    - kind: max_duration
+      seconds: 1500

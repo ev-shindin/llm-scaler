@@ -1,0 +1,27 @@
+# Two-stage shape-swap experiment: same RPS throughout, request shape
+# flips from prefill-heavy to decode-heavy halfway through. Isolates shape
+# as the variable driving any change in WVA's behavior, since load (RPS)
+# never changes.
+
+seed: 42
+arrival_distribution: poisson
+length_distribution: constant   # min=max per phase -- fixed lengths, no spread
+
+output:
+  path: shape_4k1000_1k4000_rps2_12m.jsonl
+  timestamp_column: timestamp
+  prompt_tokens_column: input_length
+  output_tokens_column: output_length
+
+phases:
+  - name: 4k1000-rps2
+    duration_s: 720
+    rate_rps: 2
+    input_tokens:  { mean: 4000 }
+    output_tokens: { mean: 1000 }
+
+  - name: 1k4000-rps2
+    duration_s: 720
+    rate_rps: 2
+    input_tokens:  { mean: 1000 }
+    output_tokens: { mean: 4000 }

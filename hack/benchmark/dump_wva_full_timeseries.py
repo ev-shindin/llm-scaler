@@ -53,7 +53,11 @@ def variant_key(label_dict):
     vname = label_dict.get("variant_name")
     if not vname:
         return "_model"
-    if vname.endswith("-v2"):
+    # "prefill" buckets as "v2": same deliberately simple stand-in used
+    # elsewhere in this pipeline for a P/D run's second role, in place of a
+    # real third variant kind. Legend/labels downstream still read
+    # "primary"/"v2"; only the underlying data differs.
+    if vname.endswith("-v2") or "prefill" in vname:
         return "v2"
     return "primary"
 

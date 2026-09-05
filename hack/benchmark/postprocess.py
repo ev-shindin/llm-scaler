@@ -100,8 +100,8 @@ def _parse_prometheus_value(line, metric_name):
         return None
 
 
-def _extract_latency(results_dir):
-    """P95 and P99 for TTFT and ITL, from results.json.
+def _extract_latency_guidellm(results_dir):
+    """P95 and P99 for TTFT and ITL, from guidellm's results.json.
 
     P95 as well as P99 because a tail read alone cannot tell a slow run from a
     run with a few slow requests: on the first pokprod run P95 TTFT was 63.5s
@@ -114,7 +114,7 @@ def _extract_latency(results_dir):
     """
     path = os.path.join(results_dir, "results.json")
     if not os.path.isfile(path):
-        return None, None, None, None
+        return None
 
     with open(path) as f:
         data = json.load(f)
@@ -136,14 +136,54 @@ def _extract_latency(results_dir):
             _pct(itl, 95), _pct(itl, 99))
 
 
-def _extract_error_count(results_dir):
-    """Error count from results.json."""
-    path = os.path.join(results_dir, "results.json")
+def _extract_latency_inference_perf(results_dir):
+    """P95 and P99 for TTFT and ITL, from inference-perf's own
+    summary_lifecycle_metrics.json -- present whether or not per-request
+    logging is enabled (report.request_lifecycle.summary is a separate,
+    much cheaper flag). Values there are in seconds; the report table's
+    columns are in ms, so scale by 1000 here rather than at every caller.
+    """
+    path = os.path.join(results_dir, "summary_lifecycle_metrics.json")
     if not os.path.isfile(path):
-        return 0
+        return None
+
     with open(path) as f:
         data = json.load(f)
-    return data["benchmarks"][0]["metrics"]["request_totals"].get("errored", 0)
+
+    latency = data.get("successes", {}).get("latency", {})
+
+    def _pct(section_key, want):
+        section = latency.get(section_key, {})
+        val = section.get(f"p{want}")
+        return val * 1000.0 if val is not None else None
+
+    ttft, itl = "time_to_first_token", "inter_token_latency"
+    return (_pct(ttft, 95), _pct(ttft, 99),
+            _pct(itl, 95), _pct(itl, 99))
+
+
+def _extract_latency(results_dir):
+    """P95/P99 TTFT and ITL, from whichever harness produced this run."""
+    return (_extract_latency_guidellm(results_dir)
+            or _extract_latency_inference_perf(results_dir)
+            or (None, None, None, None))
+
+
+def _extract_error_count(results_dir):
+    """Error count, from whichever harness produced this run."""
+    path = os.path.join(results_dir, "results.json")
+    if os.path.isfile(path):
+        with open(path) as f:
+            data = json.load(f)
+        return data["benchmarks"][0]["metrics"]["request_totals"].get("errored", 0)
+
+    path = os.path.join(results_dir, "summary_lifecycle_metrics.json")
+    if os.path.isfile(path):
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("failures", {}).get("count", 0)
+
+    return 0
 
 
 # Controller names that carry the replicas actually serving the model.

@@ -347,6 +347,21 @@ scenario:
         replicas: 1
   #      replicas: 8
         vllm:
+          # --max-num-batched-tokens is hardcoded here (not left as
+          # $VLLM_MAX_NUM_BATCHED_TOKENS) because that env var's own default,
+          # set by llm-d-benchmark's _macros.j2, is 256 -- a co-located-engine
+          # default that caps this whole replica's aggregate per-step prefill
+          # progress at 256 tokens regardless of demand or idle KV capacity.
+          # On a disaggregated prefill-only replica there is no concurrent
+          # decode work to protect from a big prefill chunk stealing step
+          # time (the usual reason to keep this small), so the real ceiling
+          # is GPU activation-memory headroom, not decode-latency fairness.
+          # 65536 is a first real step up, not a measured ceiling -- llm-d's
+          # own TPU reference deployment
+          # (llm-d/guides/pd-disaggregation/modelserver/tpu/v7/vllm/patch-prefill.yaml)
+          # uses 8192 for a much larger accelerator-bound workload; Qwen3-0.6B
+          # here is tiny and k1 (KV capacity) is ~521K tokens, so there's
+          # plenty of headroom to push further once this is validated.
           customCommand: |
             ${accelerator.runtimePreamble}
             . /shared-config/llmdbench_env.sh
@@ -357,7 +372,7 @@ scenario:
             ${accelerator.blockSizeArgs} \
             --max-model-len $VLLM_MAX_MODEL_LEN \
             --max-num-seq $VLLM_MAX_NUM_SEQ \
-            --max-num-batched-tokens $VLLM_MAX_NUM_BATCHED_TOKENS \
+            --max-num-batched-tokens 65536 \
             --tensor-parallel-size $TP_SIZE \
             ${accelerator.memoryUtilizationArgs} \
             --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"${accelerator.kvBufferDeviceJson}}' \
@@ -454,6 +469,17 @@ scenario:
       decode:
         replicas: 2
         vllm:
+          # Hardcoded for the same reason as prefill's --max-num-batched-tokens
+          # above: $VLLM_MAX_NUM_BATCHED_TOKENS defaults to 256
+          # (llm-d-benchmark's _macros.j2), well below llm-d's own reference
+          # deployment (8192, see prefill's comment). As a side effect, this
+          # also makes WVA's own k2-derivation formula
+          # (estimateCapacityFromParams) correct for decode for the first
+          # time in this scenario: WVA's deployment parser can't read
+          # $VLLM_MAX_NUM_BATCHED_TOKENS at all (no shell-variable expansion),
+          # so it was already silently assuming EffectiveMaxBatchedTokens=8192
+          # for a V1+chunked-prefill engine -- previously wrong (real value
+          # was 256), now actually true.
           customCommand: |
             ${accelerator.runtimePreamble}
             . /shared-config/llmdbench_env.sh
@@ -464,7 +490,7 @@ scenario:
             ${accelerator.blockSizeArgs} \
             --max-model-len $VLLM_MAX_MODEL_LEN \
             --max-num-seq $VLLM_MAX_NUM_SEQ \
-            --max-num-batched-tokens $VLLM_MAX_NUM_BATCHED_TOKENS \
+            --max-num-batched-tokens 8192 \
             --tensor-parallel-size $TP_SIZE \
             ${accelerator.memoryUtilizationArgs} \
             --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both"${accelerator.kvBufferDeviceJson}}' \
@@ -485,7 +511,18 @@ scenario:
                 mountPath: /shared-config
 
         parallelism:
-          tensor: 2
+          # TP=1, not 2: this ratio was inherited from the upstream llm-d guide's
+          # reference workload (gpt-oss-120b, decode TP=4 there), where TP is
+          # doing real memory sharding for a ~120B-parameter model. Qwen3-0.6B
+          # needs ~1.4GB of weights -- nothing on an H100 needs sharding -- so
+          # TP=2 bought no compute or memory benefit, only a cross-GPU
+          # all-reduce on every decode step and, more importantly, a replica
+          # that costs 2 GPUs instead of 1. That directly compounded the GPU
+          # scarcity this cluster hit under real load (8000-token RPS=10:
+          # 14 nodes reporting "Insufficient nvidia.com/gpu"): TP=1 lets WVA
+          # get 2x the decode replicas from the same GPU budget, and scale in
+          # 1-GPU increments instead of 2.
+          tensor: 1
           data: 1
           dataLocal: 1
           workers: 1
