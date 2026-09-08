@@ -1866,14 +1866,26 @@ BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX ?= v2
 
 .PHONY: benchmark-plot-two-variant
 benchmark-plot-two-variant: ## Plot two-variant replica/latency/throughput graph from the latest results (no-op for single-variant runs)
+	@# The path is announced only if the plot was WRITTEN. The script exits 0
+	@# when it draws nothing -- matplotlib absent, or a single-variant run, both
+	@# deliberate no-ops -- so `&& echo` announced a file that is not there:
+	@#
+	@#   Skipping the two-variant plot: matplotlib is not installed
+	@#   Two-variant plot: .../two_variant_v2_full_pipeline.png
+	@#
+	@# printed together at the end of a real run on waldorf, the second line
+	@# naming a file the first line had just said it would not write.
 	@LATEST_DIR=$$(ls -td $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_* 2>/dev/null | head -1); \
 	if [ -z "$$LATEST_DIR" ]; then \
 		echo "No benchmark results found, skipping two-variant plot"; \
 		exit 0; \
 	fi; \
 	python3 $(CURDIR)/hack/benchmark/plot_two_variant_pipeline.py \
-		$$LATEST_DIR && \
-	echo "Two-variant plot: $$LATEST_DIR/metrics/graphs/two_variant_v2_full_pipeline.png"
+		$$LATEST_DIR || exit $$?; \
+	PLOT="$$LATEST_DIR/metrics/graphs/two_variant_v2_full_pipeline.png"; \
+	if [ -f "$$PLOT" ]; then \
+		echo "Two-variant plot: $$PLOT"; \
+	fi
 
 VARIANT_CONFIG ?= $(CURDIR)/hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml
 WVA_V2_SATURATION_CONFIGMAP ?= $(CURDIR)/hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml
