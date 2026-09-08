@@ -307,28 +307,44 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 				"the ReplicaSet adopted the extra pod, so this test is not staging the condition it claims")
 		}, guardWindow, time.Duration(cfg.PollIntervalSec)*time.Second).Should(Succeed())
 
-		// NO PREMISE GUARD HERE, DELIBERATELY -- and the reason is worth keeping.
+		// PREMISE GUARD: wait until the analyzer has attributed the whole fleet.
 		//
-		// A guard did live here: it sampled wva_analyzer_demand before the unowned
-		// Pod existed and required a 1.25x rise afterwards, on the reasoning that a
-		// third reporting replica raises demand by half. That is wrong, and it
-		// failed a run in which the product behaved correctly.
+		// An earlier guard here sampled wva_analyzer_demand and required a 1.25x
+		// rise once the unowned Pod existed. It was reverted because it failed a run
+		// in which the product behaved correctly: demand is the greater of measured
+		// occupancy and the arrival-demand floor, the floor disappears whenever
+		// there is no arrival rate, and a baseline sampled while it was active is
+		// higher than the correct three-Pod answer. Demand is not proportional to
+		// replicas and never was a proxy for attribution.
 		//
-		// Demand is not proportional to replicas. It is the greater of measured
-		// occupancy and the arrival-demand floor, and the floor moves on its own:
-		// it is unavailable whenever there is no arrival rate ("EPP absent and no
-		// completions"). In the failing run the baseline was sampled at 7 while the
-		// floor was active, and by the time the third Pod reported the floor had
-		// gone, so demand read 6 -- three Pods x 2 tokens, exactly right, and lower
-		// than the two-Pod baseline. The guard demanded >= 8.75 and failed a spec
-		// whose own assertion then showed curr:2 tgt:2 no-change.
+		// wva_analyzer_observed_replicas is that signal, and it is monotone in the
+		// thing being waited for: the count the analyzer attributed, recorded before
+		// ReplicaCount is capped at the scale target. Supply could not witness the
+		// third Pod precisely because of that cap -- the clamp this spec exists to
+		// test -- so the pre-clamp number is the only one that can.
 		//
-		// The premise this spec needs is "the unowned Pod is scraped and attributed
-		// to this variant". Demand is a poor proxy for it and a monotonic one does
-		// not obviously exist among the metrics WVA publishes: supply is CLAMPED to
-		// the owned count by the very code under test, so it cannot witness the
-		// third Pod either. Until a signal is found that measures the premise
-		// directly, no guard beats a wrong guard.
+		// This is what the two runs that motivated it could not distinguish. Both
+		// reported demand 4 and both scraped two Pods, but one saw an owned Pod plus
+		// the unowned one and the other saw two owned Pods and no unowned one. The
+		// assertion below opened against a half-scraped fleet and reported a clamp
+		// regression for a fleet that was merely incomplete.
+		By("Waiting until the analyzer has attributed every serving replica")
+		observedQuery := fmt.Sprintf(
+			"max(wva_analyzer_observed_replicas{analyzer_name=%q,variant_name=%q,exported_namespace=%q})",
+			"saturation", variantName, cfg.LLMDNamespace)
+		Eventually(func(g Gomega) {
+			observed, err := pc.QueryWithRetry(ctx, observedQuery)
+			g.Expect(err).NotTo(HaveOccurred(),
+				"wva_analyzer_observed_replicas is not queryable yet; without it this spec "+
+					"cannot tell a half-scraped cycle from the regression it guards")
+			g.Expect(observed).To(BeNumerically(">=", float64(targetReplicas+1)),
+				"the analyzer has attributed %v replicas, want %d (the %d this Deployment "+
+					"owns plus the unowned one). Until every serving Pod lands in the SAME "+
+					"cycle, a low recommendation means the fleet is incompletely scraped, "+
+					"not that the clamp regressed",
+				observed, targetReplicas+1, targetReplicas)
+		}, time.Duration(cfg.EventuallyExtendedSec)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
 
 		By("Asserting the extra replica's capacity is never treated as removable")
 		// The regression: supply over three reporting replicas yields a full
@@ -378,6 +394,16 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 		// Demand, formatted for a failure message and never fatal on its own: it
 		// is evidence about the assertion, not part of it, so a Prometheus hiccup
 		// here must not decide the spec.
+		// Attribution, formatted for a failure message like demandNow. Evidence
+		// about the assertion, never fatal on its own.
+		observedNow := func() string {
+			v, err := pc.QueryWithRetry(ctx, observedQuery)
+			if err != nil {
+				return "unavailable"
+			}
+			return fmt.Sprintf("%.0f", v)
+		}
+
 		demandNow := func() string {
 			d, err := pc.QueryWithRetry(ctx, demandQuery)
 			if err != nil {
@@ -453,10 +479,11 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(v).To(BeNumerically(">=", float64(targetReplicas)),
 				"WVA recommended fewer replicas than the target while an unowned replica was "+
-					"reporting: its capacity was counted as spare. demand=%s -- if that has "+
-					"dropped since the gate above passed, a Pod fell out of the analyzer's view "+
-					"mid-window and this is a scrape gap rather than a clamp regression. %s",
-				demandNow(), fleet.report(guardWindow))
+					"reporting: its capacity was counted as spare. demand=%s, attributed "+
+					"replicas=%s (want %d) -- if the attributed count has fallen since the gate "+
+					"above passed, a Pod dropped out of the analyzer's view mid-window and this "+
+					"is a scrape gap rather than a clamp regression. %s",
+				demandNow(), observedNow(), targetReplicas+1, fleet.report(guardWindow))
 		}, time.Duration(cfg.EventuallyExtendedSec)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
 			Should(Succeed())
 	})

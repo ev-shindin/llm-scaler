@@ -242,6 +242,7 @@ func (e *Engine) recordAnalyzerMetrics(namespace, modelID string, results []allo
 		}
 		for _, vc := range nr.Result.VariantCapacities {
 			e.metricsEmitter.RecordAnalyzerTarget(nr.Name, namespace, modelID, vc.VariantName, vc.PerReplicaCapacity)
+			e.metricsEmitter.RecordAnalyzerObservedReplicas(nr.Name, namespace, modelID, vc.VariantName, vc.ObservedReplicas)
 			current.target[analyzerTargetSeries{analyzer: nr.Name, variant: vc.VariantName}] = struct{}{}
 		}
 	}
@@ -266,6 +267,7 @@ func (e *Engine) evictStaleAnalyzerSeries(namespace, modelID string, current ana
 	for prev := range e.lastAnalyzerSeries[modelKey].target {
 		if _, still := current.target[prev]; !still {
 			e.metricsEmitter.DeleteAnalyzerTarget(prev.analyzer, namespace, modelID, prev.variant)
+			e.metricsEmitter.DeleteAnalyzerObservedReplicas(prev.analyzer, namespace, modelID, prev.variant)
 		}
 	}
 	e.lastAnalyzerSeries[modelKey] = current
@@ -955,6 +957,12 @@ func buildCapacities(ctx context.Context, nr *allocation.NamedAnalyzerResult, me
 // listing pods, which is the cluster-wide watch this design removed. Clamping to
 // a count the scale target already publishes is what makes this cheap.
 func clampReplicaCountToScaleTarget(vc *domain.VariantCapacity, m domain.VariantMetadata) {
+	// Record what the analyzer actually saw before the cap hides it. The cap
+	// only ever lowers ReplicaCount, so once it has run there is no way to tell
+	// "the analyzer saw two replicas" from "it saw three and one is not owned"
+	// -- which is the whole question when a conceded or unadopted replica is
+	// serving. Published as wva_analyzer_observed_replicas.
+	vc.ObservedReplicas = vc.ReplicaCount
 	if m.CurrentReplicas > 0 {
 		vc.ReplicaCount = min(vc.ReplicaCount, m.CurrentReplicas)
 	}
@@ -1066,6 +1074,11 @@ func logAnalyzerResult(ctx context.Context, modelID, namespace string, nr alloca
 		// rather than being absent.
 		Role   string `json:"role"`
 		Reason string `json:"reason,omitempty"`
+		// Observed is the pre-clamp replica count. It differs from the fleet the
+		// scale target owns exactly when something else is serving, so a cycle
+		// that saw only part of the fleet is visible in this line rather than
+		// inferred from demand afterwards.
+		Observed int `json:"observed"`
 	}
 	variants := make([]variantEntry, 0, len(nr.Result.VariantCapacities))
 	for _, vc := range nr.Result.VariantCapacities {
@@ -1074,10 +1087,11 @@ func logAnalyzerResult(ctx context.Context, modelID, namespace string, nr alloca
 			role = domain.RoleBoth
 		}
 		variants = append(variants, variantEntry{
-			Name:   vc.VariantName,
-			PRC:    vc.PerReplicaCapacity,
-			Role:   role,
-			Reason: vc.Reason,
+			Name:     vc.VariantName,
+			PRC:      vc.PerReplicaCapacity,
+			Role:     role,
+			Reason:   vc.Reason,
+			Observed: vc.ObservedReplicas,
 		})
 	}
 
