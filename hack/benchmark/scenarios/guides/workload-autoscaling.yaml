@@ -288,13 +288,29 @@ scenario:
           data: 1
           dataLocal: 1
           workers: 1
+        # Sized for the model the guides actually deploy: Qwen3-0.6B on ONE GPU.
+        #
+        # This was 16 CPU / 64Gi, which is not what that model needs and is
+        # enough to make the guide unrunnable. On a busy shared cluster the
+        # decode pod sat Unschedulable — "4 Insufficient cpu" across nodes with
+        # free GPUs — so the guide failed for want of CPU it never used.
+        #
+        # Measured on CoreWeave waldorf, same model, same smoke load (15 req/s
+        # for 5m, ~1024 tok in and out), one run each:
+        #
+        #   16 CPU / 64Gi   4134 dispatched, 4134 ok, 0 failed
+        #    4 CPU / 16Gi   4136 dispatched, 4136 ok, 0 failed, Ready in 102s
+        #
+        # A LARGER model needs more than this: raise it here, or point
+        # MODEL_ID at something bigger and size to it. The point is that the
+        # default fits the default model rather than an unstated larger one.
         resources:
           limits:
-            memory: 64Gi
-            cpu: "16"
+            memory: 16Gi
+            cpu: "4"
           requests:
-            memory: 64Gi
-            cpu: "16"
+            memory: 16Gi
+            cpu: "4"
         extraEnvVars:
           - name: PYTORCH_ALLOC_CONF
             value: "expandable_segments:True"
