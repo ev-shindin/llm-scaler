@@ -2745,27 +2745,47 @@ spec:
   maxReplicaCount: ${max}
   advanced:
     restoreToOriginalReplicaCount: true
-    # Scaling behaviour, stated rather than inherited.
+    # Scaling behaviour, stated rather than inherited. Kubernetes' API-server
+    # defaults are scaleUp stabilization 0 and scaleDown 300/Percent 100; every
+    # value below is written out explicitly rather than left to inherit them,
+    # because a cluster that changes its own defaults would otherwise silently
+    # change how every WVA-created workload scales, with nothing here to say so.
     #
-    # Kubernetes' own defaults are already scaleUp stabilization 0 and scaleDown
-    # 300, so on a stock cluster this changes only the policy periods. It is
-    # written out anyway because those defaults are the API server's, not ours:
-    # a cluster that changes them would silently change how every WVA-created
-    # workload scales, and nothing here would say so.
+    # The asymmetry between scaleUp and scaleDown is the point. Scale-up acts on
+    # the current recommendation (stabilization 0) because a decode replica
+    # measured 61s to Ready and the wait is already paid in cold start.
+    # Scale-down is the direction that can be wrong in a way scale-up cannot:
+    # removing a replica too eagerly costs that same cold start on the next
+    # request, while keeping one too long only costs money.
     #
-    # The asymmetry is the point. Scale-up acts on the current recommendation
-    # (stabilization 0) because a decode replica measured 61s to Ready and the
-    # wait is already paid in cold start. Scale-down waits for 300s of sustained
-    # low demand, because removing a replica too eagerly costs that cold start
-    # on the next request while keeping one too long only costs money.
+    # scaleDown used to carry that asymmetry entirely in the stabilization
+    # window (300s, matching the API server's own default) plus a full-speed
+    # step (Percent 100 -- one step could move the whole way once the window
+    # cleared). That combination has a real failure mode: the saturation V2
+    # analyzer's own per-request service-time measurement is itself a function
+    # of how many replicas currently share the load. A fleet that just caught
+    # up reads LOW contention (fast, unqueued service time), which understates
+    # how much capacity it actually needs -- and a 100% step commits the whole
+    # way on that single, favourably-timed reading, with nothing to catch it.
     #
-    # The period is a rate limit, not a delay, and with "Percent 100" one step
-    # may move the whole way -- so the conservatism lives in the window above,
-    # not here. Nothing reacts faster than the HPA control loop either, which
-    # re-evaluates on kube-controller-manager's sync period (15s by default).
+    # value: 50 forces a re-measurement at each intermediate replica count
+    # before going further, which is what actually catches the bad case --
+    # measured live: a fleet capped at 50%/120s bottomed at half its peak and
+    # recovered, where the same trough at 100%/120s went all the way to
+    # minReplicaCount and back. Once the per-step rate is doing that work, the
+    # stabilization window does not need to carry the whole burden by itself,
+    # so it comes down from 300 to 180 -- reacting faster to a genuine drop in
+    # demand, since the multi-step descent is now the backstop against a false
+    # one rather than the window being the only line of defence.
     #
-    # Override per install with WVA_SO_SCALE_{UP,DOWN}_{PERIOD,STABILIZATION},
-    # or replace the shape entirely with WVA_DEFAULT_SO_TEMPLATE.
+    # The tradeoff is a slower recovery on a fleet that genuinely does need to
+    # go all the way down. The period is a rate limit, not a delay -- and
+    # nothing reacts faster than the HPA control loop either, which re-evaluates
+    # on kube-controller-manager's sync period (15s by default).
+    #
+    # Override per install with WVA_SO_SCALE_{UP,DOWN}_{PERIOD,STABILIZATION}
+    # or WVA_SO_SCALE_DOWN_VALUE, or replace the shape entirely with
+    # WVA_DEFAULT_SO_TEMPLATE.
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
@@ -2775,10 +2795,10 @@ spec:
               value: 100
               periodSeconds: ${WVA_SO_SCALE_UP_PERIOD:-5}
         scaleDown:
-          stabilizationWindowSeconds: ${WVA_SO_SCALE_DOWN_STABILIZATION:-300}
+          stabilizationWindowSeconds: ${WVA_SO_SCALE_DOWN_STABILIZATION:-180}
           policies:
             - type: Percent
-              value: 100
+              value: ${WVA_SO_SCALE_DOWN_VALUE:-50}
               periodSeconds: ${WVA_SO_SCALE_DOWN_PERIOD:-120}
   triggers:
     - type: external-push

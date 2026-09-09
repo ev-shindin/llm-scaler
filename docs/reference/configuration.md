@@ -173,7 +173,8 @@ do is also reachable through plan-then-apply, which does not.
 | `WVA_SO_SCALE_UP_PERIOD` | `periodSeconds` on the generated object's scale-up policy. A rate-limit window, not a delay — and nothing acts faster than the HPA control loop's sync period (15s by default) | `5` |
 | `WVA_SO_SCALE_UP_STABILIZATION` | `stabilizationWindowSeconds` for scale-up. This is the knob that delays a scale-up: HPA takes its most conservative recommendation across the window. `0` means act on the current one | `0` |
 | `WVA_SO_SCALE_DOWN_PERIOD` | `periodSeconds` on the scale-down policy | `120` |
-| `WVA_SO_SCALE_DOWN_STABILIZATION` | `stabilizationWindowSeconds` for scale-down — how long demand must stay low before a replica is removed | `300` |
+| `WVA_SO_SCALE_DOWN_STABILIZATION` | `stabilizationWindowSeconds` for scale-down — how long demand must stay low before a replica is removed | `180` |
+| `WVA_SO_SCALE_DOWN_VALUE` | The scale-down policy's `Percent` value — how much of the fleet one step may remove. Below `100`, this forces a re-measurement at each intermediate replica count before going further, which matters because the analyzer's own service-time reading is itself a function of how many replicas currently share the load; the shorter stabilization window above relies on this step limit as the real backstop rather than carrying that job alone | `50` |
 
 `WVA_DEFAULT_SO_MIN` and `_MAX` are only the values the plan is *written* with.
 What gets applied is what the file says when you apply it, per entry.
