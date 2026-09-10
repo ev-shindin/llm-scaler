@@ -22,6 +22,7 @@ import (
 // must appear here.
 var EngineSpecificQueries = []string{
 	QueryKvCacheUsage,
+	QueryMetricsAge,
 	QueryQueueLength,
 	QueryCacheConfigInfo,
 	QueryAvgOutputTokens,

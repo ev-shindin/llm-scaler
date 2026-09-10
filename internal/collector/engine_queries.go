@@ -20,6 +20,7 @@ import (
 // enforcer, not per replica in this collector).
 var engineSpecificReplicaQueries = []string{
 	registration.QueryKvCacheUsage,
+	registration.QueryMetricsAge,
 	registration.QueryQueueLength,
 	registration.QueryCacheConfigInfo,
 	registration.QueryAvgOutputTokens,
