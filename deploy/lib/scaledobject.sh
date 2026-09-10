@@ -2743,6 +2743,34 @@ spec:
   cooldownPeriod: 30
   minReplicaCount: ${min}
   maxReplicaCount: ${max}
+  # What KEDA does when WVA cannot answer.
+  #
+  # WVA returns a gRPC error from GetMetrics when its own guards leave it with
+  # no trusted view of the workload -- every replica's metrics stale. Without
+  # this stanza KEDA simply propagates no metric, the HPA holds, and the
+  # workload sits at whatever count it happened to be at, indefinitely and
+  # silently. With it, three consecutive failures put a floor under that hold.
+  #
+  # currentReplicasIfHigher, so the floor can only hold or RAISE. KEDA's static
+  # default would drop a fleet of eight to the fallback count at the moment WVA
+  # admitted it cannot see that fleet -- acting decisively on the evidence that
+  # nothing is known, which is the one thing a fallback must not do.
+  #
+  # replicas may be 0 on a scale-to-zero install, and KEDA accepts it:
+  # CheckFallbackValid requires only >= 0, checked against the pinned
+  # kedacore/keda v2.18.0. With currentReplicasIfHigher a 0 floor degrades to a
+  # plain hold, which is the right nothing-to-add behaviour for a parked
+  # workload.
+  #
+  # KEDA computes the fallback metric as target x replicas, and the trigger
+  # below leaves metricType unset, so it is AverageValue with target 1 and the
+  # arithmetic lands on exactly replicas. KEDA's docs say fallback needs
+  # AverageValue; as of 2.18 pkg/fallback handles Value too, and the only
+  # trigger types it refuses outright are cpu and memory. Ours is external-push.
+  fallback:
+    failureThreshold: ${WVA_SO_FALLBACK_FAILURES:-3}
+    replicas: ${WVA_SO_FALLBACK_REPLICAS:-${min}}
+    behavior: currentReplicasIfHigher
   advanced:
     restoreToOriginalReplicaCount: true
     # Scaling behaviour, stated rather than inherited.
