@@ -211,15 +211,10 @@ func (h *Handler) decisionFor(ctx context.Context, ref *pb.ScaledObjectRef) (dec
 	return d, ok, nil
 }
 
-// desired returns WVA's latest desired replicas for the ref and whether a
-// decision exists yet.
-func (h *Handler) desired(ctx context.Context, ref *pb.ScaledObjectRef) (int32, bool, error) {
-	d, ok, err := h.decisionFor(ctx, ref)
-	if err != nil || !ok {
-		return 0, false, err
-	}
-	return d.DesiredReplicas, true, nil
-}
+// desired is gone: it existed only to hide decisionFor's third return from
+// GetMetrics, and GetMetrics now resolves the target name itself so it can pass
+// the same name to the trust check and the store lookup without resolving twice.
+// isActive still calls decisionFor directly, as it always did.
 
 // GetMetricSpec advertises the WVA metric with a target of 1 so HPA scales the
 // target to exactly the value GetMetrics returns.
@@ -257,16 +252,22 @@ func (h *Handler) GetMetricSpec(_ context.Context, ref *pb.ScaledObjectRef) (*pb
 func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
 	ref := req.GetScaledObjectRef()
 	h.observe(ref)
-	if err := h.trusted(ctx, ref); err != nil {
-		return nil, err
-	}
-	d, ok, err := h.desired(ctx, ref)
+	// Resolved ONCE and passed to both checks below. targetName falls back to an
+	// UNCACHED Get whenever the registry has not yet enriched this ref, and its
+	// own doc comment explains that the registry hop exists precisely so every
+	// KEDA poll of every workload is not a real API request -- so a second
+	// resolution here would double that cost during the window the hop exists to
+	// protect, at the 5s polling interval the samples ship.
+	name, err := h.targetName(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
+	if err := h.trusted(ctx, ref.Namespace, name); err != nil {
+		return nil, err
+	}
 	var value int64
-	if ok {
-		value = int64(d)
+	if d, ok := h.store.Get(ref.Namespace, name); ok {
+		value = int64(d.DesiredReplicas)
 	}
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{{MetricName: MetricName, MetricValue: value}},
@@ -274,22 +275,17 @@ func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*p
 }
 
 // trusted returns a gRPC error when the collector's last pass found no usable
-// view of this ref's scale target, and nil otherwise.
+// view of the named scale target, and nil otherwise.
 //
-// A ref whose target cannot be resolved is TRUSTED, not blocked: that lookup
-// failure is already the error GetMetrics returns on its own a line later, and
-// answering it here would report the wrong reason for the same outcome.
+// Takes the resolved target name rather than the ref, so GetMetrics can resolve
+// it once -- see the note there on what a second resolution would cost.
 //
 // codes.Unavailable, because that is what it is -- the input is temporarily
 // missing and the call is worth retrying, which is exactly how KEDA treats it:
 // it counts the failure toward fallback.failureThreshold and asks again next
 // poll. Not FailedPrecondition, which invites a reader to treat it as a
 // permanent misconfiguration.
-func (h *Handler) trusted(ctx context.Context, ref *pb.ScaledObjectRef) error {
-	name, err := h.targetName(ctx, ref)
-	if err != nil {
-		return nil
-	}
+func (h *Handler) trusted(ctx context.Context, namespace, name string) error {
 	now := h.now
 	if now == nil { // zero-value Handler (tests); NewHandler always sets it.
 		now = time.Now
@@ -298,11 +294,11 @@ func (h *Handler) trusted(ctx context.Context, ref *pb.ScaledObjectRef) error {
 	if trust == nil { // zero-value Handler (tests); NewHandler always sets it.
 		trust = decision.DefaultTrust
 	}
-	if ok, reason := trust.Trust(ref.Namespace, name, now(), trustTTL); !ok {
+	if ok, reason := trust.Trust(namespace, name, now(), trustTTL); !ok {
 		log.FromContext(ctx).V(logging.DEFAULT).Info("declining to answer KEDA: no trusted view of the workload",
-			"namespace", ref.Namespace, "target", name, "reason", reason)
+			"namespace", namespace, "target", name, "reason", reason)
 		return status.Errorf(codes.Unavailable,
-			"no trusted metrics for %s/%s: %s", ref.Namespace, name, reason)
+			"no trusted metrics for %s/%s: %s", namespace, name, reason)
 	}
 	return nil
 }

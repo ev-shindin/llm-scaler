@@ -5,8 +5,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 )
 
 func row(variant, status string, ready bool) domain.ReplicaMetrics {
@@ -70,11 +75,7 @@ func TestPublishTrustVerdicts(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := decision.NewTrustStore()
-			prev := decision.DefaultTrust
-			decision.DefaultTrust = store
-			t.Cleanup(func() { decision.DefaultTrust = prev })
-
-			publishTrustVerdicts(context.Background(), tc.rows, now)
+			publishTrustVerdicts(context.Background(), store, "chat", "test-model", tc.rows, now)
 
 			ok, reason := store.Trust("chat", "vllm", now, time.Minute)
 			if !tc.wantVerdict {
@@ -96,11 +97,7 @@ func TestPublishTrustVerdicts(t *testing.T) {
 func TestPublishTrustVerdicts_PerTarget(t *testing.T) {
 	now := time.Now()
 	store := decision.NewTrustStore()
-	prev := decision.DefaultTrust
-	decision.DefaultTrust = store
-	t.Cleanup(func() { decision.DefaultTrust = prev })
-
-	publishTrustVerdicts(context.Background(), []domain.ReplicaMetrics{
+	publishTrustVerdicts(context.Background(), store, "chat", "test-model", []domain.ReplicaMetrics{
 		row("wedged", "stale", true),
 		row("healthy", "fresh", true),
 	}, now)
@@ -110,5 +107,44 @@ func TestPublishTrustVerdicts_PerTarget(t *testing.T) {
 	}
 	if ok, reason := store.Trust("chat", "healthy", now, time.Minute); !ok {
 		t.Errorf("the healthy target was blocked by its neighbour: %q", reason)
+	}
+}
+
+// TestPublishTrustVerdicts_BlockedReason pins that the abstain is visible on
+// wva_model_scaling_blocked and not only in a log line.
+//
+// WVA erroring at KEDA shows up on the HPA as ScalingActive=False, which says a
+// scaler failed but not which guard fired. Without the reason an operator sees a
+// fleet that has stopped moving and nothing on the dashboard explaining it.
+func TestPublishTrustVerdicts_BlockedReason(t *testing.T) {
+	now := time.Now()
+	reg := prometheus.NewRegistry()
+	if err := metrics.InitMetrics(reg); err != nil {
+		t.Fatalf("InitMetrics: %v", err)
+	}
+	store := decision.NewTrustStore()
+
+	count := func() int {
+		n, err := testutil.GatherAndCount(reg, constants.WVAModelScalingBlocked)
+		if err != nil {
+			t.Fatalf("GatherAndCount: %v", err)
+		}
+		return n
+	}
+
+	publishTrustVerdicts(context.Background(), store, "chat", "test-model",
+		[]domain.ReplicaMetrics{row("vllm", "stale", true)}, now)
+	if got := count(); got != 1 {
+		t.Errorf("%s has %d series after an untrusted pass, want 1",
+			constants.WVAModelScalingBlocked, got)
+	}
+
+	// Recovery clears it. The producer owns exactly this reason and deletes it
+	// when it stops holding, the same contract the other two producers follow.
+	publishTrustVerdicts(context.Background(), store, "chat", "test-model",
+		[]domain.ReplicaMetrics{row("vllm", "fresh", true)}, now)
+	if got := count(); got != 0 {
+		t.Errorf("%s has %d series after recovery, want 0",
+			constants.WVAModelScalingBlocked, got)
 	}
 }
