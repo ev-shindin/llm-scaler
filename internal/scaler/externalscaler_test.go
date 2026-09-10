@@ -2,12 +2,15 @@ package scaler_test
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	pb "github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -111,6 +114,58 @@ var _ = Describe("External scaler handler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.MetricValues[0].MetricValue).To(Equal(int64(7)),
 				"the metric must come from the ScaledObject's own target")
+		})
+
+		It("declines to answer when WVA has no trusted view of the workload", func() {
+			// The abstain path. WVA's guards reject inputs they cannot trust,
+			// and rejecting enough of them turns "the scrape is broken" into
+			// "this workload looks idle" -- which is scaled DOWN. Rather than
+			// serve a number built on nothing, WVA errors and lets KEDA do what
+			// it already does with an erroring scaler: propagate no metric, so
+			// the HPA holds, then apply spec.fallback after failureThreshold.
+			trust := decision.NewTrustStore()
+			trust.Publish(testNamespace, "chat-decode-deploy", false, "every replica's metrics are stale", time.Now())
+			h := newHandler(scaledObject(testNamespace, "chat-decode", "chat-decode-deploy")).WithTrustStore(trust)
+			store.Set(testNamespace, "chat-decode-deploy", 5)
+
+			_, err := h.GetMetrics(ctx, &pb.GetMetricsRequest{
+				ScaledObjectRef: ref("chat-decode", nil),
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(status.Code(err)).To(Equal(codes.Unavailable),
+				"Unavailable is retryable, so KEDA counts it toward failureThreshold and asks again")
+			Expect(err.Error()).To(ContainSubstring("stale"),
+				"the reason must reach KEDA's error, which is where an operator sees it first")
+		})
+
+		It("keeps answering the 0<->1 gate even when it will not size the fleet", func() {
+			// IsActive must NOT abstain. A silent scaler reads as INACTIVE
+			// there, so KEDA would scale the workload to zero on exactly the
+			// evidence that says WVA cannot see it. Declining to size a fleet
+			// is safe; declining to say a fleet should exist is not.
+			trust := decision.NewTrustStore()
+			trust.Publish(testNamespace, "chat-decode-deploy", false, "every replica's metrics are stale", time.Now())
+			h := newHandler(scaledObject(testNamespace, "chat-decode", "chat-decode-deploy")).WithTrustStore(trust)
+			store.Set(testNamespace, "chat-decode-deploy", 3)
+
+			resp, err := h.IsActive(ctx, ref("chat-decode", nil))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp.Result).To(BeTrue())
+		})
+
+		It("answers normally for a workload the trust store has no verdict on", func() {
+			// The store's silence is not evidence of a failure: a workload at
+			// zero replicas, or one seen before the collector's first pass, has
+			// no verdict and must not be frozen by that.
+			h := newHandler(scaledObject(testNamespace, "chat-decode", "chat-decode-deploy")).
+				WithTrustStore(decision.NewTrustStore())
+			store.Set(testNamespace, "chat-decode-deploy", 4)
+
+			resp, err := h.GetMetrics(ctx, &pb.GetMetricsRequest{
+				ScaledObjectRef: ref("chat-decode", nil),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp.MetricValues[0].MetricValue).To(Equal(int64(4)))
 		})
 
 		It("errors when the ScaledObject is missing", func() {

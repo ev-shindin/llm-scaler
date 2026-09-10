@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
 )
 
@@ -34,6 +35,20 @@ const MetricName = "wva-desired-replicas"
 // without being refreshed. See Handler.honoursDecision.
 const activationTTL = 60 * time.Second
 
+// trustTTL bounds how long an "I cannot see this workload" verdict keeps WVA
+// from answering. Comfortably longer than activationTTL because the two answer
+// different questions: activation expires so a target is not held AWAKE on an
+// abandoned decision, while this expires so a target is not held FROZEN by an
+// abandoned verdict. Freezing is the safer failure of the two, so it is given
+// more rope -- but not unlimited rope, because a collector that has stopped
+// publishing verdicts entirely would otherwise freeze every workload it ever
+// reported on, permanently.
+//
+// Five minutes is 20 optimize intervals at the 15s default: long enough that a
+// genuinely broken scrape stays declared broken across many cycles, short
+// enough that a wedged collector releases the fleet within one alerting window.
+const trustTTL = 5 * time.Minute
+
 // Handler implements pb.ExternalScalerServer.
 type Handler struct {
 	pb.UnimplementedExternalScalerServer
@@ -43,6 +58,9 @@ type Handler struct {
 	// the moment KEDA made its first call, with nothing in the code saying "watch".
 	client client.Reader
 	store  *decision.Store
+	// trust carries the collector's verdict on whether WVA can see a workload at
+	// all. Read by GetMetrics only — see trusted.
+	trust *decision.TrustStore
 	// registry is the set of workloads WVA manages. Every RPC registers its ref
 	// there — see observe.
 	registry *registry.Registry
@@ -50,8 +68,8 @@ type Handler struct {
 	now func() time.Time
 }
 
-// NewHandler builds a Handler. A nil store falls back to decision.Default, and a
-// nil reg to registry.Default.
+// NewHandler builds a Handler. A nil store falls back to decision.Default, a nil
+// trust store to decision.DefaultTrust, and a nil reg to registry.Default.
 //
 // c must be uncached — see the client field.
 func NewHandler(c client.Reader, store *decision.Store, reg *registry.Registry) *Handler {
@@ -61,7 +79,17 @@ func NewHandler(c client.Reader, store *decision.Store, reg *registry.Registry) 
 	if reg == nil {
 		reg = registry.Default
 	}
-	return &Handler{client: c, store: store, registry: reg, now: time.Now}
+	return &Handler{client: c, store: store, trust: decision.DefaultTrust, registry: reg, now: time.Now}
+}
+
+// WithTrustStore returns h using ts for trust verdicts instead of the
+// process-wide store. For tests, which must not race on a shared store; nil is
+// ignored so a caller cannot accidentally disarm the check.
+func (h *Handler) WithTrustStore(ts *decision.TrustStore) *Handler {
+	if ts != nil {
+		h.trust = ts
+	}
+	return h
 }
 
 // observe records that KEDA has asked about this ref. It is the discovery event:
@@ -209,9 +237,30 @@ func (h *Handler) GetMetricSpec(_ context.Context, ref *pb.ScaledObjectRef) (*pb
 // GetMetrics returns WVA's desired replica count as the metric value. Before the
 // first optimization decision exists it returns 0, so HPA holds the target at
 // minReplicaCount rather than acting on a guess.
+//
+// It can also decline to answer. When the collector's last pass found no usable
+// view of the workload -- every replica's metrics stale -- WVA's number would be
+// computed from inputs its own guards rejected, and the honest response is an
+// error rather than a figure. KEDA already defines what an erroring scaler
+// means, which is why this is an error and not a new WVA mechanism: no metric
+// reaches the HPA, so the replica count HOLDS, and after
+// spec.fallback.failureThreshold consecutive failures KEDA applies
+// spec.fallback (the generated ScaledObject ships
+// behavior: currentReplicasIfHigher, so the fallback can only hold or raise).
+// Nothing here freezes, caches or floors anything itself.
+//
+// Scope: GetMetrics only. IsActive and StreamIsActive deliberately keep
+// answering, because their answer is the 0<->1 gate and a scaler that goes
+// silent there reads as INACTIVE -- KEDA would scale the workload to zero on
+// exactly the evidence that says WVA cannot see it. Declining to size a fleet
+// is safe; declining to say a fleet should exist is not.
 func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
-	h.observe(req.GetScaledObjectRef())
-	d, ok, err := h.desired(ctx, req.GetScaledObjectRef())
+	ref := req.GetScaledObjectRef()
+	h.observe(ref)
+	if err := h.trusted(ctx, ref); err != nil {
+		return nil, err
+	}
+	d, ok, err := h.desired(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +271,40 @@ func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*p
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{{MetricName: MetricName, MetricValue: value}},
 	}, nil
+}
+
+// trusted returns a gRPC error when the collector's last pass found no usable
+// view of this ref's scale target, and nil otherwise.
+//
+// A ref whose target cannot be resolved is TRUSTED, not blocked: that lookup
+// failure is already the error GetMetrics returns on its own a line later, and
+// answering it here would report the wrong reason for the same outcome.
+//
+// codes.Unavailable, because that is what it is -- the input is temporarily
+// missing and the call is worth retrying, which is exactly how KEDA treats it:
+// it counts the failure toward fallback.failureThreshold and asks again next
+// poll. Not FailedPrecondition, which invites a reader to treat it as a
+// permanent misconfiguration.
+func (h *Handler) trusted(ctx context.Context, ref *pb.ScaledObjectRef) error {
+	name, err := h.targetName(ctx, ref)
+	if err != nil {
+		return nil
+	}
+	now := h.now
+	if now == nil { // zero-value Handler (tests); NewHandler always sets it.
+		now = time.Now
+	}
+	trust := h.trust
+	if trust == nil { // zero-value Handler (tests); NewHandler always sets it.
+		trust = decision.DefaultTrust
+	}
+	if ok, reason := trust.Trust(ref.Namespace, name, now(), trustTTL); !ok {
+		log.FromContext(ctx).V(logging.DEFAULT).Info("declining to answer KEDA: no trusted view of the workload",
+			"namespace", ref.Namespace, "target", name, "reason", reason)
+		return status.Errorf(codes.Unavailable,
+			"no trusted metrics for %s/%s: %s", ref.Namespace, name, reason)
+	}
+	return nil
 }
 
 // IsActive reports the target active unless WVA has decided it needs zero
