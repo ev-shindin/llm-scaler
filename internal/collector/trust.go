@@ -22,9 +22,12 @@ import (
 // under whatever else is running.
 //
 // The rule is narrow on purpose: a target is untrusted only when it produced
-// rows and EVERY one of them is stale. That is the metrics pipeline breaking
-// under a workload that is still there, which is the one state where WVA's
-// number is a guess and KEDA's fallback is a better answer than a guess.
+// rows and EVERY one of them is past the UNAVAILABLE threshold -- five minutes,
+// not the one-minute fresh line the soft exclusions elsewhere use. That is a
+// metrics pipeline that has STOPPED under a workload still running, which is the
+// one state where WVA's number is a guess and KEDA's fallback is better than a
+// guess. A pipeline that is merely late costs a replica its vote in an average;
+// it does not cost the workload its ability to scale.
 //
 // Two conditions that look similar and are deliberately excluded:
 //
@@ -74,7 +77,7 @@ func publishTrustVerdicts(
 	type tally struct {
 		namespace string
 		total     int
-		stale     int
+		unusable  int
 	}
 	byTarget := make(map[string]*tally, len(rows))
 	order := make([]string, 0, len(rows))
@@ -90,13 +93,17 @@ func publishTrustVerdicts(
 			order = append(order, rm.VariantName)
 		}
 		t.total++
-		// StaleOrOlder, not a comparison to "stale": that is one of two age
-		// bands past the fresh threshold, and testing it by equality made this
-		// verdict cover 1-to-5-minute-old data while exempting anything older,
-		// so the abstain switched itself off exactly as a broken scrape got
-		// worse. See domain.ReplicaMetricsMetadata.StaleOrOlder.
-		if rm.Metadata.StaleOrOlder() {
-			t.stale++
+		// Unavailable, NOT StaleOrOlder, and the gap between them is the whole
+		// point. This verdict stops WVA answering KEDA for the workload, which
+		// holds it where it stands; the soft exclusions elsewhere only drop a
+		// replica from an average. An earlier version keyed this on
+		// StaleOrOlder -- data more than a MINUTE old -- which is close enough
+		// to a healthy replica's age on a 30s scrape that a slow Prometheus
+		// could have frozen a working fleet, and it would have done so to every
+		// replica at once, since scrape lag is systemic. Five minutes is a
+		// scrape that has stopped. See ReplicaMetricsMetadata.Unavailable.
+		if rm.Metadata.Unavailable() {
+			t.unusable++
 		}
 	}
 
@@ -104,11 +111,11 @@ func publishTrustVerdicts(
 	anyUntrusted := false
 	for _, name := range order {
 		t := byTarget[name]
-		trusted := t.stale < t.total
+		trusted := t.unusable < t.total
 		reason := ""
 		if !trusted {
 			anyUntrusted = true
-			reason = "every replica's metrics are stale"
+			reason = "every replica's metrics are older than the unavailable threshold"
 			// At DEFAULT: this is about to stop WVA answering KEDA for this
 			// workload, and an operator watching replicas not move needs the
 			// reason in the controller's own log, not only in KEDA's.
@@ -116,7 +123,7 @@ func publishTrustVerdicts(
 				"namespace", t.namespace,
 				"target", name,
 				"replicas", t.total,
-				"stale", t.stale)
+				"unusable", t.unusable)
 		}
 		trust.Publish(t.namespace, name, trusted, reason, now)
 	}

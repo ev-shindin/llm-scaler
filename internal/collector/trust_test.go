@@ -36,9 +36,15 @@ func TestPublishTrustVerdicts(t *testing.T) {
 		wantVerdict bool // whether a verdict is published at all
 	}{
 		{
-			name:        "every replica stale is the one blocking case",
+			// The HARD action keys on the five-minute band, not the one-minute
+			// one. "stale" is a scrape that is LATE: the soft exclusions
+			// elsewhere already drop these replicas from the averages, and
+			// freezing a workload for lateness would fire on a healthy fleet
+			// behind a slow Prometheus -- systemically, every replica at once,
+			// which is exactly the all-replicas condition this looks for.
+			name:        "every replica merely stale keeps WVA answering",
 			rows:        []domain.ReplicaMetrics{row("vllm", "stale", true), row("vllm", "stale", true)},
-			wantTrusted: false,
+			wantTrusted: true,
 			wantVerdict: true,
 		},
 		{
@@ -58,21 +64,20 @@ func TestPublishTrustVerdicts(t *testing.T) {
 			wantVerdict: true,
 		},
 		{
-			// The hole this test exists for. "unavailable" is the age band PAST
-			// "stale" -- five minutes and older -- and the value is still in the
-			// row. Comparing the status to "stale" by equality covered
-			// 1-to-5-minute-old data and exempted everything worse, so the
-			// abstain switched itself off as the scrape got more broken.
-			name:        "every replica unavailable blocks too, not just stale",
+			// The one blocking case: every replica past five minutes, which is
+			// a scrape that has stopped rather than one running behind.
+			name:        "every replica unavailable is the one blocking case",
 			rows:        []domain.ReplicaMetrics{row("vllm", "unavailable", true), row("vllm", "unavailable", true)},
 			wantTrusted: false,
 			wantVerdict: true,
 		},
 		{
-			name: "a mix of stale and unavailable is still no usable view",
-			rows: []domain.ReplicaMetrics{row("vllm", "stale", true), row("vllm", "unavailable", true)},
-			// Neither band is usable, so neither rescues the other.
-			wantTrusted: false,
+			// A replica that is merely late still counts as a view of the
+			// workload, so it rescues the target from the abstain even though
+			// the soft exclusions will drop it from the averages.
+			name:        "a mix of stale and unavailable keeps WVA answering",
+			rows:        []domain.ReplicaMetrics{row("vllm", "stale", true), row("vllm", "unavailable", true)},
+			wantTrusted: true,
 			wantVerdict: true,
 		},
 		{
@@ -123,7 +128,7 @@ func TestPublishTrustVerdicts_PerTarget(t *testing.T) {
 	now := time.Now()
 	store := decision.NewTrustStore()
 	publishTrustVerdicts(context.Background(), store, "chat", "test-model", []domain.ReplicaMetrics{
-		row("wedged", "stale", true),
+		row("wedged", "unavailable", true),
 		row("healthy", "fresh", true),
 	}, now)
 
@@ -158,7 +163,7 @@ func TestPublishTrustVerdicts_BlockedReason(t *testing.T) {
 	}
 
 	publishTrustVerdicts(context.Background(), store, "chat", "test-model",
-		[]domain.ReplicaMetrics{row("vllm", "stale", true)}, now)
+		[]domain.ReplicaMetrics{row("vllm", "unavailable", true)}, now)
 	if got := count(); got != 1 {
 		t.Errorf("%s has %d series after an untrusted pass, want 1",
 			constants.WVAModelScalingBlocked, got)
@@ -177,7 +182,7 @@ func TestPublishTrustVerdicts_BlockedReason(t *testing.T) {
 	// verdict expires on its own after trustTTL, so a gauge left at 1 here
 	// would outlive the condition it reports and sit blocked forever.
 	publishTrustVerdicts(context.Background(), store, "chat", "test-model",
-		[]domain.ReplicaMetrics{row("vllm", "stale", true)}, now)
+		[]domain.ReplicaMetrics{row("vllm", "unavailable", true)}, now)
 	if got := count(); got != 1 {
 		t.Fatalf("%s has %d series, want 1 before the vanish", constants.WVAModelScalingBlocked, got)
 	}

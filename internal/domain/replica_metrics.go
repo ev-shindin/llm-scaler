@@ -228,3 +228,28 @@ func (m *ReplicaMetricsMetadata) StaleOrOlder() bool {
 	}
 	return m.FreshnessStatus == FreshnessStale || m.FreshnessStatus == FreshnessUnavailable
 }
+
+// Unavailable reports data past the collector's unavailable threshold (5 minutes
+// by default) -- the older of the two bands StaleOrOlder covers.
+//
+// The distinction exists because the two verdicts are spent on actions of very
+// different weight, and the weight should match the confidence.
+//
+// StaleOrOlder is for SOFT exclusions: leaving a replica out of a median, or out
+// of an ITL fit. Being wrong there costs one replica's contribution for a cycle,
+// so it can afford the tighter line -- data more than a minute old.
+//
+// This one is for the HARD action: WVA declining to answer KEDA at all, which
+// holds an entire workload where it stands. A minute is too tight to spend that
+// on. Age is measured from the sample's own timestamp to collection time, so a
+// perfectly healthy replica on a 30s scrape already sits near half of it once
+// query lag is counted, and scrape lag is systemic -- every replica of a fleet
+// crosses the line together, which is exactly the all-replicas condition the
+// abstain looks for. Five minutes is a scrape that has stopped, not a scrape
+// that is late.
+func (m *ReplicaMetricsMetadata) Unavailable() bool {
+	if m == nil {
+		return false
+	}
+	return m.FreshnessStatus == FreshnessUnavailable
+}
