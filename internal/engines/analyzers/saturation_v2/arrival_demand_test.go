@@ -186,6 +186,61 @@ var _ = Describe("estimateArrivalDemand", func() {
 		Expect(f.Tokens).To(BeNumerically("~", clean.Tokens, 0.01))
 	})
 
+	It("skips a replica whose scrape is stale, rather than outvoting it", func() {
+		// Staleness is not an outlier, so the median is the wrong tool for it:
+		// a fleet whose scrape breaks while it is busy goes stale TOGETHER, at
+		// values that are internally consistent and all wrong. Here the two
+		// stale replicas are the majority, so a median that counted them would
+		// return their value; skipping them leaves only the fresh one.
+		fresh := &domain.ReplicaMetricsMetadata{FreshnessStatus: "fresh"}
+		stale := &domain.ReplicaMetricsMetadata{FreshnessStatus: "stale"}
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 900, Metadata: stale},
+			{AvgServiceTime: 900, Metadata: stale},
+			{AvgServiceTime: 24.6, Metadata: fresh},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("skips a replica past the stale band too, not only inside it", func() {
+		// "unavailable" is the age band BEYOND "stale" -- five minutes and
+		// older -- and the value is still in the row. An earlier version of the
+		// skip compared the status to "stale" by equality, which excluded
+		// 1-to-5-minute-old data and counted anything worse at full weight.
+		fresh := &domain.ReplicaMetricsMetadata{FreshnessStatus: "fresh"}
+		ancient := &domain.ReplicaMetricsMetadata{FreshnessStatus: "unavailable"}
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 900, Metadata: ancient},
+			{AvgServiceTime: 900, Metadata: ancient},
+			{AvgServiceTime: 24.6, Metadata: fresh},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("counts a replica whose metrics were never scraped as absent, not as old", func() {
+		// "missing" is the one status that is not an age: pick() returns 0 for
+		// it anyway, and treating it as too old would exclude a replica for
+		// being new.
+		missing := &domain.ReplicaMetricsMetadata{FreshnessStatus: "missing"}
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 24.6, Metadata: missing},
+			{AvgServiceTime: 24.6, Metadata: missing},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("counts a replica with no metadata at all", func() {
+		// Absent metadata is not a staleness verdict. Rows arrive without it
+		// from paths that never set it, and reading nil as stale would silently
+		// empty the sample and take the floor to zero.
+		rm := []domain.ReplicaMetrics{{AvgServiceTime: 24.6}, {AvgServiceTime: 24.6}}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
 	It("prefers the engine's measured service time over the reconstruction", func() {
 		// The reconstruction is decode-only: it multiplies output length by
 		// inter-token latency and so cannot see prefill. Where the engine

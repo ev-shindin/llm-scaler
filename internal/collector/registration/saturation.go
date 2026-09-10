@@ -11,6 +11,26 @@ const (
 	QueryKvCacheUsage = "kv_cache_usage"
 	QueryQueueLength  = "queue_length"
 
+	// QueryMetricsAge is how old the engine's metrics actually are, in
+	// seconds, per instance.
+	//
+	// It exists because the sample timestamps returned by every other query
+	// here cannot answer that. WVA issues INSTANT queries
+	// (promAPI.Query(ctx, q, time.Now())), and Prometheus stamps every sample
+	// of an instant vector with the EVALUATION time, so subtracting it from
+	// the collection time measures WVA's own round-trip -- milliseconds --
+	// and never the age of the data. Freshness derived that way reports
+	// "fresh" unconditionally, including for a scrape that died minutes ago.
+	//
+	// timestamp() is the one function that reports the sample's own
+	// timestamp rather than the evaluation time, so time() - timestamp(x)
+	// is the real age. Taken over the KV-cache metric because that is the
+	// engine's liveness signal: it is emitted continuously by a serving
+	// replica whether or not it is handling traffic, unlike the histogram
+	// rates, which stop advancing on an idle replica that is perfectly
+	// healthy.
+	QueryMetricsAge = "metrics_age"
+
 	// V2 queries (token-based capacity analysis)
 	QueryCacheConfigInfo    = "cache_config_info"
 	QueryAvgOutputTokens    = "avg_output_tokens"
@@ -59,6 +79,16 @@ func RegisterSaturationQueries(sourceRegistry *source.SourceRegistry) {
 		Template:    `max by (model_name, instance, pod) (max_over_time(vllm:kv_cache_usage_perc{namespace="{{.namespace}}"}[1m]))`,
 		Params:      []string{source.ParamNamespace},
 		Description: "Peak KV cache utilization per instance (0.0-1.0) over last minute",
+	})
+
+	// Age of the engine's own metrics per instance, in seconds. See
+	// QueryMetricsAge for why this cannot be derived from sample timestamps.
+	registry.MustRegister(source.QueryTemplate{
+		Name:        QueryMetricsAge,
+		Type:        source.QueryTypePromQL,
+		Template:    `max by (model_name, instance, pod) (time() - timestamp(vllm:kv_cache_usage_perc{namespace="{{.namespace}}"}))`,
+		Params:      []string{source.ParamNamespace},
+		Description: "Age of the engine's metrics per instance (seconds)",
 	})
 
 	// Queue length per instance (peak over last minute)
@@ -186,6 +216,15 @@ func registerSGLangSaturationQueries(registry *source.QueryList) {
 		Template:    `max by (model_name, instance, pod) (max_over_time(sglang:token_usage{namespace="{{.namespace}}"}[1m]))`,
 		Params:      []string{source.ParamNamespace},
 		Description: "Peak KV cache utilization per instance (0.0-1.0) over last minute (SGLang)",
+	})
+
+	// Age of the engine's own metrics per instance, in seconds (SGLang).
+	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{
+		Name:        QueryMetricsAge,
+		Type:        source.QueryTypePromQL,
+		Template:    `max by (model_name, instance, pod) (time() - timestamp(sglang:token_usage{namespace="{{.namespace}}"}))`,
+		Params:      []string{source.ParamNamespace},
+		Description: "Age of the engine's metrics per instance (seconds) (SGLang)",
 	})
 
 	// Queue length per instance (peak over last minute).

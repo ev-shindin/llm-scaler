@@ -2723,6 +2723,16 @@ render_default_scaledobject() {
     local policy_line=""
     [ -z "$policy" ] || policy_line=$'\n        scalingPolicy: "'"$policy"'"'
 
+    # Floored at 1: a fallback of 0 deactivates the workload instead of holding
+    # it. See the comment on the fallback stanza below. An operator override of 0
+    # is corrected rather than honoured, because there is no state in which it
+    # does what its name says.
+    local fallback_replicas="${WVA_SO_FALLBACK_REPLICAS:-$min}"
+    case "$fallback_replicas" in
+        ''|*[!0-9]*) fallback_replicas=1 ;;
+        0) fallback_replicas=1 ;;
+    esac
+
     cat <<EOF
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -2743,6 +2753,49 @@ spec:
   cooldownPeriod: 30
   minReplicaCount: ${min}
   maxReplicaCount: ${max}
+  # What KEDA does when WVA cannot answer.
+  #
+  # WVA returns a gRPC error from GetMetrics when its own guards leave it with
+  # no trusted view of the workload -- every replica's metrics stale. Without
+  # this stanza KEDA simply propagates no metric, the HPA holds, and the
+  # workload sits at whatever count it happened to be at, indefinitely and
+  # silently. With it, three consecutive failures put a floor under that hold.
+  #
+  # currentReplicasIfHigher, so the floor can only hold or RAISE. KEDA's static
+  # default would drop a fleet of eight to the fallback count at the moment WVA
+  # admitted it cannot see that fleet -- acting decisively on the evidence that
+  # nothing is known, which is the one thing a fallback must not do.
+  #
+  # replicas is FLOORED AT 1 and must never be 0, even on a scale-to-zero
+  # install where minReplicaCount is 0. KEDA validates 0 happily
+  # (CheckFallbackValid requires only >= 0) and pkg/fallback would treat it as a
+  # harmless floor -- but pkg/fallback never runs, because the executor gets
+  # there first. In pkg/scaling/executor/scale_scaledobjects.go the branch that
+  # protects an erroring scaler is
+  #
+  #     case isError && Spec.Fallback != nil && Spec.Fallback.Replicas != 0:
+  #
+  # and KEDA's own comment on it says it exists so that minReplicas=0 does not
+  # fall through to the next case -- which calls scaleToZeroOrIdle. So
+  # replicas: 0 on a minReplicaCount: 0 ScaledObject turns "WVA cannot see this
+  # workload" into "scale the fleet to zero", the exact inverse of the intent,
+  # and it does so before failureThreshold is ever consulted.
+  #
+  # This matters here specifically because an erroring GetMetrics also makes
+  # KEDA mark the scaler INACTIVE: GetMetricsAndActivity returns on the
+  # GetMetrics error and never calls IsActive, so WVA answering the 0<->1 gate
+  # correctly does not help. This stanza is the only thing standing between an
+  # abstain and a deactivation.
+  #
+  # KEDA computes the fallback metric as target x replicas, and the trigger
+  # below leaves metricType unset, so it is AverageValue with target 1 and the
+  # arithmetic lands on exactly replicas. KEDA's docs say fallback needs
+  # AverageValue; as of 2.18 pkg/fallback handles Value too, and the only
+  # trigger types it refuses outright are cpu and memory. Ours is external-push.
+  fallback:
+    failureThreshold: ${WVA_SO_FALLBACK_FAILURES:-3}
+    replicas: ${fallback_replicas}
+    behavior: currentReplicasIfHigher
   advanced:
     restoreToOriginalReplicaCount: true
     # Scaling behaviour, stated rather than inherited.

@@ -517,6 +517,17 @@ const (
 	// this failure hid for a week. The usual cause is an EPP pod older than the
 	// ConfigMap that enabled flowControl: EPP reads --config-file once at startup.
 	ScalingBlockedNoWakeSignal = "no-wake-signal"
+
+	// ScalingBlockedNoTrustedMetrics indicates every replica of a model reported
+	// stale metrics, so WVA declined to give KEDA a target for it at all and the
+	// HPA is holding the fleet where it stands.
+	//
+	// Reported because the alternative is silent. WVA answering KEDA with an
+	// error is invisible from the WVA side -- it shows up as ScalingActive=False
+	// on the HPA, which says a scaler failed but not which guard fired or why.
+	// An operator looking at a fleet that has stopped moving needs the reason on
+	// the same dashboard as everything else that stops a fleet moving.
+	ScalingBlockedNoTrustedMetrics = "no-trusted-metrics"
 )
 
 // Reason ownership. Two engines write WVAModelScalingBlocked — the steady-state
@@ -537,6 +548,13 @@ var (
 	// what EPP actually exports.
 	ScalingBlockedReasonsWake = []string{
 		ScalingBlockedNoWakeSignal,
+	}
+
+	// ScalingBlockedReasonsCollection are decided by the metrics collector, from
+	// what it could actually read this pass. A third producer, so it declares
+	// what it owns for the same reason the other two do.
+	ScalingBlockedReasonsCollection = []string{
+		ScalingBlockedNoTrustedMetrics,
 	}
 )
 

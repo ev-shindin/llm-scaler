@@ -166,7 +166,7 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 }
 
 // medianOf takes the median per-replica value over the replicas that reported
-// one, skipping those that reported nothing.
+// one, skipping those that reported nothing and those whose scrape is stale.
 //
 // Unweighted on purpose. Every value it is used for — service time, ITL, and
 // the two token averages — is a per-request property of the same hardware and
@@ -220,9 +220,29 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 // self-contradictory; the inconsistency is recorded rather than unified, because
 // aligning them would change DP-collapse behaviour for a case neither helper was
 // written for.
+// A replica whose scrape is behind is skipped outright, not merely outvoted.
+// The collector already computes this verdict per row and the throughput
+// analyzer's checkReplicaMetrics already refuses to calibrate on it; the floor
+// was the one consumer reading Metadata.FreshnessStatus not at all, so a
+// replica frozen at whatever it last reported counted at full weight for as
+// long as its scrape stayed broken. That is the failure the median cannot
+// help with: staleness is not an outlier, and a fleet whose scrape breaks
+// while it is busy goes stale TOGETHER, at values that are internally
+// consistent and all wrong.
+//
+// Stale OR unavailable, via domain.ReplicaMetricsMetadata.StaleOrOlder. The two
+// are the same verdict at different ages -- 1 to 5 minutes and beyond 5 -- and
+// an earlier version of this test compared the status to "stale" by equality,
+// which exempted everything older than five minutes from the staleness check it
+// had just added. "missing" is left alone: it means the metric was never
+// scraped, so pick() returns 0 and the > 0 test below already covers it, and
+// counting it would exclude a replica for being new.
 func medianOf(replicaMetrics []domain.ReplicaMetrics, pick func(domain.ReplicaMetrics) float64) float64 {
 	vals := make([]float64, 0, len(replicaMetrics))
 	for _, rm := range replicaMetrics {
+		if rm.Metadata.StaleOrOlder() {
+			continue
+		}
 		if v := pick(rm); v > 0 {
 			vals = append(vals, v)
 		}

@@ -105,8 +105,9 @@ const (
 	// at or below DefaultMinTokensPerRequest, making shape tracking unreliable.
 	SanityIssueMissingShape SanityIssue = "missing_shape_metrics"
 
-	// SanityIssueStaleMetrics indicates the replica's metrics are marked stale
-	// (Metadata.FreshnessStatus == "stale"). Stale data should not be used
+	// SanityIssueStaleMetrics indicates the replica's metrics are past the fresh
+	// threshold (domain.ReplicaMetricsMetadata.StaleOrOlder, which covers BOTH
+	// "stale" and the older "unavailable" band). Stale data should not be used
 	// for calibration.
 	SanityIssueStaleMetrics SanityIssue = "stale_metrics"
 )

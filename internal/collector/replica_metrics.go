@@ -82,6 +82,12 @@ type ReplicaMetricsCollector struct {
 	apiReader client.Reader
 	recorder  record.EventRecorder
 	locator   locator.PodLocator
+	// trust receives this collector's record of whether it can see each
+	// workload. Nil means the process-wide decision.DefaultTrust, which is
+	// what production uses; tests inject their own so that exercising
+	// CollectReplicaMetrics does not mutate a package-level singleton as a
+	// side effect. See publishTrustVerdicts.
+	trust *decision.TrustStore
 	// metricsAvailableState tracks whether metrics were available in the previous
 	// cycle for each VA (keyed by namespace/name). Used for edge-triggered events.
 	metricsAvailableState map[string]bool
@@ -109,6 +115,17 @@ func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient cl
 		locator:               podLocator,
 		metricsAvailableState: make(map[string]bool),
 	}
+}
+
+// WithTrustStore returns c publishing its trust records to ts instead of the
+// process-wide store. For tests, so that exercising CollectReplicaMetrics does
+// not mutate decision.DefaultTrust underneath whatever else is running; nil is
+// ignored so a caller cannot accidentally silence the records entirely.
+func (c *ReplicaMetricsCollector) WithTrustStore(ts *decision.TrustStore) *ReplicaMetricsCollector {
+	if ts != nil {
+		c.trust = ts
+	}
+	return c
 }
 
 // BeginCycle opens an optimize cycle, arming the memo that lets every model in a
@@ -574,6 +591,11 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		generationTokenRate float64
 		kvUsageInstant      float64
 		requestRate         float64
+		// metricsAge is how old the engine's metrics actually are, in
+		// seconds, straight from QueryMetricsAge. hasMetricsAge separates a
+		// measured zero from an absent measurement.
+		metricsAge    float64
+		hasMetricsAge bool
 	}
 
 	// classifyTimestamp reports the freshness status of a single metric timestamp,
@@ -632,7 +654,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	// those as "missing" (the worst severity) would report a healthy replica as
 	// "missing" with a near-zero Age, and — because "missing" outranks "stale" —
 	// would mask a genuinely stale driving metric from the CheckModelMetrics
-	// stale-metrics gate, which keys on FreshnessStatus == "stale". A replica with
+	// stale-metrics gate, which keys on StaleOrOlder. A replica with
 	// no present timestamps at all is still reported "missing".
 	worstFreshnessStatus := func(data *podMetricData, collectedAt time.Time) (string, time.Duration) {
 		thresholds := config.DefaultFreshnessThresholds()
@@ -968,6 +990,36 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	}
 
 	// Process instantaneous KV usage (k*) results (0.0–1.0) — throughput analyzer k*
+	// Age of the engine's metrics, per instance. See registration.QueryMetricsAge
+	// for why this is a query of its own rather than a subtraction on the sample
+	// timestamps every other block here uses.
+	//
+	// A negative age is clock skew between Prometheus and the engine's exporter,
+	// not data from the future; it is clamped to zero rather than dropped, since
+	// skew says nothing about whether the scrape is alive.
+	if result := results[registration.QueryMetricsAge]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				instanceKey, _, _ := c.buildInstanceKey(ctx, namespace, value.Labels)
+				if instanceKey == "" {
+					continue
+				}
+				if podData[instanceKey] == nil {
+					continue // skip pods the KV/queue queries didn't see (scrape skew)
+				}
+				if math.IsNaN(value.Value) || math.IsInf(value.Value, 0) {
+					continue
+				}
+				age := value.Value
+				if age < 0 {
+					age = 0
+				}
+				podData[instanceKey].metricsAge = age
+				podData[instanceKey].hasMetricsAge = true
+			}
+		}
+	}
+
 	if result := results[registration.QueryKvUsageInstant]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
@@ -1137,6 +1189,29 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// Track freshness for metrics in this pod
 		trackMetricFreshness(vaName, data, collectedAt, vaMetricsFreshnessStatus)
 		freshnessStatus, freshnessAge := worstFreshnessStatus(data, collectedAt)
+		// The MEASURED age wins wherever there is one, and this is the only
+		// path that can report anything but "fresh".
+		//
+		// worstFreshnessStatus subtracts each metric's sample timestamp from the
+		// collection time, which cannot work: WVA issues instant queries and
+		// Prometheus stamps every sample of an instant vector with the
+		// EVALUATION time, so that difference is WVA's own query round-trip,
+		// measured in milliseconds, no matter how old the underlying data is.
+		// Every freshness verdict derived from it reads "fresh", which is why
+		// three separate consumers could compare this status against "stale"
+		// with == for a long time and nobody noticed the branch was dead.
+		//
+		// QueryMetricsAge asks Prometheus the question directly with
+		// time() - timestamp(x), the one function that reports a sample's own
+		// timestamp. Falls back to the old value when the query returned nothing
+		// for this pod -- an engine whose exporter is not scraped at all, or a
+		// Prometheus too old for the function -- because a wrong-but-fresh
+		// verdict is what the code did before and is not made worse by keeping
+		// it where there is no better answer.
+		if data.hasMetricsAge {
+			freshnessAge = time.Duration(data.metricsAge * float64(time.Second))
+			freshnessStatus = config.DefaultFreshnessThresholds().DetermineStatus(freshnessAge)
+		}
 		// Read from the Pod, never inferred from the scrape. A row exists
 		// because something answered /metrics, which happens before the Pod
 		// is Ready; see domain.ReplicaMetrics.Ready.
@@ -1187,6 +1262,52 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			}
 			avgITL = 0
 			avgServiceTime = 0
+		}
+		// Second guard, independent of readiness: no request can have taken
+		// longer than the Pod reporting it has been running.
+		//
+		// Every filter above this point tests one value in isolation -- NaN,
+		// Inf, negative, outside [0,1] -- and the reading that caused the
+		// incident passed all of them: 521368 is finite, positive, and a
+		// perfectly ordinary float. What makes 145 hours impossible is not the
+		// number itself but the Pod: it had just started, and was still failing
+		// its readiness probe when it reported an average request older than
+		// its own process.
+		//
+		// The Pod's uptime is used rather than any arithmetic on the other
+		// metrics, and the difference matters. An earlier version of this guard
+		// compared the measured service time against the decode-only
+		// reconstruction AvgOutputTokens x AvgITL and rejected large ratios.
+		// That is wrong for a shape this project actually serves: service time
+		// is prefill + O x ITL, so the ratio is 1 + prefill/(O x ITL) and grows
+		// without bound as O shrinks. At 30-50k prefill and a SINGLE decode
+		// token -- reranking, classification, scoring long documents -- the
+		// ratio runs to several hundred while every number involved is
+		// correct, and rejecting it would discard a real measurement and drop
+		// the floor to a decode-only estimate that understates that shape by
+		// the same factor. Uptime carries no assumption about the shape at all.
+		//
+		// Fails OPEN, like podReady: an unreadable listing, a Pod absent from
+		// it, or a Pod with no start time yields no bound, and a bound that
+		// cannot be established must not delete a value it cannot judge.
+		//
+		// The minimum uptime is not a tolerance on the comparison, which is
+		// exact. It is a guard on the INPUT: within the first seconds a Pod's
+		// uptime and its first scrape are separated by scrape interval and
+		// evaluation lag, and comparing against a number that small measures
+		// the pipeline rather than the engine. Readiness already covers most of
+		// that window; this covers a Pod that passes readiness immediately.
+		if avgServiceTime > 0 {
+			if uptime, known := c.podUptime(ctx, namespace, podName, collectedAt); known &&
+				uptime >= minUptimeForServiceTimeBound && avgServiceTime > uptime.Seconds() {
+				logger.V(logging.DEFAULT).Info("dropping a service time longer than the pod has existed",
+					"pod", podName,
+					"namespace", namespace,
+					"variant", vaName,
+					"avgServiceTime", avgServiceTime,
+					"podUptimeSeconds", uptime.Seconds())
+				avgServiceTime = 0
+			}
 		}
 		metric := domain.ReplicaMetrics{
 			PodName:               podName,
@@ -1243,6 +1364,10 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	// replicas. See collapseToPods.
 	instanceCount := len(replicaMetrics)
 	replicaMetrics = collapseToPods(replicaMetrics)
+
+	// After the collapse, so the verdict counts scale-target replicas rather
+	// than engine instances: a DP=4 pod is one replica going stale, not four.
+	publishTrustVerdicts(ctx, c.trust, namespace, modelID, replicaMetrics, collectedAt)
 
 	// Only set this after all pods have been processed, making sure not to include pods without metrics (which are skipped above).
 	// This ensures that the discovered pod count reflects only those pods that produced replica metrics.
@@ -1338,6 +1463,19 @@ func (c *ReplicaMetricsCollector) CollectSchedulerQueueMetrics(
 // that may since have ended would add demand for load nobody is carrying, and
 // keep adding it for as long as the controller ran.
 const warmPoolLendingMaxAge = 2 * time.Minute
+
+// minUptimeForServiceTimeBound is how long a Pod must have been running before
+// its uptime is used to bound the service time it reports.
+//
+// Not slack on the comparison -- a request cannot outlive the process that
+// served it, and that holds from the first second. It is a floor on the input:
+// in a Pod's first moments its uptime is the same order as the scrape interval
+// and the query's own evaluation lag, so the comparison would be measuring the
+// metrics pipeline rather than the engine. Anything an engine can report before
+// it has been up a minute is a startup artifact the readiness gate above has
+// already dropped; this only has to cover a Pod that passes readiness
+// immediately, which is short-lived by definition.
+const minUptimeForServiceTimeBound = time.Minute
 
 func (c *ReplicaMetricsCollector) CollectModelArrivalRate(
 	ctx context.Context,

@@ -197,3 +197,44 @@ func TestCollapseToPods_MixedPodsMergeOnlyWhereShared(t *testing.T) {
 	assert.Equal(t, "pod-single", pods[1].PodName)
 	assert.Equal(t, int64(4000), pods[1].TotalKvCapacityTokens)
 }
+
+// TestMergeMetadata_AgeVerdictBeatsMissing pins that a rank which reported
+// NOTHING cannot hide a rank that reported something old.
+//
+// freshnessSeverity ranks "missing" above both age verdicts, which is right
+// within a single row -- there it can only mean no metric was present at all --
+// and wrong across a pod's ranks. Merging to "missing" would hand the result to
+// StaleOrOlder, which reads "missing" as "never scraped, not old", so a DP pod
+// could carry five-minute-old numbers while reporting a status that exempts it
+// from every staleness check in the codebase, including the abstain.
+func TestMergeMetadata_AgeVerdictBeatsMissing(t *testing.T) {
+	ts := time.Now()
+
+	cases := []struct {
+		name     string
+		statuses []string
+		want     string
+	}{
+		{"stale rank is not hidden by a missing one", []string{"stale", "missing"}, "stale"},
+		{"unavailable rank is not hidden by a missing one", []string{"missing", "unavailable"}, "unavailable"},
+		{"the worse age verdict wins", []string{"stale", "unavailable", "missing"}, "unavailable"},
+		// Unchanged behaviour: with no age verdict at all, "missing" still wins
+		// over "fresh" -- this must not make a pod look fresher than it is.
+		{"missing still outranks fresh", []string{"fresh", "missing"}, "missing"},
+		{"all fresh stays fresh", []string{"fresh", "fresh"}, "fresh"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			group := make([]domain.ReplicaMetrics, 0, len(tc.statuses))
+			for _, s := range tc.statuses {
+				group = append(group, domain.ReplicaMetrics{
+					Metadata: &domain.ReplicaMetricsMetadata{CollectedAt: ts, FreshnessStatus: s},
+				})
+			}
+			merged := mergeMetadata(group)
+			require.NotNil(t, merged)
+			assert.Equal(t, tc.want, merged.FreshnessStatus)
+		})
+	}
+}

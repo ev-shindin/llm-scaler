@@ -39,6 +39,7 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
@@ -2155,5 +2156,245 @@ func TestCollectReplicaMetrics_TimingExcludedWhenNotReady(t *testing.T) {
 	if results[0].AvgInputTokens != 4000 {
 		t.Errorf("AvgInputTokens is %v, want 4000 — token shape must NOT be gated on readiness",
 			results[0].AvgInputTokens)
+	}
+}
+
+// TestCollectReplicaMetrics_ImplausibleServiceTime pins the guard that would
+// have caught the motivating incident at the source, on a READY pod, where
+// neither the readiness gate nor the median can help.
+//
+// Every other filter in this file tests one value in isolation, and 521368 is
+// finite, positive and an ordinary float — it passes all of them. What makes
+// 145 hours impossible is the Pod: no request can have taken longer than the
+// process that served it has been running.
+//
+// The prefill-heavy case is the reason this is bounded by uptime and not by
+// arithmetic on the other metrics. An earlier version compared service time
+// against the decode-only reconstruction AvgOutputTokens x AvgITL; service time
+// is prefill + O x ITL, so that ratio is 1 + prefill/(O x ITL) and runs away as
+// O shrinks. At 30-50k prefill and one decode token it reaches several hundred
+// with every number correct, and rejecting it would discard a real measurement
+// on a shape this project serves.
+func TestCollectReplicaMetrics_ImplausibleServiceTime(t *testing.T) {
+	const podUptime = 3 * time.Hour
+
+	cases := []struct {
+		name               string
+		serviceTime        float64
+		outputTokens       float64
+		itl                float64
+		startedAgo         time.Duration
+		noStartTime        bool
+		wantAvgServiceTime float64
+	}{
+		{
+			// 145 hours reported by a pod that has existed for three.
+			name: "the incident's reading is rejected", serviceTime: 521368,
+			outputTokens: 1000, itl: 0.02, startedAgo: podUptime, wantAvgServiceTime: 0,
+		},
+		{
+			// 24.66s measured on an H100 at 4000 in / 1000 out. The guard must
+			// be invisible on real data.
+			name: "a real measurement is kept", serviceTime: 24.66,
+			outputTokens: 1000, itl: 0.0246, startedAgo: podUptime, wantAvgServiceTime: 24.66,
+		},
+		{
+			// 50k prefill, ONE decode token: ~4s of prefill against a
+			// reconstruction of 1 x 0.025 = 0.025s, a ratio of ~160. Every
+			// number is correct and the value must survive. This is the case
+			// the ratio-based guard got wrong.
+			name: "50k prefill and one decode token survives", serviceTime: 4.0,
+			outputTokens: 1, itl: 0.025, startedAgo: podUptime, wantAvgServiceTime: 4.0,
+		},
+		{
+			// Same shape, a slower and much longer prefill. Still far below
+			// uptime, so still kept — the bound carries no assumption about
+			// where a request's time went.
+			name: "a 30s prefill-dominated request survives", serviceTime: 30,
+			outputTokens: 1, itl: 0.05, startedAgo: podUptime, wantAvgServiceTime: 30,
+		},
+		{
+			// Fails OPEN below the minimum uptime: in a pod's first seconds its
+			// uptime is the same order as the scrape interval, so the
+			// comparison would measure the pipeline rather than the engine.
+			name: "a pod younger than the minimum is not judged", serviceTime: 521368,
+			outputTokens: 1000, itl: 0.02, startedAgo: 10 * time.Second, wantAvgServiceTime: 521368,
+		},
+		{
+			// Fails OPEN with no start time: a bound that cannot be established
+			// must not delete a value it cannot judge.
+			name: "no start time means no bound, so the value stands", serviceTime: 521368,
+			outputTokens: 1000, itl: 0.02, noStartTime: true, wantAvgServiceTime: 521368,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			if err := metrics.InitMetrics(registry); err != nil {
+				t.Fatalf("InitMetrics: %v", err)
+			}
+			scheme := runtime.NewScheme()
+			if err := llmdVariantAutoscalingV1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme: %v", err)
+			}
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme corev1: %v", err)
+			}
+			readyPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-known", Namespace: "test-ns"},
+				Status: corev1.PodStatus{
+					Phase:      corev1.PodRunning,
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			}
+			if !tc.noStartTime {
+				started := metav1.NewTime(time.Now().Add(-tc.startedAgo))
+				readyPod.Status.StartTime = &started
+			}
+			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(readyPod).Build()
+
+			podLabels := map[string]string{
+				seriesModelLabel: "test-model",
+				"pod":            "pod-known",
+				"instance":       "10.0.0.1:8000",
+			}
+			ts := time.Now()
+			values := map[string]float64{
+				"kv_cache_usage":    0.5,
+				"avg_service_time":  tc.serviceTime,
+				"avg_itl":           tc.itl,
+				"avg_output_tokens": tc.outputTokens,
+				"avg_input_tokens":  4000,
+			}
+			mockSource := &mockMetricsSource{
+				refreshFunc: func(_ context.Context, _ source.RefreshSpec) (map[string]*source.MetricResult, error) {
+					out := make(map[string]*source.MetricResult, len(values))
+					for name, v := range values {
+						out[name] = &source.MetricResult{
+							Values: []source.MetricValue{{Labels: podLabels, Value: v, Timestamp: ts}},
+						}
+					}
+					return out, nil
+				},
+			}
+
+			collector := NewReplicaMetricsCollector(mockSource, k8sClient, k8sClient, nil,
+				scalerLocator(map[string]string{"pod-known": "va-1"}))
+			results, err := collector.CollectReplicaMetrics(
+				context.Background(), "test-model", "test-ns",
+				make(map[string]scaletarget.ScaleTargetAccessor),
+				make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling),
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("CollectReplicaMetrics: %v", err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("expected exactly 1 ReplicaMetrics entry, got %d", len(results))
+			}
+			if !results[0].Ready {
+				t.Fatal("the pod must be Ready, or the readiness gate would be what zeroed the timing")
+			}
+			if results[0].AvgServiceTime != tc.wantAvgServiceTime {
+				t.Errorf("AvgServiceTime is %v, want %v", results[0].AvgServiceTime, tc.wantAvgServiceTime)
+			}
+			// The bound governs service time alone: zeroing ITL as well would
+			// remove the decode-only fallback the floor needs once the measured
+			// value is gone.
+			if tc.itl > 0 && results[0].AvgITL != tc.itl {
+				t.Errorf("AvgITL is %v, want %v — the uptime bound must not touch ITL",
+					results[0].AvgITL, tc.itl)
+			}
+		})
+	}
+}
+
+// TestCollectReplicaMetrics_PublishesTrustRecord pins the WIRING, not the rule.
+//
+// The rule -- which rows make a workload untrusted -- is covered in trust_test.go
+// by calling publishTrustVerdicts directly. That left the one line in
+// collectReplicaMetrics that actually calls it uncovered: deleting it kept every
+// test in this package green, so the whole abstain feature could have shipped
+// disconnected from the collector with the suite reporting success.
+//
+// It also pins that the record is keyed by the SCALEDOBJECT name, which is what
+// the external scaler looks up. Keying it by the scale target instead was a real
+// bug: the generator names ScaledObjects "<target>-wva", so writer and reader
+// never met.
+func TestCollectReplicaMetrics_PublishesTrustRecord(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	if err := metrics.InitMetrics(registry); err != nil {
+		t.Fatalf("InitMetrics: %v", err)
+	}
+	scheme := runtime.NewScheme()
+	if err := llmdVariantAutoscalingV1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme corev1: %v", err)
+	}
+	readyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod-known", Namespace: "test-ns"},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(readyPod).Build()
+
+	podLabels := map[string]string{
+		seriesModelLabel: "test-model",
+		"pod":            "pod-known",
+		"instance":       "10.0.0.1:8000",
+	}
+	ts := time.Now()
+
+	// metrics_age drives freshness now: sample timestamps cannot, because an
+	// instant query stamps every sample with the evaluation time. 600s is past
+	// the 5-minute unavailable threshold.
+	mockSource := &mockMetricsSource{
+		refreshFunc: func(_ context.Context, _ source.RefreshSpec) (map[string]*source.MetricResult, error) {
+			return map[string]*source.MetricResult{
+				"kv_cache_usage": {
+					Values: []source.MetricValue{{Labels: podLabels, Value: 0.5, Timestamp: ts}},
+				},
+				"metrics_age": {
+					Values: []source.MetricValue{{Labels: podLabels, Value: 600, Timestamp: ts}},
+				},
+			}, nil
+		},
+	}
+
+	trust := decision.NewTrustStore()
+	collector := NewReplicaMetricsCollector(mockSource, k8sClient, k8sClient, nil,
+		scalerLocator(map[string]string{"pod-known": "va-1"})).WithTrustStore(trust)
+
+	results, err := collector.CollectReplicaMetrics(
+		context.Background(), "test-model", "test-ns",
+		make(map[string]scaletarget.ScaleTargetAccessor),
+		make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("CollectReplicaMetrics: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected exactly 1 ReplicaMetrics entry, got %d", len(results))
+	}
+	if got := results[0].Metadata.FreshnessStatus; got != domain.FreshnessUnavailable {
+		t.Fatalf("FreshnessStatus is %q, want %q -- a 600s metrics_age must classify as unavailable",
+			got, domain.FreshnessUnavailable)
+	}
+
+	// "va-1" is the ScaledObject name the locator resolved, and the key the
+	// external scaler will look up from ScaledObjectRef.Name.
+	ok, reason := trust.Trust("test-ns", "va-1", time.Now(), staleObservationLimit)
+	if ok {
+		t.Error("collecting an all-unavailable workload left it trusted; " +
+			"the collector is not publishing its trust record")
+	}
+	if reason == "" {
+		t.Error("the record must carry a reason for KEDA's error message")
 	}
 }
