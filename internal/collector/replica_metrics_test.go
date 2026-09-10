@@ -2157,3 +2157,124 @@ func TestCollectReplicaMetrics_TimingExcludedWhenNotReady(t *testing.T) {
 			results[0].AvgInputTokens)
 	}
 }
+
+// TestCollectReplicaMetrics_ImplausibleServiceTime pins the guard that would
+// have caught the motivating incident at the source, on a READY pod, where
+// neither the readiness gate nor the median can help.
+//
+// Every other filter in this file tests one value in isolation, and 521368 is
+// finite, positive and an ordinary float — it passes all of them. What makes it
+// impossible is only visible against the other two numbers the same pod
+// reported: AvgOutputTokens x AvgITL is the decode-only reconstruction of
+// service time, and it says ~20s.
+func TestCollectReplicaMetrics_ImplausibleServiceTime(t *testing.T) {
+	cases := []struct {
+		name               string
+		serviceTime        float64
+		outputTokens       float64
+		itl                float64
+		wantAvgServiceTime float64
+	}{
+		{
+			// 521368 against a reconstruction of 1000 x 0.02 = 20s: ~26,000x.
+			name: "the incident's reading is rejected", serviceTime: 521368,
+			outputTokens: 1000, itl: 0.02, wantAvgServiceTime: 0,
+		},
+		{
+			// 24.66 measured against 24.60 reconstructed, as observed on an
+			// H100. The guard must be invisible on real data.
+			name: "a real measurement is kept", serviceTime: 24.66,
+			outputTokens: 1000, itl: 0.0246, wantAvgServiceTime: 24.66,
+		},
+		{
+			// The reconstruction cannot see prefill, so a prefill-heavy shape
+			// legitimately measures far above it. 50x must survive; the bound
+			// is on the impossible, not on the surprising.
+			name: "a prefill-heavy shape survives a large honest ratio", serviceTime: 10,
+			outputTokens: 10, itl: 0.02, wantAvgServiceTime: 10,
+		},
+		{
+			// Fails OPEN: with no ITL there is no second opinion, and an absent
+			// cross-check must not delete a value it cannot judge.
+			name: "no ITL means no cross-check, so the value stands", serviceTime: 521368,
+			outputTokens: 1000, itl: 0, wantAvgServiceTime: 521368,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			if err := metrics.InitMetrics(registry); err != nil {
+				t.Fatalf("InitMetrics: %v", err)
+			}
+			scheme := runtime.NewScheme()
+			if err := llmdVariantAutoscalingV1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme: %v", err)
+			}
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme corev1: %v", err)
+			}
+			readyPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-known", Namespace: "test-ns"},
+				Status: corev1.PodStatus{
+					Phase:      corev1.PodRunning,
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			}
+			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(readyPod).Build()
+
+			podLabels := map[string]string{
+				seriesModelLabel: "test-model",
+				"pod":            "pod-known",
+				"instance":       "10.0.0.1:8000",
+			}
+			ts := time.Now()
+			values := map[string]float64{
+				"kv_cache_usage":    0.5,
+				"avg_service_time":  tc.serviceTime,
+				"avg_itl":           tc.itl,
+				"avg_output_tokens": tc.outputTokens,
+				"avg_input_tokens":  4000,
+			}
+			mockSource := &mockMetricsSource{
+				refreshFunc: func(_ context.Context, _ source.RefreshSpec) (map[string]*source.MetricResult, error) {
+					out := make(map[string]*source.MetricResult, len(values))
+					for name, v := range values {
+						out[name] = &source.MetricResult{
+							Values: []source.MetricValue{{Labels: podLabels, Value: v, Timestamp: ts}},
+						}
+					}
+					return out, nil
+				},
+			}
+
+			collector := NewReplicaMetricsCollector(mockSource, k8sClient, k8sClient, nil,
+				scalerLocator(map[string]string{"pod-known": "va-1"}))
+			results, err := collector.CollectReplicaMetrics(
+				context.Background(), "test-model", "test-ns",
+				make(map[string]scaletarget.ScaleTargetAccessor),
+				make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling),
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("CollectReplicaMetrics: %v", err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("expected exactly 1 ReplicaMetrics entry, got %d", len(results))
+			}
+			if !results[0].Ready {
+				t.Fatal("the pod must be Ready, or the readiness gate would be what zeroed the timing")
+			}
+			if results[0].AvgServiceTime != tc.wantAvgServiceTime {
+				t.Errorf("AvgServiceTime is %v, want %v", results[0].AvgServiceTime, tc.wantAvgServiceTime)
+			}
+			// The cross-check governs service time alone: ITL is what it is
+			// measured against, and zeroing both would remove the fallback the
+			// floor needs once the measured value is gone.
+			if tc.itl > 0 && results[0].AvgITL != tc.itl {
+				t.Errorf("AvgITL is %v, want %v — the cross-check must not touch ITL",
+					results[0].AvgITL, tc.itl)
+			}
+		})
+	}
+}

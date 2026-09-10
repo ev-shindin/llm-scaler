@@ -1188,6 +1188,46 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			avgITL = 0
 			avgServiceTime = 0
 		}
+		// Second guard, independent of readiness: a service time that
+		// disagrees with the fleet's own decode arithmetic by orders of
+		// magnitude did not come from a request.
+		//
+		// Every filter above this point tests one value in isolation -- NaN,
+		// Inf, negative, outside [0,1] -- and the reading that caused the
+		// incident passed all of them: 521368 is finite, positive, and a
+		// perfectly ordinary float. What makes it impossible is only visible
+		// against the OTHER two numbers the same pod reported.
+		// AvgOutputTokens x AvgITL is the decode-only reconstruction of service
+		// time that estimateArrivalDemand already falls back to when the
+		// measured value is absent; here it serves as a second opinion on a
+		// value that IS present. On the run this comes from, the two agreed to
+		// within 0.3% (24.66s measured against 24.60s reconstructed); in the
+		// incident they disagreed by ~26,000x.
+		//
+		// The reconstruction is decode-only, so a measured value legitimately
+		// exceeds it whenever prefill is a real share of the work, and on a
+		// prefill-heavy shape (long prompt, few output tokens) that ratio can
+		// itself be large. maxServiceTimeReconstructionRatio is therefore set
+		// far above any such shape rather than near the observed agreement: it
+		// bounds the impossible, it is not a tolerance on the expected.
+		//
+		// Fails OPEN, like podReady: with either term missing there is no
+		// second opinion, and an absent cross-check must not delete a good
+		// value.
+		if avgServiceTime > 0 && data.avgOutputTokens > 0 && data.avgITL > 0 {
+			reconstructed := data.avgOutputTokens * data.avgITL
+			if avgServiceTime > reconstructed*maxServiceTimeReconstructionRatio {
+				logger.V(logging.DEFAULT).Info("dropping implausible service time",
+					"pod", podName,
+					"namespace", namespace,
+					"variant", vaName,
+					"avgServiceTime", avgServiceTime,
+					"reconstructed", reconstructed,
+					"ratio", avgServiceTime/reconstructed,
+					"maxRatio", maxServiceTimeReconstructionRatio)
+				avgServiceTime = 0
+			}
+		}
 		metric := domain.ReplicaMetrics{
 			PodName:               podName,
 			ModelID:               modelID,
@@ -1243,6 +1283,10 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	// replicas. See collapseToPods.
 	instanceCount := len(replicaMetrics)
 	replicaMetrics = collapseToPods(replicaMetrics)
+
+	// After the collapse, so the verdict counts scale-target replicas rather
+	// than engine instances: a DP=4 pod is one replica going stale, not four.
+	publishTrustVerdicts(ctx, replicaMetrics, collectedAt)
 
 	// Only set this after all pods have been processed, making sure not to include pods without metrics (which are skipped above).
 	// This ensures that the discovered pod count reflects only those pods that produced replica metrics.
@@ -1338,6 +1382,25 @@ func (c *ReplicaMetricsCollector) CollectSchedulerQueueMetrics(
 // that may since have ended would add demand for load nobody is carrying, and
 // keep adding it for as long as the controller ran.
 const warmPoolLendingMaxAge = 2 * time.Minute
+
+// maxServiceTimeReconstructionRatio is how far a reported AvgServiceTime may
+// exceed the decode-only reconstruction (AvgOutputTokens x AvgITL) before it is
+// treated as an artifact rather than a measurement.
+//
+// Two anchors, both measured. On an H100 serving a decode-dominated shape the
+// two agree to 0.3% -- 24.66s measured against 24.60s reconstructed, of which
+// prefill was 0.055s. In the incident that motivated this guard they disagreed
+// by ~26,000x, a reported 521368s (about 145 hours) per request.
+//
+// 100x sits between them by three orders of magnitude on the side that matters.
+// It has to: the reconstruction cannot see prefill at all, so a prefill-heavy
+// shape -- a long prompt with a handful of output tokens -- makes a large ratio
+// legitimate, and the cost of a false positive here is discarding a real
+// measurement and falling back to a decode-only floor. The cost of a false
+// negative is one replica moving the fleet's estimate by 590x. Neither number
+// near the middle would be more principled than this one; what makes 100 safe
+// is the distance to the nearest real reading, not the value itself.
+const maxServiceTimeReconstructionRatio = 100.0
 
 func (c *ReplicaMetricsCollector) CollectModelArrivalRate(
 	ctx context.Context,
