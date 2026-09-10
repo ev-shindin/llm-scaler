@@ -632,7 +632,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	// those as "missing" (the worst severity) would report a healthy replica as
 	// "missing" with a near-zero Age, and — because "missing" outranks "stale" —
 	// would mask a genuinely stale driving metric from the CheckModelMetrics
-	// stale-metrics gate, which keys on FreshnessStatus == "stale". A replica with
+	// stale-metrics gate, which keys on StaleOrOlder. A replica with
 	// no present timestamps at all is still reported "missing".
 	worstFreshnessStatus := func(data *podMetricData, collectedAt time.Time) (string, time.Duration) {
 		thresholds := config.DefaultFreshnessThresholds()

@@ -172,9 +172,23 @@ func mean(group []domain.ReplicaMetrics, field func(domain.ReplicaMetrics) float
 // carried metadata.
 func mergeMetadata(group []domain.ReplicaMetrics) *domain.ReplicaMetricsMetadata {
 	var merged *domain.ReplicaMetricsMetadata
+	// The worst AGE verdict seen, tracked separately from the severity rollup
+	// below. "missing" outranks both age verdicts in freshnessSeverity, which is
+	// right within a single row -- there it can only mean no metric was present
+	// at all -- and wrong ACROSS a pod's ranks, where it lets a rank that
+	// reported nothing outrank a rank that reported something stale. Merging
+	// those to "missing" would hand the result to StaleOrOlder, which reads
+	// "missing" as "never scraped, not old", and the stale rank would vanish:
+	// a DP pod could carry five-minute-old numbers while reporting a status
+	// that exempts it from every staleness check in the codebase.
+	worstAgeVerdict := ""
 	for _, m := range group {
 		if m.Metadata == nil {
 			continue
+		}
+		if m.Metadata.StaleOrOlder() &&
+			freshnessSeverity[m.Metadata.FreshnessStatus] > freshnessSeverity[worstAgeVerdict] {
+			worstAgeVerdict = m.Metadata.FreshnessStatus
 		}
 		if merged == nil {
 			copied := *m.Metadata
@@ -190,6 +204,12 @@ func mergeMetadata(group []domain.ReplicaMetrics) *domain.ReplicaMetricsMetadata
 		if m.Metadata.CollectedAt.After(merged.CollectedAt) {
 			merged.CollectedAt = m.Metadata.CollectedAt
 		}
+	}
+	// An age verdict on any rank wins over a "missing" rollup. Only over
+	// "missing": against "fresh" the severity order already prefers the age
+	// verdict, and this must never make a pod look FRESHER than the rollup said.
+	if merged != nil && worstAgeVerdict != "" && merged.FreshnessStatus == domain.FreshnessMissing {
+		merged.FreshnessStatus = worstAgeVerdict
 	}
 	return merged
 }
