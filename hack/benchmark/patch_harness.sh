@@ -547,3 +547,140 @@ src = src.replace(ANCHOR, REPLACEMENT, 1)
 io.open(path, "w", encoding="utf-8", newline="\n").write(src)
 print("  fix 6 (modelservice chart pin): applied")
 PYEOF
+
+# ---------------------------------------------------------------------------
+# Fix 7 -- collect_metrics.sh: use the pod's ServiceAccount, not the operator's
+# kubeconfig.
+#
+# step_07_deploy_harness.py base64-encodes the CLIENT's kubeconfig into
+# LLMDBENCH_BASE64_CONTEXT_CONTENTS, and build/llm-d-benchmark.sh decodes it to
+# ~/.kube/config inside the harness pod, "so kubectl works inside the pod
+# (needed by collect_metrics.sh)". Both outcomes of that are bad:
+#
+#   inline token   the operator's credential is shipped onto the cluster, in an
+#                  env var, on a pod anyone with read access can inspect.
+#   tokenFile:     the safe kubeconfig form. The FILE is not copied, so inside
+#                  the pod every kubectl call dies with
+#                    open /home/<user>/.kube/<cluster>.token: no such file
+#
+# The second is silent. Every call in collect_metrics.sh ends in
+# `2>/dev/null || true`, so an auth failure and an empty cluster are the same
+# answer: it recorded 41 snapshots with empty controller lists, and a fleet that
+# served the whole run was reported as "Avg replicas 0.00, GPU time 0.0" beside
+# latency figures that were real -- guidellm talks to the service directly and
+# never needs the cluster at all.
+#
+# The pod already runs as a ServiceAccount with a projected token. This points
+# the collector at it, via a kubeconfig using tokenFile: so the token is never
+# an argument (no `ps` exposure) and rotation is picked up for free.
+# ---------------------------------------------------------------------------
+CM="$REPO_DIR/workload/harnesses/collect_metrics.sh"
+[ -f "$CM" ] || fail "expected file missing: $CM"
+
+"$PY" - "$CM" <<'PYEOF' || fail "fix 7 (collect_metrics in-cluster auth) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+MARK = "# wva-patch: in-cluster credentials"
+if MARK in src:
+    print("  fix 7 (collect_metrics in-cluster auth): already applied")
+    sys.exit(0)
+
+ANCHOR = '_EPP_AUTH_HEADER=""'
+if ANCHOR not in src:
+    sys.exit("anchor missing (upstream shape changed): %r" % ANCHOR)
+
+BLOCK = '''%s -- prefer the pod's ServiceAccount over the kubeconfig
+# the harness copies in. That kubeconfig is the operator's: with a tokenFile:
+# reference the file is absent here and every kubectl call fails silently, and
+# with an inline token it would put their credential on the cluster.
+#
+# tokenFile: rather than --token= so the token is never a process argument and
+# a rotated projection is picked up without restarting anything.
+_WVA_SA=/var/run/secrets/kubernetes.io/serviceaccount
+if [ -z "${KUBECTL_CMD:-}" ] && [ -r "$_WVA_SA/token" ] && [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+    _WVA_KUBECONFIG=/tmp/wva-incluster.kubeconfig
+    cat > "$_WVA_KUBECONFIG" <<WVAEOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: in-cluster
+  cluster:
+    server: https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT:-443}
+    certificate-authority: $_WVA_SA/ca.crt
+users:
+- name: sa
+  user:
+    tokenFile: $_WVA_SA/token
+contexts:
+- name: in-cluster
+  context:
+    cluster: in-cluster
+    user: sa
+current-context: in-cluster
+WVAEOF
+    KUBECTL_CMD="kubectl --kubeconfig=$_WVA_KUBECONFIG"
+    export KUBECTL_CMD
+fi
+
+''' % MARK
+
+src = src.replace(ANCHOR, BLOCK + ANCHOR, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 7 (collect_metrics in-cluster auth): applied")
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Fix 8 -- the harness Role: let the collector read what it already asks for.
+#
+# collect_metrics.sh reads replica counts with
+#
+#   $kubectl_cmd --namespace "$namespace" get deployments,statefulsets -o json
+#
+# and the Role bound to the harness ServiceAccount grants pods, pods/log,
+# services, jobs, serviceaccounts and one Secret -- not deployments, not
+# statefulsets. That call therefore returns Forbidden, and the line ends in
+# `|| all_json='{"items":[]}'`, so a denial and a namespace with no workloads
+# produce the same empty answer.
+#
+# Invisible without fix 7: while the injected kubeconfig was failing, every call
+# failed for that reason first. Once the ServiceAccount is used, this is the
+# next thing in the way, and it fails the same silent way.
+#
+# Read-only, namespaced, and only the two kinds the collector names.
+# ---------------------------------------------------------------------------
+RBAC="$REPO_DIR/config/templates/jinja/05_namespace_sa_rbac_secret.yaml.j2"
+[ -f "$RBAC" ] || fail "expected file missing: $RBAC"
+
+"$PY" - "$RBAC" <<'PYEOF' || fail "fix 8 (harness RBAC for workloads) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+MARK = "# wva-patch: replica counts"
+if MARK in src:
+    print("  fix 8 (harness RBAC for workloads): already applied")
+    sys.exit(0)
+
+ANCHOR = '''- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+'''
+if ANCHOR not in src:
+    sys.exit("anchor missing (upstream shape changed): %r" % ANCHOR)
+
+BLOCK = ANCHOR + '''%s: collect_metrics.sh reads replica counts with
+# `get deployments,statefulsets -o json`. Without this the call is Forbidden and
+# the script falls back to {"items":[]}, so the run reports a fleet of zero.
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+''' % MARK
+
+src = src.replace(ANCHOR, BLOCK, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 8 (harness RBAC for workloads): applied")
+PYEOF
