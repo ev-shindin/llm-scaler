@@ -81,6 +81,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 INSTANCES = {}          # id -> {"instance_id","status","options","env_vars"}
 SLEEPING = {}           # port -> bool
 LAST_SLEEP = {}         # port -> the last /sleep request line, query included
+SLEEP_COUNT = {}        # port -> how many times /sleep was called, ever
 LOCK = threading.Lock()
 
 
@@ -165,6 +166,10 @@ class Engine(BaseHTTPRequestHandler):
             with LOCK:
                 asked = LAST_SLEEP.get(self.server.server_address[1], "")
             self._send(200, json.dumps({"last_sleep": asked}).encode())
+        elif path == "/sleep_count":
+            with LOCK:
+                n = SLEEP_COUNT.get(self.server.server_address[1], 0)
+            self._send(200, json.dumps({"sleep_count": n}).encode())
         elif path == "/is_sleeping":
             with LOCK:
                 asleep = SLEEPING.get(self.server.server_address[1], True)
@@ -185,6 +190,13 @@ class Engine(BaseHTTPRequestHandler):
                 # for -- and that is worth proving, because the difference
                 # between the two is invisible everywhere else in this suite.
                 LAST_SLEEP[port] = self.path
+                # COUNTED, not just recorded. A hold timeout returns a Pod and
+                # the next pass borrows it straight back, so the pool's own
+                # summary is identical before and after -- same pods, same
+                # lent count -- and the sleep is the only trace the churn
+                # happened at all. last_sleep cannot show it: the second sleep
+                # writes the same line as the first.
+                SLEEP_COUNT[port] = SLEEP_COUNT.get(port, 0) + 1
             self._send(200, b"{}")
         elif path == "/wake_up":
             with LOCK:
