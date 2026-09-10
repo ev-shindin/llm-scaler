@@ -285,6 +285,14 @@ cleanup() {
         for ns in "$NAMESPACE" "$WVA_NS" "$MONITORING_NAMESPACE" \
             $([ "$SCALER_BACKEND" = "keda" ] && echo "$KEDA_NAMESPACE"); do
             [ -n "$ns" ] || continue
+            # Deduped: in a namespace-scoped install NAMESPACE and WVA_NS are the
+            # same namespace, so the list printed it twice and read as though two
+            # things had been left behind.
+            local seen=""
+            for already in ${preserved[@]+"${preserved[@]}"}; do
+                [ "$already" = "$ns" ] && { seen=yes; break; }
+            done
+            [ -n "$seen" ] && continue
             kubectl get namespace "$ns" >/dev/null 2>&1 && preserved+=("$ns")
         done
         if [ ${#preserved[@]} -ne 0 ]; then
