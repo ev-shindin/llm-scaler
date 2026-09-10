@@ -1188,6 +1188,52 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			avgITL = 0
 			avgServiceTime = 0
 		}
+		// Second guard, independent of readiness: no request can have taken
+		// longer than the Pod reporting it has been running.
+		//
+		// Every filter above this point tests one value in isolation -- NaN,
+		// Inf, negative, outside [0,1] -- and the reading that caused the
+		// incident passed all of them: 521368 is finite, positive, and a
+		// perfectly ordinary float. What makes 145 hours impossible is not the
+		// number itself but the Pod: it had just started, and was still failing
+		// its readiness probe when it reported an average request older than
+		// its own process.
+		//
+		// The Pod's uptime is used rather than any arithmetic on the other
+		// metrics, and the difference matters. An earlier version of this guard
+		// compared the measured service time against the decode-only
+		// reconstruction AvgOutputTokens x AvgITL and rejected large ratios.
+		// That is wrong for a shape this project actually serves: service time
+		// is prefill + O x ITL, so the ratio is 1 + prefill/(O x ITL) and grows
+		// without bound as O shrinks. At 30-50k prefill and a SINGLE decode
+		// token -- reranking, classification, scoring long documents -- the
+		// ratio runs to several hundred while every number involved is
+		// correct, and rejecting it would discard a real measurement and drop
+		// the floor to a decode-only estimate that understates that shape by
+		// the same factor. Uptime carries no assumption about the shape at all.
+		//
+		// Fails OPEN, like podReady: an unreadable listing, a Pod absent from
+		// it, or a Pod with no start time yields no bound, and a bound that
+		// cannot be established must not delete a value it cannot judge.
+		//
+		// The minimum uptime is not a tolerance on the comparison, which is
+		// exact. It is a guard on the INPUT: within the first seconds a Pod's
+		// uptime and its first scrape are separated by scrape interval and
+		// evaluation lag, and comparing against a number that small measures
+		// the pipeline rather than the engine. Readiness already covers most of
+		// that window; this covers a Pod that passes readiness immediately.
+		if avgServiceTime > 0 {
+			if uptime, known := c.podUptime(ctx, namespace, podName, collectedAt); known &&
+				uptime >= minUptimeForServiceTimeBound && avgServiceTime > uptime.Seconds() {
+				logger.V(logging.DEFAULT).Info("dropping a service time longer than the pod has existed",
+					"pod", podName,
+					"namespace", namespace,
+					"variant", vaName,
+					"avgServiceTime", avgServiceTime,
+					"podUptimeSeconds", uptime.Seconds())
+				avgServiceTime = 0
+			}
+		}
 		metric := domain.ReplicaMetrics{
 			PodName:               podName,
 			ModelID:               modelID,
@@ -1338,6 +1384,19 @@ func (c *ReplicaMetricsCollector) CollectSchedulerQueueMetrics(
 // that may since have ended would add demand for load nobody is carrying, and
 // keep adding it for as long as the controller ran.
 const warmPoolLendingMaxAge = 2 * time.Minute
+
+// minUptimeForServiceTimeBound is how long a Pod must have been running before
+// its uptime is used to bound the service time it reports.
+//
+// Not slack on the comparison -- a request cannot outlive the process that
+// served it, and that holds from the first second. It is a floor on the input:
+// in a Pod's first moments its uptime is the same order as the scrape interval
+// and the query's own evaluation lag, so the comparison would be measuring the
+// metrics pipeline rather than the engine. Anything an engine can report before
+// it has been up a minute is a startup artifact the readiness gate above has
+// already dropped; this only has to cover a Pod that passes readiness
+// immediately, which is short-lived by definition.
+const minUptimeForServiceTimeBound = time.Minute
 
 func (c *ReplicaMetricsCollector) CollectModelArrivalRate(
 	ctx context.Context,
