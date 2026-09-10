@@ -203,6 +203,35 @@ var _ = Describe("estimateArrivalDemand", func() {
 			To(BeNumerically("~", 24.6, 1e-9))
 	})
 
+	It("skips a replica past the stale band too, not only inside it", func() {
+		// "unavailable" is the age band BEYOND "stale" -- five minutes and
+		// older -- and the value is still in the row. An earlier version of the
+		// skip compared the status to "stale" by equality, which excluded
+		// 1-to-5-minute-old data and counted anything worse at full weight.
+		fresh := &domain.ReplicaMetricsMetadata{FreshnessStatus: "fresh"}
+		ancient := &domain.ReplicaMetricsMetadata{FreshnessStatus: "unavailable"}
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 900, Metadata: ancient},
+			{AvgServiceTime: 900, Metadata: ancient},
+			{AvgServiceTime: 24.6, Metadata: fresh},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("counts a replica whose metrics were never scraped as absent, not as old", func() {
+		// "missing" is the one status that is not an age: pick() returns 0 for
+		// it anyway, and treating it as too old would exclude a replica for
+		// being new.
+		missing := &domain.ReplicaMetricsMetadata{FreshnessStatus: "missing"}
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 24.6, Metadata: missing},
+			{AvgServiceTime: 24.6, Metadata: missing},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
 	It("counts a replica with no metadata at all", func() {
 		// Absent metadata is not a staleness verdict. Rows arrive without it
 		// from paths that never set it, and reading nil as stale would silently

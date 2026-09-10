@@ -49,8 +49,12 @@ func CheckModelMetrics(metrics []domain.ReplicaMetrics) SanityReport {
 func checkReplicaMetrics(m domain.ReplicaMetrics) []SanityIssue {
 	var issues []SanityIssue
 
-	// Stale metrics: FreshnessStatus == "stale" means the scrape is behind.
-	if m.Metadata != nil && m.Metadata.FreshnessStatus == "stale" {
+	// Stale metrics: the scrape is behind. StaleOrOlder rather than a comparison
+	// to "stale", which is one of TWO age bands past the fresh threshold -- this
+	// check previously exempted everything older than five minutes ("unavailable")
+	// from the staleness gate, so the oldest data in the system was the only data
+	// allowed to calibrate the ITL model.
+	if m.Metadata.StaleOrOlder() {
 		issues = append(issues, SanityIssueStaleMetrics)
 	}
 

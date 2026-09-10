@@ -230,13 +230,17 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 // while it is busy goes stale TOGETHER, at values that are internally
 // consistent and all wrong.
 //
-// Only "stale" is dropped. "unavailable" and "missing" mean the value was
-// never there, so pick() already returns 0 for them and the > 0 test below is
-// the guard; excluding them here as well would say the same thing twice.
+// Stale OR unavailable, via domain.ReplicaMetricsMetadata.StaleOrOlder. The two
+// are the same verdict at different ages -- 1 to 5 minutes and beyond 5 -- and
+// an earlier version of this test compared the status to "stale" by equality,
+// which exempted everything older than five minutes from the staleness check it
+// had just added. "missing" is left alone: it means the metric was never
+// scraped, so pick() returns 0 and the > 0 test below already covers it, and
+// counting it would exclude a replica for being new.
 func medianOf(replicaMetrics []domain.ReplicaMetrics, pick func(domain.ReplicaMetrics) float64) float64 {
 	vals := make([]float64, 0, len(replicaMetrics))
 	for _, rm := range replicaMetrics {
-		if rm.Metadata != nil && rm.Metadata.FreshnessStatus == freshnessStale {
+		if rm.Metadata.StaleOrOlder() {
 			continue
 		}
 		if v := pick(rm); v > 0 {
@@ -249,12 +253,6 @@ func medianOf(replicaMetrics []domain.ReplicaMetrics, pick func(domain.ReplicaMe
 	sort.Float64s(vals)
 	return vals[(len(vals)-1)/2]
 }
-
-// freshnessStale is the collector's verdict for a scrape that is behind. Spelled
-// here rather than imported because internal/collector imports the analyzers,
-// not the other way round; throughput/sanity.go carries the same literal for the
-// same reason.
-const freshnessStale = "stale"
 
 // raiseRoleDemandTo scales each role's demand so the roles still sum to total.
 //

@@ -171,12 +171,60 @@ type ReplicaMetrics struct {
 	RequestRate float64
 }
 
+// FreshnessStatus values, as written by the collector's classifier.
+//
+// Three of the four are AGE bands over the same present timestamp, and only the
+// fourth means the metric was never scraped. That distinction is the trap this
+// block exists to make visible: "unavailable" is not "absent", it is data so old
+// the collector has given up on it, and its VALUE is still sitting in the row.
+// Every consumer that tested FreshnessStatus == FreshnessStale by equality --
+// there were three -- silently exempted the oldest data in the system from the
+// staleness check it had just written.
+const (
+	// FreshnessFresh means the metric is younger than the fresh threshold
+	// (1 minute by default).
+	FreshnessFresh = "fresh"
+	// FreshnessStale means the metric is between the fresh and unavailable
+	// thresholds (1 to 5 minutes by default). The value is real but behind.
+	FreshnessStale = "stale"
+	// FreshnessUnavailable means the metric is past the unavailable threshold
+	// (5 minutes by default). Still a value, only older than FreshnessStale.
+	FreshnessUnavailable = "unavailable"
+	// FreshnessMissing means the metric carries no timestamp at all, so it was
+	// never scraped for this replica. Unlike the three above it says nothing
+	// about age, and the row's value for it is zero.
+	FreshnessMissing = "missing"
+)
+
 // ReplicaMetricsMetadata contains freshness information for replica metrics
 type ReplicaMetricsMetadata struct {
 	// CollectedAt is when the metrics were collected
 	CollectedAt time.Time
 	// Age is the age of the metrics
 	Age time.Duration
-	// FreshnessStatus indicates freshness: "fresh", "stale", "unavailable"
+	// FreshnessStatus indicates freshness: one of the Freshness* constants.
 	FreshnessStatus string
+}
+
+// StaleOrOlder reports data the collector has judged to be past the fresh
+// threshold -- FreshnessStale or FreshnessUnavailable.
+//
+// Use this rather than comparing FreshnessStatus to FreshnessStale. The two
+// differ only in how far past the threshold the data is, so a consumer that
+// excludes one and not the other applies its own rule everywhere except to the
+// data most in need of it.
+//
+// FreshnessMissing is NOT stale. It means the metric was never scraped, which is
+// also what a first collection looks like, and the row's value for it is zero --
+// so a consumer skipping zeros has already skipped it, and a consumer counting
+// it would be excluding a replica for being new.
+//
+// A nil metadata pointer is not stale either: rows reach some consumers without
+// metadata at all, and reading "no information" as "too old" would empty a
+// sample rather than leave it alone.
+func (m *ReplicaMetricsMetadata) StaleOrOlder() bool {
+	if m == nil {
+		return false
+	}
+	return m.FreshnessStatus == FreshnessStale || m.FreshnessStatus == FreshnessUnavailable
 }

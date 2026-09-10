@@ -65,6 +65,30 @@ var _ = Describe("CheckModelMetrics", func() {
 			Expect(report.AffectedPods).To(ContainElement("pod-0"))
 		})
 
+		It("flags SanityIssueStaleMetrics when FreshnessStatus is unavailable", func() {
+			// "unavailable" is the age band PAST "stale" -- five minutes and
+			// older. This check compared the status to "stale" by equality, so
+			// the oldest data in the system was the only data exempt from the
+			// staleness gate, and therefore the only data allowed through
+			// filterHealthyForShape to calibrate the ITL model.
+			m := healthyReplica("pod-0")
+			m.Metadata = &domain.ReplicaMetricsMetadata{FreshnessStatus: "unavailable"}
+			report := CheckModelMetrics([]domain.ReplicaMetrics{m})
+			Expect(report.Has(SanityIssueStaleMetrics)).To(BeTrue())
+			Expect(report.AffectedPods).To(ContainElement("pod-0"))
+		})
+
+		It("does not flag stale when FreshnessStatus is missing", func() {
+			// "missing" is not an age: the metric was never scraped, which is
+			// also what a first collection looks like. The shape and ITL checks
+			// below reject such a replica on its zeros; it must not be reported
+			// as behind.
+			m := healthyReplica("pod-0")
+			m.Metadata = &domain.ReplicaMetricsMetadata{FreshnessStatus: "missing"}
+			report := CheckModelMetrics([]domain.ReplicaMetrics{m})
+			Expect(report.Has(SanityIssueStaleMetrics)).To(BeFalse())
+		})
+
 		It("does not flag stale when FreshnessStatus is fresh", func() {
 			m := healthyReplica("pod-0")
 			m.Metadata = &domain.ReplicaMetricsMetadata{FreshnessStatus: "fresh"}
