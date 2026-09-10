@@ -2115,6 +2115,7 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# read as the literal $$MODEL_NAME, or an env value whose newline splits one
 	@# workload record into two, both parse perfectly.
 	@bash hack/check-scaledobject-parsers.sh
+	@bash hack/check-scaledobject-fallback.sh
 	@echo "Checking what warmpool.sh actually emits..."
 	@# Renders the pool manifests and asserts their shape. Every bug this covers
 	@# parses fine: one container with the proxy image under the supervisor's
