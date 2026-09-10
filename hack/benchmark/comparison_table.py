@@ -168,6 +168,25 @@ def process_one(results_dir, gpus_per_replica=1):
     row = _extract_latency_stats(results_dir)
     avg_rep, max_rep = _extract_replica_stats(results_dir)
     window_min = _replica_window_minutes(results_dir)
+
+    # A failed collection reads as a fleet of zero, and printing that as a
+    # MEASURED zero is worse than printing nothing.
+    #
+    # The collector keeps taking snapshots when its kubectl cannot authenticate
+    # -- every call ends in `2>/dev/null || true`, so "auth failed" and "no pods"
+    # are the same answer (see _collection_failure). A run whose replicas were
+    # never readable therefore produces a full timeseries of zeros, and the
+    # table renders "Avg replicas 0.00 / Max replicas 0 / GPU time 0.0" beside
+    # latency figures that ARE real, because guidellm talks to the service
+    # directly and never needed the cluster.
+    #
+    # Measured on OpenShift: one replica served the entire run, 0 errors, and
+    # the table said the fleet never had one. KV cache, queue depth and pod
+    # startup came out as "?" from the same failure, which is the honest form --
+    # so these three join them rather than asserting a number nothing observed.
+    if _collection_failure(results_dir):
+        avg_rep, max_rep, window_min = None, None, None
+
     gpu_min = (avg_rep * gpus_per_replica * window_min
                if avg_rep is not None and window_min is not None else None)
     row.update({

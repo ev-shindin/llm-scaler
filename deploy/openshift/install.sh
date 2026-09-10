@@ -55,7 +55,22 @@ check_specific_prerequisites() {
     
     log_success "All OpenShift prerequisites met"
     log_info "Connected to OpenShift as: $(oc whoami)"
-    log_info "Current project: $(oc project -q)"
+    # stderr swallowed, and a fallback for the empty case. With no project
+    # selected `oc project -q` prints
+    #
+    #   error: no project has been set
+    #
+    # on STDERR, which $( ) does not capture -- so it lands in the middle of a
+    # preflight that is otherwise succeeding, immediately above an empty
+    # "Current project:". It reads as the check failing when nothing is wrong.
+    #
+    # No project selected is the NORMAL case for a kubeconfig built from a
+    # token, which is how anyone following the token-request page connects.
+    # The line is informational either way; the install uses NAMESPACE, not the
+    # current project.
+    local project
+    project="$(oc project -q 2>/dev/null || true)"
+    log_info "Current project: ${project:-<none set; the install uses NAMESPACE>}"
 }
 
 materialize_namespace() {
