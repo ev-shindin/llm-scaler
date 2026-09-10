@@ -774,6 +774,40 @@ wva_report_scaledobjects() {
     if [ "${count:-0}" -gt 0 ]; then
         log_success "  ScaledObjects: $count workload(s) in $ns already registered with WVA."
         log_info "    The plan will offer 'adopt' for each, so you choose what happens to them."
+
+        # EXISTING is not the same as WORKING, and the difference is silent.
+        #
+        # A ScaledObject whose Ready condition is False is one KEDA is not acting
+        # on: no HPA is created, so KEDA never calls the external scaler, so WVA
+        # is never told the workload exists. Everything else looks right --
+        # `kubectl get scaledobject` lists it, the install reports success, the
+        # controller is healthy and idle -- and the only trace is a condition
+        # nobody reads.
+        #
+        # Measured on OpenShift: a ScaledObject outlived its Deployment, and when
+        # a Deployment of the same name was recreated 18 days later KEDA did not
+        # re-reconcile it. It sat at
+        #
+        #   ScaledObjectCheckFailed: deployments.apps "<name>" not found
+        #
+        # naming a Deployment that existed and was Ready, with
+        # lastTransitionTime unset. An annotation touch did not clear it; only
+        # deleting and recreating the ScaledObject did.
+        local notready
+        notready=$(kubectl get scaledobject -n "$ns" -o json 2>/dev/null | jq -r '
+            .items[]?
+            | select([ .spec.triggers[]?.metadata.scalerAddress // ""
+                       | select(startswith("wva-external-scaler.")) ] | length > 0)
+            | select([ .status.conditions[]? | select(.type == "Ready" and .status == "True") ] | length == 0)
+            | "      " + .metadata.name + ": " +
+              ([ .status.conditions[]? | select(.type == "Ready") | .message // .reason ][0] // "no Ready condition yet")
+        ' 2>/dev/null) || notready=""
+        if [ -n "$notready" ]; then
+            log_warning "    Registered, but NOT Ready — KEDA is not acting on these, so WVA is never called about them and they do not scale:"
+            printf '%s\n' "$notready" | while IFS= read -r line; do log_warning "$line"; done
+            log_warning "      A ScaledObject that outlived its target stays in this state even after the target comes back. Recreate it:"
+            log_warning "      make scaledobjects-apply WVA_DEFAULT_SO_PLAN=<plan>   # after deleting the stale one"
+        fi
         return 0
     fi
     # Deliberately log_info, not a warning: this is the expected state here.
