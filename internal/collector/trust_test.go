@@ -58,10 +58,35 @@ func TestPublishTrustVerdicts(t *testing.T) {
 			wantVerdict: true,
 		},
 		{
-			// "missing"/"unavailable" mean the metric was never there, which is
-			// a cold scrape, not a broken one.
+			// The hole this test exists for. "unavailable" is the age band PAST
+			// "stale" -- five minutes and older -- and the value is still in the
+			// row. Comparing the status to "stale" by equality covered
+			// 1-to-5-minute-old data and exempted everything worse, so the
+			// abstain switched itself off as the scrape got more broken.
+			name:        "every replica unavailable blocks too, not just stale",
+			rows:        []domain.ReplicaMetrics{row("vllm", "unavailable", true), row("vllm", "unavailable", true)},
+			wantTrusted: false,
+			wantVerdict: true,
+		},
+		{
+			name: "a mix of stale and unavailable is still no usable view",
+			rows: []domain.ReplicaMetrics{row("vllm", "stale", true), row("vllm", "unavailable", true)},
+			// Neither band is usable, so neither rescues the other.
+			wantTrusted: false,
+			wantVerdict: true,
+		},
+		{
+			// "missing" is the one status that is not an age. It means the
+			// metric was never scraped, which is also what a first collection
+			// looks like, so it must not read as too old.
 			name:        "missing is not stale",
 			rows:        []domain.ReplicaMetrics{row("vllm", "missing", true)},
+			wantTrusted: true,
+			wantVerdict: true,
+		},
+		{
+			name:        "metadata absent entirely is not stale",
+			rows:        []domain.ReplicaMetrics{{Namespace: "chat", VariantName: "vllm"}},
 			wantTrusted: true,
 			wantVerdict: true,
 		},
@@ -145,6 +170,21 @@ func TestPublishTrustVerdicts_BlockedReason(t *testing.T) {
 		[]domain.ReplicaMetrics{row("vllm", "fresh", true)}, now)
 	if got := count(); got != 0 {
 		t.Errorf("%s has %d series after recovery, want 0",
+			constants.WVAModelScalingBlocked, got)
+	}
+
+	// And a model whose rows vanish entirely clears it as well. The trust
+	// verdict expires on its own after trustTTL, so a gauge left at 1 here
+	// would outlive the condition it reports and sit blocked forever.
+	publishTrustVerdicts(context.Background(), store, "chat", "test-model",
+		[]domain.ReplicaMetrics{row("vllm", "stale", true)}, now)
+	if got := count(); got != 1 {
+		t.Fatalf("%s has %d series, want 1 before the vanish", constants.WVAModelScalingBlocked, got)
+	}
+	publishTrustVerdicts(context.Background(), store, "chat", "test-model", nil, now)
+	if got := count(); got != 0 {
+		t.Errorf("%s has %d series after the model's rows vanished, want 0 — "+
+			"the metric must not outlive the verdict, which expires on its own",
 			constants.WVAModelScalingBlocked, got)
 	}
 }

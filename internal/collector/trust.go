@@ -13,10 +13,6 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 )
 
-// freshnessStale is the collector's own verdict string for a scrape that is
-// behind, as written into ReplicaMetricsMetadata.FreshnessStatus.
-const freshnessStale = "stale"
-
 // publishTrustVerdicts records, per scale target, whether this pass produced a
 // usable view of it -- see decision.TrustStore for what the verdict is for --
 // and reports the model-level consequence on wva_model_scaling_blocked.
@@ -57,11 +53,21 @@ func publishTrustVerdicts(
 		trust = decision.DefaultTrust
 	}
 	if len(rows) == 0 {
-		// No rows says nothing about the model either way, so the blocked
-		// reason is left exactly as it was rather than cleared: clearing it
-		// here would retract the verdict every time a wedged model stopped
-		// producing rows at all, which is the direction it is most likely to
-		// go once its scrape has been broken for a while.
+		// Trust verdicts are left alone -- they expire on their own -- but the
+		// blocked reason is CLEARED.
+		//
+		// An earlier version returned here without touching the gauge, on the
+		// reasoning that no rows says nothing about the model. That is true of
+		// the verdict and false of the metric: the verdict expires after
+		// trustTTL and WVA resumes answering, while a gauge nobody rewrites
+		// stays at 1 forever, so a model whose rows vanished would report
+		// blocked long after it had stopped being blocked. The metric must not
+		// outlive the condition it reports. Retracting it here is the safe
+		// direction of the two -- it can under-report for at most trustTTL,
+		// where the alternative over-reports until the process restarts -- and
+		// a model with no rows at all is usually parked, not wedged.
+		metrics.SetModelScalingBlockedReasons(namespace, modelID,
+			constants.ScalingBlockedReasonsCollection, nil)
 		return
 	}
 
@@ -84,7 +90,12 @@ func publishTrustVerdicts(
 			order = append(order, rm.VariantName)
 		}
 		t.total++
-		if rm.Metadata != nil && rm.Metadata.FreshnessStatus == freshnessStale {
+		// StaleOrOlder, not a comparison to "stale": that is one of two age
+		// bands past the fresh threshold, and testing it by equality made this
+		// verdict cover 1-to-5-minute-old data while exempting anything older,
+		// so the abstain switched itself off exactly as a broken scrape got
+		// worse. See domain.ReplicaMetricsMetadata.StaleOrOlder.
+		if rm.Metadata.StaleOrOlder() {
 			t.stale++
 		}
 	}

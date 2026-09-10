@@ -82,10 +82,6 @@ type ReplicaMetricsCollector struct {
 	apiReader client.Reader
 	recorder  record.EventRecorder
 	locator   locator.PodLocator
-	// trust receives this collector's verdict on whether it can see each scale
-	// target. Nil means the process-wide decision.DefaultTrust, which is what
-	// production uses; tests inject their own. See publishTrustVerdicts.
-	trust *decision.TrustStore
 	// metricsAvailableState tracks whether metrics were available in the previous
 	// cycle for each VA (keyed by namespace/name). Used for edge-triggered events.
 	metricsAvailableState map[string]bool
@@ -113,16 +109,6 @@ func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient cl
 		locator:               podLocator,
 		metricsAvailableState: make(map[string]bool),
 	}
-}
-
-// WithTrustStore returns c publishing its trust verdicts to ts instead of the
-// process-wide store. For tests; nil is ignored so a caller cannot accidentally
-// silence the verdicts entirely.
-func (c *ReplicaMetricsCollector) WithTrustStore(ts *decision.TrustStore) *ReplicaMetricsCollector {
-	if ts != nil {
-		c.trust = ts
-	}
-	return c
 }
 
 // BeginCycle opens an optimize cycle, arming the memo that lets every model in a
@@ -1306,7 +1292,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 
 	// After the collapse, so the verdict counts scale-target replicas rather
 	// than engine instances: a DP=4 pod is one replica going stale, not four.
-	publishTrustVerdicts(ctx, c.trust, namespace, modelID, replicaMetrics, collectedAt)
+	publishTrustVerdicts(ctx, decision.DefaultTrust, namespace, modelID, replicaMetrics, collectedAt)
 
 	// Only set this after all pods have been processed, making sure not to include pods without metrics (which are skipped above).
 	// This ensures that the discovered pod count reflects only those pods that produced replica metrics.
