@@ -39,6 +39,7 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
@@ -2306,5 +2307,94 @@ func TestCollectReplicaMetrics_ImplausibleServiceTime(t *testing.T) {
 					results[0].AvgITL, tc.itl)
 			}
 		})
+	}
+}
+
+// TestCollectReplicaMetrics_PublishesTrustRecord pins the WIRING, not the rule.
+//
+// The rule -- which rows make a workload untrusted -- is covered in trust_test.go
+// by calling publishTrustVerdicts directly. That left the one line in
+// collectReplicaMetrics that actually calls it uncovered: deleting it kept every
+// test in this package green, so the whole abstain feature could have shipped
+// disconnected from the collector with the suite reporting success.
+//
+// It also pins that the record is keyed by the SCALEDOBJECT name, which is what
+// the external scaler looks up. Keying it by the scale target instead was a real
+// bug: the generator names ScaledObjects "<target>-wva", so writer and reader
+// never met.
+func TestCollectReplicaMetrics_PublishesTrustRecord(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	if err := metrics.InitMetrics(registry); err != nil {
+		t.Fatalf("InitMetrics: %v", err)
+	}
+	scheme := runtime.NewScheme()
+	if err := llmdVariantAutoscalingV1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme corev1: %v", err)
+	}
+	readyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod-known", Namespace: "test-ns"},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(readyPod).Build()
+
+	podLabels := map[string]string{
+		seriesModelLabel: "test-model",
+		"pod":            "pod-known",
+		"instance":       "10.0.0.1:8000",
+	}
+	ts := time.Now()
+
+	// metrics_age drives freshness now: sample timestamps cannot, because an
+	// instant query stamps every sample with the evaluation time. 600s is past
+	// the 5-minute unavailable threshold.
+	mockSource := &mockMetricsSource{
+		refreshFunc: func(_ context.Context, _ source.RefreshSpec) (map[string]*source.MetricResult, error) {
+			return map[string]*source.MetricResult{
+				"kv_cache_usage": {
+					Values: []source.MetricValue{{Labels: podLabels, Value: 0.5, Timestamp: ts}},
+				},
+				"metrics_age": {
+					Values: []source.MetricValue{{Labels: podLabels, Value: 600, Timestamp: ts}},
+				},
+			}, nil
+		},
+	}
+
+	trust := decision.NewTrustStore()
+	collector := NewReplicaMetricsCollector(mockSource, k8sClient, k8sClient, nil,
+		scalerLocator(map[string]string{"pod-known": "va-1"})).WithTrustStore(trust)
+
+	results, err := collector.CollectReplicaMetrics(
+		context.Background(), "test-model", "test-ns",
+		make(map[string]scaletarget.ScaleTargetAccessor),
+		make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("CollectReplicaMetrics: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected exactly 1 ReplicaMetrics entry, got %d", len(results))
+	}
+	if got := results[0].Metadata.FreshnessStatus; got != domain.FreshnessUnavailable {
+		t.Fatalf("FreshnessStatus is %q, want %q -- a 600s metrics_age must classify as unavailable",
+			got, domain.FreshnessUnavailable)
+	}
+
+	// "va-1" is the ScaledObject name the locator resolved, and the key the
+	// external scaler will look up from ScaledObjectRef.Name.
+	ok, reason := trust.Trust("test-ns", "va-1", time.Now(), staleObservationLimit)
+	if ok {
+		t.Error("collecting an all-unavailable workload left it trusted; " +
+			"the collector is not publishing its trust record")
+	}
+	if reason == "" {
+		t.Error("the record must carry a reason for KEDA's error message")
 	}
 }

@@ -82,6 +82,12 @@ type ReplicaMetricsCollector struct {
 	apiReader client.Reader
 	recorder  record.EventRecorder
 	locator   locator.PodLocator
+	// trust receives this collector's record of whether it can see each
+	// workload. Nil means the process-wide decision.DefaultTrust, which is
+	// what production uses; tests inject their own so that exercising
+	// CollectReplicaMetrics does not mutate a package-level singleton as a
+	// side effect. See publishTrustVerdicts.
+	trust *decision.TrustStore
 	// metricsAvailableState tracks whether metrics were available in the previous
 	// cycle for each VA (keyed by namespace/name). Used for edge-triggered events.
 	metricsAvailableState map[string]bool
@@ -109,6 +115,17 @@ func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient cl
 		locator:               podLocator,
 		metricsAvailableState: make(map[string]bool),
 	}
+}
+
+// WithTrustStore returns c publishing its trust records to ts instead of the
+// process-wide store. For tests, so that exercising CollectReplicaMetrics does
+// not mutate decision.DefaultTrust underneath whatever else is running; nil is
+// ignored so a caller cannot accidentally silence the records entirely.
+func (c *ReplicaMetricsCollector) WithTrustStore(ts *decision.TrustStore) *ReplicaMetricsCollector {
+	if ts != nil {
+		c.trust = ts
+	}
+	return c
 }
 
 // BeginCycle opens an optimize cycle, arming the memo that lets every model in a
@@ -574,6 +591,11 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		generationTokenRate float64
 		kvUsageInstant      float64
 		requestRate         float64
+		// metricsAge is how old the engine's metrics actually are, in
+		// seconds, straight from QueryMetricsAge. hasMetricsAge separates a
+		// measured zero from an absent measurement.
+		metricsAge    float64
+		hasMetricsAge bool
 	}
 
 	// classifyTimestamp reports the freshness status of a single metric timestamp,
@@ -968,6 +990,36 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	}
 
 	// Process instantaneous KV usage (k*) results (0.0–1.0) — throughput analyzer k*
+	// Age of the engine's metrics, per instance. See registration.QueryMetricsAge
+	// for why this is a query of its own rather than a subtraction on the sample
+	// timestamps every other block here uses.
+	//
+	// A negative age is clock skew between Prometheus and the engine's exporter,
+	// not data from the future; it is clamped to zero rather than dropped, since
+	// skew says nothing about whether the scrape is alive.
+	if result := results[registration.QueryMetricsAge]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				instanceKey, _, _ := c.buildInstanceKey(ctx, namespace, value.Labels)
+				if instanceKey == "" {
+					continue
+				}
+				if podData[instanceKey] == nil {
+					continue // skip pods the KV/queue queries didn't see (scrape skew)
+				}
+				if math.IsNaN(value.Value) || math.IsInf(value.Value, 0) {
+					continue
+				}
+				age := value.Value
+				if age < 0 {
+					age = 0
+				}
+				podData[instanceKey].metricsAge = age
+				podData[instanceKey].hasMetricsAge = true
+			}
+		}
+	}
+
 	if result := results[registration.QueryKvUsageInstant]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
@@ -1137,6 +1189,29 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// Track freshness for metrics in this pod
 		trackMetricFreshness(vaName, data, collectedAt, vaMetricsFreshnessStatus)
 		freshnessStatus, freshnessAge := worstFreshnessStatus(data, collectedAt)
+		// The MEASURED age wins wherever there is one, and this is the only
+		// path that can report anything but "fresh".
+		//
+		// worstFreshnessStatus subtracts each metric's sample timestamp from the
+		// collection time, which cannot work: WVA issues instant queries and
+		// Prometheus stamps every sample of an instant vector with the
+		// EVALUATION time, so that difference is WVA's own query round-trip,
+		// measured in milliseconds, no matter how old the underlying data is.
+		// Every freshness verdict derived from it reads "fresh", which is why
+		// three separate consumers could compare this status against "stale"
+		// with == for a long time and nobody noticed the branch was dead.
+		//
+		// QueryMetricsAge asks Prometheus the question directly with
+		// time() - timestamp(x), the one function that reports a sample's own
+		// timestamp. Falls back to the old value when the query returned nothing
+		// for this pod -- an engine whose exporter is not scraped at all, or a
+		// Prometheus too old for the function -- because a wrong-but-fresh
+		// verdict is what the code did before and is not made worse by keeping
+		// it where there is no better answer.
+		if data.hasMetricsAge {
+			freshnessAge = time.Duration(data.metricsAge * float64(time.Second))
+			freshnessStatus = config.DefaultFreshnessThresholds().DetermineStatus(freshnessAge)
+		}
 		// Read from the Pod, never inferred from the scrape. A row exists
 		// because something answered /metrics, which happens before the Pod
 		// is Ready; see domain.ReplicaMetrics.Ready.
@@ -1292,7 +1367,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 
 	// After the collapse, so the verdict counts scale-target replicas rather
 	// than engine instances: a DP=4 pod is one replica going stale, not four.
-	publishTrustVerdicts(ctx, decision.DefaultTrust, namespace, modelID, replicaMetrics, collectedAt)
+	publishTrustVerdicts(ctx, c.trust, namespace, modelID, replicaMetrics, collectedAt)
 
 	// Only set this after all pods have been processed, making sure not to include pods without metrics (which are skipped above).
 	// This ensures that the discovered pod count reflects only those pods that produced replica metrics.
