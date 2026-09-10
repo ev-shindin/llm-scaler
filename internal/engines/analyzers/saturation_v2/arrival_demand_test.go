@@ -186,6 +186,32 @@ var _ = Describe("estimateArrivalDemand", func() {
 		Expect(f.Tokens).To(BeNumerically("~", clean.Tokens, 0.01))
 	})
 
+	It("skips a replica whose scrape is stale, rather than outvoting it", func() {
+		// Staleness is not an outlier, so the median is the wrong tool for it:
+		// a fleet whose scrape breaks while it is busy goes stale TOGETHER, at
+		// values that are internally consistent and all wrong. Here the two
+		// stale replicas are the majority, so a median that counted them would
+		// return their value; skipping them leaves only the fresh one.
+		fresh := &domain.ReplicaMetricsMetadata{FreshnessStatus: "fresh"}
+		stale := &domain.ReplicaMetricsMetadata{FreshnessStatus: "stale"}
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 900, Metadata: stale},
+			{AvgServiceTime: 900, Metadata: stale},
+			{AvgServiceTime: 24.6, Metadata: fresh},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("counts a replica with no metadata at all", func() {
+		// Absent metadata is not a staleness verdict. Rows arrive without it
+		// from paths that never set it, and reading nil as stale would silently
+		// empty the sample and take the floor to zero.
+		rm := []domain.ReplicaMetrics{{AvgServiceTime: 24.6}, {AvgServiceTime: 24.6}}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
 	It("prefers the engine's measured service time over the reconstruction", func() {
 		// The reconstruction is decode-only: it multiplies output length by
 		// inter-token latency and so cannot see prefill. Where the engine

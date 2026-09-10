@@ -166,7 +166,7 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 }
 
 // medianOf takes the median per-replica value over the replicas that reported
-// one, skipping those that reported nothing.
+// one, skipping those that reported nothing and those whose scrape is stale.
 //
 // Unweighted on purpose. Every value it is used for — service time, ITL, and
 // the two token averages — is a per-request property of the same hardware and
@@ -220,9 +220,25 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 // self-contradictory; the inconsistency is recorded rather than unified, because
 // aligning them would change DP-collapse behaviour for a case neither helper was
 // written for.
+// A replica whose scrape is behind is skipped outright, not merely outvoted.
+// The collector already computes this verdict per row and the throughput
+// analyzer's checkReplicaMetrics already refuses to calibrate on it; the floor
+// was the one consumer reading Metadata.FreshnessStatus not at all, so a
+// replica frozen at whatever it last reported counted at full weight for as
+// long as its scrape stayed broken. That is the failure the median cannot
+// help with: staleness is not an outlier, and a fleet whose scrape breaks
+// while it is busy goes stale TOGETHER, at values that are internally
+// consistent and all wrong.
+//
+// Only "stale" is dropped. "unavailable" and "missing" mean the value was
+// never there, so pick() already returns 0 for them and the > 0 test below is
+// the guard; excluding them here as well would say the same thing twice.
 func medianOf(replicaMetrics []domain.ReplicaMetrics, pick func(domain.ReplicaMetrics) float64) float64 {
 	vals := make([]float64, 0, len(replicaMetrics))
 	for _, rm := range replicaMetrics {
+		if rm.Metadata != nil && rm.Metadata.FreshnessStatus == freshnessStale {
+			continue
+		}
 		if v := pick(rm); v > 0 {
 			vals = append(vals, v)
 		}
@@ -233,6 +249,12 @@ func medianOf(replicaMetrics []domain.ReplicaMetrics, pick func(domain.ReplicaMe
 	sort.Float64s(vals)
 	return vals[(len(vals)-1)/2]
 }
+
+// freshnessStale is the collector's verdict for a scrape that is behind. Spelled
+// here rather than imported because internal/collector imports the analyzers,
+// not the other way round; throughput/sanity.go carries the same literal for the
+// same reason.
+const freshnessStale = "stale"
 
 // raiseRoleDemandTo scales each role's demand so the roles still sum to total.
 //
