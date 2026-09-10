@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,6 +20,10 @@ type podServingState struct {
 	// ready is the kubelet's readiness verdict, which is what decides whether a
 	// Service or an EPP will route to the Pod at all.
 	ready bool
+	// startedAt is when the kubelet started the Pod, zero when it has not yet
+	// (or the field is unset). It bounds how long any request this Pod reports
+	// can possibly have taken -- see serviceTimeExceedsUptime.
+	startedAt time.Time
 }
 
 // namespacePods is one namespace's listing, plus whether it could be read.
@@ -58,10 +63,14 @@ func podStates(ctx context.Context, reader client.Reader, namespace string) name
 	out := make(map[string]podServingState, len(pods.Items))
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		out[p.Name] = podServingState{
+		state := podServingState{
 			live:  p.DeletionTimestamp == nil,
 			ready: podIsReady(p),
 		}
+		if p.Status.StartTime != nil {
+			state.startedAt = p.Status.StartTime.Time
+		}
+		out[p.Name] = state
 	}
 	return namespacePods{byName: out, listed: true}
 }
@@ -149,6 +158,29 @@ func (c *ReplicaMetricsCollector) podReady(ctx context.Context, namespace, podNa
 		return true
 	}
 	return found && state.ready
+}
+
+// podUptime reports how long the Pod has been running, and whether that could
+// be established at all.
+//
+// False whenever the listing could not be read, the Pod is not in it, or it
+// carries no start time — the same fail-open contract as podReady. A caller
+// bounding a metric by uptime must not treat "unknown" as "zero", which would
+// make every value look impossible.
+func (c *ReplicaMetricsCollector) podUptime(
+	ctx context.Context, namespace, podName string, now time.Time,
+) (time.Duration, bool) {
+	state, found, listed := c.servingState(ctx, namespace, podName)
+	if !listed || !found || state.startedAt.IsZero() {
+		return 0, false
+	}
+	uptime := now.Sub(state.startedAt)
+	if uptime < 0 {
+		// A start time in the future is clock skew between this process and the
+		// node, not a Pod that has not started. Unknown rather than zero.
+		return 0, false
+	}
+	return uptime, true
 }
 
 // seriesPodName pulls the Pod identity out of a series' labels.

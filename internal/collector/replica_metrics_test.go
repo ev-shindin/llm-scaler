@@ -2163,41 +2163,67 @@ func TestCollectReplicaMetrics_TimingExcludedWhenNotReady(t *testing.T) {
 // neither the readiness gate nor the median can help.
 //
 // Every other filter in this file tests one value in isolation, and 521368 is
-// finite, positive and an ordinary float — it passes all of them. What makes it
-// impossible is only visible against the other two numbers the same pod
-// reported: AvgOutputTokens x AvgITL is the decode-only reconstruction of
-// service time, and it says ~20s.
+// finite, positive and an ordinary float — it passes all of them. What makes
+// 145 hours impossible is the Pod: no request can have taken longer than the
+// process that served it has been running.
+//
+// The prefill-heavy case is the reason this is bounded by uptime and not by
+// arithmetic on the other metrics. An earlier version compared service time
+// against the decode-only reconstruction AvgOutputTokens x AvgITL; service time
+// is prefill + O x ITL, so that ratio is 1 + prefill/(O x ITL) and runs away as
+// O shrinks. At 30-50k prefill and one decode token it reaches several hundred
+// with every number correct, and rejecting it would discard a real measurement
+// on a shape this project serves.
 func TestCollectReplicaMetrics_ImplausibleServiceTime(t *testing.T) {
+	const podUptime = 3 * time.Hour
+
 	cases := []struct {
 		name               string
 		serviceTime        float64
 		outputTokens       float64
 		itl                float64
+		startedAgo         time.Duration
+		noStartTime        bool
 		wantAvgServiceTime float64
 	}{
 		{
-			// 521368 against a reconstruction of 1000 x 0.02 = 20s: ~26,000x.
+			// 145 hours reported by a pod that has existed for three.
 			name: "the incident's reading is rejected", serviceTime: 521368,
-			outputTokens: 1000, itl: 0.02, wantAvgServiceTime: 0,
+			outputTokens: 1000, itl: 0.02, startedAgo: podUptime, wantAvgServiceTime: 0,
 		},
 		{
-			// 24.66 measured against 24.60 reconstructed, as observed on an
-			// H100. The guard must be invisible on real data.
+			// 24.66s measured on an H100 at 4000 in / 1000 out. The guard must
+			// be invisible on real data.
 			name: "a real measurement is kept", serviceTime: 24.66,
-			outputTokens: 1000, itl: 0.0246, wantAvgServiceTime: 24.66,
+			outputTokens: 1000, itl: 0.0246, startedAgo: podUptime, wantAvgServiceTime: 24.66,
 		},
 		{
-			// The reconstruction cannot see prefill, so a prefill-heavy shape
-			// legitimately measures far above it. 50x must survive; the bound
-			// is on the impossible, not on the surprising.
-			name: "a prefill-heavy shape survives a large honest ratio", serviceTime: 10,
-			outputTokens: 10, itl: 0.02, wantAvgServiceTime: 10,
+			// 50k prefill, ONE decode token: ~4s of prefill against a
+			// reconstruction of 1 x 0.025 = 0.025s, a ratio of ~160. Every
+			// number is correct and the value must survive. This is the case
+			// the ratio-based guard got wrong.
+			name: "50k prefill and one decode token survives", serviceTime: 4.0,
+			outputTokens: 1, itl: 0.025, startedAgo: podUptime, wantAvgServiceTime: 4.0,
 		},
 		{
-			// Fails OPEN: with no ITL there is no second opinion, and an absent
-			// cross-check must not delete a value it cannot judge.
-			name: "no ITL means no cross-check, so the value stands", serviceTime: 521368,
-			outputTokens: 1000, itl: 0, wantAvgServiceTime: 521368,
+			// Same shape, a slower and much longer prefill. Still far below
+			// uptime, so still kept — the bound carries no assumption about
+			// where a request's time went.
+			name: "a 30s prefill-dominated request survives", serviceTime: 30,
+			outputTokens: 1, itl: 0.05, startedAgo: podUptime, wantAvgServiceTime: 30,
+		},
+		{
+			// Fails OPEN below the minimum uptime: in a pod's first seconds its
+			// uptime is the same order as the scrape interval, so the
+			// comparison would measure the pipeline rather than the engine.
+			name: "a pod younger than the minimum is not judged", serviceTime: 521368,
+			outputTokens: 1000, itl: 0.02, startedAgo: 10 * time.Second, wantAvgServiceTime: 521368,
+		},
+		{
+			// Fails OPEN with no start time: a bound that cannot be established
+			// must not delete a value it cannot judge.
+			name: "no start time means no bound, so the value stands", serviceTime: 521368,
+			outputTokens: 1000, itl: 0.02, noStartTime: true, wantAvgServiceTime: 521368,
 		},
 	}
 
@@ -2220,6 +2246,10 @@ func TestCollectReplicaMetrics_ImplausibleServiceTime(t *testing.T) {
 					Phase:      corev1.PodRunning,
 					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 				},
+			}
+			if !tc.noStartTime {
+				started := metav1.NewTime(time.Now().Add(-tc.startedAgo))
+				readyPod.Status.StartTime = &started
 			}
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(readyPod).Build()
 
@@ -2268,11 +2298,11 @@ func TestCollectReplicaMetrics_ImplausibleServiceTime(t *testing.T) {
 			if results[0].AvgServiceTime != tc.wantAvgServiceTime {
 				t.Errorf("AvgServiceTime is %v, want %v", results[0].AvgServiceTime, tc.wantAvgServiceTime)
 			}
-			// The cross-check governs service time alone: ITL is what it is
-			// measured against, and zeroing both would remove the fallback the
-			// floor needs once the measured value is gone.
+			// The bound governs service time alone: zeroing ITL as well would
+			// remove the decode-only fallback the floor needs once the measured
+			// value is gone.
 			if tc.itl > 0 && results[0].AvgITL != tc.itl {
-				t.Errorf("AvgITL is %v, want %v — the cross-check must not touch ITL",
+				t.Errorf("AvgITL is %v, want %v — the uptime bound must not touch ITL",
 					results[0].AvgITL, tc.itl)
 			}
 		})
