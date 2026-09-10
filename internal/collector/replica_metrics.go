@@ -1137,16 +1137,64 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// Track freshness for metrics in this pod
 		trackMetricFreshness(vaName, data, collectedAt, vaMetricsFreshnessStatus)
 		freshnessStatus, freshnessAge := worstFreshnessStatus(data, collectedAt)
+		// Read from the Pod, never inferred from the scrape. A row exists
+		// because something answered /metrics, which happens before the Pod
+		// is Ready; see domain.ReplicaMetrics.Ready.
+		ready := c.podReady(ctx, namespace, podName)
+		// Per-request timing (service time, ITL) is excluded for a pod that
+		// hasn't passed readiness -- unlike TokensInUse/KvCacheUsage below,
+		// which the Ready field's own doc comment explains are counted
+		// regardless, because a starting Pod's GPU and KV cache are real.
+		// Timing is different: it describes the cost of a REQUEST, not a
+		// resource the Pod holds, and a pod still failing its readiness probe
+		// is exactly the population most likely to report a startup artifact
+		// rather than a real one. Observed directly on a live run: a decode
+		// pod failing its readiness probe reported a batch of "completions"
+		// averaging ~145 hours of service time each, which was then averaged
+		// unweighted across the fleet by estimateArrivalDemand and inflated
+		// the demand floor ~590x for several minutes. Excluding it here is a
+		// second, independent layer under that call site's own median-based
+		// aggregation -- if a value like this shouldn't be trusted, the
+		// cleanest place to say so is where the Pod's own trust state is
+		// already known, not downstream in every consumer.
+		//
+		// Timing ONLY. AvgInputTokens/AvgOutputTokens are the same kind of
+		// per-request quantity and were considered here, but they are also read
+		// per-replica by the saturation analyzer's waitingQueueDemand to price
+		// a pod's waiting queue. A starting pod's queue is work the fleet has
+		// already accepted, so zeroing its shape would erase real demand and
+		// read as "idle" -- the failure this whole change exists to avoid,
+		// pointing the other way. Their outlier defence lives in
+		// estimateArrivalDemand, the only consumer that aggregates them across
+		// replicas.
+		avgITL := data.avgITL
+		avgServiceTime := data.avgServiceTime
+		if !ready {
+			// At DEFAULT, not DEBUG. The incident this guards against was
+			// visible only as a moved demand floor; now that both layers
+			// discard the reading, a silent drop would leave the NEXT
+			// occurrence with no trace at all -- and DEBUG is V(4) against a
+			// shipped default of -v=2, so a DEBUG line would be invisible in
+			// exactly the run that needs it. Logged only when there was
+			// something to drop, so a normally-starting pod stays quiet.
+			if data.avgITL > 0 || data.avgServiceTime > 0 {
+				logger.V(logging.DEFAULT).Info("dropping timing metrics from a not-Ready pod",
+					"pod", podName,
+					"namespace", namespace,
+					"variant", vaName,
+					"avgServiceTime", data.avgServiceTime,
+					"avgITL", data.avgITL)
+			}
+			avgITL = 0
+			avgServiceTime = 0
+		}
 		metric := domain.ReplicaMetrics{
-			PodName:      podName,
-			ModelID:      modelID,
-			Namespace:    namespace,
-			VariantName:  vaName,
-			FromWarmPool: fromWarmPool,
-			// Read from the Pod, never inferred from the scrape. A row exists
-			// because something answered /metrics, which happens before the Pod
-			// is Ready; see domain.ReplicaMetrics.Ready.
-			Ready:                 c.podReady(ctx, namespace, podName),
+			PodName:               podName,
+			ModelID:               modelID,
+			Namespace:             namespace,
+			VariantName:           vaName,
+			FromWarmPool:          fromWarmPool,
+			Ready:                 ready,
 			KvCacheUsage:          kvUsage,
 			QueueLength:           queueLen,
 			NumGpuBlocks:          data.numGpuBlocks,
@@ -1156,8 +1204,8 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			AvgOutputTokens:       data.avgOutputTokens,
 			AvgInputTokens:        data.avgInputTokens,
 			PrefixCacheHitRate:    data.prefixCacheHitRate,
-			AvgITL:                data.avgITL,
-			AvgServiceTime:        data.avgServiceTime,
+			AvgITL:                avgITL,
+			AvgServiceTime:        avgServiceTime,
 			GenerationTokenRate:   data.generationTokenRate,
 			KvUsageInstant:        data.kvUsageInstant,
 			RequestRate:           data.requestRate,

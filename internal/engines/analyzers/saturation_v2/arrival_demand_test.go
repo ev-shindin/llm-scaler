@@ -110,18 +110,80 @@ var _ = Describe("estimateArrivalDemand", func() {
 		Expect(f.Reason).To(ContainSubstring("output length"))
 	})
 
-	It("averages a timing unweighted across the replicas that reported one", func() {
+	It("takes the median timing unweighted across the replicas that reported one", func() {
 		// These are per-request costs of the same hardware and model, so every
 		// serving replica measures the same quantity and none should count for
 		// more. A replica that has completed nothing reports zero and must not
-		// drag the mean down -- through it, the floor.
+		// drag the estimate down -- through it, the floor.
+		//
+		// The values are chosen so median and mean DISAGREE. An earlier version
+		// of this case used {0.020, 0.030, 0}, whose surviving pair has a median
+		// of 0.025 and a mean of 0.025 as well: it passed against the mean this
+		// test was rewritten to rule out, and so asserted nothing about the name
+		// it carries. Four survivors skewed high put the mean at 0.045 and the
+		// (lower) median at 0.030.
 		rm := []domain.ReplicaMetrics{
 			{AvgITL: 0.020, AvgOutputTokens: measuredAvgOut},
 			{AvgITL: 0.030, AvgOutputTokens: measuredAvgOut},
+			{AvgITL: 0.040, AvgOutputTokens: measuredAvgOut},
+			{AvgITL: 0.090, AvgOutputTokens: measuredAvgOut},
 			{AvgITL: 0, AvgOutputTokens: measuredAvgOut},
 		}
-		Expect(meanOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgITL })).
-			To(BeNumerically("~", 0.025, 1e-9))
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgITL })).
+			To(BeNumerically("~", 0.030, 1e-9))
+	})
+
+	It("takes the LOWER of the two central values, so two replicas are still guarded", func() {
+		// The one arrangement where "fewer than half the replicas are affected"
+		// can never hold: with two replicas, one bad reading IS half. Averaging
+		// the central pair would return ~260,696s here -- the mean, and the
+		// incident all over again on a two-replica variant. The lower median
+		// returns the sane replica's value.
+		rm := []domain.ReplicaMetrics{
+			{AvgServiceTime: 24.6},
+			{AvgServiceTime: 521368},
+		}
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("ignores a single replica's wildly misreported timing entirely", func() {
+		// The motivating incident: one of ten decode replicas' own
+		// service-time metric implied ~145 hours per request (a vLLM-side
+		// artifact), which a mean would have handed 1/10 of the weight --
+		// enough to inflate the fleet estimate ~590x on its own. The median
+		// must not move at all for one outlier among ten sane values.
+		rm := make([]domain.ReplicaMetrics, 0, 10)
+		for i := 0; i < 9; i++ {
+			rm = append(rm, domain.ReplicaMetrics{AvgServiceTime: 24.6})
+		}
+		rm = append(rm, domain.ReplicaMetrics{AvgServiceTime: 521368})
+		Expect(medianOf(rm, func(m domain.ReplicaMetrics) float64 { return m.AvgServiceTime })).
+			To(BeNumerically("~", 24.6, 1e-9))
+	})
+
+	It("ignores a single replica's misreported token shape too", func() {
+		// Token shape reaches the floor through the same multiplication as the
+		// timing does -- lambda x W x (avgIn + avgOut) -- so a replica that can
+		// misreport one can misreport the other to the same effect. Here one of
+		// five replicas claims a 250x output length; against the unweighted mean
+		// this used to use, that alone would raise the floor ~50x.
+		//
+		// Unlike the timing, this cannot be gated at the collector: the same two
+		// fields price a starting pod's waiting queue per-replica, where zeroing
+		// them would erase real demand. The floor aggregates across replicas, so
+		// the floor is where it is handled.
+		rm := metricsAt(measuredITL, measuredAvgOut, 5)
+		rm[2].AvgOutputTokens = 250000
+
+		f := estimateArrivalDemand(domain.AnalyzerInput{ArrivalRate: 14, ReplicaMetrics: rm})
+		clean := estimateArrivalDemand(domain.AnalyzerInput{
+			ArrivalRate:    14,
+			ReplicaMetrics: metricsAt(measuredITL, measuredAvgOut, 5),
+		})
+		Expect(f.Reason).To(BeEmpty())
+		Expect(f.TokensPerRequest).To(BeNumerically("~", measuredAvgIn+measuredAvgOut, 1e-9))
+		Expect(f.Tokens).To(BeNumerically("~", clean.Tokens, 0.01))
 	})
 
 	It("prefers the engine's measured service time over the reconstruction", func() {

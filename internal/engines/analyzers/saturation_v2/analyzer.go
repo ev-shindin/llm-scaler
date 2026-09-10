@@ -1211,6 +1211,14 @@ func k2SourceLabel(replicas []ReplicaCapacity) string {
 
 // median returns the median value from a sorted slice of int64 values.
 // Returns 0 if the slice is empty.
+//
+// Averages the central pair on an even count, which is NOT what medianOf in
+// arrival_demand.go does -- it takes the lower of the two. The difference is
+// deliberate and follows from what each input is: this one blends learned
+// per-replica capacities, where every reading is trusted and the midpoint is
+// the better estimate, while medianOf exists to survive a reading that should
+// not be trusted at all. See medianOf's doc comment for the two-replica case
+// that decides it.
 func median(values []int64) int64 {
 	n := len(values)
 	if n == 0 {

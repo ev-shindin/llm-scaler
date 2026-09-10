@@ -295,6 +295,14 @@ func (a *ThroughputAnalyzer) Analyze(
 		// metrics from Observe() do not currently block demand computation here.
 		// Gating demand on the sanity report is deferred to the per-analyzer status-return
 		// PR; it requires the engine contract to accept an AnalyzerStatus opt-out signal.
+		//
+		// When that lands, gate PER REPLICA, not on the variant-level report.
+		// SanityReport is a union over the variant's pods, and the collector now
+		// zeroes AvgITL for any pod that has not passed its readiness probe, so
+		// SanityIssueITLNonPositive is present for the whole variant during every
+		// ordinary scale-up. Skipping the variant on that would stop demand
+		// computation precisely while the fleet is growing. filterHealthyForShape
+		// below already does the per-replica version of this correctly.
 
 		// Filter to healthy replicas for ITL model fitting and GPS verification.
 		// Stale replicas (cold-start, missing fields) bias the tier-2 OLS slope A
