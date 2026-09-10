@@ -35,19 +35,24 @@ const MetricName = "wva-desired-replicas"
 // without being refreshed. See Handler.honoursDecision.
 const activationTTL = 60 * time.Second
 
-// trustTTL bounds how long an "I cannot see this workload" verdict keeps WVA
-// from answering. Comfortably longer than activationTTL because the two answer
-// different questions: activation expires so a target is not held AWAKE on an
-// abandoned decision, while this expires so a target is not held FROZEN by an
-// abandoned verdict. Freezing is the safer failure of the two, so it is given
-// more rope -- but not unlimited rope, because a collector that has stopped
-// publishing verdicts entirely would otherwise freeze every workload it ever
-// reported on, permanently.
+// trustStaleLimit is how long a workload may go uncollected before WVA stops
+// answering KEDA for it.
 //
-// Five minutes is 20 optimize intervals at the 15s default: long enough that a
-// genuinely broken scrape stays declared broken across many cycles, short
-// enough that a wedged collector releases the fleet within one alerting window.
-const trustTTL = 5 * time.Minute
+// It is NOT an expiry on the verdict -- the opposite. An earlier version expired
+// an untrusted verdict back into a trusted one, so a wedged collector could not
+// freeze a fleet forever. That was covering for a signal that could not fire:
+// "I have not collected this workload in five minutes" IS the condition worth
+// abstaining on, not something to time out of. A wedged collector now holds
+// every workload it had seen, which is the honest outcome, and spec.fallback
+// makes that a hold or a raise rather than a drop.
+//
+// Twenty optimize intervals at the 15s default. It has to sit well above a
+// single missed pass: one collection that errors, or one namespace query that
+// times out, must not read as a workload that has vanished.
+//
+// Kept equal to the collector's own staleObservationLimit; they answer the same
+// question from the two ends of the store.
+const trustStaleLimit = 5 * time.Minute
 
 // Handler implements pb.ExternalScalerServer.
 type Handler struct {
@@ -145,12 +150,14 @@ func (h *Handler) observe(ref *pb.ScaledObjectRef) {
 // "active" on its own. The activation decision only has to outlive KEDA's
 // reaction, not the pod's startup.
 //
-// Scope: this governs the 0<->1 gate only. GetMetrics deliberately has no
-// freshness check (it drives HPA's scaling at >=1, where a value collapsing to 0
-// between publishes would be worse), so a stale decision on a RUNNING target
-// still reports its last replica count there. That predates this expiry and is
-// unchanged by it — expiring the activation bit does not, on its own, let a
-// target with an abandoned decision scale back down.
+// Scope: this governs the 0<->1 gate only. GetMetrics applies no freshness check
+// to the DECISION (a value collapsing to 0 between publishes would be worse than
+// a slightly old one), so a stale decision on a RUNNING target still reports its
+// last replica count there. GetMetrics does check whether WVA can see the
+// workload at all, but that is a different question answered from a different
+// store — see trusted — and it declines to answer rather than answering with a
+// stale number. Either way, expiring the activation bit does not, on its own,
+// let a target with an abandoned decision scale back down.
 func (h *Handler) honoursDecision(d decision.Decision) bool {
 	if d.DesiredReplicas <= 0 {
 		return true
@@ -233,36 +240,50 @@ func (h *Handler) GetMetricSpec(_ context.Context, ref *pb.ScaledObjectRef) (*pb
 // first optimization decision exists it returns 0, so HPA holds the target at
 // minReplicaCount rather than acting on a guess.
 //
-// It can also decline to answer. When the collector's last pass found no usable
-// view of the workload -- every replica's metrics stale -- WVA's number would be
-// computed from inputs its own guards rejected, and the honest response is an
-// error rather than a figure. KEDA already defines what an erroring scaler
-// means, which is why this is an error and not a new WVA mechanism: no metric
-// reaches the HPA, so the replica count HOLDS, and after
+// It can also decline to answer, when the collector has no usable view of the
+// workload. WVA's number would then be computed from inputs its own guards
+// rejected, and the honest response is an error rather than a figure. KEDA
+// already defines what an erroring scaler means, which is why this is an error
+// and not a new WVA mechanism: no metric reaches the HPA, and after
 // spec.fallback.failureThreshold consecutive failures KEDA applies
-// spec.fallback (the generated ScaledObject ships
-// behavior: currentReplicasIfHigher, so the fallback can only hold or raise).
-// Nothing here freezes, caches or floors anything itself.
+// spec.fallback.
 //
-// Scope: GetMetrics only. IsActive and StreamIsActive deliberately keep
-// answering, because their answer is the 0<->1 gate and a scaler that goes
-// silent there reads as INACTIVE -- KEDA would scale the workload to zero on
-// exactly the evidence that says WVA cannot see it. Declining to size a fleet
-// is safe; declining to say a fleet should exist is not.
+// What that costs, stated exactly, because an earlier version of this comment
+// got it wrong: an error here ALSO makes KEDA treat the scaler as INACTIVE.
+// pkg/scalers/external_scaler.go's GetMetricsAndActivity calls GetMetrics first
+// and returns `(nil, false, err)` on error -- it never reaches its IsActive
+// call. So WVA's own IsActive answering correctly does not protect the 0<->1
+// gate on this path, because KEDA does not ask. The protection is entirely in
+// spec.fallback: KEDA's executor takes its "log only" branch for an erroring
+// scaler when Fallback is set AND Fallback.Replicas != 0, which is precisely
+// what stops a ScaledObject with minReplicaCount: 0 falling through to
+// scaleToZeroOrIdle. deploy/lib/scaledobject.sh therefore floors
+// fallback.replicas at 1 and never emits 0 -- see the comment there, and do not
+// "simplify" it back to minReplicaCount.
+//
+// Scope is still GetMetrics only: IsActive and StreamIsActive keep answering,
+// which matters for the push path (StreamIsActive drives activation and is not
+// part of GetMetricsAndActivity).
 func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
 	ref := req.GetScaledObjectRef()
 	h.observe(ref)
-	// Resolved ONCE and passed to both checks below. targetName falls back to an
-	// UNCACHED Get whenever the registry has not yet enriched this ref, and its
-	// own doc comment explains that the registry hop exists precisely so every
-	// KEDA poll of every workload is not a real API request -- so a second
-	// resolution here would double that cost during the window the hop exists to
-	// protect, at the 5s polling interval the samples ship.
-	name, err := h.targetName(ctx, ref)
-	if err != nil {
+	// The trust check is asked of the ref ITSELF -- the ScaledObject's namespace
+	// and name -- not of the resolved scale target. That is how the collector
+	// keys it (rows carry the ScaledObject name as VariantName), and keying it
+	// like the decision store instead is the bug this replaced: the generator
+	// names ScaledObjects "<target>-wva", so a lookup by target name missed every
+	// verdict ever published and the abstain could not fire.
+	//
+	// It runs BEFORE targetName on purpose. targetName falls back to an UNCACHED
+	// Get whenever the registry has not yet enriched this ref, and there is no
+	// reason to pay for it to answer a question that has already been decided.
+	if err := h.trusted(ctx, ref.GetNamespace(), ref.GetName()); err != nil {
 		return nil, err
 	}
-	if err := h.trusted(ctx, ref.Namespace, name); err != nil {
+	// Resolved once, and only for the decision lookup, which IS keyed by the
+	// scale target -- see decision.TrustRecord for why the two stores differ.
+	name, err := h.targetName(ctx, ref)
+	if err != nil {
 		return nil, err
 	}
 	var value int64
@@ -274,11 +295,11 @@ func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*p
 	}, nil
 }
 
-// trusted returns a gRPC error when the collector's last pass found no usable
-// view of the named scale target, and nil otherwise.
+// trusted returns a gRPC error when the collector has no usable view of the
+// named ScaledObject, and nil otherwise.
 //
-// Takes the resolved target name rather than the ref, so GetMetrics can resolve
-// it once -- see the note there on what a second resolution would cost.
+// Takes the SCALEDOBJECT's namespace and name -- the ref's own fields -- because
+// that is the key the collector publishes under. See decision.TrustRecord.
 //
 // codes.Unavailable, because that is what it is -- the input is temporarily
 // missing and the call is worth retrying, which is exactly how KEDA treats it:
@@ -294,9 +315,9 @@ func (h *Handler) trusted(ctx context.Context, namespace, name string) error {
 	if trust == nil { // zero-value Handler (tests); NewHandler always sets it.
 		trust = decision.DefaultTrust
 	}
-	if ok, reason := trust.Trust(namespace, name, now(), trustTTL); !ok {
+	if ok, reason := trust.Trust(namespace, name, now(), trustStaleLimit); !ok {
 		log.FromContext(ctx).V(logging.DEFAULT).Info("declining to answer KEDA: no trusted view of the workload",
-			"namespace", namespace, "target", name, "reason", reason)
+			"namespace", namespace, "scaledObject", name, "reason", reason)
 		return status.Errorf(codes.Unavailable,
 			"no trusted metrics for %s/%s: %s", namespace, name, reason)
 	}

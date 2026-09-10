@@ -123,8 +123,14 @@ var _ = Describe("External scaler handler", func() {
 			// serve a number built on nothing, WVA errors and lets KEDA do what
 			// it already does with an erroring scaler: propagate no metric, so
 			// the HPA holds, then apply spec.fallback after failureThreshold.
+			// Keyed by the SCALEDOBJECT ("chat-decode"), not the scale target
+			// ("chat-decode-deploy"). Publishing under the target name is the
+			// bug this replaced: the generator names ScaledObjects
+			// "<target>-wva", so a lookup by target name missed every verdict
+			// and the abstain could never fire. The two names differ here on
+			// purpose so the spec fails if the key regresses.
 			trust := decision.NewTrustStore()
-			trust.Publish(testNamespace, "chat-decode-deploy", false, "every replica's metrics are stale", time.Now())
+			trust.Observe(testNamespace, "chat-decode", "m", true, "every replica's metrics are older than the unavailable threshold", time.Now())
 			h := newHandler(scaledObject(testNamespace, "chat-decode", "chat-decode-deploy")).WithTrustStore(trust)
 			store.Set(testNamespace, "chat-decode-deploy", 5)
 
@@ -134,7 +140,7 @@ var _ = Describe("External scaler handler", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(status.Code(err)).To(Equal(codes.Unavailable),
 				"Unavailable is retryable, so KEDA counts it toward failureThreshold and asks again")
-			Expect(err.Error()).To(ContainSubstring("stale"),
+			Expect(err.Error()).To(ContainSubstring("unavailable threshold"),
 				"the reason must reach KEDA's error, which is where an operator sees it first")
 		})
 
@@ -144,7 +150,7 @@ var _ = Describe("External scaler handler", func() {
 			// evidence that says WVA cannot see it. Declining to size a fleet
 			// is safe; declining to say a fleet should exist is not.
 			trust := decision.NewTrustStore()
-			trust.Publish(testNamespace, "chat-decode-deploy", false, "every replica's metrics are stale", time.Now())
+			trust.Observe(testNamespace, "chat-decode", "m", true, "stopped", time.Now())
 			h := newHandler(scaledObject(testNamespace, "chat-decode", "chat-decode-deploy")).WithTrustStore(trust)
 			store.Set(testNamespace, "chat-decode-deploy", 3)
 
