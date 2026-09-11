@@ -605,7 +605,13 @@ if declare -F enable_physical_limiter >/dev/null; then
         | head -1 | cut -d: -f1)"
     # Anything that touches the cluster. kubectl is the only way this function
     # writes, so the first kubectl line is the point of no return.
-    first_write="$(printf '%s\n' "$body" | grep -nE 'kubectl|pl_grant_|pl_set_limiter' | head -1 | cut -d: -f1)"
+    # A kubectl CALL, not the word. Unanchored, this matched
+    # `for tool in kubectl jq yq` -- the preflight that names the tools -- and
+    # reported the validation as happening after a write that is a loop header.
+    # Same anchoring the validate_at pattern needs, and for the same reason.
+    first_write="$(printf '%s\n' "$body" \
+        | grep -nE '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(kubectl|pl_grant_[a-z_]*|pl_set_limiter)[[:space:]]' \
+        | head -1 | cut -d: -f1)"
     if [ -z "$validate_at" ]; then
         fail "enable_physical_limiter never validates the limiter entry; a rejected WVA_QUOTAS would abort it after the namespace and grants exist"
     elif [ -z "$first_write" ]; then

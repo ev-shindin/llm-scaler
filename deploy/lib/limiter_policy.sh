@@ -256,6 +256,62 @@ $types" in
     printf '%s' "$types" | sed 's/^/  /'
 }
 
+# warn_unadvertised_accelerators says when WVA_QUOTAS names an accelerator no
+# node advertises.
+#
+# A budget keyed on a name nothing matches is not an error ANYWHERE: the entry
+# validates, the controller accepts it, the "GPU limiter constructed" line
+# prints -- and every accelerator the cluster does have is then unlisted, which
+# QuotaForNamespace reads as a budget of zero. Measured: `WVA_QUOTAS='H20=8'` on
+# a cluster of H200s installs clean and stops all scaling.
+#
+# Shared, because both write paths need it and only one had it. Warns; never
+# refuses -- a cluster whose nodes this caller cannot list, or that labels its
+# GPUs some way not listed here, must not be blocked from declaring a budget.
+warn_unadvertised_accelerators() {
+    [ -n "${WVA_QUOTAS:-}" ] || return 0
+    local node_products unmatched=""
+    # EVERY product key, not just the GPU Feature Discovery one.
+    # internal/constants carries seven NVIDIA spellings plus AMD and
+    # Habana, and on CoreWeave, GKE, EKS or any AMD cluster the GFD
+    # key is absent -- so reading it alone left this check inert
+    # exactly where the accelerator name is least predictable.
+    node_products="$(kubectl get nodes -o json 2>/dev/null | jq -r '
+        .items[].metadata.labels
+        | (."nvidia.com/gpu.product", ."gpu.nvidia.com/model",
+           ."cloud.google.com/gke-accelerator", ."eks.amazonaws.com/instance-gpu-name",
+           ."amd.com/gpu.device-id", ."habana.ai/gaudi", ."accelerator")
+        | select(. != null and . != "")' 2>/dev/null | sort -u || true)"
+    if [ -n "$node_products" ]; then
+        local q_pair q_name reset_q_glob=1
+        case "$-" in *f*) reset_q_glob=0 ;; esac
+        set -f
+        for q_pair in $(printf '%s' "$WVA_QUOTAS" | tr ',' ' '); do
+            q_name="${q_pair%%=*}"
+            [ -n "$q_name" ] || continue
+            # A whole TOKEN of the product name, not a substring.
+            # Substring matching was silent on the very typo this
+            # exists for: 'H20' IS a substring of 'NVIDIA-H200', and
+            # 'A10' of 'A100' -- a different, real GPU. Node labels
+            # are separated by - _ . ('NVIDIA-H100-80GB-HBM3') and WVA
+            # resolves a short name out of them, so comparing against
+            # each token keeps every correct name quiet while a typo
+            # matches nothing. -x anchors it; -F keeps a name
+            # containing a regex character from being one.
+            printf '%s\n' "$node_products" | tr '\055_.' '\n\n\n' \
+                | grep -qixF -- "$q_name" || unmatched="$unmatched $q_name"
+        done
+        [ "$reset_q_glob" = 1 ] && set +f
+    fi
+    if [ -n "$unmatched" ]; then
+        log_warning "WVA_QUOTAS names accelerators this cluster does not advertise:${unmatched}"
+        log_warning "  A budget keyed on a name nothing matches is not an error anywhere -- the entry is valid, the controller accepts it, and every accelerator you DO have is then unlisted, which the quota limiter reads as a budget of ZERO. Every managed workload stops scaling up."
+        log_warning "  This cluster advertises:"
+        printf '%s\n' "$node_products" | sed 's/^/      /' >&2
+        log_warning "  WVA resolves a SHORT name from these; check what it logged: kubectl logs -n ${WVA_NS} deploy/wva-controller-manager | grep accelerator"
+    fi
+}
+
 # policy_with_limiters <policy yaml> <limiters yaml> -- the policy with its
 # limiters: list REPLACED by the given one, on stdout.
 #
