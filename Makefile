@@ -2187,6 +2187,16 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# on a label no node carried, and one missing from the planning tools
 	@# reported five 8-GPU H200 nodes as `unknown  8x0 GiB GPU`.
 	@bash hack/check-accelerator-labels.sh
+	@echo "Checking that every refusal can actually refuse..."
+	@# log_error is an exit, and an exit inside `$$( )` ends the SUBSHELL only --
+	@# the caller gets an empty string and carries on. It is the most repeated
+	@# defect in the deploy scripts: a command printed "Refusing to publish a
+	@# bound it cannot deliver" and then "the limiter is now in force for every
+	@# WVA on this cluster", exit 0. Three review rounds each found a fresh
+	@# instance, twice in code written to fix the previous one. `bash -n` sees
+	@# nothing, and neither does a reader -- each one shipped with a comment
+	@# beside it claiming the opposite.
+	@bash hack/check-refusals.sh
 	@echo "Checking each benchmark profile names a harness that will accept it..."
 	@# guidellm and inference-perf take mutually invalid profile schemas, and a
 	@# profile that matches neither can never run. The pre-run gate in

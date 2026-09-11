@@ -422,9 +422,19 @@ for a in "$@"; do
     --from-literal=default=*) printf 'WROTE[%s]\n' "${a#--from-literal=default=}" >> "$KWROTE" ;;
     -p) : ;;
     *) if [ "$prev" = "-p" ]; then
-         # {"data":{"default":"<policy>"}} -- unwrap to the same sentinel the
-         # create form produces, so the assertions do not care which was used.
-         printf 'WROTE[%s]\n' "$(printf '%s' "$a" | jq -r '.data.default // ""' 2>/dev/null)" >> "$KWROTE"
+         # A merge patch setting data.default to NULL REMOVES the key; one
+         # setting it to "" blanks the policy. `// ""` collapsed both into the
+         # same WROTE[] sentinel -- the one the refusal case below reads as the
+         # catastrophe -- so the disable path could not be told from it.
+         if [ "$(printf '%s' "$a" | jq -r 'if .data.default == null then "null" else "set" end' 2>/dev/null)" = "null" ]; then
+           printf 'PATCHNULL[%s]\n' "$(printf '%s' "$a" | jq -r '.data | keys | join(",")' 2>/dev/null)" >> "$KWROTE"
+         else
+           printf 'WROTE[%s]\n' "$(printf '%s' "$a" | jq -r '.data.default' 2>/dev/null)" >> "$KWROTE"
+         fi
+         # The label the patch carries, recorded on its own line. cmd/main.go
+         # filters cached ConfigMaps by it in cluster-scoped mode, so a patch
+         # that drops it writes a policy nothing reads.
+         printf 'PLABEL[%s]\n' "$(printf '%s' "$a" | jq -r '.metadata.labels["app.kubernetes.io/name"] // ""' 2>/dev/null)" >> "$KWROTE"
        fi ;;
   esac
   prev="$a"
@@ -433,8 +443,20 @@ done
 # it": dropping the `| kubectl apply -f -` off the end of the pipeline leaves a
 # function that builds the right ConfigMap and ships it nowhere.
 printf 'CALL[%s]\n' "$*" >> "$KCALLS"
+# A listing this token cannot do. Recorded first, so a case can still see that
+# the attempt was made.
+if [ -n "${FAIL_LIST_DEPLOY:-}" ]; then
+  case "$*" in *"get deploy -A"*) exit 1 ;; esac
+fi
 case "$1" in
-  get) printf '%s' "${CURRENT_POLICY:-}" ;;
+  get) case "$*" in
+         # Each read answered from its own variable. Answering them all with
+         # CURRENT_POLICY made `get deploy -A` hand back the policy text as a
+         # list of NAMESPACES, and the command then looped over "scaleUpThreshold:".
+         *"deploy -A"*) printf '%s\n' "${DEPLOY_NS_LIST:-}" ;;
+         *nodes*)       printf '%s' "${NODE_JSON:-}" ;;
+         *)             printf '%s' "${CURRENT_POLICY:-}" ;;
+       esac ;;
   *) : ;;
 esac
 exit 0
@@ -460,6 +482,24 @@ run_pl() {
         fi
         WVA_QUOTAS="$1" WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a \
             pl_set_limiter wva-policy quota
+    ) >/dev/null 2>"$WORK/plerr"
+    PLRC=$?
+}
+
+# run_pl_limiter <limiter> <the policy the cluster already has> -- the same, for
+# the cases that are about the LIMITER rather than the budget, `none` above all:
+# what an operator reaches for when they want less effect, and the path whose
+# data loss outlived the fix to its sibling.
+run_pl_limiter() {
+    WROTE="$WORK/wrote"; : > "$WROTE"
+    CALLS="$WORK/calls"; : > "$CALLS"
+    (
+        PATH="$STUB:$PATH"; export PATH
+        KWROTE="$WROTE"; export KWROTE
+        KCALLS="$CALLS"; export KCALLS
+        CURRENT_POLICY="$2"; export CURRENT_POLICY
+        WVA_QUOTAS='H200=8' WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a \
+            pl_set_limiter wva-policy "$1"
     ) >/dev/null 2>"$WORK/plerr"
     PLRC=$?
 }
@@ -565,6 +605,28 @@ else
         ok "an existing policy ConfigMap is patched by key, so its other entries survive"
     fi
 
+    # THE PATCH MUST CARRY THE LABEL THE CREATE PATH APPLIES.
+    #
+    # Switching from create|label|apply to a merge patch dropped
+    # app.kubernetes.io/name, and nothing failed: the write succeeded, the
+    # command reported the limiter in force, and the policy was simply never
+    # READ. cmd/main.go filters cached ConfigMaps by that label in
+    # cluster-scoped mode and exempts only the policy namespace -- while this
+    # function also writes into each ADMIN-OWNED controller's own namespace,
+    # which is not exempt. Written, never read, under a success banner.
+    case_begin
+    run_pl 'H200=8'
+    wrote="$(cat "$WROTE")"
+    if ! printf '%s\n' "$wrote" | grep -q '^PLABEL\['; then
+        fail "the policy was not written by a patch carrying any metadata at all; this case can no longer see the label: $wrote"
+    elif printf '%s\n' "$wrote" | grep -q '^PLABEL\[\]$'; then
+        fail "the patch dropped app.kubernetes.io/name. A cluster-scoped controller's cache filters on that label outside the policy namespace, so the policy is written and never read -- under 'the limiter is now in force for every WVA on this cluster'."
+    elif ! printf '%s\n' "$wrote" | grep -q '^PLABEL\[workload-variant-autoscaler\]$'; then
+        fail "the patch carries the wrong app.kubernetes.io/name: $(printf '%s\n' "$wrote" | grep '^PLABEL')"
+    else
+        ok "the patch carries the app.kubernetes.io/name the controller's cache filters on"
+    fi
+
     # A FRESH cluster: no policy ConfigMap yet, which is the first thing
     # `make enable-physical-limiter` meets and which this harness never ran,
     # because CURRENT_POLICY was always set. pl_set_limiter substitutes
@@ -580,6 +642,236 @@ else
     else
         ok "a cluster with no policy ConfigMap yet gets one with the entry in it"
     fi
+
+    # DISABLE MUST TAKE OUT THE ENTRY, NOT THE OBJECT.
+    #
+    # `make disable-physical-limiter` DELETED the whole ConfigMap whenever
+    # removing the limiter left `default` empty -- taking the per-model and
+    # named-tier entries beside it, which are the shape
+    # config/base/manager/scaling-policy-configmap.yaml documents. That is the
+    # same data loss the enable path had just been fixed for, still live on the
+    # disable path, and it is the direction an operator reaches for when they
+    # want LESS effect, not more.
+    #
+    # A merge patch with a null value removes one key.
+    case_begin
+    run_pl_limiter none 'limiters:
+  - type: gpu-inventory'
+    wrote="$(cat "$WROTE")"
+    calls="$(cat "$CALLS")"
+    if [ "$PLRC" -ne 0 ]; then
+        fail "pl_set_limiter failed while removing the limiter: $(tail -1 "$WORK/plerr")"
+    elif printf '%s' "$calls" | grep -q 'CALL\[delete'; then
+        fail "disable DELETED the ConfigMap rather than the entry; every other policy entry in it goes too: $calls"
+    elif ! printf '%s' "$wrote" | grep -q '^PATCHNULL\[default\]$'; then
+        fail "disable did not patch data.default out by name; it recorded: [$wrote] calls: $calls"
+    else
+        ok "disabling removes the \`default\` entry by name, leaving the ConfigMap and its other entries"
+    fi
+
+    # And a policy that says MORE than limiters keeps saying it: the entry is
+    # rewritten without the limiters list rather than removed.
+    case_begin
+    run_pl_limiter none 'scaleUpThreshold: 0.85
+limiters:
+  - type: gpu-inventory'
+    wrote="$(cat "$WROTE")"
+    if [ "$PLRC" -ne 0 ]; then
+        fail "pl_set_limiter failed while removing the limiter from a fuller policy: $(tail -1 "$WORK/plerr")"
+    elif printf '%s' "$wrote" | grep -q 'PATCHNULL'; then
+        fail "disable removed the whole \`default\` entry, thresholds included, when only the limiter should have gone: $wrote"
+    elif ! printf '%s' "$wrote" | grep -q 'scaleUpThreshold'; then
+        fail "disable did not keep the rest of the policy: $wrote"
+    elif printf '%s' "$wrote" | grep -q 'limiters'; then
+        fail "disable left the limiters list in place: $wrote"
+    else
+        ok "disabling a fuller policy drops only the limiters list"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Who the cluster policy is published TO.
+# ---------------------------------------------------------------------------
+
+# A glob in WVA_LIMITER_TARGETS must not be expanded against the working
+# directory -- the same guard WVA_QUOTAS needed, and it was missing here.
+# Measured: `WVA_LIMITER_TARGETS='*'` published a cluster policy ConfigMap into a
+# namespace named after every file in the working directory, fifteen of them,
+# exit 0. The recipe runs from the repository root, where those names are things
+# like `Makefile` and `go.mod`.
+case_begin
+tdir="$WORK/targets"; mkdir -p "$tdir"
+: > "$tdir/ns-one"; : > "$tdir/ns-two"
+( cd "$tdir" && WVA_LIMITER_TARGETS='*' pl_controller_namespaces ) >"$WORK/tgt" 2>/dev/null
+if grep -q 'ns-one' "$WORK/tgt"; then
+    fail "WVA_LIMITER_TARGETS='*' was expanded against the working directory; each of those filenames becomes a namespace this command publishes cluster policy into: $(cat "$WORK/tgt")"
+elif [ "$(cat "$WORK/tgt")" != '*' ]; then
+    fail "WVA_LIMITER_TARGETS was not passed through verbatim: $(cat "$WORK/tgt")"
+else
+    ok "a glob in WVA_LIMITER_TARGETS is not expanded against the working directory"
+fi
+
+# ---------------------------------------------------------------------------
+# The unadvertised-accelerator warning, on fixture nodes.
+#
+# A budget keyed on a name nothing matches is an error NOWHERE: the entry
+# validates, the controller accepts it, and every accelerator the cluster does
+# have is then unlisted -- which QuotaForNamespace reads as a budget of zero, so
+# every managed workload stops scaling up. The warning is the only thing between
+# an operator and that, and the first version of it was SILENT ON ITS OWN WORKED
+# EXAMPLE: `grep -qi "$q_name"` is a substring match, and `H20` is a substring of
+# `NVIDIA-H200` -- the exact typo the commit message quoted. `A10` matched `A100`
+# the same way, a different real GPU.
+#
+# So both directions, on both traps: the typo must warn AND the correct name must
+# stay quiet. A warning that fires on everything is removed by the first operator
+# who reads it.
+# ---------------------------------------------------------------------------
+# Three nodes, and the third carries the GKE key rather than the GPU Feature
+# Discovery one -- because the check read that ONE key and was therefore inert on
+# CoreWeave, GKE, EKS and every AMD cluster, which is exactly where an
+# accelerator name is least predictable. With only the GFD key read, A100 below
+# warns.
+NODES='{"items":[
+  {"metadata":{"labels":{"nvidia.com/gpu.product":"NVIDIA-H100-80GB-HBM3"}}},
+  {"metadata":{"labels":{"nvidia.com/gpu.product":"NVIDIA-H200"}}},
+  {"metadata":{"labels":{"cloud.google.com/gke-accelerator":"NVIDIA-A100-SXM4-40GB"}}}
+]}'
+accel_case() {   # accel_case <WVA_QUOTAS> <warn|silent> <why>
+    case_begin
+    (
+        PATH="$STUB:$PATH"; export PATH
+        KWROTE="$WORK/wrote"; KCALLS="$WORK/calls"; export KWROTE KCALLS
+        NODE_JSON="$NODES"; export NODE_JSON
+        WVA_QUOTAS="$1" warn_unadvertised_accelerators
+    ) >/dev/null 2>"$WORK/accelerr"
+    local said="" ; grep -q 'does not advertise' "$WORK/accelerr" && said=warn
+    if [ "$2" = warn ] && [ "$said" != warn ]; then
+        fail "WVA_QUOTAS='$1' drew no warning, and $3. A budget on a name no node carries leaves every accelerator the cluster HAS unlisted, which the quota limiter reads as zero."
+    elif [ "$2" = silent ] && [ "$said" = warn ]; then
+        fail "WVA_QUOTAS='$1' was warned about, and $3. A warning that fires on correct input is one nobody reads: $(cat "$WORK/accelerr")"
+    else
+        ok "WVA_QUOTAS='$1' $([ "$2" = warn ] && echo warns || echo "stays silent") -- $3"
+    fi
+}
+accel_case 'H20=8'  warn   "H20 is a substring of NVIDIA-H200 but not a token of it"
+accel_case 'H100=8' silent "H100 is a whole token of NVIDIA-H100-80GB-HBM3"
+accel_case 'A10=8'  warn   "A10 is a substring of NVIDIA-A100-SXM4-40GB, a different real GPU"
+accel_case 'A100=8' silent "A100 is advertised, under the GKE label key rather than the GFD one"
+
+# ---------------------------------------------------------------------------
+# enable_physical_limiter, EXECUTED end to end against the stub.
+#
+# The cases above prove pl_set_limiter writes the right thing. These prove the
+# COMMAND stops when it cannot know who it is publishing to -- the failure that
+# shipped twice. `pl_controller_namespaces` refused from inside `$( )`, where the
+# exit ends the subshell and nothing else, so the command printed
+#
+#     [ERROR] could not list WVA controllers ... Refusing to announce a bound it
+#             cannot deliver
+#     [SUCCESS] The quota limiter is now in force for every WVA on this cluster.
+#
+# and exited 0. It returns a status now; the refusal is the caller's to make.
+# What is asserted is both halves: the refusal, and -- so the refusal means
+# something -- that this same harness can drive the command to success.
+# ---------------------------------------------------------------------------
+run_enable() {   # run_enable <fn> [fail-list]
+    CALLS="$WORK/calls"; : > "$CALLS"
+    WROTE="$WORK/wrote"; : > "$WROTE"
+    (
+        PATH="$STUB:$PATH"; export PATH
+        KWROTE="$WROTE"; export KWROTE
+        KCALLS="$CALLS"; export KCALLS
+        NODE_JSON=""; export NODE_JSON
+        DEPLOY_NS_LIST="tenant-a"; export DEPLOY_NS_LIST
+        CURRENT_POLICY="scaleUpThreshold: 0.85"; export CURRENT_POLICY
+        if [ "${2:-}" = "fail-list" ]; then
+            FAIL_LIST_DEPLOY=1; export FAIL_LIST_DEPLOY
+        fi
+        unset WVA_LIMITER_TARGETS
+        WVA_LIMITER_TYPE=quota WVA_QUOTAS='H200=8' "$1"
+    ) >"$WORK/enableout" 2>&1
+    ENRC=$?
+}
+
+case_begin
+run_enable enable_physical_limiter
+out="$(cat "$WORK/enableout")"
+if [ "$ENRC" -ne 0 ]; then
+    fail "enable_physical_limiter failed on a cluster where everything answers: $out"
+elif ! printf '%s' "$out" | grep -q 'in force'; then
+    fail "enable_physical_limiter succeeded without announcing anything; the cases below can no longer tell a refusal from a success: $out"
+elif ! grep -q 'install-quota' "$WROTE"; then
+    fail "enable_physical_limiter announced the limiter without writing one: $(cat "$WROTE")"
+else
+    ok "enable_physical_limiter publishes the entry and says so, when the cluster answers"
+fi
+
+case_begin
+run_enable enable_physical_limiter fail-list
+out="$(cat "$WORK/enableout")"
+if [ "$ENRC" -eq 0 ]; then
+    fail "enable_physical_limiter exited 0 having failed to list the controllers it is publishing to. Every controller it never reached goes on reading its own unbounded policy: $out"
+elif printf '%s' "$out" | grep -q 'in force'; then
+    fail "enable_physical_limiter announced the limiter in force after failing to list the controllers -- the refusal printed and the command carried on, which is the subshell trap this returns a status to avoid: $out"
+elif ! printf '%s' "$out" | grep -q 'could not list WVA controllers'; then
+    fail "enable_physical_limiter stopped without saying the listing was what failed: $out"
+elif grep -q 'WROTE\[' "$WROTE"; then
+    fail "enable_physical_limiter wrote policy despite refusing: $(cat "$WROTE")"
+else
+    ok "a controller listing it cannot do stops enable before it publishes anything"
+fi
+
+# disable is the SECOND caller of the same function, and it was the second
+# instance of the same bug: reporting a limiter removed from controllers it never
+# reached, which is the worse direction for a safety bound.
+case_begin
+run_enable disable_physical_limiter fail-list
+out="$(cat "$WORK/enableout")"
+if [ "$ENRC" -eq 0 ]; then
+    fail "disable_physical_limiter exited 0 having failed to list the controllers whose policy it would clear: $out"
+elif printf '%s' "$out" | grep -q 'Removed the limiter'; then
+    fail "disable_physical_limiter reported the limiter removed after failing to list the controllers: $out"
+else
+    ok "a controller listing it cannot do stops disable before it reports anything removed"
+fi
+
+# The TOOL preflight. This target does not run check_prerequisites -- only
+# deploy/install.sh does -- and the write path builds its patch with jq. Absent,
+# `-p ""` reached kubectl, the patch was rejected, and with no `set -e` on this
+# path the command still announced the limiter in force.
+#
+# jq is hidden from the PREFLIGHT only, by shadowing `command` -- a regular
+# builtin, so a function of the same name wins. The binary is still there, which
+# is the honest limit of this case: what it asserts is that the preflight EXISTS
+# and stops the command, not what a genuinely absent jq does downstream. The
+# alternative, rebuilding PATH out of symlinks to every coreutil bash itself
+# needs, tests the harness rather than the code. The shadow is verified to have
+# taken before anything is concluded from its silence.
+case_begin
+(
+    PATH="$STUB:$PATH"; export PATH
+    KWROTE="$WORK/wrote"; KCALLS="$WORK/calls"; export KWROTE KCALLS
+    command() {
+        case "$*" in *jq*) return 1 ;; esac
+        builtin command "$@"
+    }
+    command -v jq >/dev/null 2>&1 && { echo "HARNESS: the command shadow did not take, so this case proves nothing"; exit 99; }
+    unset WVA_LIMITER_TARGETS
+    WVA_LIMITER_TYPE=quota WVA_QUOTAS='H200=8' enable_physical_limiter
+) >"$WORK/nojq" 2>&1
+njrc=$?
+out="$(cat "$WORK/nojq")"
+if [ "$njrc" -eq 99 ]; then
+    fail "$out"
+elif [ "$njrc" -eq 0 ]; then
+    fail "enable_physical_limiter ran to completion with jq missing; the patch it builds with jq becomes -p \"\", kubectl rejects it, and this path has no set -e to notice: $out"
+elif ! printf '%s' "$out" | grep -q 'jq is required'; then
+    fail "enable_physical_limiter stopped with jq missing but did not name jq: $out"
+elif printf '%s' "$out" | grep -q 'in force'; then
+    fail "enable_physical_limiter announced the limiter in force with jq missing: $out"
+else
+    ok "a missing jq stops the command by name, before it touches the cluster"
 fi
 
 # And it must refuse a budgetless quota BEFORE it creates the namespace and
@@ -677,7 +969,7 @@ fi
 # and the check still prints OK -- and the ok() suppression means the count of
 # ok lines is not comparable against a known-good run either.
 case_begin
-CASES_EXPECTED=39
+CASES_EXPECTED=51
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else
