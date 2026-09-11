@@ -419,6 +419,27 @@ EOF
         --docker-server=<registry> --docker-username=<user> --docker-password=<token>"
     fi
 
+    # The per-model policy entries this apply is about to DELETE, saved first.
+    #
+    # The shipped scaling-policy ConfigMap carries one key, `default`. An
+    # operator adds more -- a per-model or per-namespace entry, which
+    # config/base/manager/scaling-policy-configmap.yaml documents in its own
+    # header -- and `kubectl apply -k` then deletes every one of them, because
+    # apply's three-way merge removes keys that are in last-applied-configuration
+    # and absent from the new manifest.
+    #
+    # Measured on kind: a ConfigMap holding `batch`, `default` and `interactive`
+    # came back holding `default` alone, from a plain `make deploy-wva` with no
+    # limiter involved at all -- so every install and every UPGRADE silently
+    # discarded them. Restored below, after the apply.
+    local preserved_policy=""
+    if [ "${WVA_APPLY_SCOPE:-all}" != "prereqs" ]; then
+        preserved_policy="$(kubectl get configmap wva-scaling-policy-config -n "$WVA_NS" -o json 2>/dev/null \
+            | jq -c 'if .data then {data: (.data | del(.default))} else empty end' 2>/dev/null || true)"
+        # `{"data":{}}` is "nothing but default", which needs no restoring.
+        [ "$preserved_policy" = '{"data":{}}' ] && preserved_policy=""
+    fi
+
     log_info "Applying Kustomize overlay: $kustomize_overlay (scope: ${WVA_APPLY_SCOPE:-all})"
     case "${WVA_APPLY_SCOPE:-all}" in
         all)
@@ -438,6 +459,20 @@ EOF
             log_error "WVA_APPLY_SCOPE must be all, prereqs or controller (got '${WVA_APPLY_SCOPE}')"
             ;;
     esac
+
+    # Put the operator's own entries back. A merge patch names only the keys it
+    # carries, so `default` -- which the apply has just refreshed from the
+    # shipped manifest -- is left exactly as applied.
+    if [ -n "$preserved_policy" ]; then
+        local restored_keys
+        restored_keys="$(printf '%s' "$preserved_policy" | jq -r '.data | keys | join(", ")' 2>/dev/null || true)"
+        if kubectl patch configmap wva-scaling-policy-config -n "$WVA_NS" --type=merge \
+                -p "$preserved_policy" >/dev/null 2>&1; then
+            log_info "Kept the policy entries this apply would have pruned: ${restored_keys}"
+        else
+            log_warning "Could not restore the policy entries the apply removed: ${restored_keys}. Re-add them before relying on any per-model policy."
+        fi
+    fi
 
     # The ServiceAccount exists now, so the pull secret can go on it. The pod may
     # already be starting; a Deployment restart makes the next pod pick it up
@@ -553,17 +588,37 @@ wva_reconcile_prometheus_scheme() {
     # Patches the "default" entry rather than shipping a second copy of it: the
     # entry carries every other default too, and a duplicate would drift.
     case "${WVA_LIMITER:-none}" in
-        none) ;;
+        none)
+            # Nothing to do, and that is MEASURED rather than assumed. A branch
+            # here removed a previously declared limiter, on the theory that
+            # re-installing with the default left one in force. It does not: the
+            # overlay apply 130 lines above re-applies wva-scaling-policy-config
+            # from the shipped manifest, which resets data.default -- limiters
+            # and all -- before this case is ever reached. Confirmed on kind:
+            # declare quota, re-install with none, `limiters:` count goes 1 -> 0
+            # with this branch doing nothing.
+            #
+            # The report that motivated it came from a harness that lifted this
+            # block out of the installer and never ran the apply. Code on the
+            # DEFAULT path, which every install and upgrade takes, is not the
+            # place to carry a fix for a failure the path does not have -- and it
+            # brought its own: it fired on `limiters: []` (the documented way to
+            # declare NO limiter), wrote `default: "{}"`, and aborted the install
+            # on a policy it could not parse.
+            ;;
         gpu-inventory|quota)
             log_info "Declaring the ${WVA_LIMITER} limiter in the scaling-policy ConfigMap ..."
             local policy_cm current_default updated_default
+            # The budget is validated in the PREREQS phase, before any of this
+            # ran -- see check_permissions. This is the second line of defence,
+            # for a caller that reached here another way.
             # `|| true` because a no-match is grep exit 1, which pipefail turns into
             # a failed assignment and set -e turns into an exit — before the
             # log_error below can say which ConfigMap is missing.
             policy_cm="$(kubectl get configmap -n "$WVA_NS" -o name 2>/dev/null \
                 | grep -E "configmap/(wva-)?scaling-policy-config$" | head -1 | cut -d/ -f2 || true)"
             if [ -z "$policy_cm" ]; then
-                log_error "No scaling-policy ConfigMap found in $policy_ns"
+                log_error "No scaling-policy ConfigMap found in $WVA_NS"
             fi
             current_default=$(kubectl get configmap "$policy_cm" -n "$WVA_NS" -o jsonpath='{.data.default}')
             if [ -z "$current_default" ]; then
@@ -572,14 +627,40 @@ wva_reconcile_prometheus_scheme() {
             # Idempotent, and it REPLACES rather than appends: re-running with a
             # different WVA_LIMITER must not leave both declared, since a quota
             # entry would then win over the gpu-inventory one by mode precedence.
-            updated_default=$(echo "$current_default" | yq ".limiters = [{\"type\": \"${WVA_LIMITER}\"}]")
+            # One call, no status for a caller to forget: policy_declared_limiters
+            # composes in THIS shell, so a refusal ends the install rather than
+            # handing back an empty string to patch over the policy.
+            policy_declared_limiters "$WVA_LIMITER" "$current_default"
+            updated_default="$POLICY_DECLARED"
             kubectl patch configmap "$policy_cm" -n "$WVA_NS" --type=merge \
                 -p "$(jq -n --arg d "$updated_default" '{data:{"default":$d}}')"
-            log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm})."
+            log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm}):"
+            printf '%s\n' "$LIMITER_ENTRY_DECLARED" | sed 's/^/    /' >&2
+            # The controller is the only thing that can confirm it. It validates
+            # the entry on read and, when it rejects one, discards the ENTIRE
+            # `default` policy and falls back to no limiter -- at ERROR in its log
+            # and nowhere else. Say where to look, because "the install said
+            # bounded" is exactly the belief that shipped unbounded before.
+            log_info "Confirm the controller accepted it (a rejected entry drops the whole policy AND the limiter):"
+            log_info "    kubectl logs -n ${WVA_NS} deploy/wva-controller-manager | grep -E 'GPU limiter constructed|Invalid saturation scaling'"
             # A GPU-aware optimizer allocates out of per-accelerator pools, so a
             # workload whose accelerator cannot be resolved gets no budget and stops
             # scaling up — silently. Say so at install, and say how to check, because
             # the symptom (a workload that simply never grows) looks like anything.
+            # THE QUOTA PATH'S OWN HAZARD, and the installer knew the answer
+            # three lines below without ever comparing. A budget is keyed by
+            # accelerator NAME, and a name matching no node is not an error
+            # anywhere: the entry validates, the controller accepts it, the
+            # "GPU limiter constructed" line prints -- and every accelerator the
+            # cluster actually has is absent from the map, which
+            # QuotaForNamespace reads as zero. Measured: `WVA_QUOTAS='H20=8'` on
+            # a cluster of H200s and A100s installs clean and stops all scaling.
+            # Shared with the cluster-policy path -- see
+            # warn_unadvertised_accelerators. That path publishes to every
+            # controller on the cluster and had no such check at all.
+            if [ "$WVA_LIMITER" = "quota" ]; then
+                warn_unadvertised_accelerators
+            fi
             if [ "$WVA_LIMITER" = "gpu-inventory" ]; then
                 local gpu_products
                 # Space-separated on one line, then split — a {"\n"} inside the

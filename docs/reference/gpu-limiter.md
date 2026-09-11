@@ -9,12 +9,35 @@ to be true first.
 
 ```bash
 make deploy-wva-on-k8s WVA_LIMITER=gpu-inventory   # bound by GPUs actually free
-make deploy-wva-on-k8s WVA_LIMITER=quota           # bound by declared caps
+make deploy-wva-on-k8s WVA_LIMITER=quota WVA_QUOTAS='H200=8 A100=4'   # bound by declared caps
 ```
+
+`WVA_QUOTAS` is **required** by the quota limiter and has no default: a quota
+entry that names no accelerator is not "unlimited", it is a budget of zero for
+every type, and every managed workload stops scaling up. Use `-1` for no cap on
+a type (`H100=-1`). The type is the name WVA resolves, which it logs per variant
+(`"accelerator": "H200"`). `WVA_QUOTA_SCOPE` is `namespace` (the default: each
+managed namespace gets this budget) or `cluster` (one budget across all of them).
 
 or later, by adding a `limiters:` entry to the `default` entry of the
 scaling-policy ConfigMap — applied live, no restart. **Read the next section
 first.**
+
+**Confirm the controller accepted it.** A malformed entry is rejected on read,
+and the rejection costs the **whole** `default` policy — thresholds included —
+leaving no limiter at all. It is reported at ERROR in the controller log and
+nowhere else; the install reports success either way. The install prints this
+command, and it is the only thing that answers the question:
+
+```bash
+kubectl logs -n <wva-namespace> deploy/wva-controller-manager \
+  | grep -E 'GPU limiter constructed|Invalid saturation scaling'
+```
+
+```
+INFO  GPU limiter constructed  {"type": "quota", "name": "install-quota"}   # bounded
+INFO  GPU limiter constructed  {"type": "none", "name": "no-limiter"}       # NOT bounded
+```
 
 > **Declare one kind, not both.** `limiters:` is a list, and it reads like a set
 > of bounds that all apply. It is not. One limiter is built, and a quota entry

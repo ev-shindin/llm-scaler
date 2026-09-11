@@ -68,8 +68,9 @@ pool costs nothing.
 
 | key | does |
 | --- | --- |
-| `warmPoolSleepMinSize` | Pods held free for the next spike |
-| `warmPoolMaxHold` | how long a borrowed Pod may serve before it is returned regardless |
+| `warmPoolSleepMinSize` | Pods held free for the next spike (`--reserve` at create) |
+| `warmPoolRetained` | whether the pool keeps a lent Pod rather than reclaiming it (`--type bridge`/`--type retained` at create) |
+| `warmPoolMaxHold` | how long a borrowed Pod may serve before it is returned regardless (`--max-hold` at create; meaningless when retained, and refused together with it) |
 | `warmPoolPreloadTop` | warm this many of the busiest variants without waiting for a miss |
 | `warmPoolGPUMemoryUtilization` | how much of the card a warm copy claims |
 

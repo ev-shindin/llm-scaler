@@ -41,11 +41,39 @@ pl_policy_ns() {
 # to grant a subset — and then the ones you left out are named in the warning.
 pl_controller_namespaces() {
     if [ -n "${WVA_LIMITER_TARGETS:-}" ]; then
+        # Word-splitting is wanted here; PATHNAME expansion is not. Unguarded,
+        # WVA_LIMITER_TARGETS='*' expanded against the working directory and this
+        # command published a policy ConfigMap into a namespace named after every
+        # file in it -- fifteen of them, measured. Same guard, same reason, as the
+        # one on WVA_QUOTAS.
+        local reset_t_glob=1
+        case "$-" in *f*) reset_t_glob=0 ;; esac
+        set -f
         printf '%s\n' $WVA_LIMITER_TARGETS
-        return
+        [ "$reset_t_glob" = 1 ] && set +f
+        return 0
     fi
-    kubectl get deploy -A -l app.kubernetes.io/name=workload-variant-autoscaler \
-        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u
+    # A FAILED listing is not an empty cluster, and folding the two together is
+    # how this command came to announce "the limiter is now in force for every
+    # WVA on this cluster" having reached none of them: `2>/dev/null` turned a
+    # denied or erroring `get deploy -A` into no output, the caller warned "No
+    # WVA controller found", published to the well-known namespace only, and
+    # every admin-owned controller went on reading its own unbounded ConfigMap.
+    #
+    # Measured: a controller in tenant-a, its policy still `limiters: []`, under
+    # a SUCCESS banner claiming the opposite.
+    # RETURNS non-zero; it does not log_error. Both callers invoke this inside
+    # `$( )`, where log_error's `exit 1` ends the SUBSHELL and nothing else --
+    # the command carried on and printed "the limiter is now in force for every
+    # WVA on this cluster" having listed none of them. The status is the only
+    # thing that crosses a command substitution, so the refusal is the caller's
+    # to make; both check it.
+    local out
+    if ! out="$(kubectl get deploy -A -l app.kubernetes.io/name=workload-variant-autoscaler \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null)"; then
+        return 1
+    fi
+    printf '%s' "$out" | sort -u
 }
 
 # pl_policy_cm_ns echoes the namespace whose ConfigMap the controller in $1
@@ -191,10 +219,40 @@ EOF
 # It REPLACES rather than appends: two limiter kinds in one list is not a chain,
 # a quota entry wins over a gpu-inventory one, and the loser is built as nothing.
 pl_set_limiter() {
-    local policy_ns="$1" limiter="$2" current updated
-    current="$(kubectl get configmap wva-scaling-policy-config -n "$policy_ns" \
-        -o jsonpath='{.data.default}' 2>/dev/null || true)"
-    if [ -z "$current" ]; then
+    local policy_ns="$1" limiter="$2" current updated exists=0
+    # ABSENT and FAILED are different answers, and folding them together
+    # overwrote a live policy. `... 2>/dev/null || true` turned any non-zero exit
+    # -- a transient API error, throttling, a partially privileged token -- into
+    # an empty string, which fell through to `limiters: []` and REPLACED a policy
+    # the platform team had tuned, with exit 0 and "the limiter is now in force
+    # for every WVA on this cluster". Measured: scaleUpThreshold, scaleDownBoundary,
+    # kvCacheThreshold and enableRescale all gone.
+    #
+    # So ask whether the ConfigMap exists FIRST, and treat a failure to answer as
+    # a reason to stop rather than a reason to write.
+    # NotFound, and nothing else, means "there is no policy yet".
+    #
+    # The first form of this guard asked `kubectl create namespace --dry-run=client`
+    # as its second opinion. That is PURELY CLIENT-SIDE -- it exits 0 with no
+    # cluster at all -- so the guard could never fire and every failed read still
+    # fell through to `limiters: []` and overwrote the policy. Ask the error
+    # instead: kubectl says NotFound when the object is absent and something else
+    # when it could not tell.
+    local probe probe_rc
+    probe="$(kubectl get configmap wva-scaling-policy-config -n "$policy_ns" -o jsonpath='{.data.default}' 2>&1)"
+    probe_rc=$?
+    if [ "$probe_rc" -eq 0 ]; then
+        exists=1
+        current="$probe"
+    else
+        case "$probe" in
+            *NotFound*|*"not found"*) : ;;   # genuinely absent: create it below
+            *) log_error "could not read the policy ConfigMap in $policy_ns, and this is not a NotFound:
+    ${probe}
+    Refusing to overwrite a policy this command cannot see." ;;
+        esac
+    fi
+    if [ -z "${current:-}" ]; then
         # A policy ConfigMap that carries ONLY limiters is complete and correct:
         # every other threshold has a default in the controller, and a partial
         # entry does not blank them.
@@ -203,14 +261,69 @@ pl_set_limiter() {
     if [ "$limiter" = "none" ]; then
         updated="$(printf '%s\n' "$current" | yq 'del(.limiters)')"
     else
-        updated="$(printf '%s\n' "$current" | yq ".limiters = [{\"type\": \"${limiter}\"}]")"
+        # Through limiter_entry_yaml, the same builder the installer uses.
+        #
+        # This path wrote `[{"type": "quota"}]` of its own, which the controller
+        # REJECTS ("name must not be empty") -- and a rejected entry costs the
+        # whole `default` policy, so publishing it would have stripped the policy
+        # from every WVA on the cluster and left them all unbounded, under the
+        # banner "The quota limiter is now in force for every WVA on this
+        # cluster." Exactly the claim a safety bound must never make falsely.
+        # One call, and no status to forget. This path runs from a bare
+        # `bash -c` in the Makefile with no `set -e`, so an unchecked failure
+        # used to return 0 up the chain and enable_physical_limiter went on to
+        # announce a limiter it had not written -- after blanking the policy in
+        # every target namespace. policy_declared_limiters composes in THIS
+        # shell, so a refusal ends the command rather than handing back an empty
+        # string.
+        #
+        # The `default` third argument is not a detail. This ONE policy is
+        # read by every controller on the cluster, across every namespace, so a
+        # namespace-scoped budget here has to use the reserved per-unlisted-
+        # namespace key. Keyed on a single namespace instead -- which is what the
+        # installer's own rule would pick -- that namespace gets the budget and
+        # every other one gets ZERO, so this command would stop scaling
+        # everywhere it was meant to bound it.
+        policy_declared_limiters "$limiter" "$current" default
+        updated="$POLICY_DECLARED"
     fi
     # An entry that is now empty is removed, not written as "{}". A ConfigMap
     # whose default entry is an empty object is a policy that says nothing while
     # looking like one that says something, and the next reader has to open it to
     # find out which.
     if [ "$limiter" = "none" ] && [ "$(printf '%s' "$updated" | tr -d '[:space:]')" = "{}" ]; then
-        kubectl delete configmap wva-scaling-policy-config -n "$policy_ns" --ignore-not-found >/dev/null 2>&1
+        # The `default` ENTRY, not the ConfigMap. Deleting the object took every
+        # other entry in it -- the per-model and named-tier policies an operator
+        # added -- which is the same data loss this file was just fixed for, on
+        # the disable path. A null value in a merge patch removes one key.
+        if [ "$exists" -eq 1 ]; then
+            kubectl patch configmap wva-scaling-policy-config -n "$policy_ns" --type=merge \
+                -p '{"data":{"default":null}}' >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+    # PATCH an existing ConfigMap; only CREATE a missing one.
+    #
+    # The create|apply pipeline below renders a manifest containing ONLY
+    # data.default, and `kubectl apply`'s three-way merge deletes every key that
+    # is in last-applied-configuration and not in the new manifest. Measured
+    # against a real apiserver: a ConfigMap carrying a per-model override entry
+    # beside `default` -- the shape config/base/manager/scaling-policy-configmap.yaml
+    # documents -- came back with the override GONE, exit 0, "the limiter is now
+    # in force for every WVA on this cluster". It only bites when the ConfigMap
+    # was last managed by `kubectl apply -f` with those keys present, which is
+    # the declarative shape and how the installer itself places it.
+    #
+    # A merge patch names one key and leaves the rest alone, which is what the
+    # installer's own path has always done.
+    if [ "$exists" -eq 1 ]; then
+        # Checked. Unchecked with a bare `return 0` after it, a denied
+        # configmaps/patch still reported "the limiter is now in force for every
+        # WVA on this cluster" -- narrower than the pipeline it replaced, which
+        # at least propagated its own status.
+        kubectl patch configmap wva-scaling-policy-config -n "$policy_ns" --type=merge \
+            -p "$(jq -n --arg d "$updated" '{metadata:{labels:{"app.kubernetes.io/name":"workload-variant-autoscaler"}},data:{"default":$d}}')" >/dev/null \
+            || log_error "could not write the policy into ${policy_ns}/wva-scaling-policy-config."
         return 0
     fi
     kubectl create configmap wva-scaling-policy-config -n "$policy_ns" \
@@ -225,6 +338,15 @@ policy_ns_global=""
 
 enable_physical_limiter() {
     local limiter="${WVA_LIMITER_TYPE:-gpu-inventory}"
+    # This target does not go through check_prerequisites -- only
+    # deploy/install.sh does -- and the write path now builds its patch with jq.
+    # Absent, `-p ""` reaches kubectl, the patch is rejected, and with no `set -e`
+    # on this path the command still announced the limiter in force.
+    local tool
+    for tool in kubectl jq yq; do
+        command -v "$tool" >/dev/null 2>&1 || \
+            log_error "$tool is required by this command and is not on PATH."
+    done
     local policy_ns; policy_ns="$(pl_policy_ns)"
     local namespaces ns sa granted=0
 
@@ -232,12 +354,28 @@ enable_physical_limiter() {
         gpu-inventory|quota) ;;
         *) log_error "WVA_LIMITER_TYPE must be gpu-inventory or quota (got '$limiter')" ;;
     esac
+    # Validated HERE, before the namespace is created and the grants are made.
+    # pl_set_limiter is the last step of a sequence that has already changed the
+    # cluster, so a budget this rejects must stop the command while it still has
+    # changed nothing. Discards the output: this call is for its refusals, and
+    # every one of them is a log_error, which exits the command directly -- this
+    # is not a command substitution, so there is no subshell to swallow it.
+    # `default` is the key pl_set_limiter will use, so what is validated here is
+    # what gets written.
+    limiter_entry_yaml "$limiter" default >/dev/null
+    # Both write paths warn about a budget keyed on an accelerator no node has.
+    [ "$limiter" = "quota" ] && warn_unadvertised_accelerators
 
     if ! kubectl auth can-i create clusterrolebindings >/dev/null 2>&1; then
         log_error "This is a cluster-admin action: it publishes policy a tenant cannot edit, and grants the node read that policy then requires. You cannot create ClusterRoleBindings on this cluster."
     fi
 
-    namespaces="$(pl_controller_namespaces)"
+    # The STATUS, checked here, because it is the only thing that crosses a
+    # command substitution: pl_controller_namespaces cannot refuse on its own.
+    if ! namespaces="$(pl_controller_namespaces)"; then
+        log_error "could not list WVA controllers on this cluster, so this command cannot know which ones it would leave unable to honour the policy it is about to publish. Refusing to announce a bound it cannot deliver.
+    Grant the listing, or name the targets explicitly: WVA_LIMITER_TARGETS='ns-a ns-b'"
+    fi
     if [ -z "$namespaces" ]; then
         log_warning "No WVA controller found on this cluster. Publishing the policy anyway — any WVA installed later reads it at startup."
     fi
@@ -311,7 +449,12 @@ disable_physical_limiter() {
     # been written — an "off" that reported success and disabled nothing, which
     # is the worse direction for a command whose subject is a safety bound.
     policy_ns_global="$policy_ns"
-    for ns in $(pl_controller_namespaces); do
+    local disable_namespaces
+    if ! disable_namespaces="$(pl_controller_namespaces)"; then
+        log_error "could not list WVA controllers, so this command cannot know whose policy to clear. Refusing to report a limiter removed from controllers it never reached.
+    Grant the listing, or name the targets explicitly: WVA_LIMITER_TARGETS='ns-a ns-b'"
+    fi
+    for ns in $disable_namespaces; do
         cm_ns="$(pl_policy_cm_ns "$ns")"
         case " $targets " in *" $cm_ns "*) : ;; *) targets="$targets $cm_ns" ;; esac
     done

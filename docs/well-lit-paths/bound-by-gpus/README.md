@@ -78,8 +78,13 @@ somebody owns.
 ## Tuning it
 
 The limiter is selected by the `limiters:` list on the scaling-policy
-ConfigMap's `default` entry — there is no flag and no environment variable, and
-because it is dynamic configuration the engine rebuilds it without a restart.
+ConfigMap's `default` entry — that list is the only thing the controller reads,
+and because it is dynamic configuration the engine rebuilds it without a
+restart. The installer writes that list for you: `WVA_LIMITER=quota` with
+`WVA_QUOTAS='H200=8'` for one install's own policy, `WVA_LIMITER_TYPE` with the
+same `WVA_QUOTAS` for the cluster policy every controller reads. The quota form
+**requires** a budget; an entry naming no accelerator is a budget of zero, not
+unlimited.
 Schema, scopes and validation: [quota limiter](../../reference/quota-limiter.md).
 Where the policy lives and who may edit it:
 [the GPU limiter](../../reference/gpu-limiter.md).

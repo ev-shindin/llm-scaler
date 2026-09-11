@@ -30,6 +30,18 @@ POOL_NAME="default"
 POOL_REPLICAS=2
 POOL_MAX=6
 RESERVE=1
+# Which KIND of pool this is, and how long it lends for.
+#
+# A pool is a BRIDGE unless it says otherwise: it lends a Pod to cover a
+# scale-up and takes it back after MAX_HOLD, whether or not the shortfall has
+# closed. RETAINED switches that timeout off (`expired := !cfg.Retained && ...`)
+# and the pool keeps the Pod until the variant stops wanting it.
+#
+# Empty means "say nothing", not "say the default": an unset value emits no
+# trigger key, so the controller's own default governs and the two cannot drift.
+# Only a value the operator actually chose is written into the ScaledObject.
+POOL_TYPE=""
+MAX_HOLD=""
 MODELS=""
 MODEL_SIZE=""
 GPUS_PER_POD=1
@@ -107,6 +119,19 @@ create options:
   --replicas N         starting Pod count, and minReplicaCount. Default: 2
   --max N              maxReplicaCount. MUST exceed the reserve. Default: 6
   --reserve N          warmPoolSleepMinSize. Default: 1
+  --type KIND          bridge (default) | retained.
+                       A BRIDGE lends a Pod to cover a scale-up and takes it
+                       back after --max-hold, whether or not the shortfall has
+                       closed -- so the pool stays available for the next model.
+                       A RETAINED pool switches that timeout off and keeps the
+                       Pod until the variant stops wanting it. Use it when the
+                       pool exists for one model, or when the thing you are
+                       avoiding is the churn rather than the cold start.
+                       Omit it and the controller's own default applies.
+  --max-hold DURATION  how long a BRIDGE lends before reclaiming, e.g. 5m.
+                       Meaningless with --type retained, which is exactly the
+                       switch that turns it off, so the two together are refused
+                       rather than silently ignored.
   --proxy-image REF    the pool proxy image. Optional: defaults to the one
                        config/warmpool pins, which is published
   --wva-namespace NS   where WVA runs, for scalerAddress
@@ -291,6 +316,47 @@ cmd_create() {
     log_error "--max ($POOL_MAX) must EXCEED --reserve ($RESERVE): admission draws on free-minus-reserve, so at or below the reserve the budget is zero forever and the pool holds accelerators while warming nothing"
   fi
 
+  case "$POOL_TYPE" in
+    ""|bridge|retained) ;;
+    *) log_error "--type must be 'bridge' or 'retained', got '$POOL_TYPE'" ;;
+  esac
+  if [ -n "$MAX_HOLD" ]; then
+    # Go's ParseDuration reads this on the other side, and a value it rejects
+    # makes the controller refuse the whole trigger -- the pool then runs on the
+    # fallback config while the ScaledObject says otherwise.
+    #
+    # Anchored, and deliberately NARROWER than ParseDuration. The first form of
+    # this check was a suffix glob (`*[0-9]s`), which accepted `5x5m` --
+    # ParseDuration does not, so it produced exactly the silent fallback the
+    # check exists to prevent -- and also `-5m` and `0s`, which ParseDuration
+    # DOES accept and which are worse: with
+    # `expired := !Retained && now.Sub(borrowedAt) >= MaxHold`, a zero or
+    # negative hold is expired on its first evaluation, so every lend is
+    # reclaimed at once and the pool looks broken rather than misconfigured.
+    # One or more number+unit pairs, all positive. `1h30m` is a perfectly good
+    # ParseDuration value and the first anchored form of this check refused it,
+    # which traded a silent misconfiguration for a loud refusal of a correct one.
+    if ! printf '%s' "$MAX_HOLD" | grep -Eq '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$'; then
+      log_error "--max-hold must be positive number+unit pairs, such as 90s, 1.5m, 1h or 1h30m, got '$MAX_HOLD'"
+    fi
+    # Every component zero means a zero total. ParseDuration accepts `0s`, and a
+    # zero or negative hold is expired on its first evaluation
+    # (`expired := !Retained && now.Sub(borrowedAt) >= MaxHold`), so every lend is
+    # reclaimed at once and the pool reads as broken rather than misconfigured.
+    if ! printf '%s' "$MAX_HOLD" | grep -Eq '[1-9]'; then
+      log_error "--max-hold must be greater than zero: a zero hold reclaims every lent Pod on the first pass, so the pool warms models and never bridges with them"
+    fi
+    if [ "$POOL_TYPE" = "retained" ]; then
+      # Refused, not ignored. Retention IS the absence of this timeout
+      # (`expired := !cfg.Retained && now.Sub(borrowedAt) >= cfg.MaxHold`), so a
+      # pool carrying both reads as "reclaims after 5m" and never reclaims.
+      log_error "--max-hold is meaningless with --type retained: retention is precisely what switches the hold timeout off. Drop one."
+    fi
+  fi
+  if [ -n "$POOL_TYPE" ]; then
+    log_info "Pool type: ${POOL_TYPE}$([ "$POOL_TYPE" = bridge ] && [ -n "$MAX_HOLD" ] && printf ', reclaiming after %s' "$MAX_HOLD")"
+  fi
+
   # A pool is a Deployment or a LeaderWorkerSet, never both -- delete assumes it,
   # and two workloads under one name would both supply Pods carrying the same
   # pool label. `kubectl apply` cannot notice: it creates the new kind and leaves
@@ -461,6 +527,20 @@ $(warmpool_podmonitor)"
 
   printf '%s\n' "$manifest" | kubectl apply -f - >/dev/null
   log_success "Pool '${POOL_NAME}' created in ${NAMESPACE}: ${POOL_REPLICAS} Pods (max ${POOL_MAX}), reserve ${RESERVE}, ${GPUS_PER_POD} GPU each, ${memory} per Pod"
+  # The pool's NAME and its OBJECTS' names differ, and only the name was printed.
+  # Everything created carries the wva-warm-pool- prefix, so `kubectl get deploy
+  # <pool>` is NotFound and a script written against this output stalls on a
+  # Deployment that does not exist. Measured: thirteen minutes, on a pool that
+  # was working the whole time.
+  local pool_kind=deployment
+  [ "$GROUP_SIZE" -gt 1 ] && pool_kind=leaderworkerset
+  log_info "Objects:  ${pool_kind}/wva-warm-pool-${POOL_NAME}, scaledobject/wva-warm-pool-${POOL_NAME}   (the pool NAME is '${POOL_NAME}'; every object carries the wva-warm-pool- prefix)"
+  # An idle pool Pod is NOT Ready, deliberately: the proxy answers its readiness
+  # probe with 503 "no model is awake in this Pod", which is how a sleeping Pod
+  # stays out of its InferencePool. So `kubectl rollout status` and readyReplicas
+  # both wait forever on a healthy empty pool.
+  log_info "A pool Pod holding only SLEEPING models reports NotReady on purpose -- that is what keeps it out of the InferencePool. Do not wait on readyReplicas; read the pool's own state instead:"
+  log_info "    kubectl logs -n ${WVA_NAMESPACE} deploy/wva-controller-manager | grep 'warm pool state' | tail -1"
   log_info "Models join it with:  warmPool: ${POOL_NAME}   in their ScaledObject trigger metadata"
   if [ "$NETWORK_POLICY" -eq 1 ]; then
     log_info "NetworkPolicy wva-warm-pool-${POOL_NAME}: :8001/:8002/:9001-9016 admit only WVA in ${WVA_NAMESPACE}; :8000 admits this namespace"
@@ -1186,7 +1266,31 @@ spec:
         scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
         warmPoolName: ${POOL_NAME}
         warmPoolSleepMinSize: "${RESERVE}"
+$(pool_trigger_extra)
 YAML
+}
+
+# pool_trigger_extra emits the optional pool-type keys for a ScaledObject
+# trigger, at the metadata block's own indentation, or NOTHING when the operator
+# named neither.
+#
+# Nothing, rather than the defaults spelled out: an absent key leaves the
+# controller's own default governing, and a value written here would be a second
+# copy of it, free to drift. Only a choice somebody actually made is recorded.
+#
+# warmPoolRetained is emitted for `bridge` too, as "false". It is the same
+# statement the operator made on the command line, and a pool that says it is a
+# bridge is worth being able to read off the object.
+pool_trigger_extra() {
+  if [ "$POOL_TYPE" = "retained" ]; then
+    printf '        warmPoolRetained: "true"\n'
+  elif [ "$POOL_TYPE" = "bridge" ]; then
+    printf '        warmPoolRetained: "false"\n'
+  fi
+  if [ -n "$MAX_HOLD" ]; then
+    printf '        warmPoolMaxHold: "%s"\n' "$MAX_HOLD"
+  fi
+  return 0
 }
 
 # sizing answers the question that comes before "which pools" -- whether a given
@@ -1277,6 +1381,7 @@ spec:
         scalerAddress: wva-external-scaler.${WVA_NAMESPACE}.svc.cluster.local:9090
         warmPoolName: ${POOL_NAME}
         warmPoolSleepMinSize: "${RESERVE}"
+$(pool_trigger_extra)
 YAML
 }
 
@@ -1400,6 +1505,8 @@ while [ $# -gt 0 ]; do
     --replicas)      POOL_REPLICAS="$2"; shift 2 ;;
     --max)           POOL_MAX="$2"; shift 2 ;;
     --reserve)       RESERVE="$2"; shift 2 ;;
+    --type)          POOL_TYPE="$2"; shift 2 ;;
+    --max-hold)      MAX_HOLD="$2"; shift 2 ;;
     --proxy-image)   PROXY_IMAGE="$2"; shift 2 ;;
     --wva-namespace) WVA_NAMESPACE="$2"; shift 2 ;;
     --monitoring-namespace) MONITORING_NAMESPACE="$2"; shift 2 ;;

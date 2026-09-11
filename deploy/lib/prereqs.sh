@@ -690,9 +690,36 @@ $(printf '  - %s\n' "${denied[@]}")
 $advice"
     fi
 
+    # The quota limiter's budget, checked HERE rather than where it is written.
+    #
+    # The limiter is declared at the very END of deploy_wva_controller -- after
+    # namespaces, monitoring, CRDs, RBAC, the controller Deployment and the
+    # scaler backend have all been applied. A missing or malformed WVA_QUOTAS
+    # therefore aborted an install that had already left a RUNNING, UNBOUNDED
+    # controller behind, which is the state the operator was trying to avoid.
+    #
+    # BEFORE the tenant early-return, not after it. It sat after, which made it
+    # dead code on the DEFAULT path: wva_scope_is_tenant is true whenever the
+    # scope is `namespace`, which is the default everywhere. Measured on
+    # OpenShift -- WVA_QUOTAS='H200=12abc' was refused only once the install had
+    # printed "Deploying Workload-Variant-Autoscaler...", which is exactly the
+    # late failure the comment claimed to have moved.
+    #
+    # The tenant contract below is about what a tenant may READ; WVA_LIMITER is
+    # about what THIS install WRITES into its own policy, and a tenant-scoped
+    # install writes one too. The two are independent.
+    #
+    # No `declare -F` guard: install.sh sources limiter_policy.sh
+    # unconditionally, so a missing function is a broken source tree, and
+    # skipping a safety check on it would fail open.
+    if [ "${WVA_LIMITER:-none}" = "quota" ]; then
+        limiter_entry_yaml quota >/dev/null || exit 1
+        log_success "WVA_QUOTAS parses, so the quota limiter can be declared at the end of the install"
+    fi
+
     # A tenant install has its own contract for what the CONTROLLER will need, and
-    # it is not the WVA_LIMITER question below: limiters and quotas are
-    # CLUSTER-defined, and a tenant reads them rather than declaring them.
+    # it is not the node-read question below: the physical limiter's inventory is
+    # CLUSTER-defined, and a tenant reads it rather than declaring it.
     if wva_scope_is_tenant; then
         check_tenant_install
         log_success "Permissions look sufficient"

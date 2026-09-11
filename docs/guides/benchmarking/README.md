@@ -177,6 +177,7 @@ Optional, except `BENCHMARK_NAMESPACE`.
 | `IMG` | a build of this branch | `ghcr.io/you/wva:dev` |
 | `BENCHMARK_SPEC` | `guides/workload-autoscaling` | `guides/epp-keda-saturation` |
 | `BENCHMARK_HARNESS` | `guidellm` | `inference-perf` |
+| `BENCHMARK_WORKLOAD` | `prefill_heavy` | `flat_8k1000_10rps_12m` |
 | `MODEL_ID` | `Qwen/Qwen3-0.6B` | `Qwen/Qwen3-32B` |
 | `BENCHMARK_REPO_REF` | `v0.7.8` | `main` |
 | `BENCHMARK_IMAGE_TAG` | the value of `BENCHMARK_REPO_REF` | `nightly` |

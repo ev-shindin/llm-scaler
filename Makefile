@@ -39,7 +39,10 @@ NAMESPACE           ?= llm-d-optimized-baseline
 # namespace on OpenShift, cluster elsewhere. See deploy/lib/common.sh.
 WVA_SCOPE           ?=
 # Declare a GPU limiter at install: none | gpu-inventory | quota. Default none,
-# matching the shipped config — see deploy/README.md "Bounding scaling".
+# matching the shipped config — see docs/reference/gpu-limiter.md.
+# `quota` additionally REQUIRES WVA_QUOTAS, the per-accelerator budget
+# (WVA_QUOTAS='H200=8 A100=4'); there is no default, and an empty quota entry is
+# a budget of zero rather than unlimited. WVA_QUOTA_SCOPE is namespace|cluster.
 WVA_LIMITER         ?= none
 # A ScaledObject is how a workload registers with WVA. WVA_DEFAULT_SO=true has the
 # installer create one per llm-d model server; WVA_DEFAULT_SO_NS picks the
@@ -401,15 +404,16 @@ WVA_LIMITER_TYPE    ?= gpu-inventory
 WVA_LIMITER_TARGETS ?=
 
 .PHONY: enable-physical-limiter
-enable-physical-limiter: ## CLUSTER ADMIN: bound every WVA by real GPUs. Publishes cluster policy and grants each controller the node read it then requires. WVA_LIMITER_TYPE=gpu-inventory|quota, WVA_POLICY_NS, WVA_LIMITER_TARGETS.
+enable-physical-limiter: ## CLUSTER ADMIN: bound every WVA by real GPUs. Publishes cluster policy and grants each controller the node read it then requires. WVA_LIMITER_TYPE=gpu-inventory|quota (quota also needs WVA_QUOTAS), WVA_POLICY_NS, WVA_LIMITER_TARGETS.
 	@WVA_POLICY_NS=$(WVA_POLICY_NS) WVA_LIMITER_TYPE=$(WVA_LIMITER_TYPE) \
 		WVA_LIMITER_TARGETS="$(WVA_LIMITER_TARGETS)" \
-		bash -c 'source deploy/lib/common.sh; source deploy/lib/physical_limiter.sh; enable_physical_limiter'
+		WVA_QUOTAS='$(WVA_QUOTAS)' WVA_QUOTA_SCOPE=$(WVA_QUOTA_SCOPE) \
+		bash -c 'source deploy/lib/common.sh; source deploy/lib/limiter_policy.sh; source deploy/lib/physical_limiter.sh; enable_physical_limiter'
 
 .PHONY: disable-physical-limiter
 disable-physical-limiter: ## CLUSTER ADMIN: remove the limiter from cluster policy. Scaling becomes unbounded for every WVA that reads it.
 	@WVA_POLICY_NS=$(WVA_POLICY_NS) \
-		bash -c 'source deploy/lib/common.sh; source deploy/lib/physical_limiter.sh; disable_physical_limiter'
+		bash -c 'source deploy/lib/common.sh; source deploy/lib/limiter_policy.sh; source deploy/lib/physical_limiter.sh; disable_physical_limiter'
 
 ##@ Install, in three phases
 
@@ -448,7 +452,7 @@ SCOPE ?= $(if $(WVA_SCOPE),$(WVA_SCOPE),namespace)
 define wva_phase
 	@echo "Phase '$(if $(1),$(1),auto)', $(SCOPE)-scoped$(if $(2), on $(2),)"
 	$(if $(filter prereqs,$(1)),,@echo "Image: $(IMG)")
-	$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) IMG=$(IMG) WVA_SCOPE=$(SCOPE) WVA_LIMITER=$(WVA_LIMITER) $(if $(1),INSTALL_PHASE=$(1),) $(if $(2),ENVIRONMENT=$(2),) WVA_DEFAULT_SO=$(WVA_DEFAULT_SO) $(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) $(if $(PROMETHEUS_URL),PROMETHEUS_URL=$(PROMETHEUS_URL),) ./deploy/install.sh
+	$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) IMG=$(IMG) WVA_SCOPE=$(SCOPE) WVA_LIMITER=$(WVA_LIMITER) $(if $(WVA_QUOTAS),WVA_QUOTAS='$(WVA_QUOTAS)',) $(if $(WVA_QUOTA_SCOPE),WVA_QUOTA_SCOPE=$(WVA_QUOTA_SCOPE),) $(if $(1),INSTALL_PHASE=$(1),) $(if $(2),ENVIRONMENT=$(2),) WVA_DEFAULT_SO=$(WVA_DEFAULT_SO) $(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) $(if $(PROMETHEUS_URL),PROMETHEUS_URL=$(PROMETHEUS_URL),) ./deploy/install.sh
 endef
 
 # wva_check: $(1)=ENVIRONMENT
@@ -484,7 +488,7 @@ setup-prereqs: manifests kustomize ## Phase 2 (CLUSTER ADMIN). ENVIRONMENT=kuber
 	$(call wva_phase,prereqs,$(ENVIRONMENT_INSTALL))
 
 .PHONY: deploy-wva
-deploy-wva: manifests kustomize ## Install WVA. ENVIRONMENT=kubernetes|openshift, SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>.
+deploy-wva: manifests kustomize ## Install WVA. ENVIRONMENT=kubernetes|openshift, SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>, WVA_LIMITER=none|gpu-inventory|quota (quota needs WVA_QUOTAS).
 	$(call wva_phase,$(INSTALL_PHASE_ARG),$(ENVIRONMENT_INSTALL))
 
 .PHONY: undeploy-wva
@@ -492,11 +496,11 @@ undeploy-wva: ## Remove WVA. Pass the same ENVIRONMENT, SCOPE and namespace you 
 	export KIND=$(KIND) KUBECTL=$(KUBECTL) $(if $(ENVIRONMENT_INSTALL),ENVIRONMENT=$(ENVIRONMENT_INSTALL),) $(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) WVA_SCOPE=$(SCOPE) && 		deploy/install.sh --undeploy
 
 .PHONY: deploy-wva-on-k8s
-deploy-wva-on-k8s: manifests kustomize ## Install WVA on Kubernetes. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>. Prometheus and the namespace are detected.
+deploy-wva-on-k8s: manifests kustomize ## Install WVA on Kubernetes. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>, WVA_LIMITER (quota needs WVA_QUOTAS). Prometheus and the namespace are detected.
 	$(call wva_phase,$(INSTALL_PHASE_ARG),kubernetes)
 
 .PHONY: deploy-wva-on-openshift
-deploy-wva-on-openshift: manifests kustomize ## Install WVA on OpenShift. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>.
+deploy-wva-on-openshift: manifests kustomize ## Install WVA on OpenShift. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>, WVA_LIMITER=none|gpu-inventory|quota (quota needs WVA_QUOTAS).
 	$(call wva_phase,$(INSTALL_PHASE_ARG),openshift)
 
 ## Removing. Pass the SAME SCOPE and namespace you installed with — an uninstall
@@ -1704,6 +1708,13 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@$(MAKE) --no-print-directory benchmark-patch
 	@$(MAKE) --no-print-directory benchmark-scenarios
 	@mkdir -p "$(BENCHMARK_SCENARIOS_DIR)"
+	@# The profile has to match the harness, and this is the last cheap moment to
+	@# find out. The two take mutually invalid schemas, the copy below does not
+	@# look, and BENCHMARK_HARNESS defaults to guidellm while most profiles here
+	@# are inference-perf ones -- so the DEFAULT pairing is a mismatch. Unchecked
+	@# it costs a standup, a pod and five minutes, and then reports a full table
+	@# of "?" latencies beside real-looking replica counts.
+	@BENCHMARK_SCENARIOS_DIR="$(BENCHMARK_SCENARIOS_DIR)" bash hack/check-benchmark-profiles.sh $(BENCHMARK_HARNESS) $(BENCHMARK_WORKLOAD)
 	@if [ "$(BENCHMARK_DIRECT_KEDA)" = "true" ] && [ -f "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD)" ]; then \
 		echo "Injecting external model endpoint for direct-KEDA mode..."; \
 		sed -i.bak 's|base_url: .*|base_url: http://infra-llmdbench-inference-gateway.$(BENCHMARK_NAMESPACE).svc.cluster.local:80|' \
@@ -1847,6 +1858,53 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@echo "========================================="
 	@$(MAKE) benchmark-report
 	@$(MAKE) benchmark-plot-two-variant || true
+	@# A load generator that never sent a request must not exit 0.
+	@#
+	@# The `-` on the run above is deliberate: a run that failed in POST-processing
+	@# still produced measurements worth filing, and the steps between here and
+	@# there do the filing. But it also swallowed the other case entirely. A
+	@# guidellm that rejected its own profile exited 2, sent nothing, and this
+	@# target still returned 0 -- leaving a table that read
+	@#
+	@#     Avg TTFT (ms)   ?        Avg replicas   1.00
+	@#     Avg queue depth 0.0      Max replicas   1
+	@#
+	@# which is indistinguishable from a real run of a fleet that correctly held
+	@# at one replica. That is the shape that gets believed: it was being read as
+	@# evidence that a GPU quota bound the fleet, when nothing had been asked of it.
+	@#
+	@# results.json is guidellm's own output and is the file postprocess.py reads
+	@# every latency number from, so its absence is exactly "no load ran".
+	@# `|| true` on the ls: SHELL carries -o pipefail and .SHELLFLAGS is -ec, so a
+	@# glob matching nothing makes ls exit 2, pipefail propagates it, and the
+	@# assignment kills the recipe with a bare `Error 2` -- losing the very
+	@# diagnosis below. $${USER} unset does the same, which is routine in a CI
+	@# container. An empty LATEST is then its own answer, reported not skipped.
+	@#
+	@# guidellm only: results.json is ITS output, and the file postprocess.py
+	@# reads every latency number from. Asserting it for a harness that writes
+	@# no such file would fail every successful run of that harness -- a worse
+	@# error than the one being caught.
+	@if [ "$(BENCHMARK_HARNESS)" = "guidellm" ]; then \
+		LATEST=$$(ls -td $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_* 2>/dev/null | head -1 || true); \
+		if [ -z "$$LATEST" ]; then \
+			echo ""; \
+			echo "ERROR: no results directory was produced, so the harness never ran."; \
+			echo "  Looked for: $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_*"; \
+			echo "  An unset USER cannot match that glob -- set it, or pass BENCHMARK_WORKSPACE."; \
+			exit 1; \
+		fi; \
+		if [ ! -f "$$LATEST/results.json" ]; then \
+			echo ""; \
+			echo "ERROR: the harness produced no results.json, so NO LOAD WAS GENERATED."; \
+			echo "  Every latency number above is '?' for that reason, and the replica"; \
+			echo "  counts describe an idle fleet, not a measured one."; \
+			echo "  The harness pod said:"; \
+			grep -hE "^Error|Field required|Extra inputs|returned with error" "$$LATEST"/logs/*.log 2>/dev/null | sort -u | head -8 | sed 's/^/    /'; \
+			echo "  Full log: $$LATEST/logs/"; \
+			exit 1; \
+		fi; \
+	fi
 
 ## The one benchmark to run after installing: decode-heavy at 10 req/s for five
 ## minutes, then a dashboard snapshot over exactly that window and a pointer to it.
@@ -2129,6 +2187,30 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# on a label no node carried, and one missing from the planning tools
 	@# reported five 8-GPU H200 nodes as `unknown  8x0 GiB GPU`.
 	@bash hack/check-accelerator-labels.sh
+	@echo "Checking that every refusal can actually refuse..."
+	@# log_error is an exit, and an exit inside `$$( )` ends the SUBSHELL only --
+	@# the caller gets an empty string and carries on. It is the most repeated
+	@# defect in the deploy scripts: a command printed "Refusing to publish a
+	@# bound it cannot deliver" and then "the limiter is now in force for every
+	@# WVA on this cluster", exit 0. Three review rounds each found a fresh
+	@# instance, twice in code written to fix the previous one. `bash -n` sees
+	@# nothing, and neither does a reader -- each one shipped with a comment
+	@# beside it claiming the opposite.
+	@bash hack/check-refusals.sh
+	@echo "Checking each benchmark profile names a harness that will accept it..."
+	@# guidellm and inference-perf take mutually invalid profile schemas, and a
+	@# profile that matches neither can never run. The pre-run gate in
+	@# benchmark-run uses the same classifier, so this also proves the gate still
+	@# recognises both schemas -- one that called everything unknown would reject
+	@# correct pairings instead.
+	@bash hack/check-benchmark-profiles.sh
+	@echo "Checking the limiter the installer declares..."
+	@# WVA_LIMITER=quota wrote `[{type: quota}]`, which the controller REJECTS on
+	@# read -- and a rejected entry costs the whole `default` policy and leaves no
+	@# limiter at all, while the install prints "Scaling is now bounded". Nothing
+	@# else can see it: the YAML is valid, the patch applies, and a cluster run
+	@# shows a healthy controller scaling a fleet.
+	@bash hack/check-limiter-declaration.sh
 	@echo "Checking the tenant Role still covers the generated ClusterRole..."
 	@# The ClusterRole is GENERATED from kubebuilder markers; the namespaced Role
 	@# the tenant overlay installs is maintained by hand, so it does not move when

@@ -36,10 +36,23 @@ gap and hands the work back.
   its weights in shared memory, so the pod template's memory limit is the budget
   and one model too many OOM-kills the launcher, taking **every resident model**
   with it.
-- The retained knobs, in the pool ScaledObject's trigger metadata:
+- The pool declared as retained. `create` takes it, so the pool is never a
+  bridge for the window between creating it and patching it:
+
+```bash
+deploy/warmpool.sh create -n <ns> --name <pool> --type retained \
+  --models 2 --model-size 8B --accelerator <product> --wva-namespace <wva-ns>
+```
+
+  `--type bridge --max-hold 5m` is the other choice; the two together are
+  refused, because retention is precisely what switches the hold timeout off.
+  Naming neither leaves the controller's own default in force rather than
+  writing a second copy of it into the object.
+
+- The remaining retained knobs, in the pool ScaledObject's trigger metadata:
 
 ```yaml
-warmPoolRetained: "true"
+warmPoolRetained: "true"              # what --type retained writes
 warmPoolSwitchSpareThreshold: "20"    # percent; unset = switch only on scale-up need
 warmPoolMinSwitchInterval: "10m"      # default 10m
 ```

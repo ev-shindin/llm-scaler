@@ -69,9 +69,18 @@ kubectl get pods -A -l app.kubernetes.io/name=workload-variant-autoscaler
 # correctly bounded cluster with nothing parked at zero prints nothing and
 # looks like a failure. Read the policy instead, and treat the log as a
 # bonus when scale-from-zero is in play.
+# Neither of those says the controller ACCEPTED the entry, which is the
+# thing that fails silently: a malformed one is rejected on read, costs the
+# whole default policy, and leaves the controller with NO limiter while this
+# command still prints a healthy-looking ConfigMap. The last line answers it.
+# -A12 rather than -A3: a quota entry is eight lines and -A3 cut off
+# namespaceQuotas and every number, so the budget that was just
+# published could not be read back from the verification step.
 kubectl get configmap wva-scaling-policy-config -n wva-policy \
-  -o jsonpath='{.data.default}' | grep -A3 limiters
+  -o jsonpath='{.data.default}' | grep -A12 limiters
 kubectl logs -n <wva-namespace> deploy/wva-controller-manager | grep "GPU budgets available"
+kubectl logs -n <wva-namespace> deploy/wva-controller-manager \
+  | grep -E 'GPU limiter constructed|Invalid saturation scaling'
 ```
 <!-- guide:verify.budget end -->
 
@@ -104,12 +113,30 @@ silently.
 | Parameter | Default | Example |
 | --- | --- | --- |
 | `WVA_LIMITER_TYPE` | `gpu-inventory` | `quota` |
+| `WVA_QUOTAS` | — (**required** by `quota`) | `'H200=8 A100=4'` |
+| `WVA_QUOTA_SCOPE` | `namespace` | `cluster` |
 | `WVA_POLICY_NS` | `wva-policy` | `platform-policy` |
 | `WVA_LIMITER_TARGETS` | every controller found | `team-a team-b` |
 
 `WVA_LIMITER_TYPE` is not `WVA_LIMITER`. This one writes the **cluster** policy
 every controller reads; `WVA_LIMITER` writes a single install's own policy, which
 that install's owner can then edit.
+
+`WVA_QUOTAS` has no default and `WVA_LIMITER_TYPE=quota` refuses to run without
+one — before it creates the policy namespace or grants anything. A quota entry
+that names no accelerator is not "unlimited": it is a budget of zero for every
+type, and published here it would stop every managed workload on the cluster
+from scaling up. `WVA_QUOTA_SCOPE=namespace` (the default) gives each managed
+namespace that budget; `cluster` caps the sum — **within one controller**. This
+command publishes to every controller on the cluster and each enforces its own
+copy, so with `cluster` scope and N admin-owned controllers the cluster permits
+N x the number. The default, `namespace`, is keyed on the reserved
+per-unlisted-namespace key and multiplies the same way; that is the semantic,
+not a defect, but it is the one to know before picking a number.
+
+```bash
+make enable-physical-limiter WVA_LIMITER_TYPE=quota WVA_QUOTAS='H200=8'
+```
 
 ## Next
 

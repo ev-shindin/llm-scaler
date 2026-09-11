@@ -12,11 +12,16 @@ the quota limiter. The implementation closes
 
 ## Enabling
 
-Two settings must both be in place, **both in the saturation-scaling ConfigMap's
-`default` entry**, for quota enforcement to take effect:
-
-**A `limiters:` list containing a `quota` entry** on the `default` entry, and
-that is the whole prerequisite. It is the sole source that selects the quota
+**A `limiters:` list containing a `quota` entry** on the saturation-scaling
+ConfigMap's `default` entry, and that is the whole prerequisite. The installer
+writes it for you — `make deploy-wva-on-k8s WVA_LIMITER=quota WVA_QUOTAS='H200=8'`
+for one install's own policy, or `make enable-physical-limiter
+WVA_LIMITER_TYPE=quota WVA_QUOTAS='H200=8'` for the cluster policy every
+controller reads. `WVA_QUOTAS` is **required** by both: an entry that names no
+accelerator is a budget of zero for every type, not unlimited, and would stop
+every managed workload from scaling up. `WVA_QUOTA_SCOPE` selects `namespace`
+(the default: each managed namespace gets the budget) or `cluster` (the sum
+across all of them). It is the sole source that selects the quota
 limiter (see [Selection & lifecycle](#selection--lifecycle)) and is applied
 **live** — no restart. With no `limiters:` list, nothing limits: neither the
 optimizer budget nor the scale-from-zero capacity check.

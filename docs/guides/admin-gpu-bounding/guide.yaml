@@ -44,10 +44,19 @@ verify:
       correctly bounded cluster with nothing parked at zero prints nothing and
       looks like a failure. Read the policy instead, and treat the log as a
       bonus when scale-from-zero is in play.
+      Neither of those says the controller ACCEPTED the entry, which is the
+      thing that fails silently: a malformed one is rejected on read, costs the
+      whole default policy, and leaves the controller with NO limiter while this
+      command still prints a healthy-looking ConfigMap. The last line answers it.
+      -A12 rather than -A3: a quota entry is eight lines and -A3 cut off
+      namespaceQuotas and every number, so the budget that was just
+      published could not be read back from the verification step.
     run: |
       kubectl get configmap wva-scaling-policy-config -n wva-policy \
-        -o jsonpath='{.data.default}' | grep -A3 limiters
+        -o jsonpath='{.data.default}' | grep -A12 limiters
       kubectl logs -n <wva-namespace> deploy/wva-controller-manager | grep "GPU budgets available"
+      kubectl logs -n <wva-namespace> deploy/wva-controller-manager \
+        | grep -E 'GPU limiter constructed|Invalid saturation scaling'
 
 cleanup:
   disable:
