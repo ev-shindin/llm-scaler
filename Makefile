@@ -1704,6 +1704,13 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@$(MAKE) --no-print-directory benchmark-patch
 	@$(MAKE) --no-print-directory benchmark-scenarios
 	@mkdir -p "$(BENCHMARK_SCENARIOS_DIR)"
+	@# The profile has to match the harness, and this is the last cheap moment to
+	@# find out. The two take mutually invalid schemas, the copy below does not
+	@# look, and BENCHMARK_HARNESS defaults to guidellm while most profiles here
+	@# are inference-perf ones -- so the DEFAULT pairing is a mismatch. Unchecked
+	@# it costs a standup, a pod and five minutes, and then reports a full table
+	@# of "?" latencies beside real-looking replica counts.
+	@bash hack/check-benchmark-profiles.sh $(BENCHMARK_HARNESS) $(BENCHMARK_WORKLOAD)
 	@if [ "$(BENCHMARK_DIRECT_KEDA)" = "true" ] && [ -f "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD)" ]; then \
 		echo "Injecting external model endpoint for direct-KEDA mode..."; \
 		sed -i.bak 's|base_url: .*|base_url: http://infra-llmdbench-inference-gateway.$(BENCHMARK_NAMESPACE).svc.cluster.local:80|' \
@@ -1847,6 +1854,34 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@echo "========================================="
 	@$(MAKE) benchmark-report
 	@$(MAKE) benchmark-plot-two-variant || true
+	@# A load generator that never sent a request must not exit 0.
+	@#
+	@# The `-` on the run above is deliberate: a run that failed in POST-processing
+	@# still produced measurements worth filing, and the steps between here and
+	@# there do the filing. But it also swallowed the other case entirely. A
+	@# guidellm that rejected its own profile exited 2, sent nothing, and this
+	@# target still returned 0 -- leaving a table that read
+	@#
+	@#     Avg TTFT (ms)   ?        Avg replicas   1.00
+	@#     Avg queue depth 0.0      Max replicas   1
+	@#
+	@# which is indistinguishable from a real run of a fleet that correctly held
+	@# at one replica. That is the shape that gets believed: it was being read as
+	@# evidence that a GPU quota bound the fleet, when nothing had been asked of it.
+	@#
+	@# results.json is guidellm's own output and is the file postprocess.py reads
+	@# every latency number from, so its absence is exactly "no load ran".
+	@LATEST=$$(ls -td $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_* 2>/dev/null | head -1); \
+	if [ -n "$$LATEST" ] && [ ! -f "$$LATEST/results.json" ]; then \
+		echo ""; \
+		echo "ERROR: the harness produced no results.json, so NO LOAD WAS GENERATED."; \
+		echo "  Every latency number above is '?' for that reason, and the replica"; \
+		echo "  counts describe an idle fleet, not a measured one."; \
+		echo "  The harness pod said:"; \
+		grep -hE "^Error|Field required|Extra inputs|returned with error" "$$LATEST"/logs/*.log 2>/dev/null | sort -u | head -8 | sed 's/^/    /'; \
+		echo "  Full log: $$LATEST/logs/"; \
+		exit 1; \
+	fi
 
 ## The one benchmark to run after installing: decode-heavy at 10 req/s for five
 ## minutes, then a dashboard snapshot over exactly that window and a pointer to it.
@@ -2129,6 +2164,13 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# on a label no node carried, and one missing from the planning tools
 	@# reported five 8-GPU H200 nodes as `unknown  8x0 GiB GPU`.
 	@bash hack/check-accelerator-labels.sh
+	@echo "Checking each benchmark profile names a harness that will accept it..."
+	@# guidellm and inference-perf take mutually invalid profile schemas, and a
+	@# profile that matches neither can never run. The pre-run gate in
+	@# benchmark-run uses the same classifier, so this also proves the gate still
+	@# recognises both schemas -- one that called everything unknown would reject
+	@# correct pairings instead.
+	@bash hack/check-benchmark-profiles.sh
 	@echo "Checking the limiter the installer declares..."
 	@# WVA_LIMITER=quota wrote `[{type: quota}]`, which the controller REJECTS on
 	@# read -- and a rejected entry costs the whole `default` policy and leaves no
