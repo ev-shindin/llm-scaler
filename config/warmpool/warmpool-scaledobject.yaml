@@ -80,7 +80,7 @@ spec:
         # this; hand-editing it here is the other way. Omit it and the
         # controller's own default applies, which is what create does when
         # --max-hold is not given.
-        warmPoolMaxHold: "2m"
+        # warmPoolMaxHold: "2m"
 
         # Whether this pool is a BRIDGE or is RETAINED, and it is the most
         # consequential line in this file. A bridge takes a lent Pod back after

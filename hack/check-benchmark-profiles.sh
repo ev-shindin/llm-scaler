@@ -134,6 +134,13 @@ if [ -z "${BENCHMARK_SCENARIOS_DIR:-}" ] && { [ "$g" -lt 3 ] || [ "$i" -lt 3 ]; 
     FAIL=1
 fi
 
+# `bash "$0"`, not `"$0"`. This file is committed mode 100644 like every other
+# check here, and the Makefile invokes them all as `bash hack/...` -- so a bare
+# `"$0"` exits 126 on a fresh Linux clone, and BOTH gate-direction cases then
+# report the gate as broken while the half-converted case silently passes for
+# the wrong reason. It did not reproduce on a Windows checkout or over /mnt/c in
+# WSL, because DrvFs reports every file as 0777.
+
 # The counts above say the classifier still answers. They do NOT say it answers
 # CORRECTLY -- swapping the two labels inside profile_harness leaves both counts
 # healthy (17 guidellm, 5 inference-perf reads as fine) while inverting the gate,
@@ -174,24 +181,24 @@ HALF="$(mktemp -d)"
 trap 'rm -rf "$HALF"' EXIT
 printf '%s
 ' 'metadata:' '  labels:' '    name: half' 'spec:' '  profile:' '    kind: constant'     > "$HALF/half-converted.yaml.in"
-if BENCHMARK_SCENARIOS_DIR="$HALF" "$0" guidellm half-converted >/dev/null 2>&1; then
+if BENCHMARK_SCENARIOS_DIR="$HALF" bash "$0" guidellm half-converted >/dev/null 2>&1; then
     echo "FAIL the gate accepts a half-converted profile (spec: with no backend:)."
     echo "     guidellm rejects it on sight, so the run would send nothing and still report a table."
     FAIL=1
 fi
 
-if "$0" guidellm prefill_heavy >/dev/null 2>&1; then
+if bash "$0" guidellm prefill_heavy >/dev/null 2>&1; then
     : # correct pairing accepted
 else
     echo "FAIL the gate refuses guidellm + prefill_heavy, which is a correct pairing"
     FAIL=1
 fi
-if "$0" guidellm bursty >/dev/null 2>&1; then
+if bash "$0" guidellm bursty >/dev/null 2>&1; then
     echo "FAIL the gate accepts guidellm + bursty, an inference-perf profile: the five-minute"
     echo "     all-'?' run this check exists to prevent would go ahead."
     FAIL=1
 fi
-if "$0" inference-perf bursty >/dev/null 2>&1; then
+if bash "$0" inference-perf bursty >/dev/null 2>&1; then
     : # correct pairing accepted
 else
     echo "FAIL the gate refuses inference-perf + bursty, which is a correct pairing"

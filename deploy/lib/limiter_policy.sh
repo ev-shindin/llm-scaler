@@ -4,7 +4,7 @@
 # merging it into a policy without losing the rest of it.
 #
 # Its own file because TWO commands write that list and they load differently:
-# the installer (deploy/install.sh, via infra_wva.sh) for one deployments own
+# the installer (deploy/install.sh, via infra_wva.sh) for one deployment's own
 # policy, and `make enable-physical-limiter` (physical_limiter.sh, sourced by the
 # Makefile with only common.sh beside it) for the cluster policy every WVA reads.
 # Both used to build the list inline, and both built the SAME invalid quota entry
@@ -159,31 +159,46 @@ $types" in
     # document: a caller that reads stdout and a failing status separately would
     # otherwise hold three valid-looking lines of an entry this function refused.
     local key="" install_scope
-    # The SAME answer the rest of the installer gets. `${WVA_SCOPE:-cluster}`
-    # stood here and took the opposite default: everywhere else an unset
-    # WVA_SCOPE means `namespace` (wva_install_scope, and configuration.md says
-    # so in as many words), so `deploy/install.sh` run directly with no
-    # WVA_SCOPE is a namespace-scoped install that keyed its quota on the
-    # reserved `default` key -- contradicting the comment right below.
-    if declare -F wva_install_scope >/dev/null; then
-        install_scope="$(wva_install_scope)"
-    else
-        install_scope="${WVA_SCOPE:-namespace}"
-    fi
     if [ "$scope" = "namespace" ]; then
-        if [ "$install_scope" = "namespace" ]; then
-            key="${WVA_WATCH_NS:-${WVA_NS:-}}"
+        if [ -n "${WVA_QUOTA_NS_KEY:-}" ]; then
+            # Set by a caller that KNOWS the key, and the cluster-policy path is
+            # the one that does: `make enable-physical-limiter` publishes ONE
+            # policy that every controller on the cluster reads, so keying it on
+            # a single namespace would give that namespace the budget and every
+            # other one zero. It sets `default`, the reserved per-unlisted-
+            # namespace key, which is the only correct answer for a policy with
+            # many readers.
+            key="$WVA_QUOTA_NS_KEY"
         else
-            key="default"
+            # The SAME answer the rest of the installer gets. `${WVA_SCOPE:-cluster}`
+            # stood here and took the opposite default: everywhere else an unset
+            # WVA_SCOPE means `namespace` (wva_install_scope, and configuration.md
+            # says so in as many words), so `deploy/install.sh` run directly with
+            # no WVA_SCOPE keyed its quota on `default` while the comment below
+            # said it would name the managed namespace.
+            #
+            # `|| exit 1`, because wva_install_scope reports a bad WVA_SCOPE
+            # through log_error and that exit dies in the subshell. Unchecked, a
+            # typo left install_scope empty, fell through to `default`, and the
+            # cluster path -- which has no `set -e` -- published a policy under
+            # the reserved key while printing the refusal and then SUCCESS.
+            if declare -F wva_install_scope >/dev/null; then
+                install_scope="$(wva_install_scope)" || exit 1
+            else
+                install_scope="${WVA_SCOPE:-namespace}"
+            fi
+            if [ "$install_scope" = "namespace" ]; then
+                key="${WVA_WATCH_NS:-${WVA_NS:-}}"
+            else
+                key="default"
+            fi
         fi
         # An empty key renders as a bare `:` and yq refuses the document -- and
         # the cluster-policy caller is not under `set -e`, so the refusal became
         # an EMPTY policy written to every target namespace, under "The quota
-        # limiter is now in force for every WVA on this cluster." Reached by
-        # `make enable-physical-limiter WVA_SCOPE=namespace`, where neither
-        # WVA_NS nor WVA_WATCH_NS is passed to the recipe.
+        # limiter is now in force for every WVA on this cluster."
         if [ -z "$key" ]; then
-            log_error "WVA_SCOPE=namespace needs the namespace to key the quota on, and neither WVA_WATCH_NS nor WVA_NS is set.
+            log_error "a namespace-scoped quota needs the namespace to key on, and neither WVA_WATCH_NS nor WVA_NS is set.
     Set one, or pass WVA_QUOTA_SCOPE=cluster for a budget that is not keyed by namespace."
         fi
     fi
@@ -233,8 +248,9 @@ $2"
 }
 
 # policy_declared_limiters <limiter type> <current policy yaml> -- the policy with this
-# install's limiter declared, in POLICY_DECLARED. Returns non-zero, having said
-# why, rather than producing anything a caller could write.
+# install's limiter declared, in POLICY_DECLARED. It does not RETURN on failure:
+# every refusal goes through log_error, which exits -- which is the whole design
+# below, and the reason a caller has no status to forget.
 #
 # A GLOBAL, not stdout, and that is the whole point of the function.
 #

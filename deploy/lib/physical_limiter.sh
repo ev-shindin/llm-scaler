@@ -218,7 +218,15 @@ pl_set_limiter() {
         # every target namespace. policy_declared_limiters composes in THIS
         # shell, so a refusal ends the command rather than handing back an empty
         # string.
-        policy_declared_limiters "$limiter" "$current"
+        #
+        # WVA_QUOTA_NS_KEY=default, and it is not a detail. This ONE policy is
+        # read by every controller on the cluster, across every namespace, so a
+        # namespace-scoped budget here has to use the reserved per-unlisted-
+        # namespace key. Keyed on a single namespace instead -- which is what the
+        # installer's own rule would pick -- that namespace gets the budget and
+        # every other one gets ZERO, so this command would stop scaling
+        # everywhere it was meant to bound it.
+        WVA_QUOTA_NS_KEY=default policy_declared_limiters "$limiter" "$current"
         updated="$POLICY_DECLARED"
     fi
     # An entry that is now empty is removed, not written as "{}". A ConfigMap
@@ -252,7 +260,7 @@ enable_physical_limiter() {
     # pl_set_limiter is the last step of a sequence that has already changed the
     # cluster, so a budget this rejects must stop the command while it still has
     # changed nothing. Discards the output: this call is for its refusals.
-    limiter_entry_yaml "$limiter" >/dev/null || exit 1
+    WVA_QUOTA_NS_KEY=default limiter_entry_yaml "$limiter" >/dev/null
 
     if ! kubectl auth can-i create clusterrolebindings >/dev/null 2>&1; then
         log_error "This is a cluster-admin action: it publishes policy a tenant cannot edit, and grants the node read that policy then requires. You cannot create ClusterRoleBindings on this cluster."

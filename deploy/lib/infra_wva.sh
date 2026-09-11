@@ -583,7 +583,7 @@ wva_reconcile_prometheus_scheme() {
             kubectl patch configmap "$policy_cm" -n "$WVA_NS" --type=merge \
                 -p "$(jq -n --arg d "$updated_default" '{data:{"default":$d}}')"
             log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm}):"
-            printf '%s\n' "$limiters_yaml" | sed 's/^/    /' >&2
+            printf '%s\n' "$LIMITER_ENTRY_DECLARED" | sed 's/^/    /' >&2
             # The controller is the only thing that can confirm it. It validates
             # the entry on read and, when it rejects one, discards the ENTIRE
             # `default` policy and falls back to no limiter -- at ERROR in its log

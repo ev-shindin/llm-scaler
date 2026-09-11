@@ -82,7 +82,13 @@ fail() {
 # so a failed one does not stop the ok from printing after it. Suppress it when
 # anything failed since this case began -- an `ok` under four FAILs describing the
 # same output is how a negative control gets read as half-passing.
-ok()   { CASES=$((CASES + 1)); [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] || return 0; echo "ok   $*"; }
+# The increment is BEHIND the suppression test, not in front of it. In front, a
+# case that failed once and then reached its trailing ok was counted twice --
+# once by fail(), once by the suppressed ok() -- so a genuine failure also
+# printed "FAIL 35 cases ran, not 30. A case was added or removed", which is a
+# second verdict, untrue, and blames the reader for editing the test. Each case
+# now counts exactly once, in whichever of the two it ends in.
+ok()   { [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] || return 0; CASES=$((CASES + 1)); echo "ok   $*"; }
 
 # emit <type> -- runs limiter_entry_yaml with the environment already set by the
 # caller, into $OUT/$RC/$ERR. Never lets a non-zero status abort the harness: a
@@ -156,6 +162,40 @@ else
     [ "$(printf '%s' "$got" | jq -r '.[0].namespaceQuotas.default.H200 // "absent"')" = "2" ] \
         || fail "cluster install with namespace scope should fall through to the reserved \`default\` key: $got"
     ok "a cluster install with namespace scope keys on the reserved \`default\`"
+fi
+
+# The CLUSTER-policy key. `make enable-physical-limiter` publishes ONE policy
+# that every controller on the cluster reads, so a namespace-scoped budget there
+# must use the reserved per-unlisted-namespace key: keyed on a single namespace,
+# that namespace gets the budget and every other one gets ZERO, and the command
+# meant to bound the cluster stops scaling on it instead.
+#
+# It also has to work with NO WVA_NS and no WVA_WATCH_NS, because the Makefile
+# recipe passes neither. That combination hard-failed the documented command.
+CASE_FAIL_AT="$FAIL"
+( unset WVA_NS WVA_WATCH_NS WVA_SCOPE
+  WVA_QUOTA_NS_KEY=default WVA_QUOTAS='H200=8' limiter_entry_yaml quota )     >"$WORK/clusterkey" 2>"$WORK/clustererr"
+clusterrc=$?
+if [ "$clusterrc" -ne 0 ]; then
+    fail "the cluster-policy path refused a valid budget with no WVA_NS set, which is exactly how the Makefile recipe calls it: $(cat "$WORK/clustererr")"
+elif [ "$(yq -o=json '.' "$WORK/clusterkey" 2>/dev/null | jq -r '.[0].namespaceQuotas.default.H200 // "absent"')" != "8" ]; then
+    fail "the cluster-policy path did not key on the reserved \`default\`: $(cat "$WORK/clusterkey")"
+else
+    ok "the cluster-policy path keys on the reserved \`default\`, with no namespace of its own"
+fi
+
+# An INVALID WVA_SCOPE must stop the build, not fall through to a default. It
+# fell through: wva_install_scope reports through log_error, whose exit dies in
+# the command substitution, so install_scope came back empty, the namespace
+# branch was not taken, and the entry was keyed `default` -- on a path with no
+# `set -e`, which then published it and printed SUCCESS.
+CASE_FAIL_AT="$FAIL"
+( unset WVA_QUOTA_NS_KEY
+  WVA_SCOPE=bogus WVA_NS=wva-system WVA_QUOTAS='H200=8' limiter_entry_yaml quota )     >"$WORK/badscope" 2>/dev/null
+if [ $? -eq 0 ] || [ -s "$WORK/badscope" ]; then
+    fail "an invalid WVA_SCOPE produced an entry instead of stopping: $(cat "$WORK/badscope")"
+else
+    ok "an invalid WVA_SCOPE stops the build rather than falling through to a key"
 fi
 
 # The physical limiter must carry NO quota fields: validateLimiters rejects
@@ -335,11 +375,22 @@ STUB="$WORK/stub"; mkdir -p "$STUB"
 # Records every write and answers reads with whatever CURRENT_POLICY holds.
 cat > "$STUB/kubectl" <<'STUBEOF'
 #!/usr/bin/env bash
+# A payload is recorded as a SENTINEL line, not raw.
+#
+# `--from-literal=default=` with an EMPTY value is the worst write this function
+# can make -- it is the blanked data.default that was published to every target
+# namespace -- and recording it raw left a zero-byte file, which `[ -s ]` reads
+# as "nothing was written". The assertion was blind to precisely the catastrophe
+# it exists to catch.
 for a in "$@"; do
   case "$a" in
-    --from-literal=default=*) printf '%s' "${a#--from-literal=default=}" > "$KWROTE" ;;
+    --from-literal=default=*) printf 'WROTE[%s]\n' "${a#--from-literal=default=}" >> "$KWROTE" ;;
   esac
 done
+# Every invocation too, so a case can tell "composed a document" from "delivered
+# it": dropping the `| kubectl apply -f -` off the end of the pipeline leaves a
+# function that builds the right ConfigMap and ships it nowhere.
+printf 'CALL[%s]\n' "$*" >> "$KCALLS"
 case "$1" in
   get) printf '%s' "${CURRENT_POLICY:-}" ;;
   *) : ;;
@@ -352,10 +403,19 @@ chmod +x "$STUB/kubectl"
 # the stub first on PATH. Leaves the written policy in $WROTE and status in $PLRC.
 run_pl() {
     WROTE="$WORK/wrote"; : > "$WROTE"
+    CALLS="$WORK/calls"; : > "$CALLS"
     (
         PATH="$STUB:$PATH"; export PATH
         KWROTE="$WROTE"; export KWROTE
-        CURRENT_POLICY="scaleUpThreshold: 0.85"; export CURRENT_POLICY
+        KCALLS="$CALLS"; export KCALLS
+        # "fresh" is the cluster with NO policy ConfigMap yet -- the common case
+        # on a first `make enable-physical-limiter`, and one this harness never
+        # ran because CURRENT_POLICY was always set.
+        if [ "${2:-}" = "fresh" ]; then
+            unset CURRENT_POLICY
+        else
+            CURRENT_POLICY="scaleUpThreshold: 0.85"; export CURRENT_POLICY
+        fi
         WVA_QUOTAS="$1" WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a \
             pl_set_limiter wva-policy quota
     ) >/dev/null 2>"$WORK/plerr"
@@ -367,14 +427,24 @@ if ! declare -F pl_set_limiter >/dev/null; then
 else
     run_pl 'H200=8'
     wrote="$(cat "$WROTE")"
+    calls="$(cat "$CALLS")"
     if [ "$PLRC" -ne 0 ]; then
         fail "pl_set_limiter refused a VALID budget: $(tail -1 "$WORK/plerr")"
     elif ! printf '%s' "$wrote" | grep -q 'install-quota'; then
         fail "pl_set_limiter wrote a policy with no named limiter entry, which the controller rejects: $wrote"
     elif ! printf '%s' "$wrote" | grep -q 'scaleUpThreshold'; then
         fail "pl_set_limiter dropped the rest of the policy while declaring the limiter: $wrote"
+    # DELIVERY, not just composition. Dropping the `| kubectl apply -f -` from
+    # the end of the pipeline leaves a function that builds the right ConfigMap
+    # and ships it nowhere, and asserting only on the built document passed it.
+    elif ! printf '%s' "$calls" | grep -q 'CALL\[apply'; then
+        fail "pl_set_limiter composed a ConfigMap and never applied it; the policy would never reach the cluster. Calls seen: $calls"
+    elif ! printf '%s' "$calls" | grep -q 'wva-scaling-policy-config'; then
+        fail "pl_set_limiter did not name the wva-scaling-policy-config ConfigMap: $calls"
+    elif ! printf '%s' "$calls" | grep -q 'wva-policy'; then
+        fail "pl_set_limiter wrote to a namespace other than the one it was given: $calls"
     else
-        ok "pl_set_limiter writes a named entry and keeps the rest of the policy"
+        ok "pl_set_limiter writes a named entry, keeps the rest, and applies it where it was told"
     fi
 
     # THE ONE THAT MATTERS. A budget the builder refuses must leave the policy
@@ -382,17 +452,39 @@ else
     # target namespace and returned 0, and the command then announced the limiter
     # in force -- which is what the two source-pattern versions of this case
     # failed to catch.
+    #
+    # Asserted on the stub's SENTINEL, not on the size of what it recorded. An
+    # empty --from-literal left a zero-byte file, `[ -s ]` read that as "nothing
+    # was written", and the case was blind to the one write that matters most.
     CASE_FAIL_AT="$FAIL"
     run_pl 'H200=12abc'
     wrote="$(cat "$WROTE")"
     if [ "$PLRC" -eq 0 ]; then
         fail "pl_set_limiter returned 0 on a budget the builder refuses; enable_physical_limiter would go on to announce a limiter it did not write"
-    elif [ -s "$WROTE" ] && ! printf '%s' "$wrote" | grep -q 'scaleUpThreshold'; then
+    elif printf '%s' "$wrote" | grep -q 'WROTE\[\]'; then
+        fail "pl_set_limiter wrote an EMPTY policy over data.default -- the blanked-policy failure itself"
+    elif [ -n "$wrote" ] && ! printf '%s' "$wrote" | grep -q 'scaleUpThreshold'; then
         fail "pl_set_limiter wrote a policy anyway, and it is not the one it started from: [$wrote]"
-    elif [ -s "$WROTE" ]; then
-        fail "pl_set_limiter wrote to the ConfigMap despite refusing the budget"
+    elif [ -n "$wrote" ]; then
+        fail "pl_set_limiter wrote to the ConfigMap despite refusing the budget: [$wrote]"
     else
         ok "a refused budget leaves the cluster policy untouched, and stops the command"
+    fi
+
+    # A FRESH cluster: no policy ConfigMap yet, which is the first thing
+    # `make enable-physical-limiter` meets and which this harness never ran,
+    # because CURRENT_POLICY was always set. pl_set_limiter substitutes
+    # `limiters: []` for the missing read; dropping that fallback leaves the
+    # merge with empty input.
+    CASE_FAIL_AT="$FAIL"
+    run_pl 'H200=8' fresh
+    wrote="$(cat "$WROTE")"
+    if [ "$PLRC" -ne 0 ]; then
+        fail "pl_set_limiter failed on a cluster with no policy ConfigMap yet: $(tail -1 "$WORK/plerr")"
+    elif ! printf '%s' "$wrote" | grep -q 'install-quota'; then
+        fail "pl_set_limiter wrote no limiter entry on a fresh cluster: [$wrote]"
+    else
+        ok "a cluster with no policy ConfigMap yet gets one with the entry in it"
     fi
 fi
 
@@ -411,8 +503,11 @@ if declare -F enable_physical_limiter >/dev/null; then
     # it in a log string near the top while the real call moved to the last line
     # -- mutation-tested, that printed ok. A call is the first word of a command,
     # so anchor on that.
+    # An assignment PREFIX is still a call -- `WVA_QUOTA_NS_KEY=default
+    # limiter_entry_yaml ...` is how the cluster path passes the key -- so the
+    # pattern allows any number of VAR=value words before the command.
     validate_at="$(printf '%s\n' "$body" \
-        | grep -nE '^[[:space:]]*(limiter_entry_yaml|policy_declared_limiters)[[:space:]]' \
+        | grep -nE '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(limiter_entry_yaml|policy_declared_limiters)[[:space:]]' \
         | head -1 | cut -d: -f1)"
     # Anything that touches the cluster. kubectl is the only way this function
     # writes, so the first kubectl line is the point of no return.
@@ -482,7 +577,7 @@ fi
 # and the check still prints OK -- and the ok() suppression means the count of
 # ok lines is not comparable against a known-good run either.
 CASE_FAIL_AT="$FAIL"
-CASES_EXPECTED=30
+CASES_EXPECTED=33
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else
