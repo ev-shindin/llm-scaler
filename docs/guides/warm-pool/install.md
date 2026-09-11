@@ -264,8 +264,11 @@ way; what they lose is the bridge, so their next scale-up pays a full cold start
 
 **Resize one**
 
-Re-run `create` with different `--replicas`/`--max`/`--reserve`; it is an
-`apply`, so the objects are updated in place. Changing `--models`/`--model-size`
+Re-run `create` with different `--replicas`/`--max`/`--reserve`/`--type`/
+`--max-hold`; it is an `apply`, so the objects are updated in place. `--type`
+and `--max-hold` are picked up live — both engines rebuild from the ConfigMap
+without a restart — so a bridge can become retained, and back, on a running
+pool. Changing `--models`/`--model-size`
 changes the Pod's memory limit, which **rolls the pool** and reloads every
 resident model — cheap to say and expensive to do, so decide the warm-set budget
 before you fill it.

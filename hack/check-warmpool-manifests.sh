@@ -392,6 +392,72 @@ else
   fail "the undeclared-pool report reads both kinds without tolerating a missing CRD; it will abort on most clusters"
 fi
 
+# --- pool type: bridge or retained ------------------------------------------
+# Until --type existed, the ONLY way to make a pool retained was to hand-patch
+# warmPoolRetained into the ScaledObject trigger after create, which meant the
+# pool ran as a bridge for however long that took and nothing in the create
+# output said which kind you had. These assert the choice reaches the object.
+TRIGGER_KEYS() {
+  printf '%s\n' "$1" | yq ea 'select(.kind == "ScaledObject") | .spec.triggers[0].metadata | keys | .[]' - 2>/dev/null
+}
+TRIGGER_GET() {
+  printf '%s\n' "$1" | yq ea "select(.kind == \"ScaledObject\") | .spec.triggers[0].metadata.$2 // \"absent\"" - 2>/dev/null
+}
+
+RETAINED_POOL="$(render --type retained)"
+if [ "$(TRIGGER_GET "$RETAINED_POOL" warmPoolRetained)" = "true" ]; then
+  ok "--type retained reaches the trigger as warmPoolRetained: true"
+else
+  fail "--type retained did not emit warmPoolRetained; the pool would run as a bridge and reclaim its Pod on the hold timeout"
+fi
+
+BRIDGE_POOL="$(render --type bridge --max-hold 5m)"
+if [ "$(TRIGGER_GET "$BRIDGE_POOL" warmPoolRetained)" = "false" ] &&
+   [ "$(TRIGGER_GET "$BRIDGE_POOL" warmPoolMaxHold)" = "5m" ]; then
+  ok "--type bridge --max-hold reaches the trigger as both keys"
+else
+  fail "--type bridge --max-hold did not emit both keys: $(TRIGGER_KEYS "$BRIDGE_POOL" | tr '\n' ' ')"
+fi
+
+# Absent, NOT defaulted. A value written here would be a second copy of the
+# controller's default, free to drift from it; an absent key cannot.
+PLAIN_POOL="$(render)"
+if [ "$(TRIGGER_GET "$PLAIN_POOL" warmPoolRetained)" = "absent" ] &&
+   [ "$(TRIGGER_GET "$PLAIN_POOL" warmPoolMaxHold)" = "absent" ]; then
+  ok "naming neither emits neither, leaving the controller default in force"
+else
+  fail "create wrote a pool-type key nobody asked for, which is a second copy of a default that can drift"
+fi
+
+# The group pool is a separate heredoc and has been missed by exactly this kind
+# of change before.
+GROUP_RETAINED="$(render --group-size 2 --launcher-image example.invalid/launcher:v1 --type retained)"
+if [ "$(TRIGGER_GET "$GROUP_RETAINED" warmPoolRetained)" = "true" ]; then
+  ok "a LeaderWorkerSet pool carries the type too"
+else
+  fail "--type retained is dropped on the group path: the two ScaledObject heredocs disagree"
+fi
+
+# Refusals. Each is a config that would otherwise be accepted and then ignored.
+#
+# The expected WORDS are checked, not just a non-zero exit: a script that does
+# not know these options at all refuses them too, with "unknown option", so a
+# case satisfied by that would pass on the very version the flags are MISSING
+# from. The negative control caught exactly that.
+check_refusal() {
+  local want="$1"; shift
+  local out
+  out="$(bash "$SCRIPT" create -n tenant --name pool --wva-namespace wva-system \
+           --models 1 --model-size 8B --dry-run "$@" 2>&1 >/dev/null)"
+  case "$out" in
+    *"$want"*) ok "create refuses '$*' and says why" ;;
+    *)         fail "create did not refuse '$*' with '$want'; it said: ${out:-<nothing>}" ;;
+  esac
+}
+check_refusal "--type must be" --type nonsense
+check_refusal "--max-hold must be a Go duration" --max-hold garbage
+check_refusal "meaningless with --type retained" --type retained --max-hold 5m
+
 if [ "$FAILED" -eq 0 ]; then
   echo "Warm pool manifest checks passed."
 else
