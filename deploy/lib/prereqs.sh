@@ -699,6 +699,20 @@ $advice"
         return 0
     fi
 
+    # The quota limiter's budget, checked HERE rather than where it is written.
+    #
+    # The limiter is declared at the very END of deploy_wva_controller -- after
+    # namespaces, monitoring, CRDs, RBAC, the controller Deployment and the
+    # scaler backend have all been applied. A missing or malformed WVA_QUOTAS
+    # therefore aborted an install that had already left a RUNNING, UNBOUNDED
+    # controller behind, which is the state the operator was trying to avoid.
+    # limiter_entry_yaml validates and reports; its output is discarded because
+    # this call is for its refusals.
+    if [ "${WVA_LIMITER:-none}" = "quota" ] && declare -F limiter_entry_yaml >/dev/null; then
+        limiter_entry_yaml quota >/dev/null || exit 1
+        log_success "WVA_QUOTAS parses, so the quota limiter can be declared at the end of the install"
+    fi
+
     # What the CONTROLLER will need once it is running.
     local node_read
     node_read="$(can_i_as "$sa" list nodes)"

@@ -583,7 +583,7 @@ wva_reconcile_prometheus_scheme() {
             # Idempotent, and it REPLACES rather than appends: re-running with a
             # different WVA_LIMITER must not leave both declared, since a quota
             # entry would then win over the gpu-inventory one by mode precedence.
-            updated_default=$(policy_with_limiters "$current_default" "$limiters_yaml")
+            updated_default=$(policy_with_limiters "$current_default" "$limiters_yaml") || exit 1
             kubectl patch configmap "$policy_cm" -n "$WVA_NS" --type=merge \
                 -p "$(jq -n --arg d "$updated_default" '{data:{"default":$d}}')"
             log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm}):"

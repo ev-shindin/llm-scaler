@@ -60,7 +60,7 @@ limiter_entry_yaml() {
     the entry does not name gets zero, so every managed workload stops scaling up. Use -1 for no cap on
     a type ('H100=-1'). The accelerator name is the one WVA resolves, which the controller logs per
     variant:
-        kubectl logs -n $WVA_NS deploy/wva-controller-manager | grep accelerator"
+        kubectl logs -n ${WVA_NS:-<the controller namespace>} deploy/wva-controller-manager | grep accelerator"
     fi
 
     # Accept commas or whitespace between entries, so both of the shapes an
@@ -68,27 +68,76 @@ limiter_entry_yaml() {
     local pairs pair name value
     pairs="$(printf '%s' "$WVA_QUOTAS" | tr ',' ' ')"
     local types=""
+    # Word-splitting on $pairs is what this loop is for; PATHNAME expansion is
+    # not. Unguarded, WVA_QUOTAS='*' expands against the current directory and a
+    # GPU budget is synthesised out of filenames -- exit 0, and a policy nobody
+    # wrote. Restored rather than left off: this function is called from scripts
+    # that glob afterwards.
+    local reset_glob=1
+    case "$-" in *f*) reset_glob=0 ;; esac
+    set -f
     for pair in $pairs; do
         name="${pair%%=*}"
         value="${pair#*=}"
         if [ "$name" = "$pair" ] || [ -z "$name" ] || [ -z "$value" ]; then
+            [ "$reset_glob" = 1 ] && set +f
             log_error "WVA_QUOTAS entry '$pair' is not TYPE=N (for example 'H200=8'). Whole value: '$WVA_QUOTAS'"
         fi
+        # `*[!0-9]*`, not `[0-9][0-9]*`. The second is a GLOB: its `*` matches
+        # anything, so every value whose first two characters are digits passed
+        # -- 'H200=12abc', 'H200=16Gi', 'H200=12.5'. The arithmetic test below
+        # then failed with "integer expression expected", which is not fatal
+        # inside an `if`, and the entry was emitted anyway. yq accepts
+        # `H200: 12abc` as a string, so the install patched it and reported
+        # success, and the controller threw away the whole policy on read: the
+        # exact failure this file exists to prevent, reintroduced by a glob.
         case "$value" in
-            -1|[0-9]|[0-9][0-9]*) ;;
-            *) log_error "WVA_QUOTAS entry '$pair': the budget must be a whole number of GPUs, or -1 for no cap on that type" ;;
+            -1) ;;
+            ''|*[!0-9]*)
+                [ "$reset_glob" = 1 ] && set +f
+                log_error "WVA_QUOTAS entry '$pair': the budget must be a whole number of GPUs, or -1 for no cap on that type" ;;
         esac
         # MaxQuotaValue in internal/config/quota_limiter.go. Above it the
         # controller rejects the entry, which costs the whole policy again.
         if [ "$value" -gt 1048576 ]; then
+            [ "$reset_glob" = 1 ] && set +f
             log_error "WVA_QUOTAS entry '$pair' exceeds the maximum quota of 1048576 GPUs"
         fi
         types="${types}    ${name}: ${value}
 "
     done
+    [ "$reset_glob" = 1 ] && set +f
+
+    # Namespace scope is keyed by namespace. `default` is the reserved
+    # fall-through key and means "this much PER unlisted namespace", not a shared
+    # pool — so a cluster-scoped controller managing ten tenants hands out ten
+    # budgets, not one. Name the managed namespace instead whenever there is
+    # exactly one, which is every namespace-scoped install.
+    #
+    # Resolved BEFORE the first line is printed. Nothing here may emit a partial
+    # document: a caller that reads stdout and a failing status separately would
+    # otherwise hold three valid-looking lines of an entry this function refused.
+    local key=""
+    if [ "$scope" = "namespace" ]; then
+        if [ "${WVA_SCOPE:-cluster}" = "namespace" ]; then
+            key="${WVA_WATCH_NS:-${WVA_NS:-}}"
+        else
+            key="default"
+        fi
+        # An empty key renders as a bare `:` and yq refuses the document -- and
+        # the cluster-policy caller is not under `set -e`, so the refusal became
+        # an EMPTY policy written to every target namespace, under "The quota
+        # limiter is now in force for every WVA on this cluster." Reached by
+        # `make enable-physical-limiter WVA_SCOPE=namespace`, where neither
+        # WVA_NS nor WVA_WATCH_NS is passed to the recipe.
+        if [ -z "$key" ]; then
+            log_error "WVA_SCOPE=namespace needs the namespace to key the quota on, and neither WVA_WATCH_NS nor WVA_NS is set.
+    Set one, or pass WVA_QUOTA_SCOPE=cluster for a budget that is not keyed by namespace."
+        fi
+    fi
 
     # One line per argument rather than one format with embedded newlines: a `\n`
-    # followed by a space is what hack/check-make-recipes' sibling guard in
+    # followed by a space is what the line-continuation guard in
     # lint-deploy-scripts looks for, because that is the shape a collapsed line
     # continuation leaves behind.
     printf '%s\n' '- name: install-quota' '  type: quota' "  scope: ${scope}"
@@ -98,17 +147,6 @@ limiter_entry_yaml() {
         printf '  quotas:\n'
         printf '%s' "$types"
         return 0
-    fi
-    # Namespace scope is keyed by namespace. `default` is the reserved
-    # fall-through key and means "this much PER unlisted namespace", not a shared
-    # pool — so a cluster-scoped controller managing ten tenants hands out ten
-    # budgets, not one. Name the managed namespace instead whenever there is
-    # exactly one, which is every namespace-scoped install.
-    local key
-    if [ "${WVA_SCOPE:-cluster}" = "namespace" ]; then
-        key="${WVA_WATCH_NS:-$WVA_NS}"
-    else
-        key="default"
     fi
     printf '%s\n' '  namespaceQuotas:' "    ${key}:"
     printf '%s' "$types" | sed 's/^/  /'
@@ -127,5 +165,17 @@ limiter_entry_yaml() {
 # policy with no limiters at all. Paired with limiter_entry_yaml here so the
 # offline check exercises the same transform the install runs.
 policy_with_limiters() {
-    printf '%s\n' "$1" | LIMITERS_YAML="$2" yq '.limiters = (strenv(LIMITERS_YAML) | from_yaml)'
+    local out
+    out="$(printf '%s\n' "$1" | LIMITERS_YAML="$2" yq '.limiters = (strenv(LIMITERS_YAML) | from_yaml)')" || {
+        log_error "could not merge the limiter entry into the policy. The entry was:
+$2"
+    }
+    # Empty is a failure too, and a worse one: the callers write what comes back,
+    # so an empty result BLANKS data.default. Before this, a yq refusal on the
+    # cluster-policy path -- which runs without set -e -- wrote an empty policy
+    # to every target namespace and then reported the limiter in force.
+    if [ -z "$out" ]; then
+        log_error "merging the limiter entry produced an empty policy; refusing to write it"
+    fi
+    printf '%s\n' "$out"
 }

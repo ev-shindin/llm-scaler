@@ -211,9 +211,13 @@ pl_set_limiter() {
         # from every WVA on the cluster and left them all unbounded, under the
         # banner "The quota limiter is now in force for every WVA on this
         # cluster." Exactly the claim a safety bound must never make falsely.
+        # Both `|| exit 1` are load-bearing HERE in a way they are not in the
+        # installer: this path runs from a bare `bash -c` in the Makefile, with
+        # no `set -e`, so an unchecked failure returns 0 up the chain and
+        # enable_physical_limiter goes on to announce a limiter it did not write.
         local limiters_yaml
         limiters_yaml="$(limiter_entry_yaml "$limiter")" || exit 1
-        updated="$(policy_with_limiters "$current" "$limiters_yaml")"
+        updated="$(policy_with_limiters "$current" "$limiters_yaml")" || exit 1
     fi
     # An entry that is now empty is removed, not written as "{}". A ConfigMap
     # whose default entry is an empty object is a policy that says nothing while

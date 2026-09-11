@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Executes limiter_entry_yaml() in deploy/lib/infra_wva.sh and asserts the
+# Executes limiter_entry_yaml() and policy_with_limiters() in
+# deploy/lib/limiter_policy.sh, and asserts the
 # controller would ACCEPT what it emits.
 #
 # It exists because WVA_LIMITER=quota had never bounded anything. The installer
@@ -56,12 +57,13 @@ if ! declare -F limiter_entry_yaml >/dev/null; then
     exit 1
 fi
 
-fail() { echo "FAIL $*"; FAIL=$((FAIL + 1)); }
+CASES=0
+fail() { echo "FAIL $*"; FAIL=$((FAIL + 1)); CASES=$((CASES + 1)); }
 # A case ends in one summarising ok, but its assertions are separate statements,
 # so a failed one does not stop the ok from printing after it. Suppress it when
 # anything failed since this case began -- an `ok` under four FAILs describing the
 # same output is how a negative control gets read as half-passing.
-ok()   { [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] || return 0; echo "ok   $*"; }
+ok()   { CASES=$((CASES + 1)); [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] || return 0; echo "ok   $*"; }
 
 # emit <type> -- runs limiter_entry_yaml with the environment already set by the
 # caller, into $OUT/$RC/$ERR. Never lets a non-zero status abort the harness: a
@@ -169,14 +171,60 @@ else
     esac
 fi
 
-for bad in 'H200' 'H200=' '=8' 'H200=eight' 'H200=-4' 'H200=1048577'; do
+# Each pairs the bad value with the WORDS its refusal must carry. A bare
+# "did it exit non-zero" is satisfied by a function replaced with `log_error
+# "boom"` -- mutation-tested, all six printed ok against a one-line stub.
+#
+# '12abc' and '16Gi' are here because they were ACCEPTED: the guard was
+# `[0-9][0-9]*`, a glob whose `*` matches anything, so every value starting with
+# two digits passed and `H200: 12abc` was written into the policy.
+refuse_quota() {
+    local bad="$1" want="$2"
     WVA_QUOTAS="$bad" WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a emit quota
     if [ "$RC" -eq 0 ]; then
         fail "WVA_QUOTAS='$bad' was accepted and emitted: $OUT"
-    else
-        ok "WVA_QUOTAS='$bad' refused"
+        return
     fi
-done
+    case "$ERR" in
+        *"$want"*) ok "WVA_QUOTAS='$bad' refused, saying why" ;;
+        *) fail "WVA_QUOTAS='$bad' was refused without '$want'; it said: ${ERR:-<nothing>}" ;;
+    esac
+}
+refuse_quota 'H200'         'is not TYPE=N'
+refuse_quota 'H200='        'is not TYPE=N'
+refuse_quota '=8'           'is not TYPE=N'
+refuse_quota 'H200=eight'   'whole number of GPUs'
+refuse_quota 'H200=12abc'   'whole number of GPUs'
+refuse_quota 'H200=16Gi'    'whole number of GPUs'
+refuse_quota 'H200=12.5'    'whole number of GPUs'
+refuse_quota 'H200=-4'      'whole number of GPUs'
+refuse_quota 'H200=1048577' 'maximum quota'
+
+# A glob in WVA_QUOTAS must not be expanded against the working directory. It
+# was: with `for pair in $pairs` unguarded, WVA_QUOTAS='*' in a directory of
+# `name=value` files produced a GPU budget synthesised from filenames, exit 0.
+CASE_FAIL_AT="$FAIL"
+globdir="$WORK/globtest"; mkdir -p "$globdir"
+: > "$globdir/aaa=1"; : > "$globdir/bbb=2"
+( cd "$globdir" && WVA_QUOTAS='*' WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a \
+    limiter_entry_yaml quota >"$WORK/globout" 2>"$WORK/globerr" )
+if [ -s "$WORK/globout" ] && grep -q 'aaa' "$WORK/globout"; then
+    fail "WVA_QUOTAS='*' was expanded against the working directory: $(cat "$WORK/globout")"
+else
+    ok "a glob in WVA_QUOTAS is not expanded against the working directory"
+fi
+
+# The namespace key cannot be empty: it renders as a bare `:`, yq refuses the
+# document, and the cluster-policy caller (no set -e) then wrote an EMPTY policy
+# and announced the limiter in force.
+CASE_FAIL_AT="$FAIL"
+( unset WVA_NS WVA_WATCH_NS; WVA_SCOPE=namespace WVA_QUOTAS='H200=8' \
+    limiter_entry_yaml quota >"$WORK/nskey" 2>"$WORK/nserr" )
+if [ -s "$WORK/nskey" ]; then
+    fail "namespace scope with no namespace emitted an entry with an empty key: $(cat "$WORK/nskey")"
+else
+    ok "namespace scope with no namespace to key on is refused"
+fi
 
 WVA_QUOTAS='H200=8' WVA_QUOTA_SCOPE=global emit quota
 if [ "$RC" -eq 0 ]; then
@@ -243,25 +291,50 @@ fi
 # to a cluster. What matters is that it no longer builds a list of its own.
 # ---------------------------------------------------------------------------
 CASE_FAIL_AT="$FAIL"
-PL="$ROOT/deploy/lib/physical_limiter.sh"
-if grep -q 'limiters = \[{' "$PL"; then
-    fail "physical_limiter.sh still builds its own limiters list; the cluster policy can be published in a form every controller rejects"
-elif grep -q 'limiter_entry_yaml' "$PL" && grep -q 'policy_with_limiters' "$PL"; then
-    ok "the cluster policy path builds its list through the same two functions"
+# `declare -f`, not grep on the file. bash strips comments from a function body,
+# and the file carries BOTH function names in prose -- so a file-level grep for
+# them was satisfied by the comment explaining why they are used, and the whole
+# case passed against a pl_set_limiter that had gone back to building
+# `.limiters=[{"type":"quota"}]` inline. Mutation-tested: that reintroduction
+# printed `ok` and the check exited 0.
+if ! declare -F pl_set_limiter >/dev/null; then
+    fail "pl_set_limiter is not defined -- physical_limiter.sh did not source"
 else
-    fail "physical_limiter.sh calls neither limiter_entry_yaml nor policy_with_limiters; it is building the list some third way"
+    pl_body="$(declare -f pl_set_limiter)"
+    case "$pl_body" in
+        *".limiters"*"=["*|*"limiters = ["*)
+            fail "pl_set_limiter still builds a limiters list inline; the cluster policy can be published in a form every controller rejects" ;;
+        *limiter_entry_yaml*policy_with_limiters*)
+            ok "the cluster policy path builds its list through the same two functions" ;;
+        *)
+            fail "pl_set_limiter calls neither limiter_entry_yaml nor policy_with_limiters; it is building the list some third way" ;;
+    esac
 fi
 
 # And it must refuse a budgetless quota BEFORE it creates the namespace and
 # grants RBAC -- its own writes come last, so a late refusal leaves a
 # half-configured cluster behind.
+#
+# ORDER is the assertion, not presence. A validation moved to the LAST line of
+# the function satisfies "contains limiter_entry_yaml" while producing exactly
+# the half-configured cluster the case exists to prevent -- mutation-tested, it
+# printed ok.
 CASE_FAIL_AT="$FAIL"
 if declare -F enable_physical_limiter >/dev/null; then
     body="$(declare -f enable_physical_limiter)"
-    case "$body" in
-        *limiter_entry_yaml*) ok "enable_physical_limiter validates the budget before it changes anything" ;;
-        *) fail "enable_physical_limiter never validates the limiter entry; a rejected WVA_QUOTAS would abort it after the namespace and grants exist" ;;
-    esac
+    validate_at="$(printf '%s\n' "$body" | grep -n 'limiter_entry_yaml' | head -1 | cut -d: -f1)"
+    # Anything that touches the cluster. kubectl is the only way this function
+    # writes, so the first kubectl line is the point of no return.
+    first_write="$(printf '%s\n' "$body" | grep -nE 'kubectl|pl_grant_|pl_set_limiter' | head -1 | cut -d: -f1)"
+    if [ -z "$validate_at" ]; then
+        fail "enable_physical_limiter never validates the limiter entry; a rejected WVA_QUOTAS would abort it after the namespace and grants exist"
+    elif [ -z "$first_write" ]; then
+        fail "enable_physical_limiter appears to touch no cluster state at all; this case can no longer tell early from late"
+    elif [ "$validate_at" -lt "$first_write" ]; then
+        ok "enable_physical_limiter validates the budget before it changes anything"
+    else
+        fail "enable_physical_limiter validates at line $validate_at of its body but first writes at line $first_write: a rejected WVA_QUOTAS would abort after the namespace and grants exist"
+    fi
 else
     fail "enable_physical_limiter is not defined -- physical_limiter.sh did not source"
 fi
@@ -272,22 +345,57 @@ fi
 VALIDATE="$ROOT/internal/config/quota_limiter.go"
 CASE_FAIL_AT="$FAIL"
 if [ ! -f "$VALIDATE" ]; then
-    fail "cannot find $VALIDATE to cross-check the validation rules against"
+    fail "cannot find $VALIDATE to cross-check against"
 else
-    # Every `errs = append(errs, ...)` in Validate() is a way to have the entry
-    # rejected. The count is the mirror's tripwire: a new one means a new rule
-    # this file does not assert, and an installer that may be emitting an entry
-    # the controller will throw the whole policy away over.
-    rules=$(grep -c 'errs = append(errs' "$VALIDATE")
-    expected=14
-    if [ "$rules" -ne "$expected" ]; then
-        fail "internal/config/quota_limiter.go now has $rules rejection rules, not $expected.
-     A rule was added or removed since these cases were written. Read Validate(), decide whether
-     limiter_entry_yaml can still emit an entry that trips the new one, add a case here, and
-     update \$expected."
+    # The two numbers limiter_entry_yaml HARDCODES, read back from the Go that
+    # gives them meaning. A counting tripwire stood here before and was blind to
+    # every drift worth catching: it counted `errs = append(errs` lines, so
+    # changing MaxQuotaValue or QuotaUnlimited moved nothing, and swapping one
+    # rule for another kept the total at 14. Mutation-tested -- all three
+    # printed ok.
+    if grep -qE 'MaxQuotaValue += +1 +<< +20' "$VALIDATE"; then
+        ok "MaxQuotaValue is still 1<<20, the 1048576 this script refuses above"
     else
-        ok "the $rules rejection rules in Validate() are the ones these cases were written against"
+        fail "MaxQuotaValue is no longer 1<<20; the 1048576 hardcoded in limiter_entry_yaml now rejects values the controller would accept, or passes ones it would not:
+     $(grep -n 'MaxQuotaValue' "$VALIDATE" | head -2)"
     fi
+    if grep -qE 'QuotaUnlimited += +-1' "$VALIDATE"; then
+        ok "QuotaUnlimited is still -1, the no-cap sentinel this script accepts above"
+    else
+        fail "QuotaUnlimited is no longer -1; limiter_entry_yaml still emits -1 for 'no cap':
+     $(grep -n 'QuotaUnlimited' "$VALIDATE" | head -2)"
+    fi
+fi
+
+# The name limiter_entry_yaml emits must be one validateLimiters() accepts. This
+# is the rule a counting tripwire could never see: a new rejection there -- on
+# the name, the scope, a field combination -- would make every install emit an
+# entry the controller throws the whole policy away over, and nothing in this
+# file would notice.
+CASE_FAIL_AT="$FAIL"
+SATURATION="$ROOT/internal/config/saturation_scaling.go"
+WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a WVA_QUOTAS='H200=8' emit quota
+emitted_name="$(printf '%s\n' "$OUT" | yq -o=json '.' 2>/dev/null | jq -r '.[0].name // ""')"
+if [ -z "$emitted_name" ]; then
+    fail "could not read back the emitted limiter name"
+elif [ ! -f "$SATURATION" ]; then
+    fail "cannot find $SATURATION to check the emitted name against"
+elif grep -q "\"$emitted_name\"" "$SATURATION"; then
+    fail "validateLimiters() now names '$emitted_name' literally -- the name limiter_entry_yaml emits may be special-cased or rejected there:
+     $(grep -n "\"$emitted_name\"" "$SATURATION" | head -2)"
+else
+    ok "the emitted name '$emitted_name' is not singled out by validateLimiters()"
+fi
+
+# How many cases ran. Without it, deleting a refuse_quota line removes a case
+# and the check still prints OK -- and the ok() suppression means the count of
+# ok lines is not comparable against a known-good run either.
+CASE_FAIL_AT="$FAIL"
+CASES_EXPECTED=24
+if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
+    fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
+else
+    ok "all $CASES cases ran"
 fi
 
 if [ "$FAIL" -ne 0 ]; then

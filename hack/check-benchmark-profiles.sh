@@ -32,7 +32,10 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIR="$ROOT/test/benchmark/scenarios"
+# benchmark-run reads BENCHMARK_SCENARIOS_DIR, which is overridable. Gating a
+# file from a different directory than the one that gets copied would be worse
+# than not gating at all.
+DIR="${BENCHMARK_SCENARIOS_DIR:-$ROOT/test/benchmark/scenarios}"
 
 # profile_harness <file> -- guidellm, inference-perf, or unknown.
 #
@@ -53,11 +56,21 @@ if [ $# -eq 2 ]; then
     # Gate mode: silent on success. It runs on every benchmark-run and has
     # nothing to say when the pairing is right.
     harness="$1" workload="$2"
-    f="$DIR/${workload}.yaml.in"
-    [ -f "$f" ] || f="$DIR/${workload}"
+    # Every form benchmark-run will accept, in the directory it will look in.
+    # BENCHMARK_SCENARIOS_DIR is overridable there, so honour it here or the gate
+    # judges a different file from the one that gets copied.
+    f=""
+    for cand in "${workload}.yaml.in" "${workload}.in" "${workload}"; do
+        if [ -f "$DIR/$cand" ]; then f="$DIR/$cand"; break; fi
+    done
     # Not one of ours. The harness ships its own profiles and benchmark-run
     # fetches others from the inference-perf catalog; nothing to say about those.
-    [ -f "$f" ] || exit 0
+    # It also swallows a typo, so say which it was -- silently exiting 0 on
+    # `burstyy` looks identical to a correct pairing.
+    if [ -z "$f" ]; then
+        echo "note: '$workload' is not in $DIR; leaving it to the harness (a local profile of that name would be gated here)." >&2
+        exit 0
+    fi
     got="$(profile_harness "$f")"
     [ "$got" = "$harness" ] && exit 0
     echo "ERROR: workload '$workload' is a ${got} profile, but BENCHMARK_HARNESS=${harness}."
@@ -110,6 +123,43 @@ if [ "$g" -lt 3 ] || [ "$i" -lt 3 ]; then
     echo "FAIL classified $g guidellm and $i inference-perf profiles; both were well above 3."
     echo "     A collapse here means the classifier stopped recognising a schema, which would"
     echo "     make the pre-run gate reject correct pairings."
+    FAIL=1
+fi
+
+# The counts above say the classifier still answers. They do NOT say it answers
+# CORRECTLY -- swapping the two labels inside profile_harness leaves both counts
+# healthy (17 guidellm, 5 inference-perf reads as fine) while inverting the gate,
+# so every correct pairing is refused and every mismatch waved through. Two
+# profiles are therefore pinned by name, one of each schema.
+for pair in "prefill_heavy guidellm" "symmetrical guidellm" "bursty inference-perf" "flat_8k1000_10rps_12m inference-perf"; do
+    set -- $pair
+    got="$(profile_harness "$DIR/$1.yaml.in")"
+    if [ "$got" != "$2" ]; then
+        echo "FAIL $1 classifies as '$got', but it is a $2 profile."
+        echo "     The classifier is wrong, not merely quiet: the pre-run gate would refuse"
+        echo "     correct pairings and accept the mismatch it exists to catch."
+        FAIL=1
+    fi
+done
+
+# And the gate itself, in both directions, because lint mode never enters that
+# branch -- the Makefile comment claiming this check proves the gate works was
+# only true once these ran it.
+if "$0" guidellm prefill_heavy >/dev/null 2>&1; then
+    : # correct pairing accepted
+else
+    echo "FAIL the gate refuses guidellm + prefill_heavy, which is a correct pairing"
+    FAIL=1
+fi
+if "$0" guidellm bursty >/dev/null 2>&1; then
+    echo "FAIL the gate accepts guidellm + bursty, an inference-perf profile: the five-minute"
+    echo "     all-'?' run this check exists to prevent would go ahead."
+    FAIL=1
+fi
+if "$0" inference-perf bursty >/dev/null 2>&1; then
+    : # correct pairing accepted
+else
+    echo "FAIL the gate refuses inference-perf + bursty, which is a correct pairing"
     FAIL=1
 fi
 

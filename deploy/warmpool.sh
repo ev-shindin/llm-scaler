@@ -321,13 +321,25 @@ cmd_create() {
     *) log_error "--type must be 'bridge' or 'retained', got '$POOL_TYPE'" ;;
   esac
   if [ -n "$MAX_HOLD" ]; then
-    # Go's ParseDuration, which is what reads this on the other side. A value it
-    # rejects makes the controller refuse the whole trigger, and the pool then
-    # runs on the fallback config while the ScaledObject says otherwise.
-    case "$MAX_HOLD" in
-      *[0-9]s|*[0-9]m|*[0-9]h|*[0-9]ms) ;;
-      *) log_error "--max-hold must be a Go duration such as 90s, 5m or 1h, got '$MAX_HOLD'" ;;
-    esac
+    # Go's ParseDuration reads this on the other side, and a value it rejects
+    # makes the controller refuse the whole trigger -- the pool then runs on the
+    # fallback config while the ScaledObject says otherwise.
+    #
+    # Anchored, and deliberately NARROWER than ParseDuration. The first form of
+    # this check was a suffix glob (`*[0-9]s`), which accepted `5x5m` --
+    # ParseDuration does not, so it produced exactly the silent fallback the
+    # check exists to prevent -- and also `-5m` and `0s`, which ParseDuration
+    # DOES accept and which are worse: with
+    # `expired := !Retained && now.Sub(borrowedAt) >= MaxHold`, a zero or
+    # negative hold is expired on its first evaluation, so every lend is
+    # reclaimed at once and the pool looks broken rather than misconfigured.
+    # One number, one unit, greater than zero.
+    if ! printf '%s' "$MAX_HOLD" | grep -Eq '^[0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h)$'; then
+      log_error "--max-hold must be one positive number and one unit, such as 90s, 1.5m or 1h, got '$MAX_HOLD'"
+    fi
+    if printf '%s' "$MAX_HOLD" | grep -Eq '^0+(\.0+)?(ns|us|ms|s|m|h)$'; then
+      log_error "--max-hold must be greater than zero: a zero hold reclaims every lent Pod on the first pass, so the pool warms models and never bridges with them"
+    fi
     if [ "$POOL_TYPE" = "retained" ]; then
       # Refused, not ignored. Retention IS the absence of this timeout
       # (`expired := !cfg.Retained && now.Sub(borrowedAt) >= cfg.MaxHold`), so a

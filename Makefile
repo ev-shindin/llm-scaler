@@ -1711,7 +1711,7 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@# are inference-perf ones -- so the DEFAULT pairing is a mismatch. Unchecked
 	@# it costs a standup, a pod and five minutes, and then reports a full table
 	@# of "?" latencies beside real-looking replica counts.
-	@bash hack/check-benchmark-profiles.sh $(BENCHMARK_HARNESS) $(BENCHMARK_WORKLOAD)
+	@BENCHMARK_SCENARIOS_DIR="$(BENCHMARK_SCENARIOS_DIR)" bash hack/check-benchmark-profiles.sh $(BENCHMARK_HARNESS) $(BENCHMARK_WORKLOAD)
 	@if [ "$(BENCHMARK_DIRECT_KEDA)" = "true" ] && [ -f "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD)" ]; then \
 		echo "Injecting external model endpoint for direct-KEDA mode..."; \
 		sed -i.bak 's|base_url: .*|base_url: http://infra-llmdbench-inference-gateway.$(BENCHMARK_NAMESPACE).svc.cluster.local:80|' \
@@ -1872,16 +1872,35 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@#
 	@# results.json is guidellm's own output and is the file postprocess.py reads
 	@# every latency number from, so its absence is exactly "no load ran".
-	@LATEST=$$(ls -td $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_* 2>/dev/null | head -1); \
-	if [ -n "$$LATEST" ] && [ ! -f "$$LATEST/results.json" ]; then \
-		echo ""; \
-		echo "ERROR: the harness produced no results.json, so NO LOAD WAS GENERATED."; \
-		echo "  Every latency number above is '?' for that reason, and the replica"; \
-		echo "  counts describe an idle fleet, not a measured one."; \
-		echo "  The harness pod said:"; \
-		grep -hE "^Error|Field required|Extra inputs|returned with error" "$$LATEST"/logs/*.log 2>/dev/null | sort -u | head -8 | sed 's/^/    /'; \
-		echo "  Full log: $$LATEST/logs/"; \
-		exit 1; \
+	@# `|| true` on the ls: SHELL carries -o pipefail and .SHELLFLAGS is -ec, so a
+	@# glob matching nothing makes ls exit 2, pipefail propagates it, and the
+	@# assignment kills the recipe with a bare `Error 2` -- losing the very
+	@# diagnosis below. $${USER} unset does the same, which is routine in a CI
+	@# container. An empty LATEST is then its own answer, reported not skipped.
+	@#
+	@# guidellm only: results.json is ITS output, and the file postprocess.py
+	@# reads every latency number from. Asserting it for a harness that writes
+	@# no such file would fail every successful run of that harness -- a worse
+	@# error than the one being caught.
+	@if [ "$(BENCHMARK_HARNESS)" = "guidellm" ]; then \
+		LATEST=$$(ls -td $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_* 2>/dev/null | head -1 || true); \
+		if [ -z "$$LATEST" ]; then \
+			echo ""; \
+			echo "ERROR: no results directory was produced, so the harness never ran."; \
+			echo "  Looked for: $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_*"; \
+			echo "  An unset USER cannot match that glob -- set it, or pass BENCHMARK_WORKSPACE."; \
+			exit 1; \
+		fi; \
+		if [ ! -f "$$LATEST/results.json" ]; then \
+			echo ""; \
+			echo "ERROR: the harness produced no results.json, so NO LOAD WAS GENERATED."; \
+			echo "  Every latency number above is '?' for that reason, and the replica"; \
+			echo "  counts describe an idle fleet, not a measured one."; \
+			echo "  The harness pod said:"; \
+			grep -hE "^Error|Field required|Extra inputs|returned with error" "$$LATEST"/logs/*.log 2>/dev/null | sort -u | head -8 | sed 's/^/    /'; \
+			echo "  Full log: $$LATEST/logs/"; \
+			exit 1; \
+		fi; \
 	fi
 
 ## The one benchmark to run after installing: decode-heavy at 10 req/s for five
