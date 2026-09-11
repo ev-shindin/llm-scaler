@@ -104,12 +104,25 @@ silently.
 | Parameter | Default | Example |
 | --- | --- | --- |
 | `WVA_LIMITER_TYPE` | `gpu-inventory` | `quota` |
+| `WVA_QUOTAS` | — (**required** by `quota`) | `'H200=8 A100=4'` |
+| `WVA_QUOTA_SCOPE` | `namespace` | `cluster` |
 | `WVA_POLICY_NS` | `wva-policy` | `platform-policy` |
 | `WVA_LIMITER_TARGETS` | every controller found | `team-a team-b` |
 
 `WVA_LIMITER_TYPE` is not `WVA_LIMITER`. This one writes the **cluster** policy
 every controller reads; `WVA_LIMITER` writes a single install's own policy, which
 that install's owner can then edit.
+
+`WVA_QUOTAS` has no default and `WVA_LIMITER_TYPE=quota` refuses to run without
+one — before it creates the policy namespace or grants anything. A quota entry
+that names no accelerator is not "unlimited": it is a budget of zero for every
+type, and published here it would stop every managed workload on the cluster
+from scaling up. `WVA_QUOTA_SCOPE=namespace` (the default) gives each managed
+namespace that budget; `cluster` caps the sum across all of them.
+
+```bash
+make enable-physical-limiter WVA_LIMITER_TYPE=quota WVA_QUOTAS='H200=8'
+```
 
 ## Next
 

@@ -203,7 +203,17 @@ pl_set_limiter() {
     if [ "$limiter" = "none" ]; then
         updated="$(printf '%s\n' "$current" | yq 'del(.limiters)')"
     else
-        updated="$(printf '%s\n' "$current" | yq ".limiters = [{\"type\": \"${limiter}\"}]")"
+        # Through limiter_entry_yaml, the same builder the installer uses.
+        #
+        # This path wrote `[{"type": "quota"}]` of its own, which the controller
+        # REJECTS ("name must not be empty") -- and a rejected entry costs the
+        # whole `default` policy, so publishing it would have stripped the policy
+        # from every WVA on the cluster and left them all unbounded, under the
+        # banner "The quota limiter is now in force for every WVA on this
+        # cluster." Exactly the claim a safety bound must never make falsely.
+        local limiters_yaml
+        limiters_yaml="$(limiter_entry_yaml "$limiter")" || exit 1
+        updated="$(policy_with_limiters "$current" "$limiters_yaml")"
     fi
     # An entry that is now empty is removed, not written as "{}". A ConfigMap
     # whose default entry is an empty object is a policy that says nothing while
@@ -232,6 +242,11 @@ enable_physical_limiter() {
         gpu-inventory|quota) ;;
         *) log_error "WVA_LIMITER_TYPE must be gpu-inventory or quota (got '$limiter')" ;;
     esac
+    # Validated HERE, before the namespace is created and the grants are made.
+    # pl_set_limiter is the last step of a sequence that has already changed the
+    # cluster, so a budget this rejects must stop the command while it still has
+    # changed nothing. Discards the output: this call is for its refusals.
+    limiter_entry_yaml "$limiter" >/dev/null || exit 1
 
     if ! kubectl auth can-i create clusterrolebindings >/dev/null 2>&1; then
         log_error "This is a cluster-admin action: it publishes policy a tenant cannot edit, and grants the node read that policy then requires. You cannot create ClusterRoleBindings on this cluster."

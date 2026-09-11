@@ -34,17 +34,22 @@ FAIL=0
 # the first function definition, which looks exactly like every function missing.
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-for lib in common.sh infra_wva.sh; do
+for lib in common.sh limiter_policy.sh physical_limiter.sh; do
     tr -d '\r' < "$ROOT/deploy/lib/$lib" > "$WORK/$lib"
 done
 # common.sh logs in colour and dies on an unbound variable under `set -u`.
 BLUE=''; GREEN=''; YELLOW=''; RED=''; NC=''
 # shellcheck disable=SC1090
 . "$WORK/common.sh"
-# infra_wva.sh's header names what it needs; only these reach limiter_entry_yaml.
+# limiter_policy.sh's header names what it needs; only these reach the builders.
 WVA_NS="wva-system"
 # shellcheck disable=SC1090
-. "$WORK/infra_wva.sh"
+. "$WORK/limiter_policy.sh"
+# physical_limiter.sh is sourced only so the cluster-policy case below can call
+# pl_set_limiter's validation sibling. It declares no top-level work.
+WVA_POLICY_NS="wva-policy"
+# shellcheck disable=SC1090
+. "$WORK/physical_limiter.sh"
 
 if ! declare -F limiter_entry_yaml >/dev/null; then
     echo "FAIL limiter_entry_yaml is not defined -- the library did not source"
@@ -222,6 +227,43 @@ else
     [ "$(printf '%s\n' "$merged" | yq '.limiters[0].namespaceQuotas.tenant-a.H200')" = "8" ] \
         || fail "the budget did not survive the merge: $merged"
     ok "the entry merges into the policy, replacing the old limiters and keeping the rest"
+fi
+
+# ---------------------------------------------------------------------------
+# The CLUSTER policy path writes the same list, and used to build its own.
+#
+# `make enable-physical-limiter WVA_LIMITER_TYPE=quota` publishes into the
+# well-known namespace that every WVA on the cluster reads and cannot opt out
+# of. It emitted `[{"type": "quota"}]` -- the entry the controller rejects -- so
+# it would have stripped the policy from every controller at once and left them
+# all unbounded, while printing "The quota limiter is now in force for every WVA
+# on this cluster."
+#
+# Asserted through the SOURCE rather than by running pl_set_limiter, which talks
+# to a cluster. What matters is that it no longer builds a list of its own.
+# ---------------------------------------------------------------------------
+CASE_FAIL_AT="$FAIL"
+PL="$ROOT/deploy/lib/physical_limiter.sh"
+if grep -q 'limiters = \[{' "$PL"; then
+    fail "physical_limiter.sh still builds its own limiters list; the cluster policy can be published in a form every controller rejects"
+elif grep -q 'limiter_entry_yaml' "$PL" && grep -q 'policy_with_limiters' "$PL"; then
+    ok "the cluster policy path builds its list through the same two functions"
+else
+    fail "physical_limiter.sh calls neither limiter_entry_yaml nor policy_with_limiters; it is building the list some third way"
+fi
+
+# And it must refuse a budgetless quota BEFORE it creates the namespace and
+# grants RBAC -- its own writes come last, so a late refusal leaves a
+# half-configured cluster behind.
+CASE_FAIL_AT="$FAIL"
+if declare -F enable_physical_limiter >/dev/null; then
+    body="$(declare -f enable_physical_limiter)"
+    case "$body" in
+        *limiter_entry_yaml*) ok "enable_physical_limiter validates the budget before it changes anything" ;;
+        *) fail "enable_physical_limiter never validates the limiter entry; a rejected WVA_QUOTAS would abort it after the namespace and grants exist" ;;
+    esac
+else
+    fail "enable_physical_limiter is not defined -- physical_limiter.sh did not source"
 fi
 
 # ---------------------------------------------------------------------------

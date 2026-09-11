@@ -155,6 +155,8 @@ source "$DEPLOY_LIB_DIR/prereqs.sh"
 source "$DEPLOY_LIB_DIR/infra_scaler_backend.sh"
 # shellcheck source=lib/scaler_runtime.sh
 source "$DEPLOY_LIB_DIR/scaler_runtime.sh"
+# shellcheck source=lib/limiter_policy.sh
+source "$DEPLOY_LIB_DIR/limiter_policy.sh"
 # shellcheck source=lib/infra_wva.sh
 source "$DEPLOY_LIB_DIR/infra_wva.sh"
 # shellcheck source=lib/infra_epp.sh
