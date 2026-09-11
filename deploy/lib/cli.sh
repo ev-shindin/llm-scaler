@@ -61,7 +61,10 @@ Environment Variables:
                                unlimited, it is zero for every accelerator, and the fleet freezes.
                                The TYPE is the name WVA resolves, which it logs per variant.
   WVA_QUOTA_SCOPE              namespace (default) | cluster. namespace caps each managed namespace
-                               separately; cluster caps the sum across all of them.
+                               separately; cluster caps the sum across all of them -- but only
+                               within ONE controller's policy. Published to several controllers
+                               (make enable-physical-limiter), each enforces the cap on its own,
+                               so N controllers permit N x the number.
   ENABLE_SCALE_TO_ZERO         Allow parking idle models at 0 replicas (default: true)
   WVA_DEFAULT_SO               Create default ScaledObjects for what is already running:
                                false (default) | plan (print and stop) | edit (plan, \$EDITOR, apply) | true (apply all)

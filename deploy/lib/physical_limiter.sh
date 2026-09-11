@@ -44,8 +44,22 @@ pl_controller_namespaces() {
         printf '%s\n' $WVA_LIMITER_TARGETS
         return
     fi
-    kubectl get deploy -A -l app.kubernetes.io/name=workload-variant-autoscaler \
-        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u
+    # A FAILED listing is not an empty cluster, and folding the two together is
+    # how this command came to announce "the limiter is now in force for every
+    # WVA on this cluster" having reached none of them: `2>/dev/null` turned a
+    # denied or erroring `get deploy -A` into no output, the caller warned "No
+    # WVA controller found", published to the well-known namespace only, and
+    # every admin-owned controller went on reading its own unbounded ConfigMap.
+    #
+    # Measured: a controller in tenant-a, its policy still `limiters: []`, under
+    # a SUCCESS banner claiming the opposite.
+    local out
+    if ! out="$(kubectl get deploy -A -l app.kubernetes.io/name=workload-variant-autoscaler \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}')"; then
+        log_error "could not list WVA controllers on this cluster, so this command cannot know which ones it would leave unable to honour the policy. Refusing to publish a bound it cannot deliver.
+    Grant the listing, or name the targets explicitly with WVA_LIMITER_TARGETS='ns-a ns-b'."
+    fi
+    printf '%s' "$out" | sort -u
 }
 
 # pl_policy_cm_ns echoes the namespace whose ConfigMap the controller in $1
@@ -191,10 +205,28 @@ EOF
 # It REPLACES rather than appends: two limiter kinds in one list is not a chain,
 # a quota entry wins over a gpu-inventory one, and the loser is built as nothing.
 pl_set_limiter() {
-    local policy_ns="$1" limiter="$2" current updated
-    current="$(kubectl get configmap wva-scaling-policy-config -n "$policy_ns" \
-        -o jsonpath='{.data.default}' 2>/dev/null || true)"
-    if [ -z "$current" ]; then
+    local policy_ns="$1" limiter="$2" current updated exists=0
+    # ABSENT and FAILED are different answers, and folding them together
+    # overwrote a live policy. `... 2>/dev/null || true` turned any non-zero exit
+    # -- a transient API error, throttling, a partially privileged token -- into
+    # an empty string, which fell through to `limiters: []` and REPLACED a policy
+    # the platform team had tuned, with exit 0 and "the limiter is now in force
+    # for every WVA on this cluster". Measured: scaleUpThreshold, scaleDownBoundary,
+    # kvCacheThreshold and enableRescale all gone.
+    #
+    # So ask whether the ConfigMap exists FIRST, and treat a failure to answer as
+    # a reason to stop rather than a reason to write.
+    if kubectl get configmap wva-scaling-policy-config -n "$policy_ns" >/dev/null 2>&1; then
+        exists=1
+        current="$(kubectl get configmap wva-scaling-policy-config -n "$policy_ns" \
+            -o jsonpath='{.data.default}')" || log_error "could not read the existing policy in $policy_ns. Refusing to overwrite a policy this command cannot see."
+    elif ! kubectl get namespace "$policy_ns" >/dev/null 2>&1 \
+         && ! kubectl create namespace "$policy_ns" --dry-run=client -o name >/dev/null 2>&1; then
+        # Cannot see the ConfigMap AND cannot reach the API for the namespace:
+        # the cluster is not answering, which is not the same as "no policy yet".
+        log_error "cannot determine whether a policy ConfigMap exists in $policy_ns. Refusing to guess."
+    fi
+    if [ -z "${current:-}" ]; then
         # A policy ConfigMap that carries ONLY limiters is complete and correct:
         # every other threshold has a default in the controller, and a partial
         # entry does not blank them.
@@ -235,6 +267,25 @@ pl_set_limiter() {
     # find out which.
     if [ "$limiter" = "none" ] && [ "$(printf '%s' "$updated" | tr -d '[:space:]')" = "{}" ]; then
         kubectl delete configmap wva-scaling-policy-config -n "$policy_ns" --ignore-not-found >/dev/null 2>&1
+        return 0
+    fi
+    # PATCH an existing ConfigMap; only CREATE a missing one.
+    #
+    # The create|apply pipeline below renders a manifest containing ONLY
+    # data.default, and `kubectl apply`'s three-way merge deletes every key that
+    # is in last-applied-configuration and not in the new manifest. Measured
+    # against a real apiserver: a ConfigMap carrying a per-model override entry
+    # beside `default` -- the shape config/base/manager/scaling-policy-configmap.yaml
+    # documents -- came back with the override GONE, exit 0, "the limiter is now
+    # in force for every WVA on this cluster". It only bites when the ConfigMap
+    # was last managed by `kubectl apply -f` with those keys present, which is
+    # the declarative shape and how the installer itself places it.
+    #
+    # A merge patch names one key and leaves the rest alone, which is what the
+    # installer's own path has always done.
+    if [ "$exists" -eq 1 ]; then
+        kubectl patch configmap wva-scaling-policy-config -n "$policy_ns" --type=merge \
+            -p "$(jq -n --arg d "$updated" '{data:{"default":$d}}')" >/dev/null
         return 0
     fi
     kubectl create configmap wva-scaling-policy-config -n "$policy_ns" \

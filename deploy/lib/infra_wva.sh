@@ -553,7 +553,32 @@ wva_reconcile_prometheus_scheme() {
     # Patches the "default" entry rather than shipping a second copy of it: the
     # entry carries every other default too, and a duplicate would drift.
     case "${WVA_LIMITER:-none}" in
-        none) ;;
+        none)
+            # `none` means UNBOUNDED -- cli.sh says so in as many words -- and a
+            # bare `;;` did not deliver it. Re-running the installer over a
+            # deployment that had declared a limiter left that limiter in force
+            # and printed NOTHING, and `none` is the DEFAULT, so an ordinary
+            # re-install hit it. The operator's belief and the cluster's state
+            # then differ in the dangerous direction on the next read of the
+            # docs rather than the first.
+            #
+            # Only ever REMOVES, and only says so when there was something to
+            # remove: a fresh install must not narrate the absence of a limiter
+            # nobody asked for.
+            local none_cm none_current none_updated
+            none_cm="$(kubectl get configmap -n "$WVA_NS" -o name 2>/dev/null \
+                | grep -E "configmap/(wva-)?scaling-policy-config$" | head -1 | cut -d/ -f2 || true)"
+            if [ -n "$none_cm" ]; then
+                none_current="$(kubectl get configmap "$none_cm" -n "$WVA_NS" -o jsonpath='{.data.default}' 2>/dev/null || true)"
+                if printf '%s' "$none_current" | grep -qE '^limiters:'; then
+                    log_warning "WVA_LIMITER=none: removing the limiter this deployment had declared. Scaling here becomes UNBOUNDED."
+                    none_updated="$(printf '%s\n' "$none_current" | yq 'del(.limiters)')" || \
+                        log_error "could not remove the limiters entry from ${WVA_NS}/${none_cm}"
+                    kubectl patch configmap "$none_cm" -n "$WVA_NS" --type=merge \
+                        -p "$(jq -n --arg d "$none_updated" '{data:{"default":$d}}')" >/dev/null
+                fi
+            fi
+            ;;
         gpu-inventory|quota)
             log_info "Declaring the ${WVA_LIMITER} limiter in the scaling-policy ConfigMap ..."
             local policy_cm current_default updated_default
@@ -566,7 +591,7 @@ wva_reconcile_prometheus_scheme() {
             policy_cm="$(kubectl get configmap -n "$WVA_NS" -o name 2>/dev/null \
                 | grep -E "configmap/(wva-)?scaling-policy-config$" | head -1 | cut -d/ -f2 || true)"
             if [ -z "$policy_cm" ]; then
-                log_error "No scaling-policy ConfigMap found in $policy_ns"
+                log_error "No scaling-policy ConfigMap found in $WVA_NS"
             fi
             current_default=$(kubectl get configmap "$policy_cm" -n "$WVA_NS" -o jsonpath='{.data.default}')
             if [ -z "$current_default" ]; then
@@ -595,6 +620,37 @@ wva_reconcile_prometheus_scheme() {
             # workload whose accelerator cannot be resolved gets no budget and stops
             # scaling up — silently. Say so at install, and say how to check, because
             # the symptom (a workload that simply never grows) looks like anything.
+            # THE QUOTA PATH'S OWN HAZARD, and the installer knew the answer
+            # three lines below without ever comparing. A budget is keyed by
+            # accelerator NAME, and a name matching no node is not an error
+            # anywhere: the entry validates, the controller accepts it, the
+            # "GPU limiter constructed" line prints -- and every accelerator the
+            # cluster actually has is absent from the map, which
+            # QuotaForNamespace reads as zero. Measured: `WVA_QUOTAS='H20=8'` on
+            # a cluster of H200s and A100s installs clean and stops all scaling.
+            if [ "$WVA_LIMITER" = "quota" ] && [ -n "${WVA_QUOTAS:-}" ]; then
+                local node_products unmatched=""
+                node_products="$(kubectl get nodes -o jsonpath='{.items[*].metadata.labels.nvidia\.com/gpu\.product}' 2>/dev/null | tr ' ' '\n' | grep -v '^$' | sort -u || true)"
+                if [ -n "$node_products" ]; then
+                    local q_pair q_name
+                    for q_pair in $(printf '%s' "$WVA_QUOTAS" | tr ',' ' '); do
+                        q_name="${q_pair%%=*}"
+                        [ -n "$q_name" ] || continue
+                        # Substring, not equality: node labels are long
+                        # ('NVIDIA-H100-80GB-HBM3') and WVA resolves a short name
+                        # out of them, so an exact match would warn on every
+                        # correct install.
+                        printf '%s\n' "$node_products" | grep -qi -- "$q_name" || unmatched="$unmatched $q_name"
+                    done
+                fi
+                if [ -n "$unmatched" ]; then
+                    log_warning "WVA_QUOTAS names accelerators this cluster does not advertise:${unmatched}"
+                    log_warning "  A budget keyed on a name nothing matches is not an error anywhere -- the entry is valid, the controller accepts it, and every accelerator you DO have is then unlisted, which the quota limiter reads as a budget of ZERO. Every managed workload stops scaling up."
+                    log_warning "  This cluster advertises:"
+                    printf '%s\n' "$node_products" | sed 's/^/      /' >&2
+                    log_warning "  WVA resolves a SHORT name from these; check what it logged: kubectl logs -n ${WVA_NS} deploy/wva-controller-manager | grep accelerator"
+                fi
+            fi
             if [ "$WVA_LIMITER" = "gpu-inventory" ]; then
                 local gpu_products
                 # Space-separated on one line, then split — a {"\n"} inside the

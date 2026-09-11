@@ -411,10 +411,23 @@ cat > "$STUB/kubectl" <<'STUBEOF'
 # namespace -- and recording it raw left a zero-byte file, which `[ -s ]` reads
 # as "nothing was written". The assertion was blind to precisely the catastrophe
 # it exists to catch.
+# BOTH write shapes. pl_set_limiter creates a missing ConfigMap with
+# --from-literal and PATCHES an existing one -- it has to, because the
+# create|apply pipeline's manifest carries only data.default and apply's
+# three-way merge then deletes every other key in it. A stub that knew only the
+# create form reported the patch path as writing nothing.
+prev=""
 for a in "$@"; do
   case "$a" in
     --from-literal=default=*) printf 'WROTE[%s]\n' "${a#--from-literal=default=}" >> "$KWROTE" ;;
+    -p) : ;;
+    *) if [ "$prev" = "-p" ]; then
+         # {"data":{"default":"<policy>"}} -- unwrap to the same sentinel the
+         # create form produces, so the assertions do not care which was used.
+         printf 'WROTE[%s]\n' "$(printf '%s' "$a" | jq -r '.data.default // ""' 2>/dev/null)" >> "$KWROTE"
+       fi ;;
   esac
+  prev="$a"
 done
 # Every invocation too, so a case can tell "composed a document" from "delivered
 # it": dropping the `| kubectl apply -f -` off the end of the pipeline leaves a
@@ -466,8 +479,11 @@ else
     # DELIVERY, not just composition. Dropping the `| kubectl apply -f -` from
     # the end of the pipeline leaves a function that builds the right ConfigMap
     # and ships it nowhere, and asserting only on the built document passed it.
-    elif ! printf '%s' "$calls" | grep -q 'CALL\[apply'; then
-        fail "pl_set_limiter composed a ConfigMap and never applied it; the policy would never reach the cluster. Calls seen: $calls"
+    # apply OR patch: an existing ConfigMap is PATCHED (the create|apply
+    # pipeline's manifest carries only data.default, and apply's three-way merge
+    # then deletes every other key), a missing one is created and applied.
+    elif ! printf '%s' "$calls" | grep -qE 'CALL\[(apply|patch)'; then
+        fail "pl_set_limiter composed a ConfigMap and never delivered it; the policy would never reach the cluster. Calls seen: $calls"
     elif ! printf '%s' "$calls" | grep -q 'wva-scaling-policy-config'; then
         fail "pl_set_limiter did not name the wva-scaling-policy-config ConfigMap: $calls"
     elif ! printf '%s' "$calls" | grep -q 'wva-policy'; then
@@ -523,6 +539,30 @@ else
         fail "the cluster policy carries no namespace key at all: $wrote"
     else
         ok "the cluster-policy call site keys the budget on the reserved \`default\`"
+    fi
+
+    # AN EXISTING ConfigMap must be PATCHED, never re-applied from a manifest
+    # that carries only data.default.
+    #
+    # Measured against a real apiserver: the create|apply pipeline renders a
+    # manifest with one key, and apply's three-way merge deletes every key that
+    # was in last-applied-configuration and is not in the new manifest -- so a
+    # ConfigMap carrying a per-model override entry beside `default` came back
+    # with the override GONE, exit 0, "the limiter is now in force for every WVA
+    # on this cluster". Those override entries are the shape
+    # config/base/manager/scaling-policy-configmap.yaml documents.
+    #
+    # The stub cannot model apply's merge, so what is asserted is the CHOICE:
+    # an existing ConfigMap is patched by name, not re-created.
+    case_begin
+    run_pl 'H200=8'
+    calls="$(cat "$CALLS")"
+    if printf '%s' "$calls" | grep -q 'CALL\[create configmap'; then
+        fail "pl_set_limiter re-CREATED an existing ConfigMap; kubectl apply then deletes every other data key in it, and the per-model override entries beside \`default\` are lost. Calls: $calls"
+    elif ! printf '%s' "$calls" | grep -q 'CALL\[patch configmap'; then
+        fail "pl_set_limiter neither patched nor created: $calls"
+    else
+        ok "an existing policy ConfigMap is patched by key, so its other entries survive"
     fi
 
     # A FRESH cluster: no policy ConfigMap yet, which is the first thing
@@ -631,7 +671,7 @@ fi
 # and the check still prints OK -- and the ok() suppression means the count of
 # ok lines is not comparable against a known-good run either.
 case_begin
-CASES_EXPECTED=38
+CASES_EXPECTED=39
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

@@ -41,6 +41,12 @@ limiter_entry_yaml() {
     local ltype="$1" ns_key="${2:-}"
 
     if [ "$ltype" = "gpu-inventory" ] || [ "$ltype" = "inventory" ]; then
+        # A budget handed to the PHYSICAL limiter is discarded, so say so rather
+        # than drop it: the operator typed caps and got an entry carrying none,
+        # with nothing anywhere reporting the difference.
+        if [ -n "${WVA_QUOTAS:-}" ]; then
+            log_warning "WVA_QUOTAS is set, but the ${ltype} limiter takes no budget -- it bounds by the GPUs that physically exist. The caps you passed ('${WVA_QUOTAS}') are being IGNORED. Pass WVA_LIMITER=quota to declare them instead."
+        fi
         # Physical capacity comes from the GPU operator, so there is nothing to
         # declare. A name is allowed but unused — NewLimiterFromConfig names the
         # inventory limiter itself — and quota fields are REJECTED on this type.
@@ -56,6 +62,15 @@ limiter_entry_yaml() {
         namespace|cluster) ;;
         *) log_error "WVA_QUOTA_SCOPE must be 'namespace' or 'cluster', got '$scope'" ;;
     esac
+    # WVA_SCOPE is validated HERE, not only inside the namespace branch below.
+    # Reached with WVA_QUOTA_SCOPE=cluster, the namespace branch never runs, so
+    # `WVA_SCOPE=bogus` printed its refusal -- from the subshell -- and the entry
+    # was emitted anyway, exit 0, "Scaling is now bounded". Latent in the real
+    # installer, which dies earlier on the overlay, but an input this function
+    # reads is an input this function checks.
+    if [ -n "${WVA_SCOPE:-}" ] && declare -F wva_install_scope >/dev/null; then
+        wva_install_scope >/dev/null || exit 1
+    fi
 
     if [ -z "${WVA_QUOTAS:-}" ]; then
         log_error "WVA_LIMITER=quota needs WVA_QUOTAS, a per-accelerator budget: WVA_QUOTAS='H200=8 A100=4'.
@@ -134,6 +149,13 @@ $types" in
                 [ "$reset_glob" = 1 ] && set +f
                 log_error "WVA_QUOTAS names '$name' twice. One budget per accelerator type; two would emit a duplicate YAML key and the controller would reject the entire policy." ;;
         esac
+        # An EXPLICIT zero is accepted -- an operator may mean "this type is
+        # denied here" -- but it is said out loud. The IMPLICIT empty map gets a
+        # five-line refusal for exactly the same outcome, and treating the two
+        # differently in silence is how `H200=0` came to read as a budget.
+        if [ "$value" = "0" ]; then
+            log_warning "WVA_QUOTAS gives '$name' a budget of 0, which DENIES it: any workload on '$name' will not scale up. Use -1 for no cap."
+        fi
         types="${types}    ${name}: ${value}
 "
         pairs_seen=$((pairs_seen + 1))
