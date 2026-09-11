@@ -9,7 +9,24 @@ to be true first.
 
 ```bash
 make deploy-wva-on-k8s WVA_LIMITER=gpu-inventory   # bound by GPUs actually free
-make deploy-wva-on-k8s WVA_LIMITER=quota           # bound by declared caps
+make deploy-wva-on-k8s WVA_LIMITER=quota WVA_QUOTAS='H200=8 A100=4'   # bound by declared caps
+```
+
+`WVA_QUOTAS` is **required** by the quota limiter and has no default: a quota
+entry that names no accelerator is not "unlimited", it is a budget of zero for
+every type, and every managed workload stops scaling up. Use `-1` for no cap on
+a type (`H100=-1`). The type is the name WVA resolves, which it logs per variant
+(`"accelerator": "H200"`). `WVA_QUOTA_SCOPE` is `namespace` (the default: each
+managed namespace gets this budget) or `cluster` (one budget across all of them).
+
+The install prints the entry it wrote and the command that confirms the
+controller accepted it. Run that command. A malformed entry is rejected on read
+and the rejection costs the **whole** `default` policy — thresholds included —
+leaving no limiter at all, at ERROR in the controller log and nowhere else:
+
+```
+INFO  GPU limiter constructed  {"type": "quota", "name": "install-quota"}   # bounded
+INFO  GPU limiter constructed  {"type": "none", "name": "no-limiter"}       # NOT bounded
 ```
 
 or later, by adding a `limiters:` entry to the `default` entry of the
