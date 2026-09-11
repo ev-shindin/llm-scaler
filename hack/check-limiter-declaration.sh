@@ -17,13 +17,18 @@
 # `bash -n` sees nothing wrong; neither does a cluster run, which reports a
 # healthy controller and a fleet that scales.
 #
-# The rules asserted below are QuotaLimiterEntries.Validate() and
-# validateLimiters() in internal/config. They are mirrored here rather than
-# invoked, so keep_in_sync_with() reads the Go source and fails when a NEW
-# required field appears -- a mirror nobody notices going stale is how this
-# class of bug returns.
+# The rules asserted below mirror QuotaLimiterEntries.Validate() and
+# validateLimiters() in internal/config. A mirror nobody notices going stale is
+# how this class of bug returns, so two cases read the Go back: the constants
+# limiter_entry_yaml hardcodes (MaxQuotaValue, QuotaUnlimited), and whether
+# validateLimiters singles out the name we emit. Neither covers a NEW rejection
+# rule -- read Validate() when you touch it.
 #
-# kubectl is never called: limiter_entry_yaml is pure.
+# limiter_entry_yaml and policy_with_limiters are pure and are called directly.
+# pl_set_limiter is not: it writes to a cluster, so it runs against a STUBBED
+# kubectl, and what is asserted is what it would have written. That case exists
+# because two earlier versions of it asserted on the source instead, and an
+# audit walked past both.
 
 set -u
 
@@ -42,7 +47,12 @@ done
 BLUE=''; GREEN=''; YELLOW=''; RED=''; NC=''
 # shellcheck disable=SC1090
 . "$WORK/common.sh"
-# limiter_policy.sh's header names what it needs; only these reach the builders.
+# EVERY variable the builders read, pinned -- not just the ones the cases set.
+# WVA_QUOTA_SCOPE is a documented install variable an admin plausibly has
+# exported, and with `WVA_QUOTA_SCOPE=cluster` in the environment this check
+# produced six FAILs all blaming the code. A check that depends on the caller's
+# shell reports on the shell.
+unset WVA_QUOTAS WVA_QUOTA_SCOPE WVA_SCOPE WVA_WATCH_NS WVA_LIMITER WVA_LIMITER_TYPE
 WVA_NS="wva-system"
 # shellcheck disable=SC1090
 . "$WORK/limiter_policy.sh"
@@ -58,7 +68,16 @@ if ! declare -F limiter_entry_yaml >/dev/null; then
 fi
 
 CASES=0
-fail() { echo "FAIL $*"; FAIL=$((FAIL + 1)); CASES=$((CASES + 1)); }
+# One count per CASE, not per assertion. A case with several assertions can fail
+# several times, and counting each inflated the total -- so a genuine failure
+# also produced "FAIL 30 cases ran, not 24. A case was added or removed", which
+# is a second verdict, untrue, and pointing at the wrong thing. Only the FIRST
+# failure of a case counts; the rest are more evidence about the same case.
+fail() {
+    echo "FAIL $*"
+    [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] && CASES=$((CASES + 1))
+    FAIL=$((FAIL + 1))
+}
 # A case ends in one summarising ok, but its assertions are separate statements,
 # so a failed one does not stop the ok from printing after it. Suppress it when
 # anything failed since this case began -- an `ok` under four FAILs describing the
@@ -199,6 +218,23 @@ refuse_quota 'H200=16Gi'    'whole number of GPUs'
 refuse_quota 'H200=12.5'    'whole number of GPUs'
 refuse_quota 'H200=-4'      'whole number of GPUs'
 refuse_quota 'H200=1048577' 'maximum quota'
+# All digits, so the numeric case lets it past; `[ -gt ]` on 20 digits then
+# errors with "integer expression expected", which is not fatal inside an `if`,
+# and the entry was emitted for go-yaml to refuse -- taking the whole policy.
+refuse_quota 'H200=99999999999999999999' 'far above the maximum'
+# Also all digits. YAML reads a leading zero as OCTAL: 010 becomes 8, so the
+# operator asks for ten GPUs and silently gets eight.
+refuse_quota 'H200=010'      'leading zero'
+# Two budgets for one type emit a duplicate YAML key; the controller refuses the
+# document and discards the entire policy.
+refuse_quota 'H200=8 H200=4' 'twice'
+# Non-empty, but naming NOTHING. The loop runs no iterations, so the entry came
+# out with an empty accelerator map: structurally valid, accepted by
+# validateLimiters, and read as a budget of ZERO for every type -- which stops
+# every managed workload from scaling up. The check for an EMPTY WVA_QUOTAS did
+# not see these, because they are not empty.
+refuse_quota '   '           'names no accelerator'
+refuse_quota ','             'names no accelerator'
 
 # A glob in WVA_QUOTAS must not be expanded against the working directory. It
 # was: with `for pair in $pairs` unguarded, WVA_QUOTAS='*' in a directory of
@@ -278,37 +314,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# The CLUSTER policy path writes the same list, and used to build its own.
+# The CLUSTER policy path, EXECUTED.
 #
 # `make enable-physical-limiter WVA_LIMITER_TYPE=quota` publishes into the
-# well-known namespace that every WVA on the cluster reads and cannot opt out
-# of. It emitted `[{"type": "quota"}]` -- the entry the controller rejects -- so
-# it would have stripped the policy from every controller at once and left them
-# all unbounded, while printing "The quota limiter is now in force for every WVA
-# on this cluster."
+# well-known namespace every WVA on the cluster reads and cannot opt out of. It
+# built `[{"type": "quota"}]` of its own -- the entry the controller rejects --
+# which would have stripped the policy from every controller at once while
+# printing "The quota limiter is now in force for every WVA on this cluster."
 #
-# Asserted through the SOURCE rather than by running pl_set_limiter, which talks
-# to a cluster. What matters is that it no longer builds a list of its own.
+# RUN, not pattern-matched. Two successive versions of this case asserted on the
+# source instead, and an audit walked past both: the first grepped the FILE for
+# two function names that also appear in its comments, and the second, reading
+# `declare -f`, was satisfied by `.limiters |= [...]` (the glob wanted `=[`) and
+# by the function NAME inside an unrelated log string. Pattern-matching source is
+# not a test of behaviour. kubectl is stubbed, so what is asserted is what this
+# function would WRITE.
 # ---------------------------------------------------------------------------
 CASE_FAIL_AT="$FAIL"
-# `declare -f`, not grep on the file. bash strips comments from a function body,
-# and the file carries BOTH function names in prose -- so a file-level grep for
-# them was satisfied by the comment explaining why they are used, and the whole
-# case passed against a pl_set_limiter that had gone back to building
-# `.limiters=[{"type":"quota"}]` inline. Mutation-tested: that reintroduction
-# printed `ok` and the check exited 0.
+STUB="$WORK/stub"; mkdir -p "$STUB"
+# Records every write and answers reads with whatever CURRENT_POLICY holds.
+cat > "$STUB/kubectl" <<'STUBEOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    --from-literal=default=*) printf '%s' "${a#--from-literal=default=}" > "$KWROTE" ;;
+  esac
+done
+case "$1" in
+  get) printf '%s' "${CURRENT_POLICY:-}" ;;
+  *) : ;;
+esac
+exit 0
+STUBEOF
+chmod +x "$STUB/kubectl"
+
+# run_pl <WVA_QUOTAS> -- pl_set_limiter in a SUBSHELL (its refusals exit), with
+# the stub first on PATH. Leaves the written policy in $WROTE and status in $PLRC.
+run_pl() {
+    WROTE="$WORK/wrote"; : > "$WROTE"
+    (
+        PATH="$STUB:$PATH"; export PATH
+        KWROTE="$WROTE"; export KWROTE
+        CURRENT_POLICY="scaleUpThreshold: 0.85"; export CURRENT_POLICY
+        WVA_QUOTAS="$1" WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a \
+            pl_set_limiter wva-policy quota
+    ) >/dev/null 2>"$WORK/plerr"
+    PLRC=$?
+}
+
 if ! declare -F pl_set_limiter >/dev/null; then
     fail "pl_set_limiter is not defined -- physical_limiter.sh did not source"
 else
-    pl_body="$(declare -f pl_set_limiter)"
-    case "$pl_body" in
-        *".limiters"*"=["*|*"limiters = ["*)
-            fail "pl_set_limiter still builds a limiters list inline; the cluster policy can be published in a form every controller rejects" ;;
-        *limiter_entry_yaml*policy_with_limiters*)
-            ok "the cluster policy path builds its list through the same two functions" ;;
-        *)
-            fail "pl_set_limiter calls neither limiter_entry_yaml nor policy_with_limiters; it is building the list some third way" ;;
-    esac
+    run_pl 'H200=8'
+    wrote="$(cat "$WROTE")"
+    if [ "$PLRC" -ne 0 ]; then
+        fail "pl_set_limiter refused a VALID budget: $(tail -1 "$WORK/plerr")"
+    elif ! printf '%s' "$wrote" | grep -q 'install-quota'; then
+        fail "pl_set_limiter wrote a policy with no named limiter entry, which the controller rejects: $wrote"
+    elif ! printf '%s' "$wrote" | grep -q 'scaleUpThreshold'; then
+        fail "pl_set_limiter dropped the rest of the policy while declaring the limiter: $wrote"
+    else
+        ok "pl_set_limiter writes a named entry and keeps the rest of the policy"
+    fi
+
+    # THE ONE THAT MATTERS. A budget the builder refuses must leave the policy
+    # ALONE. Removing the status check here wrote an EMPTY data.default to every
+    # target namespace and returned 0, and the command then announced the limiter
+    # in force -- which is what the two source-pattern versions of this case
+    # failed to catch.
+    CASE_FAIL_AT="$FAIL"
+    run_pl 'H200=12abc'
+    wrote="$(cat "$WROTE")"
+    if [ "$PLRC" -eq 0 ]; then
+        fail "pl_set_limiter returned 0 on a budget the builder refuses; enable_physical_limiter would go on to announce a limiter it did not write"
+    elif [ -s "$WROTE" ] && ! printf '%s' "$wrote" | grep -q 'scaleUpThreshold'; then
+        fail "pl_set_limiter wrote a policy anyway, and it is not the one it started from: [$wrote]"
+    elif [ -s "$WROTE" ]; then
+        fail "pl_set_limiter wrote to the ConfigMap despite refusing the budget"
+    else
+        ok "a refused budget leaves the cluster policy untouched, and stops the command"
+    fi
 fi
 
 # And it must refuse a budgetless quota BEFORE it creates the namespace and
@@ -322,7 +407,13 @@ fi
 CASE_FAIL_AT="$FAIL"
 if declare -F enable_physical_limiter >/dev/null; then
     body="$(declare -f enable_physical_limiter)"
-    validate_at="$(printf '%s\n' "$body" | grep -n 'limiter_entry_yaml' | head -1 | cut -d: -f1)"
+    # The CALL, not the name. Matching the name ANYWHERE was satisfied by putting
+    # it in a log string near the top while the real call moved to the last line
+    # -- mutation-tested, that printed ok. A call is the first word of a command,
+    # so anchor on that.
+    validate_at="$(printf '%s\n' "$body" \
+        | grep -nE '^[[:space:]]*(limiter_entry_yaml|policy_declared_limiters)[[:space:]]' \
+        | head -1 | cut -d: -f1)"
     # Anything that touches the cluster. kubectl is the only way this function
     # writes, so the first kubectl line is the point of no return.
     first_write="$(printf '%s\n' "$body" | grep -nE 'kubectl|pl_grant_|pl_set_limiter' | head -1 | cut -d: -f1)"
@@ -391,7 +482,7 @@ fi
 # and the check still prints OK -- and the ok() suppression means the count of
 # ok lines is not comparable against a known-good run either.
 CASE_FAIL_AT="$FAIL"
-CASES_EXPECTED=24
+CASES_EXPECTED=30
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

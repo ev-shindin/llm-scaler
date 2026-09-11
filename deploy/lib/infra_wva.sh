@@ -556,18 +556,10 @@ wva_reconcile_prometheus_scheme() {
         none) ;;
         gpu-inventory|quota)
             log_info "Declaring the ${WVA_LIMITER} limiter in the scaling-policy ConfigMap ..."
-            local policy_cm current_default updated_default limiters_yaml
-            # Built and validated BEFORE anything is read or patched, so a rejected
-            # WVA_QUOTAS stops the install rather than leaving a half-edited policy.
-            #
-            # `|| exit 1` is load-bearing: limiter_entry_yaml reports via log_error,
-            # and log_error's `exit 1` inside a command substitution kills only the
-            # SUBSHELL. Without this the caller would continue with an empty string
-            # and patch `limiters: null` over the policy.
-            limiters_yaml="$(limiter_entry_yaml "$WVA_LIMITER")" || exit 1
-            if [ -z "$limiters_yaml" ]; then
-                log_error "limiter_entry_yaml produced nothing for WVA_LIMITER=${WVA_LIMITER}"
-            fi
+            local policy_cm current_default updated_default
+            # The budget is validated in the PREREQS phase, before any of this
+            # ran -- see check_permissions. This is the second line of defence,
+            # for a caller that reached here another way.
             # `|| true` because a no-match is grep exit 1, which pipefail turns into
             # a failed assignment and set -e turns into an exit — before the
             # log_error below can say which ConfigMap is missing.
@@ -583,7 +575,11 @@ wva_reconcile_prometheus_scheme() {
             # Idempotent, and it REPLACES rather than appends: re-running with a
             # different WVA_LIMITER must not leave both declared, since a quota
             # entry would then win over the gpu-inventory one by mode precedence.
-            updated_default=$(policy_with_limiters "$current_default" "$limiters_yaml") || exit 1
+            # One call, no status for a caller to forget: policy_declared_limiters
+            # composes in THIS shell, so a refusal ends the install rather than
+            # handing back an empty string to patch over the policy.
+            policy_declared_limiters "$WVA_LIMITER" "$current_default"
+            updated_default="$POLICY_DECLARED"
             kubectl patch configmap "$policy_cm" -n "$WVA_NS" --type=merge \
                 -p "$(jq -n --arg d "$updated_default" '{data:{"default":$d}}')"
             log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm}):"

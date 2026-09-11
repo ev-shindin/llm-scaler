@@ -455,15 +455,25 @@ check_refusal() {
   esac
 }
 check_refusal "--type must be" --type nonsense
-check_refusal "--max-hold must be one positive number and one unit" --max-hold garbage
+check_refusal "number+unit pairs" --max-hold garbage
 # ParseDuration ACCEPTS these two, which is what makes them dangerous: a zero or
 # negative hold expires on its first evaluation, so every lend is reclaimed at
 # once and the pool reads as broken rather than misconfigured.
 check_refusal "greater than zero" --max-hold 0s
-check_refusal "one positive number and one unit" --max-hold -5m
+check_refusal "number+unit pairs" --max-hold -5m
 # ParseDuration REJECTS this one; the suffix glob that stood here accepted it,
 # producing the silent fallback the check was added to prevent.
-check_refusal "one positive number and one unit" --max-hold 5x5m
+check_refusal "number+unit pairs" --max-hold 5x5m
+
+# ACCEPTED, and it has to be: `1h30m` is a perfectly good ParseDuration value,
+# and the first anchored form of the guard refused it -- trading a silent
+# misconfiguration for a loud refusal of a correct one.
+COMPOUND="$(render --type bridge --max-hold 1h30m)"
+if [ "$(TRIGGER_GET "$COMPOUND" warmPoolMaxHold)" = "1h30m" ]; then
+  ok "a compound Go duration (1h30m) is accepted and reaches the trigger"
+else
+  fail "--max-hold 1h30m was refused or mangled; ParseDuration accepts it"
+fi
 check_refusal "meaningless with --type retained" --type retained --max-hold 5m
 
 if [ "$FAILED" -eq 0 ]; then

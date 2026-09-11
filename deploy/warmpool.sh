@@ -333,11 +333,17 @@ cmd_create() {
     # `expired := !Retained && now.Sub(borrowedAt) >= MaxHold`, a zero or
     # negative hold is expired on its first evaluation, so every lend is
     # reclaimed at once and the pool looks broken rather than misconfigured.
-    # One number, one unit, greater than zero.
-    if ! printf '%s' "$MAX_HOLD" | grep -Eq '^[0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h)$'; then
-      log_error "--max-hold must be one positive number and one unit, such as 90s, 1.5m or 1h, got '$MAX_HOLD'"
+    # One or more number+unit pairs, all positive. `1h30m` is a perfectly good
+    # ParseDuration value and the first anchored form of this check refused it,
+    # which traded a silent misconfiguration for a loud refusal of a correct one.
+    if ! printf '%s' "$MAX_HOLD" | grep -Eq '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$'; then
+      log_error "--max-hold must be positive number+unit pairs, such as 90s, 1.5m, 1h or 1h30m, got '$MAX_HOLD'"
     fi
-    if printf '%s' "$MAX_HOLD" | grep -Eq '^0+(\.0+)?(ns|us|ms|s|m|h)$'; then
+    # Every component zero means a zero total. ParseDuration accepts `0s`, and a
+    # zero or negative hold is expired on its first evaluation
+    # (`expired := !Retained && now.Sub(borrowedAt) >= MaxHold`), so every lend is
+    # reclaimed at once and the pool reads as broken rather than misconfigured.
+    if ! printf '%s' "$MAX_HOLD" | grep -Eq '[1-9]'; then
       log_error "--max-hold must be greater than zero: a zero hold reclaims every lent Pod on the first pass, so the pool warms models and never bridges with them"
     fi
     if [ "$POOL_TYPE" = "retained" ]; then

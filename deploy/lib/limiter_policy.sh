@@ -73,7 +73,7 @@ limiter_entry_yaml() {
     # GPU budget is synthesised out of filenames -- exit 0, and a policy nobody
     # wrote. Restored rather than left off: this function is called from scripts
     # that glob afterwards.
-    local reset_glob=1
+    local reset_glob=1 pairs_seen=0
     case "$-" in *f*) reset_glob=0 ;; esac
     set -f
     for pair in $pairs; do
@@ -96,17 +96,58 @@ limiter_entry_yaml() {
             ''|*[!0-9]*)
                 [ "$reset_glob" = 1 ] && set +f
                 log_error "WVA_QUOTAS entry '$pair': the budget must be a whole number of GPUs, or -1 for no cap on that type" ;;
+            0|[1-9]*) ;;
+            *)
+                # A LEADING ZERO. All digits, so the case above lets it past, and
+                # go-yaml then reads it as OCTAL: `H200: 010` becomes 8. The
+                # operator asks for ten GPUs, gets eight, and nothing anywhere
+                # says so.
+                [ "$reset_glob" = 1 ] && set +f
+                log_error "WVA_QUOTAS entry '$pair': drop the leading zero -- YAML reads 0-prefixed numbers as octal, so '$value' would become a different budget" ;;
         esac
+        # LENGTH before arithmetic. `[ "$value" -gt ... ]` on a 20-digit number
+        # errors with "integer expression expected" -- again not fatal inside an
+        # `if` -- and the entry was emitted, after which go-yaml refuses to
+        # unmarshal it into an int and the whole policy is discarded. Seven
+        # digits cannot exceed the cap by enough to matter, and cannot overflow.
+        if [ "${#value}" -gt 7 ]; then
+            [ "$reset_glob" = 1 ] && set +f
+            log_error "WVA_QUOTAS entry '$pair' is far above the maximum quota of 1048576 GPUs"
+        fi
         # MaxQuotaValue in internal/config/quota_limiter.go. Above it the
         # controller rejects the entry, which costs the whole policy again.
         if [ "$value" -gt 1048576 ]; then
             [ "$reset_glob" = 1 ] && set +f
             log_error "WVA_QUOTAS entry '$pair' exceeds the maximum quota of 1048576 GPUs"
         fi
+        # A REPEATED accelerator emits the key twice under one map. yq writes it
+        # happily; go-yaml refuses the document ("mapping key already defined"),
+        # which discards the whole policy -- the same catastrophic path as an
+        # unparseable value, from a plausible typo.
+        case "
+$types" in
+            *"
+    ${name}: "*)
+                [ "$reset_glob" = 1 ] && set +f
+                log_error "WVA_QUOTAS names '$name' twice. One budget per accelerator type; two would emit a duplicate YAML key and the controller would reject the entire policy." ;;
+        esac
         types="${types}    ${name}: ${value}
 "
+        pairs_seen=$((pairs_seen + 1))
     done
     [ "$reset_glob" = 1 ] && set +f
+    # ZERO pairs is not an empty WVA_QUOTAS, and the check for one did not catch
+    # it: `WVA_QUOTAS="   "` and `WVA_QUOTAS=","` are non-empty, the loop runs no
+    # iterations, and the entry came out with an accelerator map containing
+    # NOTHING -- structurally valid, accepted by validateLimiters, and read by
+    # QuotaForNamespace as a budget of zero for every type. Every managed
+    # workload then stops scaling up, which is the precise failure that requiring
+    # WVA_QUOTAS exists to prevent.
+    if [ "$pairs_seen" -eq 0 ]; then
+        log_error "WVA_QUOTAS is set but names no accelerator: '$WVA_QUOTAS'.
+    An entry with an empty budget map is not unlimited -- it is zero for every accelerator, and every
+    managed workload stops scaling up. Give it a budget: WVA_QUOTAS='H200=8'"
+    fi
 
     # Namespace scope is keyed by namespace. `default` is the reserved
     # fall-through key and means "this much PER unlisted namespace", not a shared
@@ -117,9 +158,20 @@ limiter_entry_yaml() {
     # Resolved BEFORE the first line is printed. Nothing here may emit a partial
     # document: a caller that reads stdout and a failing status separately would
     # otherwise hold three valid-looking lines of an entry this function refused.
-    local key=""
+    local key="" install_scope
+    # The SAME answer the rest of the installer gets. `${WVA_SCOPE:-cluster}`
+    # stood here and took the opposite default: everywhere else an unset
+    # WVA_SCOPE means `namespace` (wva_install_scope, and configuration.md says
+    # so in as many words), so `deploy/install.sh` run directly with no
+    # WVA_SCOPE is a namespace-scoped install that keyed its quota on the
+    # reserved `default` key -- contradicting the comment right below.
+    if declare -F wva_install_scope >/dev/null; then
+        install_scope="$(wva_install_scope)"
+    else
+        install_scope="${WVA_SCOPE:-namespace}"
+    fi
     if [ "$scope" = "namespace" ]; then
-        if [ "${WVA_SCOPE:-cluster}" = "namespace" ]; then
+        if [ "$install_scope" = "namespace" ]; then
             key="${WVA_WATCH_NS:-${WVA_NS:-}}"
         else
             key="default"
@@ -178,4 +230,44 @@ $2"
         log_error "merging the limiter entry produced an empty policy; refusing to write it"
     fi
     printf '%s\n' "$out"
+}
+
+# policy_declared_limiters <limiter type> <current policy yaml> -- the policy with this
+# install's limiter declared, in POLICY_DECLARED. Returns non-zero, having said
+# why, rather than producing anything a caller could write.
+#
+# A GLOBAL, not stdout, and that is the whole point of the function.
+#
+# Both halves above report failure through log_error, whose `exit 1` ends the
+# SUBSHELL when they are called as `$(...)` -- so every caller had to remember
+# `|| exit 1`, on every one of four call sites, and a caller that forgot got an
+# empty string it then wrote over the policy. That is not hypothetical: it is
+# the bug this file was created to fix, it was found again in review after the
+# fix, and an audit got past two separate source-pattern assertions written to
+# catch it. A caller cannot forget a check it does not have to make.
+#
+# So the composition happens HERE, in the caller's own shell, where log_error's
+# exit is the caller's exit. What a caller gets is a variable that is set and
+# correct, or a process that has already stopped.
+POLICY_DECLARED=""
+# The entry itself, so a caller can SHOW what it declared without rebuilding it.
+LIMITER_ENTRY_DECLARED=""
+policy_declared_limiters() {
+    local ltype="$1" current="$2" entry
+    POLICY_DECLARED=""
+    LIMITER_ENTRY_DECLARED=""
+    # The type is an ARGUMENT, not read from the environment. The two callers
+    # name it in different variables -- WVA_LIMITER for an install's own policy,
+    # WVA_LIMITER_TYPE for the cluster policy -- and reading either here would
+    # let one leak into the other's path: an admin with WVA_LIMITER exported in
+    # their shell would silently redirect `make enable-physical-limiter`.
+    entry="$(limiter_entry_yaml "$ltype")" || exit 1
+    if [ -z "$entry" ]; then
+        log_error "the limiter entry came out empty; refusing to write it over the policy"
+    fi
+    LIMITER_ENTRY_DECLARED="$entry"
+    POLICY_DECLARED="$(policy_with_limiters "$current" "$entry")" || exit 1
+    if [ -z "$POLICY_DECLARED" ]; then
+        log_error "the merged policy came out empty; refusing to write it"
+    fi
 }

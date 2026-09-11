@@ -43,6 +43,11 @@ DIR="${BENCHMARK_SCENARIOS_DIR:-$ROOT/test/benchmark/scenarios}"
 # half-converted file comes back unknown instead of passing on one line.
 profile_harness() {
     local f="$1"
+    # BOTH keys per schema, deliberately. A half-converted file -- `spec:` with no
+    # `backend:` -- must come back unknown rather than be classified on one line
+    # and then rejected by the harness five minutes later. Asserted below against
+    # a fixture, because dropping either key from this function is invisible to a
+    # count of how many profiles classified.
     if grep -qE '^spec:' "$f" && grep -qE '^  backend:' "$f"; then
         echo guidellm
     elif grep -qE '^load:' "$f" && grep -qE '^server:' "$f"; then
@@ -119,7 +124,10 @@ if [ ${#unknown[@]} -ne 0 ]; then
     echo "     inference-perf wants load:/api:/server:/tokenizer:/data:."
     FAIL=1
 fi
-if [ "$g" -lt 3 ] || [ "$i" -lt 3 ]; then
+# Only against THIS repo's own profile set. An overridden directory legitimately
+# holds one profile, or none of one kind, and the floor is a statement about what
+# this repo ships -- not about the classifier.
+if [ -z "${BENCHMARK_SCENARIOS_DIR:-}" ] && { [ "$g" -lt 3 ] || [ "$i" -lt 3 ]; }; then
     echo "FAIL classified $g guidellm and $i inference-perf profiles; both were well above 3."
     echo "     A collapse here means the classifier stopped recognising a schema, which would"
     echo "     make the pre-run gate reject correct pairings."
@@ -131,6 +139,18 @@ fi
 # healthy (17 guidellm, 5 inference-perf reads as fine) while inverting the gate,
 # so every correct pairing is refused and every mismatch waved through. Two
 # profiles are therefore pinned by name, one of each schema.
+if [ -n "${BENCHMARK_SCENARIOS_DIR:-}" ]; then
+    # The pinned names below are the ones THIS repo ships. Against an overridden
+    # directory they are simply absent, and asserting on them produced
+    # "flat_8k1000_10rps_12m classifies as 'unknown', the classifier is wrong" --
+    # a confident accusation about a file that was never there. The gate above
+    # still honours the override; only the pinned-name and gate-direction blocks
+    # are skipped.
+    echo "note: BENCHMARK_SCENARIOS_DIR is set, so the checks pinned to this repo's own profiles are skipped."
+    echo "benchmark profiles OK ($g guidellm, $i inference-perf, in $DIR)"
+    exit "$FAIL"
+fi
+
 for pair in "prefill_heavy guidellm" "symmetrical guidellm" "bursty inference-perf" "flat_8k1000_10rps_12m inference-perf"; do
     set -- $pair
     got="$(profile_harness "$DIR/$1.yaml.in")"
@@ -145,6 +165,21 @@ done
 # And the gate itself, in both directions, because lint mode never enters that
 # branch -- the Makefile comment claiming this check proves the gate works was
 # only true once these ran it.
+# A HALF-CONVERTED profile. Dropping either of the two required keys from
+# profile_harness leaves every count and every pinned name unchanged, so nothing
+# above notices -- but the gate then accepts a file the harness will reject,
+# which is the whole failure. Built here rather than shipped, so the repo does
+# not carry a broken profile.
+HALF="$(mktemp -d)"
+trap 'rm -rf "$HALF"' EXIT
+printf '%s
+' 'metadata:' '  labels:' '    name: half' 'spec:' '  profile:' '    kind: constant'     > "$HALF/half-converted.yaml.in"
+if BENCHMARK_SCENARIOS_DIR="$HALF" "$0" guidellm half-converted >/dev/null 2>&1; then
+    echo "FAIL the gate accepts a half-converted profile (spec: with no backend:)."
+    echo "     guidellm rejects it on sight, so the run would send nothing and still report a table."
+    FAIL=1
+fi
+
 if "$0" guidellm prefill_heavy >/dev/null 2>&1; then
     : # correct pairing accepted
 else
