@@ -182,6 +182,122 @@ wva_render_manager_config_patch() {
 EOF
 }
 
+# limiter_entry_yaml emits the `limiters:` list that WVA_LIMITER declares, as
+# YAML on stdout. Pure: it reads WVA_LIMITER-related variables and writes no
+# cluster state, so hack/check-limiter-declaration.sh can execute it offline.
+#
+# It exists because the installer used to emit `[{"type": "quota"}]` and call
+# that "bounded by the quota limiter". The controller rejects it —
+#
+#     Invalid saturation scaling config entry ... "limiters: entry[0]: name must
+#     not be empty"
+#
+# — and rejecting the entry throws away the WHOLE `default` policy, thresholds
+# included, then falls back to no limiter at all: "scaling is UNCONSTRAINED". The
+# install printed success either way, so WVA_LIMITER=quota had never once bounded
+# anything, and the one line that said so was an ERROR in the controller log.
+#
+# A quota entry needs a budget from the operator; there is no safe default. An
+# empty one is not "unlimited" — QuotaForNamespace returns an empty map for a
+# namespace it does not list, callers read that as zero, and the fleet freezes.
+# So WVA_QUOTAS is required, and a missing or malformed one stops the install
+# before the ConfigMap is touched.
+limiter_entry_yaml() {
+    local ltype="$1"
+
+    if [ "$ltype" = "gpu-inventory" ] || [ "$ltype" = "inventory" ]; then
+        # Physical capacity comes from the GPU operator, so there is nothing to
+        # declare. A name is allowed but unused — NewLimiterFromConfig names the
+        # inventory limiter itself — and quota fields are REJECTED on this type.
+        printf -- '- type: %s\n' "$ltype"
+        return 0
+    fi
+    if [ "$ltype" != "quota" ]; then
+        log_error "limiter_entry_yaml: unknown limiter type '$ltype'"
+    fi
+
+    local scope="${WVA_QUOTA_SCOPE:-namespace}"
+    case "$scope" in
+        namespace|cluster) ;;
+        *) log_error "WVA_QUOTA_SCOPE must be 'namespace' or 'cluster', got '$scope'" ;;
+    esac
+
+    if [ -z "${WVA_QUOTAS:-}" ]; then
+        log_error "WVA_LIMITER=quota needs WVA_QUOTAS, a per-accelerator budget: WVA_QUOTAS='H200=8 A100=4'.
+    There is no default to fall back on. A quota entry with no budget is not unlimited — an accelerator
+    the entry does not name gets zero, so every managed workload stops scaling up. Use -1 for no cap on
+    a type ('H100=-1'). The accelerator name is the one WVA resolves, which the controller logs per
+    variant:
+        kubectl logs -n $WVA_NS deploy/wva-controller-manager | grep accelerator"
+    fi
+
+    # Accept commas or whitespace between entries, so both of the shapes an
+    # operator reaches for work: 'H200=8,A100=4' and 'H200=8 A100=4'.
+    local pairs pair name value
+    pairs="$(printf '%s' "$WVA_QUOTAS" | tr ',' ' ')"
+    local types=""
+    for pair in $pairs; do
+        name="${pair%%=*}"
+        value="${pair#*=}"
+        if [ "$name" = "$pair" ] || [ -z "$name" ] || [ -z "$value" ]; then
+            log_error "WVA_QUOTAS entry '$pair' is not TYPE=N (for example 'H200=8'). Whole value: '$WVA_QUOTAS'"
+        fi
+        case "$value" in
+            -1|[0-9]|[0-9][0-9]*) ;;
+            *) log_error "WVA_QUOTAS entry '$pair': the budget must be a whole number of GPUs, or -1 for no cap on that type" ;;
+        esac
+        # MaxQuotaValue in internal/config/quota_limiter.go. Above it the
+        # controller rejects the entry, which costs the whole policy again.
+        if [ "$value" -gt 1048576 ]; then
+            log_error "WVA_QUOTAS entry '$pair' exceeds the maximum quota of 1048576 GPUs"
+        fi
+        types="${types}    ${name}: ${value}
+"
+    done
+
+    # One line per argument rather than one format with embedded newlines: a `\n`
+    # followed by a space is what hack/check-make-recipes' sibling guard in
+    # lint-deploy-scripts looks for, because that is the shape a collapsed line
+    # continuation leaves behind.
+    printf '%s\n' '- name: install-quota' '  type: quota' "  scope: ${scope}"
+    if [ "$scope" = "cluster" ]; then
+        # Cluster scope caps the SUM across every namespace, so it is keyed by
+        # accelerator type alone. Indented one level less than the namespace form.
+        printf '  quotas:\n'
+        printf '%s' "$types"
+        return 0
+    fi
+    # Namespace scope is keyed by namespace. `default` is the reserved
+    # fall-through key and means "this much PER unlisted namespace", not a shared
+    # pool — so a cluster-scoped controller managing ten tenants hands out ten
+    # budgets, not one. Name the managed namespace instead whenever there is
+    # exactly one, which is every namespace-scoped install.
+    local key
+    if [ "${WVA_SCOPE:-cluster}" = "namespace" ]; then
+        key="${WVA_WATCH_NS:-$WVA_NS}"
+    else
+        key="default"
+    fi
+    printf '%s\n' '  namespaceQuotas:' "    ${key}:"
+    printf '%s' "$types" | sed 's/^/  /'
+}
+
+# policy_with_limiters <policy yaml> <limiters yaml> -- the policy with its
+# limiters: list REPLACED by the given one, on stdout.
+#
+# Replaced, not merged: re-running the install with a different WVA_LIMITER must
+# not leave both declared, because EffectiveLimiterMode collapses the list to one
+# mode (quota wins) and the other entry is then silently unenforced.
+#
+# strenv, not env. `env()` parses the value as YAML and a multi-line document
+# makes it fail -- `Error: EOF`, with no mention of the variable -- which aborted
+# the install after it had already re-applied the shipped ConfigMap, leaving the
+# policy with no limiters at all. Paired with limiter_entry_yaml here so the
+# offline check exercises the same transform the install runs.
+policy_with_limiters() {
+    printf '%s\n' "$1" | LIMITERS_YAML="$2" yq '.limiters = (strenv(LIMITERS_YAML) | from_yaml)'
+}
+
 deploy_wva_controller() {
     log_info "Deploying Workload-Variant-Autoscaler..."
     log_info "Using image: $WVA_IMAGE_REPO:$WVA_IMAGE_TAG"
@@ -556,7 +672,18 @@ wva_reconcile_prometheus_scheme() {
         none) ;;
         gpu-inventory|quota)
             log_info "Declaring the ${WVA_LIMITER} limiter in the scaling-policy ConfigMap ..."
-            local policy_cm current_default updated_default
+            local policy_cm current_default updated_default limiters_yaml
+            # Built and validated BEFORE anything is read or patched, so a rejected
+            # WVA_QUOTAS stops the install rather than leaving a half-edited policy.
+            #
+            # `|| exit 1` is load-bearing: limiter_entry_yaml reports via log_error,
+            # and log_error's `exit 1` inside a command substitution kills only the
+            # SUBSHELL. Without this the caller would continue with an empty string
+            # and patch `limiters: null` over the policy.
+            limiters_yaml="$(limiter_entry_yaml "$WVA_LIMITER")" || exit 1
+            if [ -z "$limiters_yaml" ]; then
+                log_error "limiter_entry_yaml produced nothing for WVA_LIMITER=${WVA_LIMITER}"
+            fi
             # `|| true` because a no-match is grep exit 1, which pipefail turns into
             # a failed assignment and set -e turns into an exit — before the
             # log_error below can say which ConfigMap is missing.
@@ -572,10 +699,18 @@ wva_reconcile_prometheus_scheme() {
             # Idempotent, and it REPLACES rather than appends: re-running with a
             # different WVA_LIMITER must not leave both declared, since a quota
             # entry would then win over the gpu-inventory one by mode precedence.
-            updated_default=$(echo "$current_default" | yq ".limiters = [{\"type\": \"${WVA_LIMITER}\"}]")
+            updated_default=$(policy_with_limiters "$current_default" "$limiters_yaml")
             kubectl patch configmap "$policy_cm" -n "$WVA_NS" --type=merge \
                 -p "$(jq -n --arg d "$updated_default" '{data:{"default":$d}}')"
-            log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm})."
+            log_warning "Scaling is now bounded by the ${WVA_LIMITER} limiter (declared in ${WVA_NS}/${policy_cm}):"
+            printf '%s\n' "$limiters_yaml" | sed 's/^/    /' >&2
+            # The controller is the only thing that can confirm it. It validates
+            # the entry on read and, when it rejects one, discards the ENTIRE
+            # `default` policy and falls back to no limiter -- at ERROR in its log
+            # and nowhere else. Say where to look, because "the install said
+            # bounded" is exactly the belief that shipped unbounded before.
+            log_info "Confirm the controller accepted it (a rejected entry drops the whole policy AND the limiter):"
+            log_info "    kubectl logs -n ${WVA_NS} deploy/wva-controller-manager | grep -E 'GPU limiter constructed|Invalid saturation scaling'"
             # A GPU-aware optimizer allocates out of per-accelerator pools, so a
             # workload whose accelerator cannot be resolved gets no budget and stops
             # scaling up — silently. Say so at install, and say how to check, because
