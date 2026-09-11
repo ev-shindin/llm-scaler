@@ -119,6 +119,11 @@ warmPools:
     apply: no        # <- change to yes for the pools you want
 ```
 
+The plan creates **bridges**. It carries no `type`/`maxHold`, so a pool that
+must be retained is created with the CLI instead --
+`deploy/warmpool.sh create --type retained ...` -- or the plan's pool is patched
+afterwards, during which it is a bridge and can lend and reclaim.
+
 Change the ones you want to `yes` and save. Pools are created **after** the
 ScaledObjects, because a pool nothing can borrow from is accelerators held for
 nothing.
@@ -266,9 +271,14 @@ way; what they lose is the bridge, so their next scale-up pays a full cold start
 
 Re-run `create` with different `--replicas`/`--max`/`--reserve`/`--type`/
 `--max-hold`; it is an `apply`, so the objects are updated in place. `--type`
-and `--max-hold` are picked up live — both engines rebuild from the ConfigMap
-without a restart — so a bridge can become retained, and back, on a running
-pool. Changing `--models`/`--model-size`
+and `--max-hold` are picked up live — the pool rebuilds from the trigger
+metadata on its next reconcile, with no restart — so a bridge can become
+retained, and back, on a running pool.
+
+> **Pass `--type` again on every re-run of a retained pool.** Naming it emits the
+> key; omitting it emits nothing, and `apply` prunes what the previous apply
+> wrote — so a re-run to change `--replicas` silently turns a retained pool back
+> into a bridge, which will then reclaim its Pod on the hold timeout. Changing `--models`/`--model-size`
 changes the Pod's memory limit, which **rolls the pool** and reloads every
 resident model — cheap to say and expensive to do, so decide the warm-set budget
 before you fill it.

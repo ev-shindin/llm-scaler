@@ -69,9 +69,16 @@ kubectl get pods -A -l app.kubernetes.io/name=workload-variant-autoscaler
 # correctly bounded cluster with nothing parked at zero prints nothing and
 # looks like a failure. Read the policy instead, and treat the log as a
 # bonus when scale-from-zero is in play.
+# 
+# Neither of those says the controller ACCEPTED the entry, which is the
+# thing that fails silently: a malformed one is rejected on read, costs the
+# whole default policy, and leaves the controller with NO limiter while this
+# command still prints a healthy-looking ConfigMap. The last line answers it.
 kubectl get configmap wva-scaling-policy-config -n wva-policy \
   -o jsonpath='{.data.default}' | grep -A3 limiters
 kubectl logs -n <wva-namespace> deploy/wva-controller-manager | grep "GPU budgets available"
+kubectl logs -n <wva-namespace> deploy/wva-controller-manager \
+  | grep -E 'GPU limiter constructed|Invalid saturation scaling'
 ```
 <!-- guide:verify.budget end -->
 

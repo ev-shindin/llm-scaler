@@ -26,7 +26,17 @@ cluster where non-WVA workloads compete for the same accelerators you want both.
 ## Declaring it
 
 Both shapes live in the `limiters:` list on the scaling policy's `default`
-entry. **Cluster scope** caps a type across every namespace:
+entry. The installer generates one for you rather than having you write it —
+`WVA_LIMITER=quota WVA_QUOTAS='H200=8'` (one install's own policy) or
+`WVA_LIMITER_TYPE=quota WVA_QUOTAS='H200=8'` (the cluster policy every
+controller reads), with `WVA_QUOTA_SCOPE=namespace|cluster` choosing between the
+two shapes below. Which namespace the generated entry is keyed on follows the
+install: a **namespace-scoped** install keys it on the namespace the controller
+manages, a **cluster-scoped** one on the reserved `default` key, whose meaning
+is the paragraph after next. Hand-write the entry when you want several
+namespaces named explicitly; `WVA_QUOTAS` writes one.
+
+**Cluster scope** caps a type across every namespace:
 
 ```yaml
 limiters:

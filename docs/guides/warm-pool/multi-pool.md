@@ -124,10 +124,17 @@ start on demand, so no ordinary replicas are coming and exactly one model is
 awake at a time. Something has to decide which, or the model that happened to
 wake first keeps the accelerators however the load moves.
 
-Two knobs, both trigger metadata on the pool's ScaledObject:
+Retention itself is chosen at create, so the pool is never a bridge for the
+window between making it and patching it:
+
+```bash
+deploy/warmpool.sh create -n <ns> --name <pool> --type retained ...
+```
+
+The two switch knobs are trigger metadata on the pool's ScaledObject, alongside
+the `warmPoolRetained: "true"` that `--type retained` writes:
 
 ```yaml
-warmPoolRetained: "true"
 warmPoolSwitchSpareThreshold: "20"    # percent
 warmPoolMinSwitchInterval: "10m"      # default 10m
 ```

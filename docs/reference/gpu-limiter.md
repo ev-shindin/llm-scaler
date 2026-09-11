@@ -19,19 +19,25 @@ a type (`H100=-1`). The type is the name WVA resolves, which it logs per variant
 (`"accelerator": "H200"`). `WVA_QUOTA_SCOPE` is `namespace` (the default: each
 managed namespace gets this budget) or `cluster` (one budget across all of them).
 
-The install prints the entry it wrote and the command that confirms the
-controller accepted it. Run that command. A malformed entry is rejected on read
+or later, by adding a `limiters:` entry to the `default` entry of the
+scaling-policy ConfigMap — applied live, no restart. **Read the next section
+first.**
+
+**Confirm the controller accepted it.** A malformed entry is rejected on read,
 and the rejection costs the **whole** `default` policy — thresholds included —
-leaving no limiter at all, at ERROR in the controller log and nowhere else:
+leaving no limiter at all. It is reported at ERROR in the controller log and
+nowhere else; the install reports success either way. The install prints this
+command, and it is the only thing that answers the question:
+
+```bash
+kubectl logs -n <wva-namespace> deploy/wva-controller-manager \
+  | grep -E 'GPU limiter constructed|Invalid saturation scaling'
+```
 
 ```
 INFO  GPU limiter constructed  {"type": "quota", "name": "install-quota"}   # bounded
 INFO  GPU limiter constructed  {"type": "none", "name": "no-limiter"}       # NOT bounded
 ```
-
-or later, by adding a `limiters:` entry to the `default` entry of the
-scaling-policy ConfigMap — applied live, no restart. **Read the next section
-first.**
 
 > **Declare one kind, not both.** `limiters:` is a list, and it reads like a set
 > of bounds that all apply. It is not. One limiter is built, and a quota entry

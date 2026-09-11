@@ -76,8 +76,20 @@ spec:
 
         # How long a borrowed Pod may serve before it is returned regardless, so
         # a scale-up that never arrives cannot turn the reserve into permanent
-        # capacity for one variant.
+        # capacity for one variant. `deploy/warmpool.sh create --max-hold` writes
+        # this; hand-editing it here is the other way. Omit it and the
+        # controller's own default applies, which is what create does when
+        # --max-hold is not given.
         warmPoolMaxHold: "2m"
+
+        # Whether this pool is a BRIDGE or is RETAINED, and it is the most
+        # consequential line in this file. A bridge takes a lent Pod back after
+        # warmPoolMaxHold whether or not the shortfall closed; retained switches
+        # that timeout off and the pool keeps the Pod until the variant stops
+        # wanting it. `create --type bridge|retained` writes it. Commented out
+        # because omitting it leaves the controller's default in force rather
+        # than a second copy of it here, free to drift.
+        # warmPoolRetained: "true"
 
         # Warm this many of the busiest variants without waiting for each to
         # miss first.

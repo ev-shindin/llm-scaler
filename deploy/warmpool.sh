@@ -521,6 +521,20 @@ $(warmpool_podmonitor)"
 
   printf '%s\n' "$manifest" | kubectl apply -f - >/dev/null
   log_success "Pool '${POOL_NAME}' created in ${NAMESPACE}: ${POOL_REPLICAS} Pods (max ${POOL_MAX}), reserve ${RESERVE}, ${GPUS_PER_POD} GPU each, ${memory} per Pod"
+  # The pool's NAME and its OBJECTS' names differ, and only the name was printed.
+  # Everything created carries the wva-warm-pool- prefix, so `kubectl get deploy
+  # <pool>` is NotFound and a script written against this output stalls on a
+  # Deployment that does not exist. Measured: thirteen minutes, on a pool that
+  # was working the whole time.
+  local pool_kind=deployment
+  [ "$GROUP_SIZE" -gt 1 ] && pool_kind=leaderworkerset
+  log_info "Objects:  ${pool_kind}/wva-warm-pool-${POOL_NAME}, scaledobject/wva-warm-pool-${POOL_NAME}   (the pool NAME is '${POOL_NAME}'; every object carries the wva-warm-pool- prefix)"
+  # An idle pool Pod is NOT Ready, deliberately: the proxy answers its readiness
+  # probe with 503 "no model is awake in this Pod", which is how a sleeping Pod
+  # stays out of its InferencePool. So `kubectl rollout status` and readyReplicas
+  # both wait forever on a healthy empty pool.
+  log_info "A pool Pod holding only SLEEPING models reports NotReady on purpose -- that is what keeps it out of the InferencePool. Do not wait on readyReplicas; read the pool's own state instead:"
+  log_info "    kubectl logs -n ${WVA_NAMESPACE} deploy/wva-controller-manager | grep 'warm pool state' | tail -1"
   log_info "Models join it with:  warmPool: ${POOL_NAME}   in their ScaledObject trigger metadata"
   if [ "$NETWORK_POLICY" -eq 1 ]; then
     log_info "NetworkPolicy wva-warm-pool-${POOL_NAME}: :8001/:8002/:9001-9016 admit only WVA in ${WVA_NAMESPACE}; :8000 admits this namespace"

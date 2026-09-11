@@ -39,7 +39,10 @@ NAMESPACE           ?= llm-d-optimized-baseline
 # namespace on OpenShift, cluster elsewhere. See deploy/lib/common.sh.
 WVA_SCOPE           ?=
 # Declare a GPU limiter at install: none | gpu-inventory | quota. Default none,
-# matching the shipped config — see deploy/README.md "Bounding scaling".
+# matching the shipped config — see docs/reference/gpu-limiter.md.
+# `quota` additionally REQUIRES WVA_QUOTAS, the per-accelerator budget
+# (WVA_QUOTAS='H200=8 A100=4'); there is no default, and an empty quota entry is
+# a budget of zero rather than unlimited. WVA_QUOTA_SCOPE is namespace|cluster.
 WVA_LIMITER         ?= none
 # A ScaledObject is how a workload registers with WVA. WVA_DEFAULT_SO=true has the
 # installer create one per llm-d model server; WVA_DEFAULT_SO_NS picks the
@@ -485,7 +488,7 @@ setup-prereqs: manifests kustomize ## Phase 2 (CLUSTER ADMIN). ENVIRONMENT=kuber
 	$(call wva_phase,prereqs,$(ENVIRONMENT_INSTALL))
 
 .PHONY: deploy-wva
-deploy-wva: manifests kustomize ## Install WVA. ENVIRONMENT=kubernetes|openshift, SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>.
+deploy-wva: manifests kustomize ## Install WVA. ENVIRONMENT=kubernetes|openshift, SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>, WVA_LIMITER=none|gpu-inventory|quota (quota needs WVA_QUOTAS).
 	$(call wva_phase,$(INSTALL_PHASE_ARG),$(ENVIRONMENT_INSTALL))
 
 .PHONY: undeploy-wva
@@ -493,11 +496,11 @@ undeploy-wva: ## Remove WVA. Pass the same ENVIRONMENT, SCOPE and namespace you 
 	export KIND=$(KIND) KUBECTL=$(KUBECTL) $(if $(ENVIRONMENT_INSTALL),ENVIRONMENT=$(ENVIRONMENT_INSTALL),) $(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) WVA_SCOPE=$(SCOPE) && 		deploy/install.sh --undeploy
 
 .PHONY: deploy-wva-on-k8s
-deploy-wva-on-k8s: manifests kustomize ## Install WVA on Kubernetes. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>. Prometheus and the namespace are detected.
+deploy-wva-on-k8s: manifests kustomize ## Install WVA on Kubernetes. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>, WVA_LIMITER (quota needs WVA_QUOTAS). Prometheus and the namespace are detected.
 	$(call wva_phase,$(INSTALL_PHASE_ARG),kubernetes)
 
 .PHONY: deploy-wva-on-openshift
-deploy-wva-on-openshift: manifests kustomize ## Install WVA on OpenShift. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>.
+deploy-wva-on-openshift: manifests kustomize ## Install WVA on OpenShift. SCOPE=namespace|cluster, INSTALL_PHASE=all|prereqs|wva, IMG=<your build>, WVA_LIMITER=none|gpu-inventory|quota (quota needs WVA_QUOTAS).
 	$(call wva_phase,$(INSTALL_PHASE_ARG),openshift)
 
 ## Removing. Pass the SAME SCOPE and namespace you installed with — an uninstall

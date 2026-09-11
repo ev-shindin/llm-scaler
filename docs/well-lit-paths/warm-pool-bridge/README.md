@@ -41,7 +41,8 @@ you.
 
 [Bridge a scale-up with a warm pool](../../guides/warm-pool/) — sizing, the two
 images, the NetworkPolicy, and how the pool is declared. The pool is an ordinary
-Deployment; its knobs are annotations on it.
+Deployment; its knobs are trigger metadata on the ScaledObject that declares it,
+and `deploy/warmpool.sh create` writes them.
 
 ## Several models in one pool
 
@@ -119,7 +120,12 @@ refusal, and how a bridge is attributed.
 
 ## Tuning it
 
-Pool size, the retained-model rule and the switch interval are annotations,
-documented in the guide. The reasoning behind the design, including what was
+How long the pool lends before reclaiming is `--max-hold` at create, and it is
+the knob this path turns: too short and the bridge is pulled before the ordinary
+replicas arrive, too long and the pool is unavailable for the next model.
+`wva_warmpool_bridge_seconds` should track the ordinary start time — sitting at
+`--max-hold` instead means the scale-up never completed and the pool is masking
+it. Pool size, the retained-model rule and the switch interval are trigger
+metadata too, documented in the guide. The reasoning behind the design, including what was
 measured and rejected, is in
 [proposals/fast-model-loading.md](../../proposals/fast-model-loading.md).

@@ -189,7 +189,8 @@ restart (the engine rebuilds it on the next optimization cycle).
 A `limiters:` list selects a **single mode**, so declare **one** of these forms:
 
 ```yaml
-# (a) physical-capacity limiter (also the default when no limiters: is declared):
+# (a) physical-capacity limiter. NOT a default -- with no limiters: list,
+# nothing limits at all (NewLimiterFromConfig returns a no-op limiter):
 default: |
   analyzers:
     - type: saturation
@@ -216,7 +217,8 @@ default: |
   `default` entry — a budget-scope setting, like `enableRescale` — so a tenant cannot
   widen a cap via a per-model or namespace-local entry. A `limiters:` block placed on any
   other entry parses and validates but is **silently ignored** at runtime.
-- With no `limiters:` block, the physical-inventory limiter is used.
+- With no `limiters:` block **nothing bounds scaling** — that is the shipped
+  default, and the controller says so at startup: "scaling is UNCONSTRAINED".
 
 ## Configuration
 
