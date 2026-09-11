@@ -277,7 +277,14 @@ if [ -z "$DEFAULTED" ]; then
   fail "create without --proxy-image produced nothing: the flag is still required"
 else
   ok "create works without --proxy-image"
-  MANIFEST_IMG="$(grep -A2 'name: proxy$' "$(dirname "$0")/../config/warmpool/warmpool-deployment.yaml"     | grep -m1 'image:' | sed 's/.*image: //')"
+  # -A12, and asserted non-empty. It was -A2, and `image:` sits NINE lines below
+  # `name: proxy` -- so MANIFEST_IMG was always the empty string, `grep -qF ""`
+  # always matched, and this case printed ok unconditionally. Vacuous on Linux
+  # and on Windows alike; it was never comparing anything.
+  MANIFEST_IMG="$(grep -A12 'name: proxy[[:space:]]*$' "$(dirname "$0")/../config/warmpool/warmpool-deployment.yaml"     | grep -m1 'image:' | sed 's/.*image: //' | tr -d '')"
+  if [ -z "$MANIFEST_IMG" ]; then
+    fail "could not read the proxy image out of config/warmpool/warmpool-deployment.yaml; the comparison below would pass on an empty string"
+  fi
   if printf '%s
 ' "$DEFAULTED" | grep -qF "$MANIFEST_IMG"; then
     ok "the default proxy image is the one config/warmpool pins"
@@ -312,7 +319,14 @@ if [ -z "$DEFAULTED" ]; then
   fail "create without --proxy-image produced nothing: the flag is still required"
 else
   ok "create works without --proxy-image"
-  MANIFEST_IMG="$(grep -A2 'name: proxy$' "$(dirname "$0")/../config/warmpool/warmpool-deployment.yaml"     | grep -m1 'image:' | sed 's/.*image: //')"
+  # -A12, and asserted non-empty. It was -A2, and `image:` sits NINE lines below
+  # `name: proxy` -- so MANIFEST_IMG was always the empty string, `grep -qF ""`
+  # always matched, and this case printed ok unconditionally. Vacuous on Linux
+  # and on Windows alike; it was never comparing anything.
+  MANIFEST_IMG="$(grep -A12 'name: proxy[[:space:]]*$' "$(dirname "$0")/../config/warmpool/warmpool-deployment.yaml"     | grep -m1 'image:' | sed 's/.*image: //' | tr -d '')"
+  if [ -z "$MANIFEST_IMG" ]; then
+    fail "could not read the proxy image out of config/warmpool/warmpool-deployment.yaml; the comparison below would pass on an empty string"
+  fi
   if printf '%s
 ' "$DEFAULTED" | grep -qF "$MANIFEST_IMG"; then
     ok "the default proxy image is the one config/warmpool pins"

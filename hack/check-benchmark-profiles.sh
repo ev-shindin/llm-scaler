@@ -109,6 +109,14 @@ fi
 FAIL=0
 g=0 i=0
 unknown=()
+# A directory with no profiles leaves the glob LITERAL, and every message below
+# then reports on a file called `*`: "these profiles match neither harness
+# schema: *". Say what is actually wrong instead.
+if ! compgen -G "$DIR/*.yaml.in" >/dev/null 2>&1; then
+    echo "FAIL no *.yaml.in profiles in $DIR"
+    echo "     Nothing can be classified, so nothing below would be about the classifier."
+    exit 1
+fi
 for p in "$DIR"/*.yaml.in; do
     case "$(profile_harness "$p")" in
         guidellm)       g=$((g + 1)) ;;
@@ -146,15 +154,24 @@ fi
 # healthy (17 guidellm, 5 inference-perf reads as fine) while inverting the gate,
 # so every correct pairing is refused and every mismatch waved through. Two
 # profiles are therefore pinned by name, one of each schema.
-if [ -n "${BENCHMARK_SCENARIOS_DIR:-}" ]; then
-    # The pinned names below are the ones THIS repo ships. Against an overridden
+# DIVERGENCE, not set-ness. Keyed on whether the variable EXISTS, this skipped
+# every pinned assertion whenever BENCHMARK_SCENARIOS_DIR was set to the repo's
+# own scenarios directory -- which is the Makefile's default, and a value an
+# operator may well export. The classifier could then be inverted (17 guidellm,
+# 5 inference-perf "reads as fine") and this check would print OK.
+if [ "$DIR" != "$ROOT/test/benchmark/scenarios" ]; then
+    # The pinned names below are the ones THIS repo ships. Against a DIFFERENT
     # directory they are simply absent, and asserting on them produced
     # "flat_8k1000_10rps_12m classifies as 'unknown', the classifier is wrong" --
     # a confident accusation about a file that was never there. The gate above
     # still honours the override; only the pinned-name and gate-direction blocks
     # are skipped.
-    echo "note: BENCHMARK_SCENARIOS_DIR is set, so the checks pinned to this repo's own profiles are skipped."
-    echo "benchmark profiles OK ($g guidellm, $i inference-perf, in $DIR)"
+    echo "note: profiles are being read from $DIR, so the checks pinned to this repo's own are skipped."
+    if [ "$FAIL" -ne 0 ]; then
+        echo "benchmark profile check FAILED"
+    else
+        echo "benchmark profiles OK ($g guidellm, $i inference-perf, in $DIR)"
+    fi
     exit "$FAIL"
 fi
 

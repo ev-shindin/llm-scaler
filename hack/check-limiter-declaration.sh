@@ -62,40 +62,46 @@ WVA_POLICY_NS="wva-policy"
 # shellcheck disable=SC1090
 . "$WORK/physical_limiter.sh"
 
+# The tools, named before anything is asserted. Without this a missing jq made
+# every case that parses output fail, first among them "name is empty -- the
+# controller rejects the entry and drops the whole policy" -- fifteen confident
+# accusations against the code for an absent binary. Both siblings in this Make
+# target already guard; this one did not.
+for tool in yq jq; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "FATAL: $tool is required by this check, and is missing. Nothing below would be about the code."
+        exit 2
+    }
+done
+
 if ! declare -F limiter_entry_yaml >/dev/null; then
     echo "FAIL limiter_entry_yaml is not defined -- the library did not source"
     exit 1
 fi
 
 CASES=0
-# One count per CASE, not per assertion. A case with several assertions can fail
-# several times, and counting each inflated the total -- so a genuine failure
-# also produced "FAIL 30 cases ran, not 24. A case was added or removed", which
-# is a second verdict, untrue, and pointing at the wrong thing. Only the FIRST
-# failure of a case counts; the rest are more evidence about the same case.
-fail() {
-    echo "FAIL $*"
-    [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] && CASES=$((CASES + 1))
-    FAIL=$((FAIL + 1))
-}
+# A case is counted where it BEGINS, by case_begin, not derived from whether it
+# passed or failed. Two previous attempts derived it and both were wrong in
+# opposite directions: counting in both fail() and ok() double-counted a failing
+# multi-assert case ("FAIL 35 cases ran, not 30"), and moving the increment
+# behind ok()'s suppression under-counted one ("32 cases ran, not 33"). Either
+# way a real failure printed a SECOND, untrue verdict accusing the reader of
+# editing the test. A marker at the start of each case cannot depend on its
+# outcome.
+case_begin() { CASES=$((CASES + 1)); CASE_FAIL_AT="$FAIL"; }
+fail() { echo "FAIL $*"; FAIL=$((FAIL + 1)); }
 # A case ends in one summarising ok, but its assertions are separate statements,
 # so a failed one does not stop the ok from printing after it. Suppress it when
-# anything failed since this case began -- an `ok` under four FAILs describing the
-# same output is how a negative control gets read as half-passing.
-# The increment is BEHIND the suppression test, not in front of it. In front, a
-# case that failed once and then reached its trailing ok was counted twice --
-# once by fail(), once by the suppressed ok() -- so a genuine failure also
-# printed "FAIL 35 cases ran, not 30. A case was added or removed", which is a
-# second verdict, untrue, and blames the reader for editing the test. Each case
-# now counts exactly once, in whichever of the two it ends in.
-ok()   { [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] || return 0; CASES=$((CASES + 1)); echo "ok   $*"; }
+# anything failed since this case began -- an `ok` under four FAILs describing
+# the same output is how a negative control gets read as half-passing.
+ok()   { [ "$FAIL" -eq "${CASE_FAIL_AT:-0}" ] || return 0; echo "ok   $*"; }
 
 # emit <type> -- runs limiter_entry_yaml with the environment already set by the
 # caller, into $OUT/$RC/$ERR. Never lets a non-zero status abort the harness: a
 # refusal is the expected result for half these cases. Every case starts here, so
 # this is also where the per-case failure mark is taken.
 emit() {
-    CASE_FAIL_AT="$FAIL"
+    case_begin
     OUT="$(limiter_entry_yaml "$1" 2>"$WORK/err")"
     RC=$?
     ERR="$(cat "$WORK/err")"
@@ -172,9 +178,9 @@ fi
 #
 # It also has to work with NO WVA_NS and no WVA_WATCH_NS, because the Makefile
 # recipe passes neither. That combination hard-failed the documented command.
-CASE_FAIL_AT="$FAIL"
+case_begin
 ( unset WVA_NS WVA_WATCH_NS WVA_SCOPE
-  WVA_QUOTA_NS_KEY=default WVA_QUOTAS='H200=8' limiter_entry_yaml quota )     >"$WORK/clusterkey" 2>"$WORK/clustererr"
+  WVA_QUOTAS='H200=8' limiter_entry_yaml quota default )     >"$WORK/clusterkey" 2>"$WORK/clustererr"
 clusterrc=$?
 if [ "$clusterrc" -ne 0 ]; then
     fail "the cluster-policy path refused a valid budget with no WVA_NS set, which is exactly how the Makefile recipe calls it: $(cat "$WORK/clustererr")"
@@ -184,14 +190,37 @@ else
     ok "the cluster-policy path keys on the reserved \`default\`, with no namespace of its own"
 fi
 
+# The key is an ARGUMENT, so nothing in the operator's environment can set it.
+# It was an environment variable for one commit, and that made it the
+# highest-precedence input to the document while being the only input with no
+# validation: `WVA_QUOTA_NS_KEY='evil: 1'` emitted YAML no parser accepts, and a
+# merely wrong one left the managed namespace unlisted -- a budget of zero for
+# everything, reported as success.
+case_begin
+( export WVA_QUOTA_NS_KEY=hijacked
+  WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a WVA_QUOTAS='H200=8'       limiter_entry_yaml quota ) >"$WORK/envkey" 2>/dev/null
+if grep -q 'hijacked' "$WORK/envkey"; then
+    fail "an exported WVA_QUOTA_NS_KEY reached the policy; the namespace key must come only from the caller's argument: $(cat "$WORK/envkey")"
+else
+    ok "no environment variable can set the namespace key"
+fi
+
+# And an invalid key argument is refused rather than written verbatim.
+case_begin
+( WVA_QUOTAS='H200=8' limiter_entry_yaml quota 'evil: 1' ) >"$WORK/badkey" 2>/dev/null
+if [ $? -eq 0 ] || [ -s "$WORK/badkey" ]; then
+    fail "an invalid namespace key was accepted: $(cat "$WORK/badkey")"
+else
+    ok "an invalid namespace key is refused rather than written into the document"
+fi
+
 # An INVALID WVA_SCOPE must stop the build, not fall through to a default. It
 # fell through: wva_install_scope reports through log_error, whose exit dies in
 # the command substitution, so install_scope came back empty, the namespace
 # branch was not taken, and the entry was keyed `default` -- on a path with no
 # `set -e`, which then published it and printed SUCCESS.
-CASE_FAIL_AT="$FAIL"
-( unset WVA_QUOTA_NS_KEY
-  WVA_SCOPE=bogus WVA_NS=wva-system WVA_QUOTAS='H200=8' limiter_entry_yaml quota )     >"$WORK/badscope" 2>/dev/null
+case_begin
+( WVA_SCOPE=bogus WVA_NS=wva-system WVA_QUOTAS='H200=8' limiter_entry_yaml quota )     >"$WORK/badscope" 2>/dev/null
 if [ $? -eq 0 ] || [ -s "$WORK/badscope" ]; then
     fail "an invalid WVA_SCOPE produced an entry instead of stopping: $(cat "$WORK/badscope")"
 else
@@ -279,7 +308,7 @@ refuse_quota ','             'names no accelerator'
 # A glob in WVA_QUOTAS must not be expanded against the working directory. It
 # was: with `for pair in $pairs` unguarded, WVA_QUOTAS='*' in a directory of
 # `name=value` files produced a GPU budget synthesised from filenames, exit 0.
-CASE_FAIL_AT="$FAIL"
+case_begin
 globdir="$WORK/globtest"; mkdir -p "$globdir"
 : > "$globdir/aaa=1"; : > "$globdir/bbb=2"
 ( cd "$globdir" && WVA_QUOTAS='*' WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a \
@@ -293,7 +322,7 @@ fi
 # The namespace key cannot be empty: it renders as a bare `:`, yq refuses the
 # document, and the cluster-policy caller (no set -e) then wrote an EMPTY policy
 # and announced the limiter in force.
-CASE_FAIL_AT="$FAIL"
+case_begin
 ( unset WVA_NS WVA_WATCH_NS; WVA_SCOPE=namespace WVA_QUOTAS='H200=8' \
     limiter_entry_yaml quota >"$WORK/nskey" 2>"$WORK/nserr" )
 if [ -s "$WORK/nskey" ]; then
@@ -329,7 +358,7 @@ fi
 # and no mention of the variable. The install aborted AFTER re-applying the
 # shipped ConfigMap, so the policy was left with no limiters at all.
 # ---------------------------------------------------------------------------
-CASE_FAIL_AT="$FAIL"
+case_begin
 FIXTURE_POLICY='# a comment the operator wrote
 scaleUpThreshold: 0.85
 kvCacheThreshold: 0.80
@@ -370,7 +399,7 @@ fi
 # not a test of behaviour. kubectl is stubbed, so what is asserted is what this
 # function would WRITE.
 # ---------------------------------------------------------------------------
-CASE_FAIL_AT="$FAIL"
+case_begin
 STUB="$WORK/stub"; mkdir -p "$STUB"
 # Records every write and answers reads with whatever CURRENT_POLICY holds.
 cat > "$STUB/kubectl" <<'STUBEOF'
@@ -456,7 +485,7 @@ else
     # Asserted on the stub's SENTINEL, not on the size of what it recorded. An
     # empty --from-literal left a zero-byte file, `[ -s ]` read that as "nothing
     # was written", and the case was blind to the one write that matters most.
-    CASE_FAIL_AT="$FAIL"
+    case_begin
     run_pl 'H200=12abc'
     wrote="$(cat "$WROTE")"
     if [ "$PLRC" -eq 0 ]; then
@@ -471,12 +500,37 @@ else
         ok "a refused budget leaves the cluster policy untouched, and stops the command"
     fi
 
+    # THE CALL SITE, not the library. The three cases above prove the library
+    # HONOURS a key it is given; none of them proved pl_set_limiter GIVES it one.
+    # Deleting the `default` argument from the call was green on all 35 cases
+    # while, with WVA_NS exported -- the state of anyone who just ran the
+    # installer -- it wrote `namespaceQuotas: {<WVA_NS>: ...}` into the policy
+    # every controller on the cluster reads: that one namespace gets the budget
+    # and every other gets ZERO, under "in force for every WVA on this cluster".
+    #
+    # WVA_WATCH_NS is set here deliberately. If the call site stops passing
+    # `default`, the installer's own rule picks it up, and the emitted key
+    # changes to tenant-a -- which is exactly the regression.
+    case_begin
+    run_pl 'H200=8'
+    wrote="$(cat "$WROTE")"
+    # Grepped, not reparsed: the sentinel wraps a MULTI-LINE payload, so
+    # `WROTE[` opens on one line and `]` closes on another and no per-line
+    # extraction gets the document back. The two key names are all this needs.
+    if printf '%s' "$wrote" | grep -q 'tenant-a:'; then
+        fail "the cluster policy was keyed on the managed namespace instead of the reserved \`default\`: every OTHER namespace then reads a budget of zero and stops scaling up. Wrote: $wrote"
+    elif ! printf '%s' "$wrote" | grep -q 'default:'; then
+        fail "the cluster policy carries no namespace key at all: $wrote"
+    else
+        ok "the cluster-policy call site keys the budget on the reserved \`default\`"
+    fi
+
     # A FRESH cluster: no policy ConfigMap yet, which is the first thing
     # `make enable-physical-limiter` meets and which this harness never ran,
     # because CURRENT_POLICY was always set. pl_set_limiter substitutes
     # `limiters: []` for the missing read; dropping that fallback leaves the
     # merge with empty input.
-    CASE_FAIL_AT="$FAIL"
+    case_begin
     run_pl 'H200=8' fresh
     wrote="$(cat "$WROTE")"
     if [ "$PLRC" -ne 0 ]; then
@@ -496,7 +550,7 @@ fi
 # the function satisfies "contains limiter_entry_yaml" while producing exactly
 # the half-configured cluster the case exists to prevent -- mutation-tested, it
 # printed ok.
-CASE_FAIL_AT="$FAIL"
+case_begin
 if declare -F enable_physical_limiter >/dev/null; then
     body="$(declare -f enable_physical_limiter)"
     # The CALL, not the name. Matching the name ANYWHERE was satisfied by putting
@@ -529,7 +583,7 @@ fi
 # The mirror above is only worth anything while it matches the Go it mirrors.
 # ---------------------------------------------------------------------------
 VALIDATE="$ROOT/internal/config/quota_limiter.go"
-CASE_FAIL_AT="$FAIL"
+case_begin
 if [ ! -f "$VALIDATE" ]; then
     fail "cannot find $VALIDATE to cross-check against"
 else
@@ -558,7 +612,7 @@ fi
 # the name, the scope, a field combination -- would make every install emit an
 # entry the controller throws the whole policy away over, and nothing in this
 # file would notice.
-CASE_FAIL_AT="$FAIL"
+case_begin
 SATURATION="$ROOT/internal/config/saturation_scaling.go"
 WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a WVA_QUOTAS='H200=8' emit quota
 emitted_name="$(printf '%s\n' "$OUT" | yq -o=json '.' 2>/dev/null | jq -r '.[0].name // ""')"
@@ -576,8 +630,8 @@ fi
 # How many cases ran. Without it, deleting a refuse_quota line removes a case
 # and the check still prints OK -- and the ok() suppression means the count of
 # ok lines is not comparable against a known-good run either.
-CASE_FAIL_AT="$FAIL"
-CASES_EXPECTED=33
+case_begin
+CASES_EXPECTED=38
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

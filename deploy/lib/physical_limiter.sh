@@ -219,14 +219,14 @@ pl_set_limiter() {
         # shell, so a refusal ends the command rather than handing back an empty
         # string.
         #
-        # WVA_QUOTA_NS_KEY=default, and it is not a detail. This ONE policy is
+        # The `default` third argument is not a detail. This ONE policy is
         # read by every controller on the cluster, across every namespace, so a
         # namespace-scoped budget here has to use the reserved per-unlisted-
         # namespace key. Keyed on a single namespace instead -- which is what the
         # installer's own rule would pick -- that namespace gets the budget and
         # every other one gets ZERO, so this command would stop scaling
         # everywhere it was meant to bound it.
-        WVA_QUOTA_NS_KEY=default policy_declared_limiters "$limiter" "$current"
+        policy_declared_limiters "$limiter" "$current" default
         updated="$POLICY_DECLARED"
     fi
     # An entry that is now empty is removed, not written as "{}". A ConfigMap
@@ -259,8 +259,12 @@ enable_physical_limiter() {
     # Validated HERE, before the namespace is created and the grants are made.
     # pl_set_limiter is the last step of a sequence that has already changed the
     # cluster, so a budget this rejects must stop the command while it still has
-    # changed nothing. Discards the output: this call is for its refusals.
-    WVA_QUOTA_NS_KEY=default limiter_entry_yaml "$limiter" >/dev/null
+    # changed nothing. Discards the output: this call is for its refusals, and
+    # every one of them is a log_error, which exits the command directly -- this
+    # is not a command substitution, so there is no subshell to swallow it.
+    # `default` is the key pl_set_limiter will use, so what is validated here is
+    # what gets written.
+    limiter_entry_yaml "$limiter" default >/dev/null
 
     if ! kubectl auth can-i create clusterrolebindings >/dev/null 2>&1; then
         log_error "This is a cluster-admin action: it publishes policy a tenant cannot edit, and grants the node read that policy then requires. You cannot create ClusterRoleBindings on this cluster."

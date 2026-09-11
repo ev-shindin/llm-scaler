@@ -12,7 +12,10 @@
 #
 # Requires funcs: log_error.
 # Requires vars: none unconditionally; the quota path reads WVA_QUOTAS,
-# WVA_QUOTA_SCOPE, WVA_SCOPE, WVA_WATCH_NS and WVA_NS.
+# WVA_QUOTA_SCOPE, WVA_SCOPE, WVA_WATCH_NS and WVA_NS. The namespace a
+# namespace-scoped budget is keyed on is an ARGUMENT, never an environment
+# variable -- it is the highest-precedence input to the document, and one that
+# could arrive from an operator's exported shell would be unvalidatable.
 
 # limiter_entry_yaml emits the `limiters:` list that WVA_LIMITER declares, as
 # YAML on stdout. Pure: it reads WVA_LIMITER-related variables and writes no
@@ -35,7 +38,7 @@
 # So WVA_QUOTAS is required, and a missing or malformed one stops the install
 # before the ConfigMap is touched.
 limiter_entry_yaml() {
-    local ltype="$1"
+    local ltype="$1" ns_key="${2:-}"
 
     if [ "$ltype" = "gpu-inventory" ] || [ "$ltype" = "inventory" ]; then
         # Physical capacity comes from the GPU operator, so there is nothing to
@@ -160,15 +163,27 @@ $types" in
     # otherwise hold three valid-looking lines of an entry this function refused.
     local key="" install_scope
     if [ "$scope" = "namespace" ]; then
-        if [ -n "${WVA_QUOTA_NS_KEY:-}" ]; then
-            # Set by a caller that KNOWS the key, and the cluster-policy path is
+        if [ -n "$ns_key" ]; then
+            # Given by a caller that KNOWS the key, and the cluster-policy path is
             # the one that does: `make enable-physical-limiter` publishes ONE
             # policy that every controller on the cluster reads, so keying it on
             # a single namespace would give that namespace the budget and every
             # other one zero. It sets `default`, the reserved per-unlisted-
             # namespace key, which is the only correct answer for a policy with
             # many readers.
-            key="$WVA_QUOTA_NS_KEY"
+            key="$ns_key"
+            # Validated like every other input, because it is the HIGHEST-
+            # precedence one: it goes straight into the document ahead of the
+            # scope rules. As an environment variable it was neither validated
+            # nor validatable -- `WVA_QUOTA_NS_KEY='evil: 1'` emitted YAML no
+            # parser accepts, and a merely WRONG one (`oops`) left the managed
+            # namespace unlisted with no `default` to fall through to, which
+            # reads as a budget of zero and stops every workload. An ARGUMENT
+            # cannot arrive from an operator's exported shell at all.
+            case "$key" in
+                *[!a-z0-9-]*|-*|*-|"")
+                    log_error "the namespace key '$key' is not a Kubernetes namespace name (lowercase letters, digits and '-'). It is written verbatim into the policy, so an invalid one either breaks the document or silently lists a namespace nothing matches." ;;
+            esac
         else
             # The SAME answer the rest of the installer gets. `${WVA_SCOPE:-cluster}`
             # stood here and took the opposite default: everywhere else an unset
@@ -269,7 +284,7 @@ POLICY_DECLARED=""
 # The entry itself, so a caller can SHOW what it declared without rebuilding it.
 LIMITER_ENTRY_DECLARED=""
 policy_declared_limiters() {
-    local ltype="$1" current="$2" entry
+    local ltype="$1" current="$2" ns_key="${3:-}" entry
     POLICY_DECLARED=""
     LIMITER_ENTRY_DECLARED=""
     # The type is an ARGUMENT, not read from the environment. The two callers
@@ -277,7 +292,7 @@ policy_declared_limiters() {
     # WVA_LIMITER_TYPE for the cluster policy -- and reading either here would
     # let one leak into the other's path: an admin with WVA_LIMITER exported in
     # their shell would silently redirect `make enable-physical-limiter`.
-    entry="$(limiter_entry_yaml "$ltype")" || exit 1
+    entry="$(limiter_entry_yaml "$ltype" "$ns_key")" || exit 1
     if [ -z "$entry" ]; then
         log_error "the limiter entry came out empty; refusing to write it over the policy"
     fi
