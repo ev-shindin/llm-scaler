@@ -1,4 +1,9 @@
-# GLM-5.2-FP8 on llm-d, with replicas that can change P/D role in place.
+# A model on llm-d with replicas that can change P/D role in place.
+#
+# Model-neutral by design: nothing here depends on which model is served,
+# because the property that matters is structural -- llm-d.ai/role is kept
+# out of every selector. Set the model on the `- zai-org/...` line below;
+# it is the only place it appears.
 #
 # The one structural difference from a stock llm-d guide: llm-d.ai/role is NOT
 # in the Deployment selector, so it is an ordinary mutable pod label. A guide
@@ -9,41 +14,41 @@
 # Every replica is one 8-GPU node at EP=8. The RATIO is which pods carry which
 # role label; the Deployment only maintains total capacity.
 #
-#   kubectl apply -f glm52-switchable.yaml
+#   kubectl apply -f pd-switchable.yaml
 #   ./switch-role.sh <pod> decode
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: glm52-switchable
+  name: pd-switchable
   namespace: evgensh-pdswitch
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: glm52-switchable
+  name: pd-switchable
   namespace: evgensh-pdswitch
   labels:
-    llm-d.ai/guide: glm52-switchable
+    llm-d.ai/guide: pd-switchable
 spec:
   replicas: 2
   selector:
     matchLabels:
       # llm-d.ai/role is deliberately ABSENT. Adding it here would make every
       # role change orphan the pod and start a cold replacement.
-      llm-d.ai/guide: glm52-switchable
-      llm-d.ai/model: GLM-5.2-FP8
+      llm-d.ai/guide: pd-switchable
+      llm-d.ai/model: pd-switchable
       llm-d.ai/engine-type: vllm
   template:
     metadata:
       labels:
-        llm-d.ai/guide: glm52-switchable
-        llm-d.ai/model: GLM-5.2-FP8
+        llm-d.ai/guide: pd-switchable
+        llm-d.ai/model: pd-switchable
         llm-d.ai/engine-type: vllm
         llm-d.ai/accelerator-vendor: nvidia
         llm-d.ai/accelerator-variant: gpu
         llm-d.ai/role: prefill        # starting role only; mutable from here
     spec:
-      serviceAccountName: glm52-switchable
+      serviceAccountName: pd-switchable
       containers:
         - name: modelserver
           # Either an image built from this branch, or stock vllm/vllm-openai:v0.28.0
@@ -51,7 +56,7 @@ spec:
           image: vllm/vllm-openai:v0.28.0
           command: ["vllm", "serve"]
           args:
-            - zai-org/GLM-5.2-FP8
+            - zai-org/GLM-5.3          # the model: change this line
             - --trust-remote-code
             - --port=8000
             - --data-parallel-size=8
@@ -109,7 +114,7 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           startupProbe:
-            # GLM-5.2 is ~753 GB. 120 x 30s = 60 min before giving up.
+            # A 700 GB model loads slowly. 120 x 30s = 60 min before giving up.
             httpGet: { path: /v1/models, port: modelserver }
             initialDelaySeconds: 15
             periodSeconds: 30
@@ -127,7 +132,7 @@ spec:
 apiVersion: inference.networking.k8s.io/v1
 kind: InferencePool
 metadata:
-  name: glm52-switchable
+  name: pd-switchable
   namespace: evgensh-pdswitch
 spec:
   appProtocol: http
@@ -135,13 +140,13 @@ spec:
   # ejects a replica from the pool.
   selector:
     matchLabels:
-      llm-d.ai/guide: glm52-switchable
+      llm-d.ai/guide: pd-switchable
   targetPorts:
     - number: 8000
   endpointPickerRef:
     group: ""
     kind: Service
-    name: glm52-switchable-epp
+    name: pd-switchable-epp
     port:
       number: 9002
     failureMode: FailOpen

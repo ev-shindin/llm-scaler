@@ -1,10 +1,14 @@
-# Serve GLM-5.2 with replicas that change P/D role in place
+# Serve a model with replicas that change P/D role in place
 
 A prefill replica and a decode replica of the same model differ by configuration,
 not by weights. An engine can therefore be told to change role and does so in
-**378 ms**, without reloading its 753 GB of weights or starting a new pod.
+**well under a second**, without reloading its weights or starting a new pod.
+Measured on 2 x 8 H200 at EP=16: 797-799 ms on vLLM v0.28.0 and 52 ms on a
+current vLLM, for a switch onto a buffer the engine already held.
 
-This guide deploys GLM-5.2-FP8 on llm-d in a shape where that is actually usable.
+This guide deploys such a model on llm-d in a shape where that is actually
+usable. Nothing here is model-specific -- the property that matters is
+structural -- so set the model on the one line the manifest calls out.
 The shape matters: a stock llm-d guide **cannot** host role switching, for a
 reason measured below.
 
@@ -34,10 +38,19 @@ removes the pod from its owner.
 `check-label-semantics.sh` demonstrates it both ways in about a minute, with no
 GPUs:
 
+<!-- guide:prerequisites.label_semantics start -->
 ```bash
+# Prove the claim this guide rests on before deploying anything: that
+# llm-d.ai/role in a Deployment's selector makes relabelling orphan the pod.
+# Takes about a minute and needs no GPUs -- it deploys two pause Deployments,
+# one with the role in the selector and one without, relabels a pod in each,
+# and reports who owns it afterwards.
 ./check-label-semantics.sh "$NAMESPACE"
+# expect BOTH:
+#   PASS  role in the selector: relabelling orphaned the pod ...
+#   PASS  role out of the selector: pod kept its owner, no replacement
 ```
-
+<!-- guide:prerequisites.label_semantics end -->
 ```
 role IN  selector: pods=3 owner_of_relabelled=<none, ORPHANED>
 role OUT selector: pods=2 owner_of_relabelled=labeltest-role-out-of-selector-54c5d4f558
@@ -51,14 +64,14 @@ the opposite of the point. So the role must be kept out of every selector.
 
 ## The deployment
 
-[`glm52-switchable.yaml`](glm52-switchable.yaml) puts every switchable replica in
+[`switchable.yaml`](switchable.yaml) puts every switchable replica in
 **one** Deployment whose selector omits the role:
 
 ```yaml
 selector:
   matchLabels:
-    llm-d.ai/guide: glm52-switchable      # llm-d.ai/role deliberately absent
-    llm-d.ai/model: GLM-5.2-FP8
+    llm-d.ai/guide: pd-switchable      # llm-d.ai/role deliberately absent
+    llm-d.ai/model: pd-switchable
     llm-d.ai/engine-type: vllm
 ```
 
@@ -69,10 +82,15 @@ already filters on the label and does not care who owns the pod.
 **The ratio becomes a labelling decision.** Scaling the Deployment changes total
 capacity; relabelling changes the prefill:decode split.
 
+<!-- guide:deploy start -->
 ```bash
-kubectl apply -n "$NAMESPACE" -f glm52-switchable.yaml
+# One Deployment holds every switchable replica and its selector omits the
+# role, so a pod can be relabelled without leaving its owner. The model is one
+# line in the manifest; nothing else in it is model-specific.
+kubectl apply -n "$NAMESPACE" -f switchable.yaml
+kubectl rollout status -n "$NAMESPACE" deploy/pd-switchable --timeout=60m
 ```
-
+<!-- guide:deploy end -->
 Settings in there that are not guessable, and each of which has cost a run:
 
 | setting | why |
@@ -89,8 +107,17 @@ Settings in there that are not guessable, and each of which has cost a run:
 
 Four steps. Only step 3 is the engine's.
 
+<!-- guide:switch start -->
 ```bash
-POD=$(kubectl get pod -n "$NAMESPACE" -l llm-d.ai/guide=glm52-switchable \
+# Four steps, and only step 3 belongs to the engine. Between steps 1 and 4 the
+# replica serves nothing -- that is the cost of doing it safely, a few hundred
+# milliseconds against the minutes a replacement replica takes.
+# 
+# The engine must not relabel itself. That would put Kubernetes write
+# credentials in every inference pod so each could mutate cluster state about
+# itself. The engine owns the mechanism; the controller owns the decision, the
+# label and the ordering.
+POD=$(kubectl get pod -n "$NAMESPACE" -l llm-d.ai/guide=pd-switchable \
         -o name | head -1)
 
 # 1. out of BOTH roles, so the picker stops selecting it. Pool membership is
@@ -99,8 +126,9 @@ kubectl label -n "$NAMESPACE" "$POD" llm-d.ai/role-
 
 # 2. let in-flight requests finish
 
-# 3. switch the engine -- and CHECK IT. A switch that did nothing also returns
-#    fast and still answers correctly, so timing and output prove nothing.
+# 3. switch the engine -- and CHECK IT. A switch that did nothing also
+#    returns fast and still answers correctly, so timing and output prove
+#    nothing.
 kubectl exec -n "$NAMESPACE" "$POD" -- curl -s -X POST localhost:8000/switch_pd_role \
   -H 'Content-Type: application/json' \
   -d '{"backend":"deepep_v2","max_num_tokens":128,"max_num_batched_tokens":128}'
@@ -109,7 +137,7 @@ kubectl exec -n "$NAMESPACE" "$POD" -- curl -s -X POST localhost:8000/switch_pd_
 # 4. back in, as the new role
 kubectl label -n "$NAMESPACE" "$POD" llm-d.ai/role=decode
 ```
-
+<!-- guide:switch end -->
 Between steps 1 and 4 the replica serves nothing. That is the cost of doing it
 safely — a few hundred milliseconds, against the minutes a replacement replica
 takes.
