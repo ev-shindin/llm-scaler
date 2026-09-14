@@ -19,11 +19,14 @@
 #       and a weight layout, and a pool holding "both" would be closer to
 #       holding one.
 #
-#   model.shortName: PINNED on both stacks. Left out, the harness generates
-#       `{first8}-{sha256(namespace/model)[:8]}-{last8}` -- namespace-dependent,
-#       unguessable, and the name every object in the stack takes. The driver
-#       has to find each stack's decode Deployment, and reproducing that hash
-#       outside the harness is how it would silently match nothing.
+#   model.shortName: set on both stacks, and IGNORED -- the harness generates
+#       `{first8}-{sha256(namespace/model)[:8]}-{last8}` regardless. Measured on
+#       CoreWeave: unsloth/Meta-Llama-3.1-8B-Instruct in evgensh-twomodel became
+#       `unsloth--244120d9-instruct`, which shares no substring with the stack
+#       name. It is kept here only as documentation of the intent; nothing may
+#       depend on it. The driver resolves each stack through the shared
+#       HTTPRoute's backendRef instead -- the same table the load's own requests
+#       follow, so what it measures and what it resolves cannot drift.
 #
 #   wva: per stack, with IDENTICAL variantCost. variantCost is what WVA's
 #       solver uses to choose which model to scale when they compete for the
@@ -31,13 +34,23 @@
 #       contention, and the report would read that as the pool helping one
 #       model and not the other.
 #
-#   wva.prometheus: kube-prometheus-stack, not OpenShift Thanos. Wrong here, the
-#       controller reads no metrics, every variant looks idle, and NEITHER arm
-#       scales -- two flat runs that agree perfectly and mean nothing.
+#   wva.prometheus: REMOVED. This repo's installer resolves the Prometheus URL
+#       from the cluster, so a value here is a second source of truth that
+#       drifts -- and it is the field that matters most to get right: pointed at
+#       a Prometheus that does not scrape this namespace, the controller reads
+#       no metrics, every variant looks idle, and NEITHER arm ever scales. Two
+#       flat runs that agree perfectly and mean nothing.
 #
 #   hpa.maxReplicas: 3, and the driver LOWERS it for the pool arm. Insurance
 #       lowers your maximum fleet, so an arm holding a pool and the same ceiling
 #       is a bigger cluster, not a pool.
+#
+#   router.epp featureGates: [flowControl] -- ADDED, and the example has none.
+#       WVA's arrival-rate and throughput analysis is driven by EPP queue depth,
+#       and that gate is what emits it. Without it `make benchmark-deploy-wva`
+#       refuses to install ("Router queue not enabled"), which is the right
+#       refusal: the controller would otherwise scale on a degraded demand
+#       signal in BOTH arms, measuring something other than what this claims to.
 #
 #   storage.modelPvc.accessModes: ReadWriteMany -- see the note at the block.
 #
@@ -305,6 +318,19 @@ shared:
           optimized-baseline-plugins.yaml: |
             apiVersion: llm-d.ai/v1alpha1
             kind: EndpointPickerConfig
+            # WVA's arrival-rate and throughput analysis is driven by EPP
+            # QUEUE DEPTH, and the flowControl gate is what emits it. It is
+            # off by default, and the gaie chart's own EndpointPickerConfig
+            # has no featureGates block at all -- which is why the config is
+            # inlined here rather than patched.
+            #
+            # Without it `make benchmark-deploy-wva` REFUSES to install
+            # ("Router queue not enabled"), and that refusal is right: the
+            # controller would run on a degraded demand signal, so both arms
+            # of the comparison would scale on something other than what the
+            # scenario claims to be measuring.
+            featureGates:
+            - flowControl
             plugins:
             - type: queue-scorer
             - type: kv-cache-utilization-scorer
@@ -527,13 +553,16 @@ scenario:
         enabled: true
         port: 8443
         secure: true
-      # Vanilla Kubernetes: kube-prometheus-stack, not OpenShift's Thanos. On a
-      # cluster where this is wrong the controller reads no metrics, every
-      # variant looks idle, and NEITHER arm ever scales -- which produces two
-      # flat runs that agree perfectly and mean nothing.
-      prometheus:
-        baseUrl: http://prometheus-operated.llm-d-monitoring.svc.cluster.local
-        port: 9090
+      # NO prometheus block, deliberately. This repo's installer RESOLVES the
+      # Prometheus URL from the cluster (deploy/lib/infra_monitoring.sh: the
+      # `prometheus-operated` Service of whichever Prometheus CR it finds,
+      # with the scheme taken from the CR rather than the port number), and a
+      # value here would be a second source of truth that drifts. It is also
+      # the field that matters most to get right: pointed at a Prometheus that
+      # does not scrape this namespace, the controller reads no metrics, every
+      # variant looks idle, and NEITHER arm ever scales -- two flat runs that
+      # agree perfectly and mean nothing. `verify` checks the controller is
+      # actually reading, rather than trusting either source.
       variantAutoscaling:
         variantCost: "10.0"
       hpa:
@@ -602,9 +631,16 @@ scenario:
         enabled: true
         port: 8443
         secure: true
-      prometheus:
-        baseUrl: http://prometheus-operated.llm-d-monitoring.svc.cluster.local
-        port: 9090
+      # NO prometheus block, deliberately. This repo's installer RESOLVES the
+      # Prometheus URL from the cluster (deploy/lib/infra_monitoring.sh: the
+      # `prometheus-operated` Service of whichever Prometheus CR it finds,
+      # with the scheme taken from the CR rather than the port number), and a
+      # value here would be a second source of truth that drifts. It is also
+      # the field that matters most to get right: pointed at a Prometheus that
+      # does not scrape this namespace, the controller reads no metrics, every
+      # variant looks idle, and NEITHER arm ever scales -- two flat runs that
+      # agree perfectly and mean nothing. `verify` checks the controller is
+      # actually reading, rather than trusting either source.
       variantAutoscaling:
         variantCost: "10.0"
       hpa:

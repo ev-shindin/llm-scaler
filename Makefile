@@ -149,6 +149,17 @@ BENCHMARK_HARNESS    ?= guidellm
 BENCHMARK_WORKLOAD   ?= prefill_heavy
 BENCHMARK_FORCE      ?= true
 BENCHMARK_MONITORING ?= true
+# Skip the chained smoketest after standup.
+#
+# For a MULTI-MODEL stack, which routes by PATH PREFIX. The smoketest's
+# model-readiness poll asks <gateway>/v1/models -- the gateway ROOT, which such a
+# stack does not route -- so it 404s and burns its whole 1800s timeout on a stack
+# where both models are already answering. Measured on CoreWeave: the root 404s
+# while /qwen3-8b/v1/models returns 200 listing the model, at the same moment.
+#
+# Single-model runs should leave this false: there the smoketest is the only
+# thing that checks the stack serves at all before a benchmark is started.
+BENCHMARK_SKIP_SMOKETEST ?= false
 BENCHMARK_UV         ?= false
 BENCHMARK_SCENARIOS_DIR ?= $(CURDIR)/test/benchmark/scenarios
 # The model WVA is benchmarked against, forwarded to the benchmark CLI as `-m`,
@@ -1481,6 +1492,7 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) standup \
 		-p $(BENCHMARK_NAMESPACE) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
+		$(if $(filter true,$(BENCHMARK_SKIP_SMOKETEST)),--skip-smoketest,) \
 		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,); \
 	rc=$$?; \
 	mv $(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml.bak \

@@ -84,6 +84,19 @@ case "$args" in
   # nothing about EPPs.
   *"get deploy "*"-o jsonpath={.status.readyReplicas}"*) echo "${READY:-1}"; exit 0 ;;
   *"get deploy "*"-o jsonpath={.status.replicas}"*) echo "${READY:-1}"; exit 0 ;;
+  # The routing table, which is how a stack name resolves to its backend. Names
+  # are the HASH form the harness actually generates, not the scenario's pinned
+  # shortName -- which it ignores.
+  *"get httproute -o json"*)
+      if [ "${ROUTES:-1}" = "1" ]; then
+        echo '{"items":[{"metadata":{"name":"multi-model-route"},"spec":{"rules":[
+          {"matches":[{"path":{"value":"/llama-31-8b"}}],"backendRefs":[{"name":"unsloth--244120d9-instruct-router"}]},
+          {"matches":[{"path":{"value":"/qwen3-8b"}}],"backendRefs":[{"name":"qwen-qwe-6e036fd5-qwen3-8b-router"}]}]}}]}'
+      else
+        echo '{"items":[]}'
+      fi
+      exit 0 ;;
+  *"get deploy "*"-o name"*) [ "${DEPLOY_EXISTS:-1}" = "1" ] && exit 0; exit 1 ;;
   *"get pvc"*) [ "${HAS_PVC:-1}" = "1" ] && exit 0; exit 1 ;;
   *"get pods -l llm-d.ai/warm-pool"*)
       [ "${POOL_EXISTS:-0}" = "1" ] && echo "wva-warm-pool-twomodel-abc"
@@ -249,6 +262,68 @@ OUT="$(PATH="$STUB:$PATH" BENCHMARK_NAMESPACE= bash "$SCRIPT" status 2>&1)"; RC=
     || ok "every verb requires a namespace"
 
 # ---------------------------------------------------------------------------
+# Both halves of the spec must exist, or the CLI cannot see it at all.
+#
+# `--spec` resolves config/specification/<name>.yaml.j2 and NEVER a scenario, so
+# a scenario shipped on its own is invisible: the CLI reports
+# "Specification '<name>' not found" and prints the list it does know, which
+# reads like a missing file while the scenario is plainly sitting in the clone.
+# That cost one standup.
+# ---------------------------------------------------------------------------
+case_begin
+SPEC_DIR="$ROOT/hack/benchmark/scenarios/guides"
+if [ ! -f "$SPEC_DIR/two-model-warm-pool.yaml" ]; then
+    fail "the scenario two-model-warm-pool.yaml is missing"
+elif [ ! -f "$SPEC_DIR/two-model-warm-pool.yaml.j2" ]; then
+    fail "two-model-warm-pool.yaml exists but its SPECIFICATION (.yaml.j2) does not, so --spec cannot resolve it and the standup dies after installing the scenario"
+elif ! grep -q 'scenario_file' "$SPEC_DIR/two-model-warm-pool.yaml.j2"; then
+    fail "the specification does not name a scenario_file; the CLI would render the default one"
+elif ! grep -q 'scenarios/guides/two-model-warm-pool.yaml' "$SPEC_DIR/two-model-warm-pool.yaml.j2"; then
+    fail "the specification points at a scenario other than its own: $(grep -A1 scenario_file "$SPEC_DIR/two-model-warm-pool.yaml.j2")"
+else
+    ok "the scenario and its specification both exist, and the specification names it"
+fi
+
+case_begin
+# The stack names are the HTTPRoute path prefixes AND the driver's defaults --
+# one fact in two files. Drift makes every request 404 for a whole run.
+if ! grep -q 'STACK_A="${STACK_A:-llama-31-8b}"' "$SCRIPT"; then
+    fail "the driver's STACK_A default changed; it must match a stack name in the scenario"
+elif ! grep -qE '^  - name: "llama-31-8b"' "$SPEC_DIR/two-model-warm-pool.yaml"; then
+    fail "the scenario has no stack named llama-31-8b, which the driver builds model A's endpoint from"
+elif ! grep -qE '^  - name: "qwen3-8b"' "$SPEC_DIR/two-model-warm-pool.yaml"; then
+    fail "the scenario has no stack named qwen3-8b, which the driver builds model B's endpoint from"
+elif ! grep -q 'STACK_B="${STACK_B:-qwen3-8b}"' "$SCRIPT"; then
+    fail "the driver's STACK_B default changed; it must match a stack name in the scenario"
+else
+    ok "both stack names are the driver's defaults and the scenario's, which is what the HTTPRoute keys on"
+fi
+
+# The stack -> Deployment mapping must come from the ROUTE, never from a name.
+# The harness IGNORES model.shortName and generates a namespace-salted hash --
+# measured on CoreWeave: unsloth/Meta-Llama-3.1-8B-Instruct became
+# `unsloth--244120d9-instruct`, which shares no substring with the stack name
+# `llama-31-8b`. Matching names finds nothing, silently, and verify then reports
+# a stack that is plainly serving as absent.
+case_begin
+DEPLOY_EXISTS=1 ROUTES=1 run_verb verify
+if printf '%s' "$OUT" | grep -q 'unsloth--244120d9-instruct-decode'; then
+    ok "a stack resolves to its Deployment through the HTTPRoute, not through its name"
+elif printf '%s' "$OUT" | grep -q 'no decode Deployment'; then
+    fail "the stack did not resolve to a Deployment. It has to be looked up through the route's backendRef, because the harness's generated name shares no substring with the stack name."
+else
+    fail "verify did not name the Deployment it resolved, so this case cannot tell how it was found: $OUT"
+fi
+
+case_begin
+ROUTES=0 run_verb verify
+if [ "$RC" -eq 0 ]; then
+    fail "verify passed with NO HTTPRoute: there is no path for either model, and every request in a 34-minute run would 404"
+else
+    ok "a namespace with no HTTPRoute is refused"
+fi
+
+# ---------------------------------------------------------------------------
 # The schedule and the report, executed.
 # ---------------------------------------------------------------------------
 case_begin
@@ -259,7 +334,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=15
+CASES_EXPECTED=19
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

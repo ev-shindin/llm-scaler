@@ -298,6 +298,45 @@ def one_request(rec, model_key, base_url, model_id, prompt, max_tokens,
         rec.add(row)
 
 
+def wait_for_endpoints(endpoints, timeout):
+    """Both models answer a one-token request from THIS Pod, or give up.
+
+    Returns True once every endpoint has answered at least once.
+    """
+    deadline = time.time() + timeout
+    pending = dict(endpoints)
+    last = {}
+    while pending and time.time() < deadline:
+        for key in list(pending):
+            url, model_id = pending[key]
+            conn = None
+            try:
+                conn, path = connect(url, 30)
+                body = json.dumps({"model": model_id, "prompt": "ready?",
+                                   "max_tokens": 1, "stream": False})
+                conn.request("POST", path, body=body,
+                             headers={"Content-Type": "application/json"})
+                resp = conn.getresponse()
+                resp.read()
+                if resp.status == 200:
+                    print("  endpoint ready: %s (%s)" % (model_id, url), flush=True)
+                    del pending[key]
+                else:
+                    last[key] = "HTTP %d" % resp.status
+            except Exception as exc:                   # noqa: BLE001
+                last[key] = "%s: %s" % (type(exc).__name__, exc)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:                  # noqa: BLE001
+                        pass
+        if pending:
+            print("  waiting for %s (%s)" % (sorted(pending), last), flush=True)
+            time.sleep(5)
+    return not pending
+
+
 def drive(args):
     schedule = build_schedule(args.phase_seconds, args.cycles,
                               args.low_rps, args.high_rps, args.lead_in)
@@ -327,6 +366,23 @@ def drive(args):
     pool = ThreadPoolExecutor(max_workers=workers)
 
     endpoints = {"a": (args.endpoint_a, args.model_a), "b": (args.endpoint_b, args.model_b)}
+
+    # BOTH endpoints must answer before t0 is taken.
+    #
+    # A fresh Pod on a service mesh cannot resolve DNS for the first half-minute
+    # or so: the sidecar starts alongside this container and nothing makes the
+    # application wait for it. Measured on CoreWeave -- two probe Pods in a row
+    # failed with "Temporary failure in name resolution" and the third got a 200
+    # from a model that had been serving the whole time.
+    #
+    # Starting the schedule anyway would spend the lead-in, and possibly the
+    # first burst, recording connection errors as if the cluster had produced
+    # them -- in whichever arm happened to start on a colder sidecar.
+    if not wait_for_endpoints(endpoints, args.warmup_timeout):
+        print("ERROR: the endpoints never answered from inside this Pod. Nothing was "
+              "measured; this is the Pod's network, not the models.", file=sys.stderr)
+        return 4
+
     t0 = time.time()
 
     print("schedule (%d phases, %ds total):" % (len(schedule), total), flush=True)
@@ -425,6 +481,8 @@ def main(argv):
     p.add_argument("--output-tokens", type=int, default=200)
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--max-workers", type=int, default=1024)
+    p.add_argument("--warmup-timeout", type=int, default=300,
+                   help="how long to wait for both endpoints to answer before t0")
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--arm", default="unknown", help="pool|nopool, recorded in the meta")
     p.add_argument("--out", default="/results/requests.jsonl")

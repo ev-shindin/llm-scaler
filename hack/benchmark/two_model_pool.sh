@@ -251,16 +251,55 @@ verb_preflight() {
 verb_standup() {
     need_ns
     [ -f "$ROOT/hack/benchmark/scenarios/$BENCH_SPEC.yaml" ] || \
-        die "no scenario spec at hack/benchmark/scenarios/$BENCH_SPEC.yaml"
+        die "no scenario at hack/benchmark/scenarios/$BENCH_SPEC.yaml"
+    # BOTH halves. `--spec` resolves a SPECIFICATION
+    # (config/specification/<name>.yaml.j2) and never a scenario, so a scenario
+    # shipped without one is invisible to the CLI: it reports
+    # "Specification '<name>' not found" and prints the list it does know, which
+    # reads like a missing file while the scenario sits in the clone. Measured,
+    # on the first run of this standup.
+    [ -f "$ROOT/hack/benchmark/scenarios/$BENCH_SPEC.yaml.j2" ] || \
+        die "no specification at hack/benchmark/scenarios/$BENCH_SPEC.yaml.j2.
+    The scenario exists, but --spec resolves the SPECIFICATION, so the CLI cannot see it."
+    # RE-RENDERING OUR OWN STACKS IS FINE; clobbering someone else's is not.
+    #
+    # The standup refuses outright when it finds an EPP, because a second
+    # standup applies its own EPP, Service, InferencePool and PodMonitor over
+    # whatever is there and the pods keep answering -- silent damage to a stack
+    # somebody may be using. But this scenario is edited and re-run (an EPP
+    # feature gate, a replica count), and every re-run trips that guard.
+    #
+    # So the override is taken only when the namespace's shared route already
+    # carries BOTH of this scenario's stacks -- which is what "these EPPs are
+    # ours" looks like from outside. Anything else is left to the guard.
+    local allow_reuse=false epps
+    epps="$(k get deploy -o name 2>/dev/null | grep -c -- '-epp' || true)"
+    if [ "${epps:-0}" -gt 0 ]; then
+        if [ -n "$(stack_backend "$STACK_A")" ] && [ -n "$(stack_backend "$STACK_B")" ]; then
+            allow_reuse=true
+            info "re-rendering: the route already carries $STACK_A and $STACK_B, so the ${epps} EPP(s) here are this scenario's"
+        else
+            die "$NS already runs ${epps} EPP(s), and the shared route does not carry both of this scenario's stacks -- so they belong to something else. A standup would apply its own EPP, Service, InferencePool and PodMonitor over them, silently. Use a clean namespace."
+        fi
+    fi
+
     info "standing up both stacks from $BENCH_SPEC"
     ( cd "$ROOT" && \
+        BENCHMARK_ALLOW_EPP_REUSE="$allow_reuse" \
         BENCHMARK_NAMESPACE="$NS" \
         BENCHMARK_SPEC="$BENCH_SPEC" \
         BENCHMARK_MODEL_ID= \
         BENCHMARK_DECODE_REPLICAS="$MIN_REPLICAS" \
         BENCHMARK_KEDA_MIN_REPLICAS="$MIN_REPLICAS" \
         BENCHMARK_KEDA_MAX_REPLICAS="$MAX_REPLICAS" \
+        BENCHMARK_SKIP_SMOKETEST=true \
         make --no-print-directory benchmark-standup ) || die "standup failed"
+    # The smoketest is skipped because it cannot pass here -- its readiness poll
+    # asks the gateway ROOT for /v1/models, which a path-prefixed multi-model
+    # stack does not route, so it 404s for its whole 1800s timeout while both
+    # models answer at their own prefixes. `verify` does the same job correctly:
+    # it asks each model on the path the load will actually use.
+    info "the standup's own smoketest was skipped (it cannot see a path-prefixed stack); 'verify' is the check that replaces it"
     verb_status
     ok "stacks stood up. Run 'verify' before any load."
 }
@@ -272,28 +311,54 @@ gateway_host() {
     # REFUSES on ambiguity rather than taking the first. Two gateway Services in
     # one namespace means something else is deployed here, and driving the wrong
     # one produces a run of 404s that reads as a pool result.
+    #
+    # The HTTP port BY NAME, never ports[0]. Measured on CoreWeave: the istio
+    # gateway Service lists 15021 (status-port) first and 80 second, so ports[0]
+    # sent every request at the readiness port -- which answers, with 404, for
+    # the whole run.
     local svcs count
     svcs="$(k get svc -o json 2>/dev/null | jq -r '
         [.items[] | select(.metadata.name | test("inference-gateway|-gateway$"))
-         | .metadata.name + ":" + ((.spec.ports[0].port|tostring))] | unique | .[]')"
+         | .metadata.name as $n
+         | (.spec.ports[] | select(.name == "http" or .name == "http2" or .port == 80) | .port) as $p
+         | $n + ":" + ($p|tostring)] | unique | .[]')"
     count="$(printf '%s\n' "$svcs" | grep -c . || true)"
     [ "${count:-0}" -eq 1 ] || return 1
     printf '%s' "$svcs"
+}
+
+# The stack's backend, read from the HTTPRoute the gateway actually routes on.
+#
+# NOT from the scenario's `model.shortName`: the harness IGNORES that and
+# generates `{first8}-{sha256(namespace/model)[:8]}-{last8}` regardless --
+# measured, `unsloth/Meta-Llama-3.1-8B-Instruct` in this namespace became
+# `unsloth--244120d9-instruct`. Matching the stack name against Deployment names
+# therefore finds nothing, silently, and `verify` would report a stack that is
+# plainly serving as absent.
+#
+# The route is also the RIGHT source: it is the same table the load generator's
+# requests follow, so what this resolves and what the run measures cannot drift.
+stack_backend() {
+    k get httproute -o json 2>/dev/null | jq -r --arg p "/$1" '
+        [.items[].spec.rules[]?
+         | select([.matches[]?.path.value] | index($p))
+         | .backendRefs[0].name] | .[0] // ""'
+}
+
+decode_deploy_for() {
+    local backend prefix
+    backend="$(stack_backend "$1")"
+    [ -n "$backend" ] || return 0
+    # The modelservice chart names the pool `<shortName>-router` and the
+    # Deployment `<shortName>-decode`.
+    prefix="${backend%-router}"
+    k get deploy "${prefix}-decode" -o name >/dev/null 2>&1 && printf '%s' "${prefix}-decode"
 }
 
 endpoint_for_stack() {
     local hostport="$1" stack="$2"
     printf 'http://%s.%s.svc.cluster.local:%s/%s/v1/completions' \
         "${hostport%%:*}" "$NS" "${hostport##*:}" "$stack"
-}
-
-decode_deploy_for() {
-    # The stack's decode Deployment. Named from the scenario's pinned
-    # `model.shortName`, so this matches on the stack's own short name rather
-    # than reproducing the harness's name hash.
-    k get deploy -o json 2>/dev/null | jq -r --arg s "$1" '
-        [.items[] | select(.metadata.name | test($s)) | select(.metadata.name | test("decode"))
-         | .metadata.name] | .[0] // ""'
 }
 
 verb_verify() {
@@ -334,6 +399,44 @@ verb_verify() {
     verify_probe "$(endpoint_for_stack "$hostport" "$STACK_B")" "$MODEL_B" || probe_rc=1
     [ "$probe_rc" -eq 0 ] || die "at least one model did not answer a single request"
 
+    # IS THE CONTROLLER ACTUALLY READING? This is the failure that produces two
+    # flat runs which agree perfectly and mean nothing: a Prometheus that does
+    # not scrape this namespace leaves every variant looking idle, so NEITHER
+    # arm ever scales and the report compares two straight lines. Nothing else
+    # in this scenario would notice -- the stacks serve, the pool lends nothing
+    # because nothing ever asks, and both arms finish.
+    #
+    # Warned, not fatal: a controller that is still starting is normal at this
+    # point, and refusing here would block a standup that is merely young.
+    local wva_ready
+    wva_ready="$(k get deploy -l app.kubernetes.io/name=workload-variant-autoscaler \
+        -o jsonpath='{.items[*].status.readyReplicas}' 2>/dev/null)"
+    if [ -z "${wva_ready:-}" ] || [ "${wva_ready:-0}" = "0" ]; then
+        warn "no READY WVA controller in $NS. Nothing will scale, and both arms would be flat."
+    else
+        ok "WVA controller ready"
+    fi
+    local not_ready
+    not_ready="$(k get scaledobject -o json 2>/dev/null | jq -r '
+        [.items[]
+         | select([.spec.triggers[]?.metadata.warmPoolName] | all(. == null))
+         | select([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length == 0)
+         | .metadata.name + " (" + ([.status.conditions[]? | select(.type=="Ready") | .message // "no Ready condition"] | join("; ")) + ")"]
+        | .[]' 2>/dev/null)"
+    if [ -n "$not_ready" ]; then
+        warn "ScaledObjects that are not Ready -- these models cannot scale, so the run would compare two flat lines:"
+        printf '%s\n' "$not_ready" | sed 's/^/      /' >&2
+    else
+        ok "every model ScaledObject reports Ready"
+    fi
+    local errs
+    errs="$(k logs -l app.kubernetes.io/name=workload-variant-autoscaler --tail=400 2>/dev/null \
+        | grep -iE 'prometheus|metrics' | grep -iE 'error|refused|denied|timeout|no such host' | tail -5)"
+    if [ -n "$errs" ]; then
+        warn "the controller is logging metric-read errors; it may be pointed at a Prometheus that does not scrape this namespace:"
+        printf '%s\n' "$errs" | sed 's/^/      /' >&2
+    fi
+
     if k get deploy "wva-warm-pool-$POOL_NAME" >/dev/null 2>&1; then
         info "pool '$POOL_NAME':"
         k get pods -l "llm-d.ai/warm-pool=$POOL_NAME" -o wide 2>/dev/null | sed 's/^/    /' >&2
@@ -343,24 +446,68 @@ verb_verify() {
     ok "verify passed"
 }
 
+# One real request, from a Pod, RETRIED.
+#
+# Not `kubectl run --rm -i`: that ties the result to an attach, and on this
+# cluster it fails two ways that have nothing to do with the model --
+# "timed out waiting for the condition" when the attach loses the race with the
+# container, and "Temporary failure in name resolution" when the Pod's DNS is
+# not up yet (a service mesh adds a sidecar the application does not wait for).
+# Both were reported as "the model did NOT answer", about a model that was
+# answering when asked again a second later.
+#
+# So: create, wait for it to FINISH, read its log, delete. And try more than
+# once, because the first attempt after a rollout legitimately loses that race.
 verify_probe() {
-    local url="$1" model="$2" out
+    local url="$1" model="$2" out pod attempt rc
     info "probing $model at $url"
-    out="$(k run "probe-$RANDOM" --rm -i --restart=Never --quiet \
-        --image="$(load_image)" --command -- \
-        python3 -c "
-import json,urllib.request
-req=urllib.request.Request('$url', data=json.dumps({'model':'$model','prompt':'hello','max_tokens':4}).encode(), headers={'Content-Type':'application/json'})
-try:
-    r=urllib.request.urlopen(req, timeout=120)
-    print('HTTP', r.status)
-except Exception as e:
-    print('FAILED', e)
-" 2>&1)" || true
-    case "$out" in
-        *"HTTP 200"*) ok "  $model answered"; return 0 ;;
-        *) warn "  $model did NOT answer: $out"; return 1 ;;
-    esac
+    for attempt in 1 2 3; do
+        pod="probe-$(date +%s)-$RANDOM"
+        k run "$pod" --restart=Never --quiet --image="$(load_image)" --command -- \
+            python3 -c "
+import json,time,urllib.request
+# Retried INSIDE the Pod. A fresh Pod here cannot resolve DNS for the first
+# half-minute or so -- a mesh sidecar starts alongside the container and the
+# application does not wait for it -- and one attempt reports a serving model as
+# dead. Measured: attempts 1 and 2 failed to resolve, attempt 3 returned 200.
+body=json.dumps({'model':'$model','prompt':'hello','max_tokens':4}).encode()
+deadline=time.time()+180
+last=''
+while time.time()<deadline:
+    try:
+        req=urllib.request.Request('$url', data=body, headers={'Content-Type':'application/json'})
+        r=urllib.request.urlopen(req, timeout=120)
+        print('HTTP', r.status)
+        break
+    except Exception as e:
+        last=str(e)
+        time.sleep(5)
+else:
+    print('FAILED', last)
+" >/dev/null 2>&1 || true
+        # A Pod that runs for a second is never observed Ready, so wait on the
+        # phase instead of on a condition.
+        local waited=0
+        while [ "$waited" -lt 180 ]; do
+            case "$(k get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)" in
+                Succeeded|Failed) break ;;
+            esac
+            sleep 5
+            waited=$(( waited + 5 ))
+        done
+        out="$(k logs "$pod" 2>&1)"
+        k delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1
+        case "$out" in
+            *"HTTP 200"*) ok "  $model answered (attempt $attempt)"; return 0 ;;
+            *"name resolution"*|*"timed out waiting"*|"")
+                warn "  attempt $attempt could not reach the network from the probe Pod (${out:-no output}); retrying"
+                sleep 10
+                continue ;;
+            *) warn "  $model did NOT answer: $out"; return 1 ;;
+        esac
+    done
+    warn "  $model: three probe Pods failed to reach the network. That is the probe, not the model -- check DNS/mesh readiness in $NS."
+    return 1
 }
 
 # The image the load Pod runs, resolved from a Deployment already in the
@@ -592,7 +739,11 @@ set_arm_ceiling() {
             -p "{\"spec\":{\"maxReplicaCount\":$ceiling}}" >/dev/null || \
             warn "could not set maxReplicaCount on $so"
     done
-    info "arm '$arm': each model may reach ${ceiling} replicas (pool holds ${POOL_REPLICAS} Pods)"
+    # The pool's Pods only exist in the pool arm, and saying otherwise here
+    # misreports the one number that makes the arms comparable.
+    local held=0
+    [ "$arm" = "pool" ] && held="$POOL_REPLICAS"
+    info "arm '$arm': each model may reach ${ceiling} replicas; the pool holds ${held} Pod(s) -- ceiling $(( 2 * ceiling * GPUS_PER_REPLICA + held * GPUS_PER_REPLICA )) accelerators"
     echo "$ceiling"
 }
 
