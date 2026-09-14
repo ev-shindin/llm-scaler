@@ -1,5 +1,5 @@
 #!/bin/bash
-# Prove why glm52-switchable.yaml keeps llm-d.ai/role OUT of the Deployment
+# Prove why switchable.yaml keeps llm-d.ai/role OUT of the Deployment
 # selector, by doing it both ways and relabelling a pod of each.
 #
 # No GPUs and no vLLM: this is Kubernetes ownership semantics. Runs in about a
