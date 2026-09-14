@@ -23,10 +23,34 @@ two things: "`deepep_v2` instead of the specialist" and "switchable instead of
 fixed". B separates them. C differs from B only by the retained spare buffer
 (286 MiB/GPU at EP=16) and the patched rebuild path.
 
-Arms B and C use `vllm/vllm-openai:nightly-385dce36bcee42309924a5ece951a96db3dce7f2`
-(arm C with the injection from `tools/pd_role_switch/README.md` §1b). Arm A is
-the same image unpatched — same base for all three, so the image is not a
-variable.
+### Where each arm's engine comes from
+
+All three run the same base image, so the image is never a variable:
+
+```
+vllm/vllm-openai:nightly-385dce36bcee42309924a5ece951a96db3dce7f2
+```
+
+**Arms A and B** use it unmodified.
+
+**Arm C** needs the role-switch patch, which lives in a **different repository**:
+
+| | |
+| --- | --- |
+| repo | `github.com/ev-shindin/vllm-conf` (the vLLM fork) |
+| branch | `feat/pd-role-switch` |
+| how to apply | `tools/pd_role_switch/README.md` §"1b. Put this branch into a stock image" |
+| verify | the injection must report **13 hunks, 0 rejects**; then `import vllm.v1.engine.pd_role` must succeed |
+
+That base image is chosen, not arbitrary: it is two commits from the branch's own
+merge base, and those two touch only the mooncake connector and its tests — none
+of the thirteen files the injection patches. A base that drifts further fails at
+the `.rej` check rather than at runtime, which is the intended behaviour.
+
+Arm C also needs `deep_ep` rebuilt against the NCCL in the image;
+`tools/pd_role_switch/build_deep_ep.sh` in the same repo does it and takes about
+80 s. Note **`deepep_v2` requires an RDMA device even on one node**, so the pod
+must request `rdma/ib` or every rank fails with `DeepEPv2 requires NCCL GIN`.
 
 > **The backend names read backwards, and the production manifests settle it.**
 >
@@ -227,34 +251,17 @@ itself. Both modes are required and must be labelled in results:
 
 Identical across arms unless a table says otherwise.
 
-**Launch** (2 nodes, EP=16; rank 0 serves the API, rank 1 is `--headless
---data-parallel-start-rank 8`):
+**Launch.** The three arms' flags and environment are
+[`test/evaluation/pd-role-switch/arms.env`](../../test/evaluation/pd-role-switch/arms.env),
+not repeated here:
 
 ```bash
-vllm serve zai-org/GLM-5.3 \
-  --trust-remote-code \
-  --block-size 64 \
-  --kv-cache-dtype fp8 \
-  --data-parallel-size 16 --data-parallel-size-local 8 \
-  --data-parallel-address $MASTER_ADDR --data-parallel-rpc-port 5555 \
-  --enable-expert-parallel \
-  --tensor-parallel-size 1 \
-  --all2all-backend <per arm> \
-  --moe-backend <deep_gemm for arm A; omit for B and C> \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
-  --max-num-batched-tokens <1024 prefill | 128 decode> \
-  --max-num-seqs <from the §2b sizing table, per pattern> \
-  --gpu-memory-utilization <0.90 prefill | 0.95 decode> \
-  --max-model-len <input + output, rounded up>
+source test/evaluation/pd-role-switch/arms.env
+arm_flags C prefill     # flags for arm C in the prefill role
+arm_env   C             # its environment
 ```
 
-Decode runs add `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`.
-
-> **`run_switch_test.sh` defaults to `zai-org/GLM-5.2-FP8`.** That default is
-> deliberate in the fork — it matches the published table there — but this
-> evaluation runs GLM-5.3, so **`MODEL=zai-org/GLM-5.3` must be set on every
-> run**. Nothing else in the harness is model-specific: rank and layer counts
-> come from the switch response rather than a constant.
+Rank 0 serves the API; rank 1 is `--headless --data-parallel-start-rank 8`.
 
 **Environment**, all runs: `VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0` (two nodes),
 `NVSHMEM_HCA_PREFIX=ibp`, `VLLM_ENGINE_READY_TIMEOUT_S=3600`,
@@ -262,6 +269,49 @@ Decode runs add `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`.
 
 **`VLLM_PD_PAUSE_MODE` is left at its default (`wait`)** and stated in results.
 It is worth 40× on switch-under-load and nothing idle.
+
+### The load generator
+
+**Use the llm-d-benchmark harness already in this repo**, not a new script.
+`test/benchmark/scenarios/` holds 17 scenarios in its format and the
+`make benchmark-*` targets drive them, so a second generator would be another
+thing to trust for no gain.
+
+The four patterns are committed as harness scenarios, so nothing here needs
+transcribing into a new file:
+
+| pattern | scenario |
+| --- | --- |
+| P1 | `test/benchmark/scenarios/pd_eval_p1_agent.yaml.in` |
+| P2 | `test/benchmark/scenarios/pd_eval_p2_automation.yaml.in` |
+| P3 | `test/benchmark/scenarios/pd_eval_p3_longctx.yaml.in` |
+| D1 | `test/benchmark/scenarios/pd_eval_d1_decode.yaml.in` |
+
+Each carries its shape and its provenance; `__REQUEST_RATE__` and
+`__MAX_DURATION__` are substituted by the Makefile, so **one file serves every
+rung of a ladder**.
+
+**The harness drives by rate, and so does the production document** — 8,444
+req/min at the AutomationBench boundary, 463 for AgentX, 968 for CyberGym. Rate
+is therefore the axis, and the ceilings in §2b become a **bound on in-flight
+work** rather than the dial: a rate whose in-flight set exceeds them preempts,
+and preemption silently distorts latency.
+
+**Production rates cannot be used directly** — they are fleet-wide across 9P+8D,
+and one group at EP=16 is a fraction of that. Drive a **ladder** and report where
+it breaks, as production established 2,500 agents comfortable and 3,000 the
+boundary:
+
+| pattern | ladder (req/s) | stop when |
+| --- | --- | --- |
+| P1 | 0.25, 0.5, 1, 2, 4 | TTFT p90 leaves its unloaded band, or KV > 90% |
+| P2 | 1, 2, 4, 8, 16 | as above |
+| P3 | 0.1, 0.25, 0.5, 1 | as above |
+| D1 | 2, 4, 8, 16, 32 | output tok/s stops rising |
+
+Each rung is a separate run. **Arms are compared at equal offered rate**, and the
+rung where an arm saturates is itself a result — an arm that saturates earlier
+has less headroom, which is what A-vs-B and B-vs-C are really asking.
 
 **Generator rules** — each corresponds to a measurement previously discarded:
 
@@ -292,7 +342,8 @@ that silently distorts latency.
 record the reported KV cache blocks and derive tokens per rank. Then issue 1, 4,
 8, 16 concurrent P1-shaped requests and record where preemption first appears.
 
-**Output:** a concurrency ceiling per pattern, used as `--max-num-seqs` below.
+**Output:** a concurrency ceiling per pattern, used as `--max-num-seqs` and as
+the in-flight bound the rate ladders must not exceed.
 **Gate:** if measured capacity is within 20% of the §2b derived figures,
 proceed. If not, the arithmetic is wrong and every sizing here needs redoing.
 
@@ -304,31 +355,40 @@ One arm at a time, no llm-d, no EPP, nothing between generator and engine.
 
 #### Prefill runs — metric is **latency**
 
-| run | arm | pattern | cache mode | concurrency |
-| --- | --- | --- | --- | --- |
-| 1.1 | A | P1, P2, P3 | unique | 1, then run-0 ceiling |
-| 1.2 | B | P1, P2, P3 | unique | as 1.1 |
-| 1.3 | C | P1, P2, P3 | unique | as 1.1 |
-| 1.4 | A | P1, P2 | shared-prefix | run-0 ceiling |
-| 1.5 | B | P1, P2 | shared-prefix | run-0 ceiling |
-| 1.6 | C | P1, P2 | shared-prefix | run-0 ceiling |
+| run | arm | backend | pattern | cache mode | load |
+| --- | --- | --- | --- | --- | --- |
+| 1.1 | A | `deepep_high_throughput` | P1, P2, P3 | unique | the full ladder |
+| 1.2 | B | `deepep_v2` | P1, P2, P3 | unique | the same rungs as 1.1 |
+| 1.3 | C | `deepep_v2` | P1, P2, P3 | unique | the same rungs as 1.1 |
+| 1.4 | A | `deepep_high_throughput` | P1, P2 | shared-prefix | saturating rung |
+| 1.5 | B | `deepep_v2` | P1, P2 | shared-prefix | saturating rung |
+| 1.6 | C | `deepep_v2` | P1, P2 | shared-prefix | saturating rung |
 
-Concurrency 1 and saturated are both required: the existing result is that our
-engine is **1.46× faster unloaded and 1.35× slower at 16 concurrent**, so a
-single concurrency level would support either conclusion.
+Every arm runs the **same rungs**, so a comparison is always at equal offered
+rate. Where an arm saturates is itself a result.
 
-`--max-num-batched-tokens 2048`, matching the prefill role the switch defines.
+The lowest rung and the saturating rung are both required: the existing result
+is that our engine is **1.46x faster unloaded and 1.35x slower at 16
+concurrent**, so a single load level would support either conclusion.
+
+`--max-num-batched-tokens 1024`, which is what production's prefill group runs.
+Note this differs from `run_switch_test.sh`, whose default is 2048 -- that is a
+harness default, not a definition of the role, and the budget-keyed KV direction
+works from any change in it.
 
 #### Decode runs — metric is **throughput**
 
-| run | arm | pattern | concurrency | duration |
-| --- | --- | --- | --- | --- |
-| 1.7 | A | D1 | 16, 64, ceiling | ≥60 s sustained |
-| 1.8 | B | D1 | 16, 64, ceiling | ≥60 s sustained |
-| 1.9 | C | D1 | 16, 64, ceiling | ≥60 s sustained |
+| run | arm | backend | pattern | load | duration |
+| --- | --- | --- | --- | --- | --- |
+| 1.7 | A | `deepep_low_latency` | D1 | the D1 ladder | ≥300 s per rung |
+| 1.8 | B | `deepep_v2` | D1 | the same rungs | ≥300 s per rung |
+| 1.9 | C | `deepep_v2` | D1 | the same rungs | ≥300 s per rung |
 
-`--max-num-batched-tokens 128`, matching the decode role. Sustained, not
-single-shot: report tok/s over the steady window after warm-up.
+`--max-num-batched-tokens 128` and
+`--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`, matching
+production's decode group. Sustained, not single-shot: report tok/s over the
+steady window after warm-up, and stop climbing the ladder when output tok/s
+stops rising.
 
 #### Run 1.10 — switch under production-shaped load (arm C only)
 
@@ -348,7 +408,7 @@ measured; under production-shaped load it is not.**
 
 ---
 
-### Set 2 — a P/D pair under llm-d with EPP
+### Set 2 — prefill and decode groups under llm-d with EPP
 
 Prefill and decode groups behind the endpoint picker, so routing, NIXL, the CPU
 offload tier and P2P are all in the path. **2P + 1D, EP=16 each = 6 nodes per
@@ -366,19 +426,12 @@ from when there is only one.
 vLLM connector configuration rather than separate infrastructure, so there is no
 reason to omit them. Prefill runs a MultiConnector — Nixl for P/D transfer plus:
 
-```json
-{"kv_connector": "OffloadingConnector",
- "kv_role": "kv_both",
- "kv_connector_extra_config": {
-   "spec_name": "TieringOffloadingSpec",
-   "cpu_bytes_to_use": 53687091200,
-   "eviction_policy": "lru",
-   "offload_prompt_only": true,
-   "secondary_tiers": [{"type": "p2p", "host": "${POD_IP}", "port": "${P2P_BASE}"}]}}
-```
+`OffloadingConnector` with `TieringOffloadingSpec`, 50 GiB of CPU KV per pod,
+LRU, `offload_prompt_only`, and a P2P secondary tier — copied from the canary's
+prefill MultiConnector in `glm_data/prefill LWS`.
 
-50 GiB of CPU KV per pod, as the canary sets it. Production's 28.1 TiB aggregate
-is that figure across a fleet of ~17 groups; at 2P+1D we get the **mechanism at
+Production's 28.1 TiB aggregate is that same per-pod figure
+across a fleet of ~17 groups; at 2P+1D we get the **mechanism at
 about 1/200th the capacity**, which is enough to test whether switchability
 interferes with offload and P2P, and not enough to reproduce the 85% hit rate.
 
@@ -397,7 +450,7 @@ request, zero failures**), queue wait at the picker, per-group KV utilisation.
 The run that justifies the work. **2P+1D → 1P+2D**, mirroring production's
 10P/7D → 9P/8D.
 
-1. Drive P2 at a concurrency where **decode is the limiter** — production found
+1. Drive P2 at a rate where **decode is the limiter** — production found
    exactly this, moving 10P/7D → 9P/8D because decode KV saturated first.
    Confirm it *is* the limiter from per-group KV utilisation before switching,
    rather than assuming the load shape produced it.
@@ -426,8 +479,15 @@ you change, so the switchable deployment shape in that guide is a prerequisite.
 | phase | nodes | wall time |
 | --- | --- | --- |
 | run 0 | 2 | ~20 min |
-| set 1 (runs 1.1–1.10) | 2, sequential | ~4–5 h incl. repeats |
-| set 2 (runs 2.1–2.4) | **6 per arm**, sequential | ~6–7 h |
+| set 1 prefill (1.1–1.6) | 2, sequential | ~5 h |
+| set 1 decode (1.7–1.9) | 2, sequential | ~2 h |
+| set 1 switch-under-load (1.10) | 2 | ~30 min |
+| set 2 (2.1–2.4) | **6 per arm**, sequential | ~7–8 h |
+
+Set 1 prefill is the long pole and the ladder is why: three arms x three
+patterns x up to five rungs is about 45 measured runs. They share an engine
+within an arm, so the cost is three engine starts plus the runs themselves —
+but it is a day, not an afternoon, and worth knowing before booking nodes.
 
 Weight load is ~106 s from node-local NVMe against 1403 s from the shared PVC —
 `HF_HOME=/mnt/local/hf-cache` is not optional at this run count. Kermit has had
@@ -437,10 +497,15 @@ Weight load is ~106 s from node-local NVMe against 1403 s from the shared PVC �
 
 ## 7. What this does not establish
 
-- **Fleet-level benefit.** 1P/1D is not 9P/8D. This establishes mechanism and
-  cost, not what a production fleet gains.
-- **Cache-tier behaviour.** No CPU offload tier (production: 28.1 TiB), no P2P.
-  The 85% reuse that defines this workload is only partly reproducible.
+- **Fleet-level benefit.** 2P+1D is not 9P/8D. This establishes the mechanism
+  and its cost, and that one group can change role while the fleet keeps
+  serving — not what a 17-group fleet gains from doing it.
+- **Cache-tier behaviour at production scale.** The CPU offload tier and P2P are
+  configured as the canary configures them, so the mechanism is exercised. What
+  is not reproducible is the capacity: 50 GiB per pod across three groups
+  against production'''s 28.1 TiB across ~17. Expect hit rates nothing like the
+  85% that defines this workload, and report what was achieved rather than
+  comparing it to that figure.
 - **EP=32.** Everything here is EP=16.
 - **Whether switching is the right control action.** That needs a controller
   that does not exist yet.

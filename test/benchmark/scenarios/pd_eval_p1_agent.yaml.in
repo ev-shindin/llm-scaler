@@ -1,0 +1,29 @@
+metadata:
+  labels:
+    name: pd-eval-p1-agent
+    description: |
+      Interactive coding-agent shape: very long prompt, short answer.
+
+      P/D role-switch evaluation. Derived from the GLM-5.2 production platform
+      overview: AgentX, 463 req/min carrying 28.15M input and 0.375M output tokens/min.
+      60,000 input / 810 output. Reference TTFT p90 5.77 s.
+
+      Rate is one rung of a ladder, not a production figure -- production rates
+      are fleet-wide across 9P+8D and this drives a single group. See
+      docs/proposals/pd-role-switch-evaluation.md.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: poisson
+    rate: __REQUEST_RATE__
+  data:
+  - kind: synthetic_text
+    prompt_tokens: 60000
+    output_tokens: 810
+  constraints:
+  - kind: max_duration
+    seconds: __MAX_DURATION__
