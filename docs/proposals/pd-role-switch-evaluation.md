@@ -157,7 +157,11 @@ All belong in any statement of results:
    count, so absolute figures do not transfer.
 2. **H200, not H100** — and at EP16 the extra memory is *required*, not spare.
 3. **InfiniBand, not RoCE GDR** — different transport under NVSHMEM/DeepEP.
-4. **No CPU KV tier, no P2P** — the 85% reuse is only partly reproducible.
+4. **CPU/P2P tier at ~1/200th of production capacity.** The mechanism is
+   configured as the canary configures it (50 GiB per pod, LRU,
+   `offload_prompt_only`, P2P secondary), but production's 28.1 TiB aggregate
+   comes from ~17 groups. Expect a far lower hit rate than 85%; report the
+   achieved rate rather than targeting one.
 
 **The model delta is closed.** GLM-5.3 is already on the node-local NVMe
 (703.8 GB, 282 safetensors, fp8) and is what production serves, so the
@@ -340,10 +344,39 @@ measured; under production-shaped load it is not.**
 
 ### Set 2 — a P/D pair under llm-d with EPP
 
-Prefill group and decode group behind the endpoint picker, so routing, NIXL and
-the KV connector are in the path. **1P + 1D, EP=16 each = 4 nodes per arm.**
+Prefill and decode groups behind the endpoint picker, so routing, NIXL, the CPU
+offload tier and P2P are all in the path. **2P + 1D, EP=16 each = 6 nodes per
+arm.**
 
-| run | arm | prefill group | decode group | patterns |
+**Why 2P and not 1P.** Run 2.4 switches a prefill replica into the decode role.
+With a single prefill group that leaves the fleet with *no prefill capacity* and
+it stops serving — the experiment cannot run. Production's actual move was
+10P/7D → 9P/8D: one of many groups changed role. 2P+1D → 1P+2D is the smallest
+topology that reproduces that shape, and it is also what makes the P2P tier
+non-degenerate, since P2P pulls between prefill ranks and has nowhere to pull
+from when there is only one.
+
+**The CPU offload tier and P2P are configured, matching the canary.** Both are
+vLLM connector configuration rather than separate infrastructure, so there is no
+reason to omit them. Prefill runs a MultiConnector — Nixl for P/D transfer plus:
+
+```json
+{"kv_connector": "OffloadingConnector",
+ "kv_role": "kv_both",
+ "kv_connector_extra_config": {
+   "spec_name": "TieringOffloadingSpec",
+   "cpu_bytes_to_use": 53687091200,
+   "eviction_policy": "lru",
+   "offload_prompt_only": true,
+   "secondary_tiers": [{"type": "p2p", "host": "${POD_IP}", "port": "${P2P_BASE}"}]}}
+```
+
+50 GiB of CPU KV per pod, as the canary sets it. Production's 28.1 TiB aggregate
+is that figure across a fleet of ~17 groups; at 2P+1D we get the **mechanism at
+about 1/200th the capacity**, which is enough to test whether switchability
+interferes with offload and P2P, and not enough to reproduce the 85% hit rate.
+
+| run | arm | prefill groups (x2) | decode group | patterns |
 | --- | --- | --- | --- | --- |
 | 2.1 | A | `deepep_high_throughput` | `deepep_low_latency` | P1, P2, P3 |
 | 2.2 | B | `deepep_v2` | `deepep_v2` | P1, P2, P3 |
@@ -355,14 +388,21 @@ request, zero failures**), queue wait at the picker, per-group KV utilisation.
 
 #### Run 2.4 — re-roling a fleet whose ratio is wrong (arm C only)
 
-The run that justifies the work.
+The run that justifies the work. **2P+1D → 1P+2D**, mirroring production's
+10P/7D → 9P/8D.
 
 1. Drive P2 at a concurrency where **decode is the limiter** — production found
    exactly this, moving 10P/7D → 9P/8D because decode KV saturated first.
+   Confirm it *is* the limiter from per-group KV utilisation before switching,
+   rather than assuming the load shape produced it.
 2. Record steady-state throughput and TTFT with the ratio wrong.
-3. Switch the prefill replica into the decode role **and move its
-   `llm-d.ai/role` pod label**, per `docs/guides/pd-role-switch/README.md`.
-4. Re-measure.
+3. Switch **one of the two** prefill replicas into the decode role **and move its
+   `llm-d.ai/role` pod label**, per `docs/guides/pd-role-switch/README.md`. The
+   fleet keeps serving throughout on the remaining prefill group — which is the
+   point, and is why 1P+1D could not have tested this.
+4. Re-measure, and record what the CPU/P2P tier did across the switch: a
+   re-roled replica's offloaded prompt KV becomes a P2P source for a role it no
+   longer holds, and whether that is harmless is not known.
 
 **Compare against leaving it alone**, not against a dedicated fleet. The claim
 under test is "a wrong ratio can be corrected in seconds without restarting",
@@ -381,7 +421,7 @@ you change, so the switchable deployment shape in that guide is a prerequisite.
 | --- | --- | --- |
 | run 0 | 2 | ~20 min |
 | set 1 (runs 1.1–1.10) | 2, sequential | ~4–5 h incl. repeats |
-| set 2 (runs 2.1–2.4) | 4 per arm, sequential | ~5–6 h |
+| set 2 (runs 2.1–2.4) | **6 per arm**, sequential | ~6–7 h |
 
 Weight load is ~106 s from node-local NVMe against 1403 s from the shared PVC —
 `HF_HOME=/mnt/local/hf-cache` is not optional at this run count. Kermit has had
