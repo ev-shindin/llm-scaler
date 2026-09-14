@@ -77,6 +77,17 @@ exists to check it**.
 is **EP32 on H100-80GB**; this evaluation is **EP16 on H200-141GB**. Those are
 not interchangeable, so parameters divide into two kinds.
 
+> **Where each half of this plan comes from.** The load shapes in §3 are from the
+> **GLM-5.2** platform overview — the measured production window, 6.28M requests
+> of real traffic. The configuration here is from the **GLM-5.3** manifests,
+> which are labelled a canary: `llm-d.ai/model: GLM-5.3`, namespace
+> `glm53-serving`, instance `wide-ep-lws-v2runner-canary`. Two adjacent
+> generations, not a contradiction — 5.3 is what is being rolled out and 5.2 is
+> what has a measured window. Two consequences: the workload shapes are assumed
+> to carry across the generation (they are agent-workload properties, so they
+> should, but that is an assumption), and the configuration is a **canary**, so
+> it may not be the settled production shape.
+
 ### Copy: what defines the role
 
 These say what prefill and decode *are*, and must match or the arms stop being
@@ -144,9 +155,15 @@ All belong in any statement of results:
 1. **EP=16, not 32** — half a production group; all2all cost scales with rank
    count, so absolute figures do not transfer.
 2. **H200, not H100** — and at EP16 the extra memory is *required*, not spare.
-3. **GLM-5.2, not 5.3** — 5.2 is what is cached on the nodes.
-4. **InfiniBand, not RoCE GDR** — different transport under NVSHMEM/DeepEP.
-5. **No CPU KV tier, no P2P** — the 85% reuse is only partly reproducible.
+3. **InfiniBand, not RoCE GDR** — different transport under NVSHMEM/DeepEP.
+4. **No CPU KV tier, no P2P** — the 85% reuse is only partly reproducible.
+
+**The model delta is closed.** GLM-5.3 is already on the node-local NVMe
+(703.8 GB, 282 safetensors, fp8) and is what production serves, so the
+evaluation uses it. GLM-5.2-FP8 is identical in every field that affects sizing
+— 78 layers, `first_k_dense_replace` 3, 256 experts top-8, `kv_lora_rank` 512,
+`qk_rope_head_dim` 64, hidden size 6144, 1M context, fp8, same size on disk —
+so every figure in §2 and §2b holds for either.
 
 ---
 
