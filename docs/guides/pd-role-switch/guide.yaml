@@ -1,0 +1,59 @@
+name: pd-role-switch
+
+# Commands live here and are rendered into README.md between
+# <!-- guide:... --> markers, so what a reader copies cannot drift from what
+# this file declares. Run `make guides-render` after editing.
+
+prerequisites:
+  label_semantics:
+    note: |
+      Prove the claim this guide rests on before deploying anything: that
+      llm-d.ai/role in a Deployment's selector makes relabelling orphan the pod.
+      Takes about a minute and needs no GPUs -- it deploys two pause Deployments,
+      one with the role in the selector and one without, relabels a pod in each,
+      and reports who owns it afterwards.
+    run: |
+      ./check-label-semantics.sh "$NAMESPACE"
+      # expect BOTH:
+      #   PASS  role in the selector: relabelling orphaned the pod ...
+      #   PASS  role out of the selector: pod kept its owner, no replacement
+
+deploy:
+  note: |
+    One Deployment holds every switchable replica and its selector omits the
+    role, so a pod can be relabelled without leaving its owner. The model is one
+    line in the manifest; nothing else in it is model-specific.
+  run: |
+    kubectl apply -n "$NAMESPACE" -f switchable.yaml
+    kubectl rollout status -n "$NAMESPACE" deploy/pd-switchable --timeout=60m
+
+switch:
+  note: |
+    Four steps, and only step 3 belongs to the engine. Between steps 1 and 4 the
+    replica serves nothing -- that is the cost of doing it safely, a few hundred
+    milliseconds against the minutes a replacement replica takes.
+
+    The engine must not relabel itself. That would put Kubernetes write
+    credentials in every inference pod so each could mutate cluster state about
+    itself. The engine owns the mechanism; the controller owns the decision, the
+    label and the ordering.
+  run: |
+    POD=$(kubectl get pod -n "$NAMESPACE" -l llm-d.ai/guide=pd-switchable \
+            -o name | head -1)
+
+    # 1. out of BOTH roles, so the picker stops selecting it. Pool membership is
+    #    untouched -- that keys on llm-d.ai/guide.
+    kubectl label -n "$NAMESPACE" "$POD" llm-d.ai/role-
+
+    # 2. let in-flight requests finish
+
+    # 3. switch the engine -- and CHECK IT. A switch that did nothing also
+    #    returns fast and still answers correctly, so timing and output prove
+    #    nothing.
+    kubectl exec -n "$NAMESPACE" "$POD" -- curl -s -X POST localhost:8000/switch_pd_role \
+      -H 'Content-Type: application/json' \
+      -d '{"backend":"deepep_v2","max_num_tokens":128,"max_num_batched_tokens":128}'
+    #    expect ranks_switched == the rank count and layers_switched > 0
+
+    # 4. back in, as the new role
+    kubectl label -n "$NAMESPACE" "$POD" llm-d.ai/role=decode

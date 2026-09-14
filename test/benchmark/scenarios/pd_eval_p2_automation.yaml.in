@@ -1,0 +1,29 @@
+metadata:
+  labels:
+    name: pd-eval-p2-automation
+    description: |
+      Business-automation shape at the concurrency where queueing appears.
+
+      P/D role-switch evaluation. Derived from the GLM-5.2 production platform
+      overview: AutomationBench at 3,000 agents, 8,444 req/min, 148.81M input and 6.60M output tokens/min.
+      17,600 input / 780 output. Reference TTFT p90 14.43 s, queue p90 10.18 s.
+
+      Rate is one rung of a ladder, not a production figure -- production rates
+      are fleet-wide across 9P+8D and this drives a single group. See
+      docs/proposals/pd-role-switch-evaluation.md.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: poisson
+    rate: __REQUEST_RATE__
+  data:
+  - kind: synthetic_text
+    prompt_tokens: 17600
+    output_tokens: 780
+  constraints:
+  - kind: max_duration
+    seconds: __MAX_DURATION__
