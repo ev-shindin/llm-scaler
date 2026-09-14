@@ -53,7 +53,8 @@ variable.
 
 ## 2. Platform facts (measured, not assumed)
 
-Read from the cached `config.json` of `zai-org/GLM-5.2-FP8`:
+Read from the cached `config.json` of `zai-org/GLM-5.3` (703.8 GB, 282
+safetensors, fp8, already on the node-local NVMe):
 
 | property | value | consequence |
 | --- | --- | --- |
@@ -226,7 +227,7 @@ Identical across arms unless a table says otherwise.
 --data-parallel-start-rank 8`):
 
 ```bash
-vllm serve zai-org/GLM-5.2-FP8 \
+vllm serve zai-org/GLM-5.3 \
   --trust-remote-code \
   --block-size 64 \
   --kv-cache-dtype fp8 \
