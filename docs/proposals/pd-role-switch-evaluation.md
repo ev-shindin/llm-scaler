@@ -250,6 +250,12 @@ vllm serve zai-org/GLM-5.3 \
 
 Decode runs add `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`.
 
+> **`run_switch_test.sh` defaults to `zai-org/GLM-5.2-FP8`.** That default is
+> deliberate in the fork — it matches the published table there — but this
+> evaluation runs GLM-5.3, so **`MODEL=zai-org/GLM-5.3` must be set on every
+> run**. Nothing else in the harness is model-specific: rank and layer counts
+> come from the switch response rather than a constant.
+
 **Environment**, all runs: `VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0` (two nodes),
 `NVSHMEM_HCA_PREFIX=ibp`, `VLLM_ENGINE_READY_TIMEOUT_S=3600`,
 `HF_HOME=/mnt/local/hf-cache`. Pod must request `rdma/ib`.
