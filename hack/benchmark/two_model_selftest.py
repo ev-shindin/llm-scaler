@@ -343,6 +343,28 @@ if run_report(BASE_META, dict(BASE_META), rows_b=slow) == 0:
 else:
     ok("driver queueing above the limit is refused")
 
+case("an arm thinned by the loader's OWN network errors is refused")
+# Measured on CoreWeave: a new connection per request meant a DNS lookup per
+# request, and at ~14 rps for 34 minutes the resolver gave out -- gaierror on
+# half of all requests, in both arms. The table was produced anyway, over the
+# survivors, and read as a result.
+lossy = ([dict(BASE_ROWS[0]) for _ in range(90)]
+         + [dict(BASE_ROWS[0], ttft=None, error="gaierror: [Errno -3] Temporary failure")
+            for _ in range(10)])
+if run_report(BASE_META, dict(BASE_META), rows_b=lossy) == 0:
+    fail("the report tabulated an arm that lost 10%% of its requests to client-side DNS "
+         "failures; those are the loader's network, not the cluster's")
+else:
+    ok("client-side network loss above the threshold is refused")
+
+case("a few client-side errors do not void a run")
+few = ([dict(BASE_ROWS[0]) for _ in range(199)]
+       + [dict(BASE_ROWS[0], ttft=None, error="gaierror: blip")])
+if run_report(BASE_META, dict(BASE_META), rows_b=few) != 0:
+    fail("one client-side error in 200 voided the run; the threshold is too tight to ever pass")
+else:
+    ok("an occasional client-side error does not void the run")
+
 case("a missing meta is refused rather than assumed")
 d = tempfile.mkdtemp()
 for name in ("nopool", "pool"):

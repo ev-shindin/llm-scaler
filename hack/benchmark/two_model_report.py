@@ -251,6 +251,23 @@ def admissible(a, b, max_queue_delay):
             problems.append("the %s arm issued %d of %d planned arrivals: the DRIVER was "
                             "the limit, not the cluster" % (arm["name"], m.get("issued"),
                                                             m.get("planned")))
+        # CLIENT-SIDE network failures are the loader's, not the cluster's, and
+        # a run thinned by them is not a measurement of anything. Measured here:
+        # a new connection per request meant a DNS lookup per request, and at
+        # ~14 rps for 34 minutes the cluster resolver gave out -- `gaierror` on
+        # roughly HALF of all requests, in both arms. The table was produced
+        # anyway, over the survivors, and looked like a result.
+        rows = arm["rows"]
+        netfail = sum(1 for r in rows
+                      if (r.get("error") or "").startswith(("gaierror", "ConnectionRefusedError",
+                                                            "ConnectionResetError", "OSError",
+                                                            "TimeoutError", "socket.timeout")))
+        arm["netfail"] = netfail
+        if rows and netfail > 0.02 * len(rows):
+            problems.append("the %s arm lost %d of %d requests to CLIENT-SIDE network errors "
+                            "(%.0f%%) -- the loader's own DNS or sockets, not the models. "
+                            "What is left is the survivors of that, not the scenario."
+                            % (arm["name"], netfail, len(rows), 100.0 * netfail / len(rows)))
         qd = pct([r.get("queue_delay", 0.0) for r in arm["rows"]], 95)
         arm["queue_p95"] = qd
         if qd is not None and qd > max_queue_delay:

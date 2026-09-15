@@ -26,11 +26,11 @@ Default shape — a 2 minute lead-in, then four 8 minute phases (34 minutes):
 
 | phase | window | model A | model B | what it is for |
 | --- | --- | --- | --- | --- |
-| lead-in | 0–120s | 2 rps | 2 rps | both stacks serve before anything is measured, so the first burst is a scale-up and not a first-request penalty |
-| 1 | 120–600s | 2 rps | **12 rps** | B rises. A is idle, and A's replicas are capacity B does not have |
-| 2 | 600–1080s | **12 rps** | 2 rps | A rises while B falls — the swap the pool is supposed to absorb |
-| 3 | 1080–1560s | 2 rps | **12 rps** | B rises again, with whatever state the first cycle left |
-| 4 | 1560–2040s | **12 rps** | 2 rps | A rises again |
+| lead-in | 0–120s | 3 rps | 3 rps | both stacks serve before anything is measured, so the first burst is a scale-up and not a first-request penalty |
+| 1 | 120–600s | 3 rps | **9 rps** | B rises. A is idle, and A's replicas are capacity B does not have |
+| 2 | 600–1080s | **9 rps** | 3 rps | A rises while B falls — the swap the pool is supposed to absorb |
+| 3 | 1080–1560s | 3 rps | **9 rps** | B rises again, with whatever state the first cycle left |
+| 4 | 1560–2040s | **9 rps** | 3 rps | A rises again |
 
 **Why 8 minutes and not 4.** Scale-down stabilization here is 300s — fast up,
 slow down, because under-provisioning costs TTFT irrecoverably while
@@ -48,11 +48,21 @@ Measured on an H200: one replica of an 8B model absorbed **40 rps** of
 1000-token requests without queueing, because `maxNumSeq` defaults to 256 — so
 neither arm ever added a replica and there was nothing to compare. The scenario
 caps concurrency at `maxNumSeq: 32`, which is a normal production value, and the
-defaults below (2 → 12 rps, 1000 input and 1000 output tokens) then take each
-model from one replica to three and back. Capping concurrency does not bias the
+defaults below (3 → 9 rps, 1000 input and 500 output tokens) then take each model
+from one replica to three and back. Capping concurrency does not bias the
 comparison: what a pool bridges is a **model load**, whose cost is fixed by the
 weights and the storage, so this changes when a scale-up is triggered, not how
 long the new replica takes to arrive — identically in both arms.
+
+**The burst must also be SERVABLE at full scale**, and that is the other half of
+the calibration. At 1000-token outputs, 12 rps was above what even three
+replicas could deliver: the queue grew without bound, the driver pegged at its
+worker cap, and both arms would have measured a permanently overloaded system
+— "which one is less broken", not what a bridge is worth. Measured here, one
+replica serves ~3.8 rps of 500-token requests and three serve ~11, so 3 → 9 rps
+needs a scale-up and is comfortably served once it lands. If you change models,
+accelerators or token counts, **re-measure both ends**: the rate that forces a
+scale-up, and the rate the fleet can still serve at its ceiling.
 
 Arrivals are a **Poisson process at the phase's rate, open-loop** — issued
 whether or not earlier requests have returned. A closed-loop driver cannot

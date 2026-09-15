@@ -57,6 +57,7 @@ import argparse
 import json
 import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -184,16 +185,35 @@ class Recorder:
         return len(rows)
 
 
-def connect(url, timeout):
+def connect(url, timeout, resolved=None):
+    """A fresh connection to `url`, optionally to an ALREADY-RESOLVED address.
+
+    A new connection per request is deliberate -- a pooled one can be handed to
+    a replica that is already saturated where a new one would have been routed
+    elsewhere, and this run exists to measure what the router does during a
+    ramp. But a new connection also means a new DNS lookup, and a 34-minute run
+    at 14 rps makes ~28,000 of them: measured on CoreWeave, roughly HALF of all
+    requests came back `gaierror` -- the cluster's resolver, not the models.
+    Both arms were hit about equally, so the comparison was not biased, it was
+    thinned to the survivors of a DNS failure that has nothing to do with warm
+    pools.
+    So the name is resolved ONCE and the connection is made to the address, with
+    the Host header preserved so the gateway still routes on it.
+    """
     parts = urlparse(url)
+    scheme = parts.scheme
+    port = parts.port or (443 if scheme == "https" else 80)
     host = parts.hostname
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    cls = HTTPSConnection if parts.scheme == "https" else HTTPConnection
-    return cls(host, port, timeout=timeout), (parts.path or "/")
+    cls = HTTPSConnection if scheme == "https" else HTTPConnection
+    if resolved:
+        conn = cls(resolved, port, timeout=timeout)
+    else:
+        conn = cls(host, port, timeout=timeout)
+    return conn, (parts.path or "/"), host
 
 
 def one_request(rec, model_key, base_url, model_id, prompt, max_tokens,
-                t0, t_sched_offset, phase, timeout):
+                t0, t_sched_offset, phase, timeout, resolved=None):
     """Issue one streaming completion and record it.
 
     A new connection per request, deliberately: a pooled connection can be
@@ -226,7 +246,7 @@ def one_request(rec, model_key, base_url, model_id, prompt, max_tokens,
     }
     conn = None
     try:
-        conn, path = connect(base_url, timeout)
+        conn, path, host = connect(base_url, timeout, resolved)
         body = json.dumps({
             "model": model_id,
             "prompt": prompt,
@@ -241,7 +261,8 @@ def one_request(rec, model_key, base_url, model_id, prompt, max_tokens,
         })
         conn.request("POST", path, body=body,
                      headers={"Content-Type": "application/json",
-                              "Accept": "text/event-stream"})
+                              "Accept": "text/event-stream",
+                              "Host": host})
         resp = conn.getresponse()
         row["status"] = resp.status
         if resp.status != 200:
@@ -301,30 +322,38 @@ def one_request(rec, model_key, base_url, model_id, prompt, max_tokens,
 def wait_for_endpoints(endpoints, timeout):
     """Both models answer a one-token request from THIS Pod, or give up.
 
-    Returns True once every endpoint has answered at least once.
+    Returns {key: resolved-address} once every endpoint has answered at least
+    once, or None. The address is resolved HERE, once, and every request then
+    connects to it -- see connect() for why.
     """
     deadline = time.time() + timeout
     pending = dict(endpoints)
+    addrs = {}
     last = {}
     while pending and time.time() < deadline:
         for key in list(pending):
             url, model_id = pending[key]
             conn = None
             try:
-                conn, path = connect(url, 30)
+                if key not in addrs:
+                    addrs[key] = socket.gethostbyname(urlparse(url).hostname)
+                conn, path, host = connect(url, 30, addrs[key])
                 body = json.dumps({"model": model_id, "prompt": "ready?",
                                    "max_tokens": 1, "stream": False})
                 conn.request("POST", path, body=body,
-                             headers={"Content-Type": "application/json"})
+                             headers={"Content-Type": "application/json",
+                                      "Host": host})
                 resp = conn.getresponse()
                 resp.read()
                 if resp.status == 200:
-                    print("  endpoint ready: %s (%s)" % (model_id, url), flush=True)
+                    print("  endpoint ready: %s (%s -> %s)"
+                          % (model_id, url, addrs[key]), flush=True)
                     del pending[key]
                 else:
                     last[key] = "HTTP %d" % resp.status
             except Exception as exc:                   # noqa: BLE001
                 last[key] = "%s: %s" % (type(exc).__name__, exc)
+                addrs.pop(key, None)
             finally:
                 if conn is not None:
                     try:
@@ -334,7 +363,7 @@ def wait_for_endpoints(endpoints, timeout):
         if pending:
             print("  waiting for %s (%s)" % (sorted(pending), last), flush=True)
             time.sleep(5)
-    return not pending
+    return addrs if not pending else None
 
 
 def drive(args):
@@ -378,7 +407,8 @@ def drive(args):
     # Starting the schedule anyway would spend the lead-in, and possibly the
     # first burst, recording connection errors as if the cluster had produced
     # them -- in whichever arm happened to start on a colder sidecar.
-    if not wait_for_endpoints(endpoints, args.warmup_timeout):
+    addrs = wait_for_endpoints(endpoints, args.warmup_timeout)
+    if not addrs:
         print("ERROR: the endpoints never answered from inside this Pod. Nothing was "
               "measured; this is the Pod's network, not the models.", file=sys.stderr)
         return 4
@@ -408,7 +438,7 @@ def drive(args):
                 url, model_id = endpoints[key]
                 pool.submit(one_request, rec, key, url, model_id,
                             prompt_for(key, i), args.output_tokens,
-                            t0, at, phase, args.timeout)
+                            t0, at, phase, args.timeout, addrs[key])
                 i += 1
                 fired = True
             cursor[key] = i
@@ -448,6 +478,7 @@ def drive(args):
         "input_tokens": args.input_tokens,
         "output_tokens": args.output_tokens,
         "seed": args.seed,
+        "resolved": addrs,
     }
     with open(args.out + ".meta.json", "w") as fh:
         json.dump(meta, fh, indent=2)

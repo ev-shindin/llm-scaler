@@ -63,8 +63,11 @@ case "$args" in
       case "${GATEWAYS:-1}" in
         0) echo '{"items":[]}' ;;
         1) echo '{"items":[{"metadata":{"name":"infra-llmdbench-inference-gateway"},"spec":{"ports":[{"port":80}]}}]}' ;;
-        *) echo '{"items":[{"metadata":{"name":"infra-llmdbench-inference-gateway"},"spec":{"ports":[{"port":80}]}},
-                            {"metadata":{"name":"other-inference-gateway"},"spec":{"ports":[{"port":8080}]}}]}' ;;
+        # BOTH on the HTTP port, or it is not an ambiguity: a second gateway
+        # that exposes no port 80 is correctly resolvable, and the case would
+        # pass while proving nothing.
+        *) echo '{"items":[{"metadata":{"name":"infra-llmdbench-inference-gateway"},"spec":{"ports":[{"name":"http","port":80}]}},
+                            {"metadata":{"name":"other-inference-gateway"},"spec":{"ports":[{"name":"http","port":80}]}}]}' ;;
       esac
       exit 0 ;;
   *"get deploy -o name"*)
@@ -97,6 +100,11 @@ case "$args" in
       fi
       exit 0 ;;
   *"get deploy "*"-o name"*) [ "${DEPLOY_EXISTS:-1}" = "1" ] && exit 0; exit 1 ;;
+  # The probe Pod's lifecycle. Without these the probe polls for its Pod to
+  # finish, against a stub that never says it did -- 180s per attempt, three
+  # attempts, two models, and the check takes twenty minutes to say nothing.
+  *"get pod probe-"*"jsonpath={.status.phase}"*) echo "Succeeded"; exit 0 ;;
+  *"logs probe-"*) echo "${PROBE_RESULT:-HTTP 200}"; exit 0 ;;
   *"get pvc"*) [ "${HAS_PVC:-1}" = "1" ] && exit 0; exit 1 ;;
   *"get pods -l llm-d.ai/warm-pool"*)
       [ "${POOL_EXISTS:-0}" = "1" ] && echo "wva-warm-pool-twomodel-abc"
