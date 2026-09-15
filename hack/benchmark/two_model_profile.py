@@ -278,14 +278,14 @@ def build_parser():
     p.add_argument("--cycles", type=int, default=2)
     p.add_argument("--lead-in", type=int, default=120)
     p.add_argument("--low-rps", type=float, default=3)
-    p.add_argument("--high-rps", type=float, default=9)
+    p.add_argument("--high-rps", type=float, default=6)
     p.add_argument("--input-tokens", type=int, default=1000)
     p.add_argument("--output-tokens", type=int, default=500)
     p.add_argument("--overlap", type=int, default=90,
                    help="seconds of BOTH models at the low rate between phases, "
                         "so their bursts cannot run into each other when the two "
                         "drain at different speeds")
-    p.add_argument("--rise-window", type=int, default=90,
+    p.add_argument("--rise-window", type=int, default=240,
                    help="seconds at the start of each phase measured as its own "
                         "stage; the harness reports TTFT per stage and nothing "
                         "finer, so this is what a rise window can be")

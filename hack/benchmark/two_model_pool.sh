@@ -99,7 +99,13 @@ PHASE_SECONDS="${PHASE_SECONDS:-480}"
 CYCLES="${CYCLES:-2}"
 LEAD_IN="${LEAD_IN:-120}"
 LOW_RPS="${LOW_RPS:-3}"
-HIGH_RPS="${HIGH_RPS:-9}"
+# 6, not 9. MEASURED at 9: once fully scaled, Llama served it comfortably
+# (steady-state p50 83ms) while Qwen did not -- steady-state p50 5717ms and
+# 5841ms, which is an unbounded queue, not a transient. 9 rps straddles the two
+# models' capacity, and for the slower one the run measured which arm was less
+# broken rather than what a bridge is worth. 6 sits inside both models' capacity
+# at two replicas while still needing a scale-up from one.
+HIGH_RPS="${HIGH_RPS:-6}"
 INPUT_TOKENS="${INPUT_TOKENS:-1000}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-500}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
@@ -114,7 +120,15 @@ PREFIX_GROUPS="${PREFIX_GROUPS:-32}"
 # rise window can be -- and the rise window is this scenario's headline number.
 # Must be shorter than PHASE_SECONDS or the phase is not cut at all and every
 # scale-up is averaged into eight minutes of steady state.
-RISE_WINDOW="${RISE_WINDOW:-90}"
+#
+# 240, not 90, and the difference decided a whole run. MEASURED: from a burst
+# starting to the model's OWN second replica reporting READY took 127s, 157s,
+# 218s. The pool lent 99-100s ahead of that every time -- the mechanism works --
+# but a 90s window sees only the first third of the ramp, and on one rise the
+# lend itself did not arrive until +119s, AFTER the window had closed. That rise
+# then read as the pool being 1992ms WORSE. The window has to contain the event
+# it is named after.
+RISE_WINDOW="${RISE_WINDOW:-240}"
 # Seconds of BOTH models at the low rate between consecutive bursts. 90, sized
 # from measurement: at 30 the two ladders drifted 59s apart over a 2130s run and
 # the bursts genuinely overlapped for 32s. The drift ACCUMULATES -- it does not
