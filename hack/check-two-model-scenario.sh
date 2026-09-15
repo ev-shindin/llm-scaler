@@ -364,6 +364,52 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# The load Job, rendered. Load comes from inference-perf -- the llm-d harness's
+# own generator -- so what the Pod is handed decides whether a run happens at
+# all, and every one of these mistakes produces a plausible-looking directory
+# rather than an error.
+# ---------------------------------------------------------------------------
+# Sourced rather than invoked: these are about what the render FUNCTIONS
+# produce, and reaching them through a verb would need a cluster.
+( . "$SCRIPT" ) >/dev/null 2>&1 || true
+# shellcheck disable=SC1090
+. "$SCRIPT" >/dev/null 2>&1
+NS=ns-under-test
+
+case_begin
+url="$(base_url_for_stack gw-svc:80 llama-31-8b)"
+if printf '%s' "$url" | grep -q '/v1'; then
+    fail "base_url_for_stack returned '$url'. inference-perf appends the route itself, so every request would go to /v1/completions/v1/completions and the gateway would 404 the whole run"
+elif ! printf '%s' "$url" | grep -q '/llama-31-8b$'; then
+    fail "base_url_for_stack returned '$url', which does not end at the stack's path prefix; llm-d routes a multi-model stack by path and the requests would reach the wrong stack"
+else
+    ok "the harness base_url is the gateway plus the stack prefix, with no route"
+fi
+
+case_begin
+JOB_YAML="$(MODEL_A=model-a MODEL_B=model-b LOAD_IMAGE=ghcr.io/llm-d/llm-d-benchmark:vX \
+    render_load_job wva-two-model-load-pool pool 1770000000 2>&1)"
+n_containers="$(printf '%s\n' "$JOB_YAML" | grep -c '^        - name: load-')"
+n_starts="$(printf '%s\n' "$JOB_YAML" | grep -c '1770000000')"
+if [ "$n_containers" -ne 2 ]; then
+    fail "the load Job rendered $n_containers load container(s), not 2. Only one model would be driven, and the other's rows would be an empty half of an anti-phase run"
+elif [ "$n_starts" -ne 2 ]; then
+    fail "the two containers do not share one start barrier ($n_starts of 2 carry it); their ladders would be offset by however far apart the containers happened to start, which is the anti-phase this scenario measures"
+elif ! printf '%s\n' "$JOB_YAML" | grep -q '/profiles/run.sh'; then
+    fail "the load containers do not run the harness wrapper, so nothing waits on the barrier or holds the Pod open for collection"
+else
+    ok "one Pod, two containers, one start barrier"
+fi
+
+case_begin
+img="$(LOAD_IMAGE="" ROOT=/nonexistent load_image)"
+if ! printf '%s' "$img" | grep -q 'llm-d-benchmark'; then
+    fail "load_image resolved to '$img', which is not the harness image. inference-perf lives only in llm-d-benchmark; any other image starts, finds no such command, and the arm ends with an empty results directory"
+else
+    ok "the load image is the llm-d-benchmark harness ($img)"
+fi
+
+# ---------------------------------------------------------------------------
 # The schedule and the report, executed.
 # ---------------------------------------------------------------------------
 case_begin
@@ -374,7 +420,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=21
+CASES_EXPECTED=24
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

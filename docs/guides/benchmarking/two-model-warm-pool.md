@@ -67,23 +67,66 @@ scale-up, and the rate the fleet can still serve at its ceiling.
 Arrivals are a **Poisson process at the phase's rate, open-loop** — issued
 whether or not earlier requests have returned. A closed-loop driver cannot
 measure this: when the server slows it sends less, so the queue never grows and
-TTFT stays flat, which makes a cold scale-up look free. The arrival times are
-computed **before the run starts**, from a per-model seed, so both arms send
-byte-identical traffic.
+TTFT stays flat, which makes a cold scale-up look free.
 
 Change the shape with `PHASE_SECONDS`, `CYCLES`, `LOW_RPS`, `HIGH_RPS`.
 
+### The load generator is the llm-d harness
+
+Load comes from **inference-perf**, the generator llm-d-benchmark itself uses,
+run from the `ghcr.io/llm-d/llm-d-benchmark` image — one instance per model, as
+two containers of one Pod. Three things follow from that, and each was a defect
+in the bespoke client it replaced:
+
+- **Token counts are real.** inference-perf tokenizes with each model's own
+  tokenizer, so `INPUT_TOKENS` means input tokens for *both* of two different
+  models. A generator that counts words is off by whatever the tokenizer does,
+  differently per model — in a scenario whose whole point is comparing two.
+- **The schedule is data, not control flow.** Each phase is one inference-perf
+  `load.stages` entry, and anti-phase is the two profiles carrying **mirrored
+  ladders** over identical boundaries. `two_model_profile.py` renders both from
+  one schedule, and writes that schedule next to the results; the report
+  refuses two arms whose schedules differ.
+- **The driver reports its own queueing.** `load_summary.schedule_delay` is
+  inference-perf measuring how late it issued its own arrivals. The report
+  refuses an arm whose p95 exceeds `--max-queue-delay` (250 ms), and — since a
+  missing measurement would percentile to a passing 0.0 — refuses an arm that
+  reports none at all.
+
+The two containers share a **start barrier**: an absolute epoch, `PRELOAD_GRACE`
+seconds (default 420) after the Job is created. Each fetches its tokenizer
+*before* the barrier, because the two downloads do not take the same time and
+the difference would offset the ladders for the whole run. A container that
+reaches the barrier late prints `LATE-START` and `run` refuses the arm rather
+than reporting a run that was never anti-phase; raise `PRELOAD_GRACE` and rerun.
+
+`PREFIX_GROUPS` (default 32) is the number of distinct shared prefixes in the
+generated dataset, and it is **not** a detail. llm-d's shipped scheduling
+profile weights `prefix-cache-scorer` highest, so with a single prefix the first
+replica to cache it wins every later request regardless of its queue — measured
+on CoreWeave: one replica did 6,000,692 prompt tokens while every other Ready
+replica, including an awake warm-pool Pod in the EPP's own backend list, did
+zero. The report refuses an arm where one engine did all the work, because every
+TTFT and GPU number from such a run describes a one-replica fleet.
+
+Results arrive as inference-perf's own `per_request_lifecycle_metrics.json` and
+`summary_lifecycle_metrics.json`, one directory per model;
+`harness_results.py` converts them to the `requests.jsonl` + `meta.json` pair
+the report compares, computing nothing the harness already measured.
+
 ## What makes the two arms comparable
 
-Four ways they can silently stop being, each of which still produces a complete
-and plausible table. The tooling enforces all four rather than trusting them:
+Six ways they can silently stop being, each of which still produces a complete
+and plausible table. The tooling enforces every one rather than trusting it:
 
 | | enforced by |
 | --- | --- |
 | The pool arm must not be allowed **more cluster**. Insurance lowers the ceiling, so each model is capped at `MAX_REPLICAS - ⌈POOL_REPLICAS/2⌉` in the pool arm and `MAX_REPLICAS` without it — the same peak either way. | `run` writes `budget.json`; the report **refuses** if the pool arm could reach more accelerators |
 | The fleet must start at the floor. With 300s scale-down stabilization and one arm always running first, the second would start on an already-scaled fleet and pay no cold load at all. | `reset` pins both ScaledObjects at `MIN_REPLICAS`, waits for it, then releases them |
 | The pool must be **warm**. A cold pool pays a model load *into* the pool on the first burst, on top of the replica's own — a true measurement of a pool nobody would operate that way. | `warm` pins a copy of each model and waits; `run ARM=pool` re-checks |
-| The traffic must be identical. | arrivals pre-computed from `SEED`; the report refuses if the seeds or the schedule differ |
+| The traffic must be identical. | both arms render the same inference-perf profiles from `SEED`; the report refuses if the seeds or the schedule differ |
+| The load must reach **more than one replica**. Capacity that is never routed to cannot affect TTFT, so a run where the router pinned everything to one engine measures a one-replica fleet in both arms. | `run` captures per-engine prompt tokens before and after; the report **refuses** if one engine did all the work |
+| The **driver** must not be the queue being measured. | inference-perf reports its own `schedule_delay`; the report refuses above 250 ms at p95, and refuses an arm that reports none |
 
 ## What it needs
 

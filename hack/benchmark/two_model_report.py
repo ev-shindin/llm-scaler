@@ -289,6 +289,50 @@ def routing_problem(arm):
     return None
 
 
+# Failures that happened on the DRIVER's side of the wire. Two families,
+# because the load generator changed: the stdlib names the earlier bespoke
+# loader raised, and the aiohttp ones inference-perf raises. A name missing
+# from this list does not become a cluster failure -- it becomes a failure the
+# guard cannot see, which is why the list is explicit and not a catch-all.
+_CLIENT_SIDE = (
+    # stdlib
+    "gaierror", "ConnectionRefusedError", "ConnectionResetError", "OSError",
+    "TimeoutError", "socket.timeout",
+    # aiohttp / inference-perf
+    "ClientConnectorError", "ClientConnectionError", "ClientOSError",
+    "ServerDisconnectedError", "ServerTimeoutError", "ClientPayloadError",
+    "asyncio.TimeoutError", "ConnectionTimeoutError",
+)
+
+
+def is_client_side(err):
+    return bool(err) and str(err).startswith(_CLIENT_SIDE)
+
+
+def driver_queueing(arm):
+    """p95 of the load generator's own scheduling delay, in seconds.
+
+    Two sources, in order of preference, because the generator changed and a
+    stored run from either is still readable:
+
+      1. `queue_delay_p95` in the meta -- what inference-perf measured about
+         itself and reported in `load_summary.schedule_delay`.
+      2. a per-row `queue_delay`, which the earlier bespoke loader recorded.
+
+    Returns None when NEITHER exists. That is a refusal, not a zero: rows with
+    no such field would otherwise percentile to 0.0 and clear the guard
+    silently, which is the exact shape of the failure the guard is for.
+    """
+    meta = arm.get("meta") or {}
+    reported = meta.get("queue_delay_p95")
+    if isinstance(reported, (int, float)):
+        return float(reported)
+    measured = [r["queue_delay"] for r in arm["rows"] if "queue_delay" in r]
+    if measured:
+        return pct(measured, 95)
+    return None
+
+
 def admissible(a, b, max_queue_delay):
     """Everything that makes the two arms comparable. Returns a list of reasons."""
     problems = []
@@ -324,19 +368,24 @@ def admissible(a, b, max_queue_delay):
         # roughly HALF of all requests, in both arms. The table was produced
         # anyway, over the survivors, and looked like a result.
         rows = arm["rows"]
-        netfail = sum(1 for r in rows
-                      if (r.get("error") or "").startswith(("gaierror", "ConnectionRefusedError",
-                                                            "ConnectionResetError", "OSError",
-                                                            "TimeoutError", "socket.timeout")))
+        netfail = sum(1 for r in rows if is_client_side(r.get("error")))
         arm["netfail"] = netfail
         if rows and netfail > 0.02 * len(rows):
             problems.append("the %s arm lost %d of %d requests to CLIENT-SIDE network errors "
                             "(%.0f%%) -- the loader's own DNS or sockets, not the models. "
                             "What is left is the survivors of that, not the scenario."
                             % (arm["name"], netfail, len(rows), 100.0 * netfail / len(rows)))
-        qd = pct([r.get("queue_delay", 0.0) for r in arm["rows"]], 95)
+        qd = driver_queueing(arm)
         arm["queue_p95"] = qd
-        if qd is not None and qd > max_queue_delay:
+        if qd is None:
+            # Not "probably fine". Every TTFT below contains the driver's own
+            # delay, and with no measurement of it there is nothing that says
+            # the difference between the arms is the cluster's.
+            problems.append("the %s arm reports no driver queueing at all -- neither per "
+                            "request nor in the generator's own summary -- so nothing "
+                            "establishes that the latencies below are the cluster's"
+                            % arm["name"])
+        elif qd > max_queue_delay:
             problems.append("the %s arm's own queueing reached %.0f ms at p95 (limit %.0f): "
                             "that is the loader's latency, not the cluster's, and it is "
                             "inside every TTFT below"

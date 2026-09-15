@@ -38,8 +38,18 @@
 #   * The pool was COLD. Then the first burst pays a model load INTO the pool on
 #     top of the replica's own, and the arm reports the cost of a pool nobody
 #     would operate that way. `warm` pins both models resident and waits.
-#   * The load differed. Arrival times are pre-computed from a per-model seed,
-#     so both arms send byte-identical traffic.
+#   * The load differed. Both arms render the SAME inference-perf profiles from
+#     the same seed, and the report refuses two arms whose schedules differ.
+#
+# WHO GENERATES THE LOAD
+# ----------------------
+# inference-perf, the llm-d benchmark harness's own generator, one instance per
+# model, in two containers of one Pod. Not a bespoke client: the harness
+# tokenizes with each model's own tokenizer (so `input_tokens` means input
+# tokens for both of two different models), expresses the schedule as stages
+# (so anti-phase is two mirrored ladders rather than a loop keeping time), and
+# reports its OWN scheduling delay -- the quantity that decides whether the
+# driver or the cluster produced the latency being compared.
 #
 # STEP BY STEP, DELIBERATELY. The expensive failures here are the ones found at
 # minute 40 of a 45-minute run.
@@ -94,6 +104,16 @@ INPUT_TOKENS="${INPUT_TOKENS:-1000}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-500}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 SEED="${SEED:-1729}"
+# Distinct shared prefixes in the generated dataset. NOT a detail: llm-d's
+# shipped scheduling profile weights the prefix-cache scorer highest, so with
+# one prefix the first replica to cache it wins every subsequent request and
+# the run measures a one-replica fleet no matter how much capacity is added.
+PREFIX_GROUPS="${PREFIX_GROUPS:-32}"
+# Seconds between creating the load Job and the instant both containers start
+# their ladders. It has to cover the image pull and the two tokenizer
+# downloads; each container reports whether it made it, and the driver refuses
+# the arm if either did not.
+PRELOAD_GRACE="${PRELOAD_GRACE:-420}"
 
 MAX_REPLICAS="${MAX_REPLICAS:-3}"
 MIN_REPLICAS="${MIN_REPLICAS:-1}"
@@ -378,10 +398,18 @@ decode_deploy_for() {
     k get deploy "${prefix}-decode" -o name >/dev/null 2>&1 && printf '%s' "${prefix}-decode"
 }
 
-endpoint_for_stack() {
+base_url_for_stack() {
+    # What inference-perf wants: the gateway plus this stack's path prefix, and
+    # NOTHING else. Its client appends the route (`/v1/completions`) itself, so
+    # a base_url that already carries one produces `/v1/completions/v1/
+    # completions` -- a 404 from the gateway on every request, for a whole run.
     local hostport="$1" stack="$2"
-    printf 'http://%s.%s.svc.cluster.local:%s/%s/v1/completions' \
+    printf 'http://%s.%s.svc.cluster.local:%s/%s' \
         "${hostport%%:*}" "$NS" "${hostport##*:}" "$stack"
+}
+endpoint_for_stack() {
+    # The full completions URL, for the driver's own probes.
+    printf '%s/v1/completions' "$(base_url_for_stack "$@")"
 }
 
 # The EPP Deployment behind each stack: the route's backendRef names the pool
@@ -634,13 +662,21 @@ else:
 # namespace so the nodes have pulled it -- a multi-GB pull at the start of a
 # timed run puts the registry inside the measurement.
 load_image() {
+    # The llm-d-benchmark harness image, because inference-perf -- the harness's
+    # load generator -- is what drives this scenario.
+    #
+    # The TAG follows the checked-out clone, not a constant. llm-d-benchmark's
+    # own defaults.yaml pins the image to v0.7.0 regardless of the ref, and the
+    # Makefile already had to work around that for the standup: a profile
+    # schema written for one version against a binary from another fails at
+    # parse time, minutes into a run. Same hazard here -- the profiles this
+    # scenario renders are read by whatever inference-perf is in this image.
     if [ -n "$LOAD_IMAGE" ]; then printf '%s' "$LOAD_IMAGE"; return 0; fi
-    local img
-    img="$(k get deploy -o json 2>/dev/null | jq -r '
-        [.items[] | select(.metadata.name|test("epp|decode"))
-         | .spec.template.spec.containers[0].image] | .[0] // ""')"
-    [ -n "$img" ] || { printf 'ghcr.io/llm-d/llm-d-benchmark:v0.7.8'; return 0; }
-    printf '%s' "$img"
+    local ref=""
+    if [ -d "$ROOT/llm-d-benchmark/.git" ]; then
+        ref="$(git -C "$ROOT/llm-d-benchmark" describe --tags --exact-match 2>/dev/null)"
+    fi
+    printf 'ghcr.io/llm-d/llm-d-benchmark:%s' "${ref:-v0.7.8}"
 }
 
 # ---------------------------------------------------------------------------
@@ -999,8 +1035,8 @@ verb_run() {
     local hostport
     hostport="$(gateway_host)" || die "did not find exactly one inference gateway Service in $NS"
     local url_a url_b
-    url_a="$(endpoint_for_stack "$hostport" "$STACK_A")"
-    url_b="$(endpoint_for_stack "$hostport" "$STACK_B")"
+    url_a="$(base_url_for_stack "$hostport" "$STACK_A")"
+    url_b="$(base_url_for_stack "$hostport" "$STACK_B")"
 
     local ceiling; ceiling="$(set_arm_ceiling "$arm")"
 
@@ -1013,37 +1049,80 @@ verb_run() {
     local total=$(( LEAD_IN + 2 * CYCLES * PHASE_SECONDS ))
     info "arm=$arm  ${total}s of load"
 
-    # The generator goes in as a ConfigMap rather than an image: it is standard
-    # library, and building and pushing an image would put a registry between an
-    # edit and a run.
+    # The two inference-perf profiles and the phase table they were built from,
+    # rendered here and kept with the results. The report refuses two arms whose
+    # schedules differ, and it can only do that if the schedule the load
+    # actually ran is the one written down.
+    profile_args() {
+        printf '%s\n' \
+            --model-a "$MODEL_A" --model-b "$MODEL_B" \
+            --endpoint-a "$url_a" --endpoint-b "$url_b" \
+            --phase-seconds "$PHASE_SECONDS" --cycles "$CYCLES" --lead-in "$LEAD_IN" \
+            --low-rps "$LOW_RPS" --high-rps "$HIGH_RPS" \
+            --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
+            --prefix-groups "$PREFIX_GROUPS" --request-timeout "$REQUEST_TIMEOUT" \
+            --seed "$SEED" --results-root /results
+    }
+    local pyargs; pyargs="$(profile_args)"
+    # shellcheck disable=SC2046 # deliberate word splitting of the rendered flags
+    python3 "$HERE/two_model_profile.py" --emit schedule $pyargs > "$out_dir/schedule.json" \
+        || die "could not render the phase schedule"
+    local role
+    for role in a b; do
+        python3 "$HERE/two_model_profile.py" --emit profile --role "$role" $pyargs \
+            > "$out_dir/profile-$role.yaml" || die "could not render profile $role"
+        [ -s "$out_dir/profile-$role.yaml" ] || die "profile $role rendered empty"
+    done
+
+    # Profiles go in as a ConfigMap rather than baked into an image: an edit
+    # would otherwise need a build and a registry push between it and a run.
     k delete configmap wva-two-model-load --ignore-not-found >/dev/null 2>&1
-    k create configmap wva-two-model-load --from-file=two_model_load.py="$HERE/two_model_load.py" >/dev/null \
+    k create configmap wva-two-model-load \
+        --from-file=profile-a.yaml="$out_dir/profile-a.yaml" \
+        --from-file=profile-b.yaml="$out_dir/profile-b.yaml" \
+        --from-file=run.sh="$HERE/two_model_harness_run.sh" >/dev/null \
         || die "could not create the loader ConfigMap"
+
+    # Both containers start their ladders at this instant. It has to cover the
+    # image pull and two tokenizer downloads; a container that reaches the
+    # barrier late says so, and the arm is refused rather than reported.
+    local start_at=$(( $(date +%s) + PRELOAD_GRACE ))
 
     RUN_JOB="wva-two-model-load-$arm"
     trap run_interrupted INT TERM
     k delete job "$RUN_JOB" --ignore-not-found >/dev/null 2>&1
-    render_load_job "$RUN_JOB" "$url_a" "$url_b" "$arm" > "$out_dir/job.yaml"
+    render_load_job "$RUN_JOB" "$arm" "$start_at" > "$out_dir/job.yaml"
     [ -s "$out_dir/job.yaml" ] || die "the load Job rendered empty"
     k apply -f "$out_dir/job.yaml" >/dev/null || die "could not create the load Job"
 
     # The per-engine baseline, BEFORE any load, so the delta is this arm's work.
     capture_pod_work "$out_dir/podwork.before"
 
-    local until_ts=$(( $(date +%s) + total + 300 ))
+    # The sampler has to cover the preload grace as well as the load: the pool
+    # is holding accelerators from the moment the arm starts, and a window that
+    # begins at the barrier would credit it with fewer than it held.
+    local until_ts=$(( $(date +%s) + PRELOAD_GRACE + total + 300 ))
     sample_gpus "$out_dir/gpus.jsonl" "$until_ts" &
     RUN_SAMPLER=$!
 
-    # Waited on by the loader's OWN line, not by the Job's completion. The Pod
-    # stays alive afterwards on purpose: `kubectl cp` is exec+tar and cannot run
-    # in a terminated container, so waiting for Completed and then copying loses
-    # the results of every successful run -- which is what the first version did.
-    info "waiting for the loader to report its results (up to $(( total + 600 ))s)..."
-    local deadline=$(( $(date +%s) + total + 600 )) pod="" done=0
+    # Waited on by the loader's OWN lines, not by the Job's completion, and on
+    # BOTH of them: one container finishing means half a run. The Pod stays
+    # alive afterwards on purpose -- `kubectl cp` is exec+tar and cannot run in
+    # a terminated container, so waiting for Completed and then copying loses
+    # the results of every successful run.
+    local budget=$(( PRELOAD_GRACE + total + 600 ))
+    info "waiting for both loaders to report their results (up to ${budget}s)..."
+    local deadline=$(( $(date +%s) + budget )) pod="" done=0 log=""
     while [ "$(date +%s)" -lt "$deadline" ]; do
         pod="$(k get pods -l "job-name=$RUN_JOB" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
         if [ -n "$pod" ]; then
-            if k logs "$pod" 2>/dev/null | grep -q 'RESULTS-WRITTEN'; then done=1; break; fi
+            log="$(k logs "$pod" --all-containers 2>/dev/null)"
+            if printf '%s' "$log" | grep -q 'RESULTS-WRITTEN-a' &&
+               printf '%s' "$log" | grep -q 'RESULTS-WRITTEN-b'; then done=1; break; fi
+            if printf '%s' "$log" | grep -q 'PRELOAD-FAILED\|RUN-FAILED'; then
+                warn "a loader container reported a failure; stopping the wait"
+                break
+            fi
             # A loader that died in its first second must not cost the full
             # schedule before anyone is told.
             case "$(k get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)" in
@@ -1055,26 +1134,52 @@ verb_run() {
     kill "$RUN_SAMPLER" 2>/dev/null; RUN_SAMPLER=""
 
     if [ -n "$pod" ]; then
-        k logs "$pod" > "$out_dir/loader.log" 2>&1 || true
+        k logs "$pod" --all-containers --prefix > "$out_dir/loader.log" 2>&1 || true
+    fi
+    # A container that reached the barrier after it had passed ran its ladder
+    # offset from the other one's for the whole run. That is not anti-phase, and
+    # a report over it compares a burst against whatever the other model
+    # happened to be doing.
+    if [ -s "$out_dir/loader.log" ] && grep -q 'LATE-START' "$out_dir/loader.log"; then
+        warn "$(grep -o 'LATE-START-[ab] by [0-9.]*s' "$out_dir/loader.log" | sort -u | tr '\n' ' ')"
+        die "a loader missed the start barrier, so the two models were not in anti-phase. Raise PRELOAD_GRACE (now ${PRELOAD_GRACE}s) and rerun arm $arm."
     fi
     if [ "$done" -eq 1 ]; then
-        k cp "$pod:/results/requests.jsonl" "$out_dir/requests.jsonl" >/dev/null 2>&1 || \
-            warn "could not copy requests.jsonl out of $pod"
-        k cp "$pod:/results/requests.jsonl.meta.json" "$out_dir/meta.json" >/dev/null 2>&1 || \
-            warn "could not copy the meta out of $pod -- the report refuses without it"
+        # One emptyDir shared by both containers, so one copy takes both.
+        rm -rf "$out_dir/harness"
+        k cp "$pod:/results" "$out_dir/harness" -c load-a >/dev/null 2>&1 || \
+            warn "could not copy the harness results out of $pod"
     fi
     trap - INT TERM
     run_cleanup
     RUN_JOB=""
     capture_pod_work "$out_dir/podwork.after"
-    [ -s "$out_dir/requests.jsonl" ] || \
-        die "no requests were recorded for arm $arm. See $out_dir/loader.log"
+
+    [ -d "$out_dir/harness/a" ] && [ -d "$out_dir/harness/b" ] || \
+        die "no harness results for arm $arm. See $out_dir/loader.log"
+    python3 "$HERE/harness_results.py" \
+        --results-a "$out_dir/harness/a" --results-b "$out_dir/harness/b" \
+        --schedule "$out_dir/schedule.json" \
+        --out "$out_dir/requests.jsonl" \
+        --arm "$arm" --model-a "$MODEL_A" --model-b "$MODEL_B" \
+        --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
+        --seed "$SEED" --prefix-groups "$PREFIX_GROUPS" \
+        || die "could not convert the harness results for arm $arm. See $out_dir/loader.log"
+    mv "$out_dir/requests.jsonl.meta.json" "$out_dir/meta.json"
     ok "arm $arm: $(wc -l < "$out_dir/requests.jsonl") requests, $(wc -l < "$out_dir/gpus.jsonl" 2>/dev/null || echo 0) GPU samples in $out_dir"
 }
 
 render_load_job() {
-    local job="$1" url_a="$2" url_b="$3" arm="$4"
-    local total=$(( LEAD_IN + 2 * CYCLES * PHASE_SECONDS ))
+    local job="$1" arm="$2" start_at="$3"
+    # TWO CONTAINERS, ONE POD, on purpose. The models have to burst against each
+    # other, so their load must come from one scheduling unit on one node with
+    # one image pull: two Pods start whenever the scheduler gets to each of
+    # them, and the skew between those two moments is the anti-phase this
+    # scenario exists to measure.
+    #
+    # The results emptyDir is shared, so one `kubectl cp` takes both models'
+    # reports. The HF cache is a SEPARATE volume, so a tokenizer download never
+    # lands inside what is copied out as results.
     cat <<YAML
 apiVersion: batch/v1
 kind: Job
@@ -1092,51 +1197,54 @@ spec:
     spec:
       restartPolicy: Never
       containers:
-        - name: load
-          image: $(load_image)
-          command: ["/bin/sh", "-c"]
-          # The sleep is not idleness: kubectl cp is exec+tar and cannot run in
-          # a terminated container, so the Pod has to outlive the write. The
-          # driver deletes the Job as soon as it has copied.
-          args:
-            - |
-              python3 /loader/two_model_load.py \
-                --endpoint-a='$url_a' \
-                --endpoint-b='$url_b' \
-                --model-a='$MODEL_A' \
-                --model-b='$MODEL_B' \
-                --phase-seconds=$PHASE_SECONDS \
-                --cycles=$CYCLES \
-                --lead-in=$LEAD_IN \
-                --low-rps=$LOW_RPS \
-                --high-rps=$HIGH_RPS \
-                --input-tokens=$INPUT_TOKENS \
-                --output-tokens=$OUTPUT_TOKENS \
-                --timeout=$REQUEST_TIMEOUT \
-                --seed=$SEED \
-                --arm='$arm' \
-                --out=/results/requests.jsonl
-              rc=\$?
-              echo "loader exited \$rc; holding the Pod open for collection"
-              sleep 1800
-          resources:
-            requests:
-              cpu: "2"
-              memory: "2Gi"
-            limits:
-              cpu: "4"
-              memory: "4Gi"
-          volumeMounts:
-            - name: loader
-              mountPath: /loader
-            - name: results
-              mountPath: /results
+$(render_load_container a "$MODEL_A" "$start_at")
+$(render_load_container b "$MODEL_B" "$start_at")
+
       volumes:
-        - name: loader
+        - name: profiles
           configMap:
             name: wva-two-model-load
         - name: results
           emptyDir: {}
+        - name: hf
+          emptyDir: {}
+YAML
+}
+
+render_load_container() {
+    local role="$1" tokenizer="$2" start_at="$3"
+    # CPU matters more than it looks: both containers share one Pod, and an
+    # open-loop generator that cannot get on a core delays its own arrivals and
+    # then reports the delay as the cluster's latency. The report refuses an arm
+    # whose driver queueing is large, so starving this is a wasted run, not a
+    # quiet bias.
+    cat <<YAML
+        - name: load-$role
+          image: $(load_image)
+          command: ["/bin/sh", "/profiles/run.sh"]
+          env:
+            - name: ROLE
+              value: "$role"
+            - name: TOKENIZER
+              value: "$tokenizer"
+            - name: START_AT
+              value: "$start_at"
+            - name: HF_HOME
+              value: /hf/$role
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+            - name: profiles
+              mountPath: /profiles
+            - name: results
+              mountPath: /results
+            - name: hf
+              mountPath: /hf
 YAML
 }
 
