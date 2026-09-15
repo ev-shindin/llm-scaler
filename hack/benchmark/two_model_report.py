@@ -286,17 +286,32 @@ def pod_work(d):
     return work
 
 
-def routing_problem(arm):
-    """Did the load actually reach more than one replica?
+def deployment_of(pod):
+    """The Deployment a Pod belongs to: its name minus the ReplicaSet hash and
+    the Pod suffix. `qwen-...-decode-74bd9cbc64-2hxzj` -> `qwen-...-decode`."""
+    parts = pod.rsplit("-", 2)
+    return parts[0] if len(parts) == 3 else pod
 
-    THE GUARD THAT WAS MISSING. Measured on CoreWeave: one Qwen replica did
-    6,000,692 prompt tokens while every other replica the autoscaler added did
-    ZERO -- including an awake, Ready warm-pool Pod that was in the EPP's own
-    backend list. With one shared prompt prefix, llm-d's prefix-cache scorer is
-    the highest-weighted scorer in the shipped profile, so the first replica to
-    cache the prefix wins every later request regardless of its queue, and the
-    others never receive one. Capacity cannot help when it is never used, and
-    every TTFT and GPU number from such a run describes a one-replica fleet.
+
+def routing_problem(arm):
+    """Did the load actually reach the capacity each MODEL was given?
+
+    PER MODEL, and that is the whole point. Pooling the two models hides the
+    failure completely: measured on CoreWeave, the busiest engine held 48.9% of
+    ALL traffic -- comfortably under any threshold worth setting -- while per
+    model it held 99.0% and 98.7%. Every replica either arm added during that
+    run served between 0.3% and 2.0%. Both arms were one-replica-per-model
+    fleets wearing the aggregate as a disguise, and the report compared them.
+
+    Pool Pods are judged apart. A lent Pod serves whichever model borrowed it,
+    so it belongs to no one Deployment, and folding it into a model's group
+    would credit that model with capacity it did not have.
+
+    THE GUARD THAT WAS MISSING, AND THEN WAS MISSING AGAIN. llm-d's shipped
+    scheduling profile weights the prefix-cache scorer highest, so the first
+    replica to cache a prefix keeps winning regardless of its queue. Capacity
+    cannot help when it is never used, and every TTFT and accelerator number
+    from such a run describes a fleet that was never really built.
     """
     work = arm.get("work")
     if work is None:
@@ -309,13 +324,26 @@ def routing_problem(arm):
                 "%.0f prompt tokens and the rest did none. Added capacity was never routed to, "
                 "so this run measures a one-replica fleet."
                 % (arm["name"], len(busy), len(work), top[0], top[1]))
-    total = sum(work.values())
-    if total > 0 and len(busy) > 1:
-        share = max(work.values()) / total
+
+    groups = {}
+    for pod, v in work.items():
+        key = "the warm pool" if "warm-pool" in pod else deployment_of(pod)
+        groups.setdefault(key, []).append((pod, v))
+
+    for key, pods in sorted(groups.items()):
+        if key == "the warm pool" or len(pods) < 2:
+            continue
+        total = sum(v for _, v in pods)
+        if total <= 0:
+            continue
+        _, top = max(pods, key=lambda kv: kv[1])
+        share = top / total
         if share > 0.95:
-            return ("in the %s arm one engine did %.0f%% of all prompt tokens; the other "
-                    "replicas were effectively unused, so added capacity cannot have affected "
-                    "TTFT" % (arm["name"], 100 * share))
+            return ("in the %s arm one engine of %s served %.1f%% of that MODEL's prompt "
+                    "tokens across %d replicas -- the others were effectively unused. The "
+                    "model scaled and the traffic did not follow, so its added capacity "
+                    "cannot have affected TTFT."
+                    % (arm["name"], key, 100 * share, len(pods)))
     return None
 
 
