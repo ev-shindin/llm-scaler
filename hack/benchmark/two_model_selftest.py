@@ -621,6 +621,40 @@ if rc != 2:
 else:
     ok("a flat rate is refused")
 
+case("per-request reporting is off")
+# It stores the raw SSE text of every chunk of every response: 1.2 GB for an
+# ELEVEN MINUTE run, which kubectl cp (exec+tar) truncated -- losing the arm at
+# the collection step after all its accelerators had been spent. Nothing needs
+# it: there are no token timestamps in it, and the counts and failure breakdown
+# live in the 7 KB stage files.
+_, text_r = render("a")
+rl = yaml.safe_load(text_r)["report"]["request_lifecycle"]
+if rl.get("per_request"):
+    fail("per_request reporting is on. The file reached 1.2 GB for an eleven-minute run "
+         "and kubectl cp truncated it, which loses the arm after its accelerators are "
+         "already spent")
+elif not rl.get("per_stage") or not rl.get("summary"):
+    fail("per_stage or summary reporting is off: %s. Those files are where every latency "
+         "in the report comes from" % rl)
+else:
+    ok("stage and summary reports on, the 1.2 GB per-request file off")
+
+case("stages run back to back, with no sleep between them")
+# `interval` is the SLEEP BETWEEN STAGES, not a metrics interval: the load
+# generator does `if self.stageInterval: await sleep(self.stageInterval)` after
+# each stage drains. Measured at 30 -- the value the shipped guide profiles use
+# -- that is 30s of zero load immediately before every rise stage, so queues
+# drain and the autoscaler sees an idle fleet in the seconds before the burst
+# this scenario exists to measure.
+_, text_i = render("a")
+doc_i = yaml.safe_load(text_i)
+if doc_i["load"].get("interval", 0) != 0:
+    fail("load.interval is %s. That is a sleep between stages, not a metrics interval: "
+         "every rise would be preceded by that many seconds of silence, and the scale-up "
+         "would be measured from an idle fleet" % doc_i["load"].get("interval"))
+else:
+    ok("no sleep between stages; a phase boundary is a change of rate, not a pause")
+
 case("a rise window as long as the phase is refused")
 rc, _ = render("a", ["--rise-window=480", "--phase-seconds=480"])
 if rc != 2:
@@ -786,6 +820,46 @@ elif harness.pick_percentile({"median": 0.007}, 50) != 0.007:
     fail("the median is written as `median` by this generator and was not found")
 else:
     ok("the fallback is upward or nothing, and `median` is p50")
+
+case("a run with NO per-request file still converts")
+# The profile turns per-request reporting off: the file stores the raw SSE text
+# of every chunk of every response and reached 1.2 GB for an eleven-minute run,
+# which kubectl cp truncated -- losing the arm at collection after all its
+# accelerators had been spent.
+bare_a = harness_dir([], two_stages)
+bare_b = harness_dir([], two_stages)
+for d in (bare_a, bare_b):
+    os.remove(os.path.join(d, "per_request_lifecycle_metrics.json"))
+bare_rows, bare_meta = harness.convert(convert_args(bare_a, bare_b))
+if bare_meta["issued"] != 2 * (24 + 1 + 117 + 2):
+    fail("issued is %s, not the generator's own per-stage counts. With no rows to count, "
+         "a length would be zero and read as a cluster that answered nothing"
+         % bare_meta["issued"])
+elif not bare_meta["windows"]["a"]["stages"]:
+    fail("the windows were lost along with the per-request file")
+else:
+    ok("counts and windows come from the stage files, with no per-request file at all")
+
+case("loss is counted from the generator's own failure labels")
+lossy_meta = dict(BASE_META)
+lossy_meta["failures_by_label"] = {"a": {"Connection Error": 20}, "b": {"Connection Error": 5}}
+lossy_meta["issued"] = 420
+if run_report(BASE_META, lossy_meta) == 0:
+    fail("an arm that lost 25 of 420 requests to connection failures was compared. With "
+         "per-request reporting off there are no rows to count, and counting zero would "
+         "clear the guard silently -- which is the exact failure it exists for")
+else:
+    ok("failure labels are counted when there are no rows")
+
+case("an HTTP failure is the cluster's, not the driver's")
+served_meta = dict(BASE_META)
+served_meta["failures_by_label"] = {"a": {"HTTP 500": 20}, "b": {}}
+served_meta["issued"] = 420
+if run_report(BASE_META, served_meta) != 0:
+    fail("500s from the model voided the arm. A response that arrived is the cluster "
+         "answering, which is the thing being measured, not a driver that could not ask")
+else:
+    ok("a request the model answered badly is not counted as one that never arrived")
 
 case("a run with no measured driver queueing is refused")
 no_qd = dict(BASE_META)

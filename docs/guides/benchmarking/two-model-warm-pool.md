@@ -100,6 +100,24 @@ the difference would offset the ladders for the whole run. A container that
 reaches the barrier late prints `LATE-START` and `run` refuses the arm rather
 than reporting a run that was never anti-phase; raise `PRELOAD_GRACE` and rerun.
 
+**Stages run back to back.** `load.interval` is inference-perf's *sleep between
+stages* — `if self.stageInterval: await sleep(self.stageInterval)` — not a
+metrics interval, which is what the name reads as and what llm-d's own shipped
+guide profiles set to `30.0`. At 30 that is thirty seconds of **zero load**
+immediately before every rise stage: queues drain and the autoscaler sees an
+idle fleet in exactly the seconds before the burst, understating every
+scale-up, and 240s of silence inside a 2040s run. It is `0` here, because a
+phase boundary is a change of rate, not a pause.
+
+**Tokenizers are cached on the shared model claim.** Each arm would otherwise
+fetch both from the public internet, and a blip there costs the whole arm —
+measured: a `CAS Client Error` from the Hugging Face CDN took model A down while
+model B fetched fine, and the run was refused after five minutes of preload
+grace with both models' accelerators already held. The `hf` volume is
+`CACHE_CLAIM` under `subPath: benchmark-tokenizer-cache`, so nothing is written
+into the weights tree; with no such claim it falls back to an `emptyDir` and
+simply refetches. The fetch itself retries five times with backoff.
+
 `RISE_WINDOW` (default 90) is how much of each phase becomes its own stage, and
 must be shorter than `PHASE_SECONDS` — the profile generator refuses otherwise,
 because an uncut phase has no rise stage to read.
@@ -136,11 +154,18 @@ Two consequences worth knowing before reading a table:
   `10655087.75`, an uptime), so GPU samples are aligned against the driver's own
   start barrier instead.
 
-Results arrive as inference-perf's `per_request_lifecycle_metrics.json`,
-`stage_N_lifecycle_metrics.json` and `summary_lifecycle_metrics.json`, one
-directory per model; `harness_results.py` converts them to the `requests.jsonl`
-+ `meta.json` pair the report compares, computing nothing the harness already
-measured.
+**Per-request reporting is off.** That file stores the raw SSE text of every
+chunk of every response and reached **1.2 GB for an eleven-minute run**, which
+`kubectl cp` (exec+tar) truncated — losing an arm at the collection step after
+all its accelerators had been spent. Nothing needs it: it carries no token
+timestamps, request counts are in `successes.count`, and the failure breakdown
+is in `failures.by_label`, in stage files of 7 KB each. A stored run that has one
+is still read.
+
+Results arrive as `stage_N_lifecycle_metrics.json` and
+`summary_lifecycle_metrics.json`, one directory per model;
+`harness_results.py` converts them to the `requests.jsonl` + `meta.json` pair
+the report compares, computing nothing the harness already measured.
 
 ### The data path resolves nothing
 

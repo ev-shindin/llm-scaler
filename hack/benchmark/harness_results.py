@@ -7,15 +7,14 @@ WHERE EACH NUMBER COMES FROM, and why it is not the obvious place.
 
 inference-perf v0.6.1 writes, per run directory:
 
-  per_request_lifecycle_metrics.json   one record per request: start_time and
-                                       end_time, `info` with input/output token
-                                       counts and the raw response chunks, and
-                                       `error` with an `error_type`
   stage_<n>_lifecycle_metrics.json     per stage: load_summary (count,
-                                       requested/achieved rate, schedule_delay)
-                                       plus `successes.latency`, which is where
-                                       `time_to_first_token` lives
+                                       requested/achieved rate, schedule_delay),
+                                       `successes.latency` -- where
+                                       `time_to_first_token` lives -- and
+                                       `failures.by_label`, the breakdown of
+                                       what went wrong
   summary_lifecycle_metrics.json       the same, over the whole run
+  per_request_lifecycle_metrics.json   OPTIONAL and off by default: see below
 
 **TTFT is per STAGE, not per request.** The per-request records carry no token
 timestamps at all in this version -- measured on CoreWeave: 210 records, every
@@ -24,10 +23,19 @@ latency cannot be re-cut into windows after the fact, and the profile makes the
 windows that matter into stages instead. This converter reads the distributions
 the harness computed; it does not recompute them from data that is not there.
 
-**start_time is a MONOTONIC clock, not epoch** -- measured: 10655087.75, an
-uptime. It orders requests and nothing else. The run's origin on the wall clock
-comes from `--t0`, the start barrier the driver handed both containers, and
-that is what the GPU samples are aligned against.
+**The per-request file is not collected.** It stores the raw SSE text of every
+chunk of every response, and reached 1.2 GB for an eleven-minute run -- which
+`kubectl cp` (exec+tar) truncated, losing an arm at the collection step after
+all its accelerators had been spent. The profile turns it off. Everything the
+report needs is in the stage files: counts in `successes.count`, and the failure
+breakdown in `failures.by_label`. It is still READ when present, so a stored run
+from before remains readable.
+
+**start_time, where a per-request file does exist, is a MONOTONIC clock, not
+epoch** -- measured: 10655087.75, an uptime. It orders requests and nothing
+else. The run's origin on the wall clock comes from `--t0`, the start barrier
+the driver handed both containers, and that is what the GPU samples are aligned
+against.
 
 The converter refuses rather than emitting a short file when something it needs
 is absent: a report built over a truncated conversion looks exactly like a
@@ -162,6 +170,11 @@ def window_from(doc):
     return {
         "n": successes.get("count", 0),
         "failed": failures.get("count", 0),
+        # {label: count}. The label is the generator's own ("Connection Error",
+        # an HTTP status, ...) and is what the report classifies on now that
+        # there is no per-request error_type to read.
+        "by_label": {label: (body or {}).get("count", 0)
+                     for label, body in (failures.get("by_label") or {}).items()},
         "p50": pick_percentile(ttft, 50),
         "p95": pick_percentile(ttft, 95),
         "p99": pick_percentile(ttft, 99),
@@ -203,21 +216,18 @@ def convert(args):
 
     sides = {}
     for role, root in (("a", args.results_a), ("b", args.results_b)):
+        # Optional: the profile turns per-request reporting off, because the
+        # file is enormous and carries nothing the report needs.
         pr_path = find_one(root, _PER_REQUEST)
-        if pr_path is None:
-            raise ValueError(
-                "no %s under %s. inference-perf did not finish writing its report, so "
-                "this arm has no per-request data -- see the container log before "
-                "trusting anything else in the directory." % (_PER_REQUEST, root))
         sm_path = find_one(root, _SUMMARY)
         if sm_path is None:
             raise ValueError(
                 "no %s under %s. The whole-run latency distribution lives there and "
                 "cannot be recomputed: this version records no per-request token "
                 "times." % (_SUMMARY, root))
-        per_request = load_json(pr_path)
-        if not isinstance(per_request, list) or not per_request:
-            raise ValueError("%s holds no request records" % pr_path)
+        per_request = load_json(pr_path) if pr_path else []
+        if pr_path and not isinstance(per_request, list):
+            raise ValueError("%s is not a list of request records" % pr_path)
         sides[role] = {
             "per_request": per_request,
             "overall": window_from(load_json(sm_path)),
@@ -226,16 +236,20 @@ def convert(args):
             "summary_path": sm_path,
         }
 
-    origin = min(min(r["start_time"] for r in s["per_request"]
-                     if r.get("start_time") is not None)
-                 for s in sides.values())
+    starts = [r["start_time"] for s in sides.values() for r in s["per_request"]
+              if r.get("start_time") is not None]
+    origin = min(starts) if starts else 0.0
 
     rows = []
     for role in ("a", "b"):
         rows.extend(rows_from(sides[role]["per_request"], role, origin))
     rows.sort(key=lambda r: r["t_rel"])
 
-    issued = len(rows)
+    # From the generator's own per-stage counts, not from len(rows): with
+    # per-request reporting off there are no rows, and a zero there would read
+    # as a cluster that answered nothing.
+    issued = sum(w["n"] + w["failed"]
+                 for role in ("a", "b") for w in sides[role]["stages"])
     planned = int(round(planned_arrivals(schedule, "rate_a")
                         + planned_arrivals(schedule, "rate_b")))
 
@@ -267,6 +281,11 @@ def convert(args):
         "prefix_groups": args.prefix_groups,
         "queue_delay_p95": queue_p95,
         "generator": "inference-perf",
+        # {role: {label: count}}, summed over the run. What the report's loss
+        # guard counts, and what it prints as the failure breakdown.
+        "failures_by_label": {
+            role: sides[role]["overall"].get("by_label") or {}
+            for role in ("a", "b")},
         # What the report prints: the harness's own distributions, per stage
         # and over the whole run.
         "windows": {role: {"overall": sides[role]["overall"],

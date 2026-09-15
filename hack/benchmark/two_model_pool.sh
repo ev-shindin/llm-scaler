@@ -1274,9 +1274,36 @@ $(render_load_container b "$MODEL_B" "$start_at" "$url_b")
             name: wva-two-model-load
         - name: results
           emptyDir: {}
+$(render_hf_volume)
+YAML
+}
+
+render_hf_volume() {
+    # The tokenizer cache, on the SHARED model claim when there is one.
+    #
+    # Each arm otherwise fetches both tokenizers from the public internet, and a
+    # blip there costs the whole arm: measured, a `CAS Client Error: Request
+    # middleware error` from the Hugging Face CDN took model A down while model
+    # B fetched fine, and the run was refused after five minutes of preload
+    # grace with both models' accelerators already held. The retry in the
+    # wrapper covers a blip; this removes the fetch entirely from every arm
+    # after the first.
+    #
+    # subPath, so this never writes into the weights tree the models read. The
+    # files are a few MB -- this is not a meaningful claim on a 100Gi cache.
+    if [ -n "$CACHE_CLAIM" ] && k get pvc "$CACHE_CLAIM" >/dev/null 2>&1; then
+        cat <<YAML
+        - name: hf
+          persistentVolumeClaim:
+            claimName: $CACHE_CLAIM
+YAML
+    else
+        # No claim: an emptyDir still works, it just refetches each arm.
+        cat <<YAML
         - name: hf
           emptyDir: {}
 YAML
+    fi
 }
 
 render_load_container() {
@@ -1317,6 +1344,7 @@ render_load_container() {
               mountPath: /results
             - name: hf
               mountPath: /hf
+              subPath: benchmark-tokenizer-cache
 YAML
 }
 

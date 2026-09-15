@@ -456,6 +456,19 @@ else
     ok "one Pod, two containers, one start barrier"
 fi
 
+# Each arm otherwise refetches both tokenizers across the public internet, and a
+# blip there costs the arm: measured, a CAS Client Error from the Hugging Face
+# CDN took model A down while model B fetched fine, and the run was refused
+# after five minutes of preload grace with both models' accelerators held.
+case_begin
+if ! printf '%s\n' "$JOB_YAML" | grep -A2 '^        - name: hf$' | grep -q 'persistentVolumeClaim'; then
+    fail "the tokenizer cache is not on the shared claim, so every arm refetches both tokenizers from the internet and a CDN blip costs a whole arm: $(printf '%s\n' "$JOB_YAML" | grep -A2 '^        - name: hf$')"
+elif ! printf '%s\n' "$JOB_YAML" | grep -q 'subPath: benchmark-tokenizer-cache'; then
+    fail "the cache mount has no subPath, so it would write into the same tree the models read their weights from"
+else
+    ok "tokenizers cache on the shared claim, under their own subPath"
+fi
+
 case_begin
 img="$(LOAD_IMAGE="" ROOT=/nonexistent load_image)"
 if ! printf '%s' "$img" | grep -q 'llm-d-benchmark'; then
@@ -475,7 +488,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=28
+CASES_EXPECTED=29
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

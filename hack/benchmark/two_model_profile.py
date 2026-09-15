@@ -148,10 +148,19 @@ def render_profile(args, stages, role):
     # a fleet that is scaling has a very different queue against a grid than
     # against the bursty arrivals it actually sees.
     lines.append("  type: poisson")
-    # The generator's own metrics interval, NOT the stage length -- stages carry
-    # their own durations, and the phase boundaries come from those. Kept well
-    # below a phase so a phase is described by several points rather than one.
-    lines.append("  interval: %d" % max(1, min(30, args.phase_seconds)))
+    # ZERO, and it is not a detail. `interval` is the SLEEP BETWEEN STAGES --
+    # inference-perf's load generator does `if self.stageInterval: await
+    # sleep(self.stageInterval)` after each stage drains -- not a metrics
+    # interval, which is what the name suggests and what the shipped guide
+    # profiles' `interval: 30.0` reads as.
+    #
+    # Measured at 30: exactly 30s of ZERO load between every stage, including
+    # immediately before each rise stage. Queues drain and the autoscaler sees
+    # an idle fleet in the seconds before the burst this scenario exists to
+    # measure, which understates every scale-up -- and on the default schedule
+    # it is 240s of silence in a 2040s run. Stages must run back to back,
+    # because a phase boundary is a change of rate, not a pause.
+    lines.append("  interval: 0")
     lines.append("  base_seed: %d" % seed)
     lines.append("  request_timeout: %.1f" % float(args.request_timeout))
     # The driver must never be the bottleneck being measured. Sized against the
@@ -193,9 +202,17 @@ def render_profile(args, stages, role):
     lines.append("  request_lifecycle:")
     lines.append("    summary: true")
     lines.append("    per_stage: true")
-    # The per-request file is what the report reads: percentiles over a whole
-    # run cannot be re-cut into rise windows after the fact.
-    lines.append("    per_request: true")
+    # OFF. The per-request record stores `response_metrics.response_chunks` --
+    # the raw SSE text of every chunk of every response -- and at 500 output
+    # tokens that file reached 1.2 GB for an ELEVEN MINUTE run. `kubectl cp` is
+    # exec+tar and truncated it, so the arm was lost at the collection step
+    # after all its accelerators had been spent.
+    #
+    # Nothing is lost by turning it off. It carries no token timestamps (that is
+    # why the rise windows are stages), and the counts and failure breakdown the
+    # report needs are in `successes.count` and `failures.by_label` of the stage
+    # files, which are 7 KB each.
+    lines.append("    per_request: false")
     lines.append("storage:")
     lines.append("  local_storage:")
     lines.append("    path: %s" % yaml_quote("%s/%s" % (args.results_root.rstrip("/"), role)))

@@ -306,11 +306,19 @@ def routing_problem(arm):
     return None
 
 
-# Failures that happened on the DRIVER's side of the wire. Two families,
-# because the load generator changed: the stdlib names the earlier bespoke
-# loader raised, and the aiohttp ones inference-perf raises. A name missing
-# from this list does not become a cluster failure -- it becomes a failure the
-# guard cannot see, which is why the list is explicit and not a catch-all.
+# Failures where NO RESPONSE WAS EVER RECEIVED. Two families, because the load
+# generator changed: the stdlib exception names the earlier bespoke loader
+# raised, and the labels inference-perf groups its failures under.
+#
+# The label form is deliberately about the OUTCOME rather than the blame. A
+# "Connection Error" can be the driver's sockets or the cluster refusing, and
+# at 6% either way the arm is not measuring what it claims -- so the guard
+# fires on "the request never got a response", which is what can actually be
+# told from the data.
+#
+# A name missing from this list does not become a cluster failure -- it becomes
+# a failure the guard cannot see, which is why the list is explicit and not a
+# catch-all.
 _CLIENT_SIDE = (
     # stdlib
     "gaierror", "ConnectionRefusedError", "ConnectionResetError", "OSError",
@@ -326,8 +334,45 @@ _CLIENT_SIDE = (
 )
 
 
+# inference-perf's own grouping labels for failures that never reached the
+# model. Matched case-insensitively and by substring: these are display strings,
+# not identifiers.
+_NO_RESPONSE_LABELS = ("connection error", "timeout", "client error")
+
+
 def is_client_side(err):
-    return bool(err) and str(err).startswith(_CLIENT_SIDE)
+    if not err:
+        return False
+    text = str(err)
+    if text.startswith(_CLIENT_SIDE):
+        return True
+    low = text.lower()
+    return any(label in low for label in _NO_RESPONSE_LABELS)
+
+
+def lost_requests(arm):
+    """(count, {label: count}) of requests that never received a response.
+
+    From the generator's own per-label failure breakdown when there is one --
+    with per-request reporting off there are no rows to count, and counting
+    zero would clear the guard silently. Falls back to the rows for a stored
+    run from the earlier loader.
+    """
+    by_label = ((arm.get("meta") or {}).get("failures_by_label")) or {}
+    if by_label:
+        kinds = {}
+        for labels in by_label.values():
+            for label, n in labels.items():
+                kinds[label] = kinds.get(label, 0) + n
+        lost = sum(n for label, n in kinds.items() if is_client_side(label))
+        return lost, kinds
+    kinds = {}
+    for r in arm["rows"]:
+        err = r.get("error")
+        if err:
+            kinds[str(err).split(":")[0]] = kinds.get(str(err).split(":")[0], 0) + 1
+    lost = sum(1 for r in arm["rows"] if is_client_side(r.get("error")))
+    return lost, kinds
 
 
 def driver_queueing(arm):
@@ -388,14 +433,16 @@ def admissible(a, b, max_queue_delay):
         # ~14 rps for 34 minutes the cluster resolver gave out -- `gaierror` on
         # roughly HALF of all requests, in both arms. The table was produced
         # anyway, over the survivors, and looked like a result.
-        rows = arm["rows"]
-        netfail = sum(1 for r in rows if is_client_side(r.get("error")))
+        netfail, kinds = lost_requests(arm)
         arm["netfail"] = netfail
-        if rows and netfail > 0.02 * len(rows):
-            problems.append("the %s arm lost %d of %d requests to CLIENT-SIDE network errors "
-                            "(%.0f%%) -- the loader's own DNS or sockets, not the models. "
-                            "What is left is the survivors of that, not the scenario."
-                            % (arm["name"], netfail, len(rows), 100.0 * netfail / len(rows)))
+        arm["failure_kinds"] = kinds
+        issued = m.get("issued") or len(arm["rows"])
+        if issued and netfail > 0.02 * issued:
+            problems.append("the %s arm lost %d of %d requests that never received a "
+                            "response at all (%.0f%%) -- connection or timeout failures, "
+                            "not answers from the models. What is left is the survivors "
+                            "of that, not the scenario."
+                            % (arm["name"], netfail, issued, 100.0 * netfail / issued))
         qd = driver_queueing(arm)
         arm["queue_p95"] = qd
         if qd is None:
@@ -480,17 +527,15 @@ def main(argv):
                 label, arm["name"], w["n"], w["failed"],
                 fmt_ms(w["p50"]), fmt_ms(w["p95"]), fmt_ms(w["p99"]), fmt_ms(w["max"])))
     print("")
-    kinds = {(k, arm["name"]): failure_kinds(arm["rows"], k)
-             for k in ("a", "b") for arm in (a, b)}
-    if any(kinds.values()):
-        print("Failures by kind (a request that did not deliver every token it asked for "
-              "is a failure, not a fast success -- counting torn streams as successes "
-              "lets a saturating arm improve its own percentiles):")
+    if any(arm.get("failure_kinds") for arm in (a, b)):
+        print("Failures by kind, as the load generator grouped them. A request that never "
+              "received a response is a failure, not a fast success -- counting one as a "
+              "success lets a saturating arm improve its own percentiles:")
         print("")
-        for (k, armname), kk in sorted(kinds.items()):
+        for arm in (a, b):
+            kk = arm.get("failure_kinds") or {}
             if kk:
-                label = args.model_a if k == "a" else args.model_b
-                print("- %s / %s: %s" % (label, armname,
+                print("- %s: %s" % (arm["name"],
                       ", ".join("%s=%d" % (n, c) for n, c in sorted(kk.items()))))
         print("")
 

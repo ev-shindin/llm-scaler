@@ -40,11 +40,30 @@ echo "role=$ROLE tokenizer=$TOKENIZER profile=$PROFILE start_at=$START_AT"
 # phase. It also fails LOUDLY and early: a tokenizer that cannot be fetched
 # fails inference-perf at startup, minutes into a run that has already begun
 # holding accelerators.
+#
+# RETRIED, because the fetch crosses the public internet and a blip there costs
+# a whole arm. Measured: `CAS Client Error: Request middleware error: error
+# sending request` from the Hugging Face CDN took model A down while model B
+# fetched fine, and the arm was refused after five minutes of preload grace --
+# with both models' accelerators already held.
 python3 - "$TOKENIZER" <<'PY'
-import sys
+import sys, time
 from transformers import AutoTokenizer
-AutoTokenizer.from_pretrained(sys.argv[1])
-print("tokenizer cached: %s" % sys.argv[1], flush=True)
+
+name = sys.argv[1]
+for attempt in range(1, 6):
+    try:
+        AutoTokenizer.from_pretrained(name)
+        print("tokenizer cached: %s (attempt %d)" % (name, attempt), flush=True)
+        sys.exit(0)
+    except Exception as exc:          # noqa: BLE001 -- any failure is worth a retry
+        # Printed every time: a fetch that needed four attempts is worth knowing
+        # about even when the fifth succeeds.
+        print("tokenizer fetch %d/5 failed for %s: %s: %s"
+              % (attempt, name, type(exc).__name__, str(exc)[:200]), flush=True)
+        time.sleep(5 * attempt)
+print("TOKENIZER-UNFETCHABLE %s" % name, flush=True)
+sys.exit(1)
 PY
 preload_rc=$?
 if [ "$preload_rc" -ne 0 ]; then
