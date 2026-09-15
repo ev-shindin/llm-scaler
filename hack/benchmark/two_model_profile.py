@@ -22,9 +22,16 @@ One profile per model, written from one schedule so the two cannot drift:
 `--emit schedule` prints that schedule as JSON for the report's meta, and
 `--emit profile --role a|b` prints the YAML for one side of it.
 
-The phases are the harness's STAGES, one for one. A stage is time-boxed, so
-both models cross every boundary together as long as they start together --
-which the Job's start barrier, not this file, is responsible for.
+Phases become STAGES, and every phase after the lead-in is cut in two at
+`--rise-window`. inference-perf v0.6.1 reports `time_to_first_token` only as a
+per-stage distribution -- its per-request records carry no token timestamps --
+so the first 90s of a rise, which is this scenario's headline number, has to BE
+a stage or it cannot be measured at all. The cut does not change the load: both
+sub-stages run the same rate back to back.
+
+A stage is time-boxed, so both models cross every boundary together as long as
+they start together -- which the Job's start barrier, not this file, is
+responsible for.
 """
 
 import argparse
@@ -58,15 +65,51 @@ def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in):
     return phases
 
 
-def schedule_json(schedule):
+def schedule_json(stages):
+    """The stage table, which is what the report buckets against.
+
+    Stages, not the coarser phases: these ARE the windows the harness reports
+    a TTFT distribution for, so a report keyed on anything else would be
+    describing windows nobody measured.
+    """
     return [{"start": s, "end": e, "rate_a": ra, "rate_b": rb}
-            for s, e, ra, rb in schedule]
+            for s, e, ra, rb in stages]
 
 
-def stages_for(schedule, role):
-    """The harness stage ladder for one model: (rate, duration) per phase."""
+def stage_map(schedule, rise_window):
+    """The STAGES both models run, as (start, end, rate_a, rate_b).
+
+    Every phase after the lead-in is cut in two at `rise_window`: an opening
+    sub-stage and the remainder, at the SAME rate, so the load is unchanged.
+
+    Why cut it at all: inference-perf v0.6.1 reports `time_to_first_token` only
+    as a per-STAGE distribution -- there are no per-request token timestamps to
+    re-cut afterwards. The headline number of this scenario is TTFT in the first
+    90s of a rise, so that window has to BE a stage or it cannot be measured.
+    Pooling a rise into its whole 8-minute phase averages the scale-up away.
+
+    Cut for BOTH models even though only one rises per phase: identical stage
+    boundaries mean one stage index means one window for both, and the opening
+    of a falling model's phase is a useful control rather than a cost.
+    """
+    stages = []
+    for start, end, ra, rb in schedule:
+        if start == 0 and ra == rb:
+            # The lead-in: nothing rises into it, so there is nothing to cut out.
+            stages.append((start, end, ra, rb))
+            continue
+        if end - start > rise_window > 0:
+            stages.append((start, start + rise_window, ra, rb))
+            stages.append((start + rise_window, end, ra, rb))
+        else:
+            stages.append((start, end, ra, rb))
+    return stages
+
+
+def stages_for(stages, role):
+    """One model's ladder: (rate, duration) per stage."""
     idx = 2 if role == "a" else 3
-    return [(ph[idx], ph[1] - ph[0]) for ph in schedule]
+    return [(st[idx], st[1] - st[0]) for st in stages]
 
 
 def split_input(input_tokens):
@@ -88,7 +131,7 @@ def yaml_quote(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
-def render_profile(args, schedule, role):
+def render_profile(args, stages, role):
     model = args.model_a if role == "a" else args.model_b
     base_url = args.endpoint_a if role == "a" else args.endpoint_b
     system_len, question_len = split_input(args.input_tokens)
@@ -117,7 +160,7 @@ def render_profile(args, schedule, role):
     lines.append("  num_workers: %d" % args.workers)
     lines.append("  worker_max_concurrency: %d" % args.max_concurrency)
     lines.append("  stages:")
-    for rate, duration in stages_for(schedule, role):
+    for rate, duration in stages_for(stages, role):
         lines.append("  - rate: %g" % rate)
         lines.append("    duration: %d" % duration)
     lines.append("api:")
@@ -187,6 +230,10 @@ def build_parser():
     p.add_argument("--high-rps", type=float, default=9)
     p.add_argument("--input-tokens", type=int, default=1000)
     p.add_argument("--output-tokens", type=int, default=500)
+    p.add_argument("--rise-window", type=int, default=90,
+                   help="seconds at the start of each phase measured as its own "
+                        "stage; the harness reports TTFT per stage and nothing "
+                        "finer, so this is what a rise window can be")
     p.add_argument("--prefix-groups", type=int, default=32)
     p.add_argument("--prompts-per-group", type=int, default=64)
     p.add_argument("--request-timeout", type=float, default=300)
@@ -223,11 +270,12 @@ def main(argv):
 
     schedule = build_schedule(args.phase_seconds, args.cycles,
                               args.low_rps, args.high_rps, args.lead_in)
+    stages = stage_map(schedule, args.rise_window)
     if args.emit == "schedule":
-        json.dump(schedule_json(schedule), sys.stdout, indent=2)
+        json.dump(schedule_json(stages), sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
-    sys.stdout.write(render_profile(args, schedule, args.role))
+    sys.stdout.write(render_profile(args, stages, args.role))
     return 0
 
 

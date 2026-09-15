@@ -14,6 +14,12 @@ It reports four things, and the last two decide the question.
      Pooling them into one percentile produces a number that looks like n=700
      and carries the weight of n=1. Printed separately, with counts, so the
      reader can see how thin the evidence is.
+
+     Every latency here is the LOAD GENERATOR's own per-stage distribution.
+     inference-perf v0.6.1 records no per-request token times, so nothing can
+     be re-cut into a window after the run -- which is why the profile makes
+     each rise window a stage of its own. The report reads what the harness
+     measured; it does not recompute it.
   3. Accelerator-seconds, INCLUDING the pool's own. A pool arm that wins on
      TTFT while holding extra accelerators for the whole run has not won; it
      has spent.
@@ -74,44 +80,55 @@ def fmt_ms(v):
     return "-" if v is None else "%.0f" % (v * 1000.0)
 
 
-def rise_windows(schedule, model_key, window):
-    """(start, end) for each phase where THIS model's rate went up.
+def rise_stages(schedule, model_key):
+    """Indices of the stages where THIS model's rate went UP.
 
-    Keyed on the rate rising rather than on the phase index, so a schedule with
-    a different lead-in or an odd cycle count still marks the right windows --
-    and a model that never rises yields nothing rather than silently marking
-    phase 1.
+    Stages, not phases: inference-perf reports `time_to_first_token` per stage
+    and nothing finer, and the profile cuts the opening `--rise-window` seconds
+    of every phase into its own stage precisely so a rise IS one. The index is
+    what addresses the harness's own distribution for that window.
+
+    Keyed on the rate rising rather than on position, so a schedule with a
+    different lead-in or an odd cycle count still marks the right stages -- and
+    a model that never rises yields nothing rather than silently marking the
+    first one.
     """
     out = []
     prev = None
     key = "rate_a" if model_key == "a" else "rate_b"
-    for ph in schedule:
-        rate = ph[key]
+    for i, st in enumerate(schedule):
+        rate = st[key]
         if prev is not None and rate > prev:
-            out.append((ph["start"], min(ph["start"] + window, ph["end"])))
+            out.append(i)
         prev = rate
     return out
 
 
+def window_of(arm, model_key, index=None):
+    """The harness's own distribution for one window of one model.
+
+    `index` None means the whole run. Returns None when the arm's meta carries
+    no such window -- a refusal upstream, never a zero here.
+    """
+    w = ((arm.get("meta") or {}).get("windows") or {}).get(model_key)
+    if not w:
+        return None
+    if index is None:
+        return w.get("overall")
+    stages = w.get("stages") or []
+    return stages[index] if 0 <= index < len(stages) else None
+
+
 def served_and_failed(rows, model_key):
-    served = [r for r in rows if r["model"] == model_key and r.get("ttft") is not None
-              and not r.get("error")]
-    failed = [r for r in rows if r["model"] == model_key
-              and (r.get("ttft") is None or r.get("error"))]
+    """Rows for one model, split on whether the request failed.
+
+    NO LATENCY: inference-perf v0.6.1 records no per-request token times, so
+    rows carry counts and error types only. Every TTFT in this report comes
+    from the harness's own per-stage distributions -- see `window_of`.
+    """
+    served = [r for r in rows if r["model"] == model_key and not r.get("error")]
+    failed = [r for r in rows if r["model"] == model_key and r.get("error")]
     return served, failed
-
-
-def summarize(rows, model_key, lo=None, hi=None):
-    served, failed = served_and_failed(rows, model_key)
-    if lo is not None:
-        served = [r for r in served if lo <= r["t_sched"] < hi]
-        failed = [r for r in failed if lo <= r["t_sched"] < hi]
-    t = [r["ttft"] for r in served]
-    return {
-        "n": len(served), "failed": len(failed),
-        "p50": pct(t, 50), "p95": pct(t, 95), "p99": pct(t, 99),
-        "max": max(t) if t else None,
-    }
 
 
 def failure_kinds(rows, model_key):
@@ -298,8 +315,12 @@ _CLIENT_SIDE = (
     # stdlib
     "gaierror", "ConnectionRefusedError", "ConnectionResetError", "OSError",
     "TimeoutError", "socket.timeout",
-    # aiohttp / inference-perf
-    "ClientConnectorError", "ClientConnectionError", "ClientOSError",
+    # aiohttp / inference-perf. `ClientConnector` is a PREFIX on purpose: the
+    # family has DNS, SSL and certificate variants, and the one that actually
+    # occurred was ClientConnectorDNSError -- which an exact
+    # "ClientConnectorError" did not match, so 25 of 420 requests (6%, three
+    # times the threshold) were charged to the cluster and the table printed.
+    "ClientConnector", "ClientConnectionError", "ClientOSError",
     "ServerDisconnectedError", "ServerTimeoutError", "ClientPayloadError",
     "asyncio.TimeoutError", "ConnectionTimeoutError",
 )
@@ -400,7 +421,6 @@ def main(argv):
     p.add_argument("--pool", required=True)
     p.add_argument("--model-a", default="A")
     p.add_argument("--model-b", default="B")
-    p.add_argument("--rise-window", type=int, default=90)
     p.add_argument("--max-queue-delay", type=float, default=0.25,
                    help="p95 driver queueing above which the arms are not comparable")
     p.add_argument("--gap-limit", type=float, default=30.0,
@@ -428,19 +448,20 @@ def main(argv):
         return 2
 
     schedule = a["meta"]["schedule"]
-    windows = {"a": rise_windows(schedule, "a", args.rise_window),
-               "b": rise_windows(schedule, "b", args.rise_window)}
+    rises = {"a": rise_stages(schedule, "a"), "b": rise_stages(schedule, "b")}
 
     print("")
     print("# Two models, anti-phase bursts, warm pool on and off")
     print("")
     print("- model A: `%s`" % args.model_a)
     print("- model B: `%s`" % args.model_b)
-    print("- schedule: %d phases, %ds total; rise window %ds"
-          % (len(schedule), schedule[-1]["end"], args.rise_window))
+    print("- schedule: %d stages, %ds total. Every latency below is the load "
+          "generator's OWN per-stage distribution -- this harness records no "
+          "per-request token times, so a rise window has to BE a stage."
+          % (len(schedule), schedule[-1]["end"]))
     for k, label in (("a", args.model_a), ("b", args.model_b)):
         print("- %s rises at: %s" % (label,
-              ", ".join("%ds" % s for s, _ in windows[k]) or "never"))
+              ", ".join("%ds" % schedule[i]["start"] for i in rises[k]) or "never"))
     print("- driver queueing (p95): nopool %s ms, pool %s ms"
           % (fmt_ms(a["queue_p95"]), fmt_ms(b["queue_p95"])))
     print("")
@@ -451,10 +472,13 @@ def main(argv):
     print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for key, label in (("a", args.model_a), ("b", args.model_b)):
         for arm in (a, b):
-            s = summarize(arm["rows"], key)
+            w = window_of(arm, key)
+            if w is None:
+                print("| %s | %s | - | - | - | - | - | - |" % (label, arm["name"]))
+                continue
             print("| %s | %s | %d | %d | %s | %s | %s | %s |" % (
-                label, arm["name"], s["n"], s["failed"],
-                fmt_ms(s["p50"]), fmt_ms(s["p95"]), fmt_ms(s["p99"]), fmt_ms(s["max"])))
+                label, arm["name"], w["n"], w["failed"],
+                fmt_ms(w["p50"]), fmt_ms(w["p95"]), fmt_ms(w["p99"]), fmt_ms(w["max"])))
     print("")
     kinds = {(k, arm["name"]): failure_kinds(arm["rows"], k)
              for k in ("a", "b") for arm in (a, b)}
@@ -478,12 +502,16 @@ def main(argv):
     print("| model | rise at | arm | served | failed | p50 | p95 | max |")
     print("| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |")
     for key, label in (("a", args.model_a), ("b", args.model_b)):
-        for lo, hi in windows[key]:
+        for i in rises[key]:
+            lo = schedule[i]["start"]
             for arm in (a, b):
-                s = summarize(arm["rows"], key, lo, hi)
+                w = window_of(arm, key, i)
+                if w is None:
+                    print("| %s | %ds | %s | - | - | - | - | - |" % (label, lo, arm["name"]))
+                    continue
                 print("| %s | %ds | %s | %d | %d | %s | %s | %s |" % (
-                    label, lo, arm["name"], s["n"], s["failed"],
-                    fmt_ms(s["p50"]), fmt_ms(s["p95"]), fmt_ms(s["max"])))
+                    label, lo, arm["name"], w["n"], w["failed"],
+                    fmt_ms(w["p50"]), fmt_ms(w["p95"]), fmt_ms(w["max"])))
     print("")
 
     print("## Accelerators")
@@ -517,9 +545,10 @@ def main(argv):
     print("## What this says")
     print("")
     for key, label in (("a", args.model_a), ("b", args.model_b)):
-        for lo, hi in windows[key]:
-            sn = summarize(a["rows"], key, lo, hi)
-            sp = summarize(b["rows"], key, lo, hi)
+        for i in rises[key]:
+            lo = schedule[i]["start"]
+            sn = window_of(a, key, i) or {"p95": None, "n": 0, "failed": 0}
+            sp = window_of(b, key, i) or {"p95": None, "n": 0, "failed": 0}
             if sn["p95"] is None or sp["p95"] is None:
                 print("- **%s**, rise at %ds: one arm served nothing in the window." % (label, lo))
                 continue
@@ -546,7 +575,7 @@ def main(argv):
               "comparison is **not** established; the TTFT numbers alone do not settle it.")
     # The limit of the evidence, printed every time, because a table invites a
     # conclusion the sample size does not support.
-    n_rises = len(windows["a"]) + len(windows["b"])
+    n_rises = len(rises["a"]) + len(rises["b"])
     print("")
     print("**How far this goes.** %d scale-up events per arm, one run each, no repetition "
           "and no confidence interval. A difference of the same order as the spread "

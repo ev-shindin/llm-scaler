@@ -108,9 +108,14 @@ case "$args" in
   # The controller's own Prometheus URL, and the flow-control probe. FC_MODELS
   # is what Prometheus answers: the model_name labels that actually have a
   # flow-control series.
-  *"get cm wva-manager-config"*) echo "PROMETHEUS_BASE_URL: \"${PROM_URL:-https://prom.example:9090}\""; exit 0 ;;
+  *"get cm wva-manager-config"*) echo "PROMETHEUS_BASE_URL: \"${PROM_URL-https://prom.example:9090}\""; exit 0 ;;
   *"get pod fcheck-"*"jsonpath={.status.phase}"*) echo "Succeeded"; exit 0 ;;
-  *"logs fcheck-"*) echo "MODELS ${FC_MODELS-unsloth/Meta-Llama-3.1-8B-Instruct Qwen/Qwen3-8B}"; exit 0 ;;
+  *"logs fcheck-"*)
+      # FCHECK_OUT stands in for whatever the probe printed, so a query that
+      # never answered can be told apart from one that answered "no series".
+      if [ -n "${FCHECK_OUT:-}" ]; then echo "$FCHECK_OUT"; else
+        echo "MODELS ${FC_MODELS-unsloth/Meta-Llama-3.1-8B-Instruct Qwen/Qwen3-8B}"; fi
+      exit 0 ;;
   *"rollout restart"*|*"rollout status"*) exit 0 ;;
   *"get pvc"*) [ "${HAS_PVC:-1}" = "1" ] && exit 0; exit 1 ;;
   *"get pods -l llm-d.ai/warm-pool"*)
@@ -363,6 +368,29 @@ else
     ok "flow control live for one model but not the other is refused"
 fi
 
+# NOT KNOWING IS NOT PASSING. Both of these used to `return 0`, which is the
+# same outcome the 34-minute arms got: the check ran, looked at nothing, and
+# said nothing was wrong.
+case_begin
+PROM_URL="" run_verb verify
+if [ "$RC" -eq 0 ]; then
+    fail "verify passed without being able to read PROMETHEUS_BASE_URL; it checked nothing and reported success, which is how two full arms ran on a metric that was never emitted"
+elif ! printf '%s' "$OUT" | grep -q 'WVA_NS'; then
+    fail "verify refused without naming the knob that fixes it (WVA_NS, when the controller is elsewhere): $OUT"
+else
+    ok "an unreadable Prometheus URL is refused, not skipped"
+fi
+
+case_begin
+FCHECK_OUT="QUERYFAIL timeout" run_verb verify
+if [ "$RC" -eq 0 ]; then
+    fail "verify passed when the Prometheus query never answered; an unanswered query says nothing about whether the signal exists"
+elif ! printf '%s' "$OUT" | grep -q 'SKIP_FLOW_CONTROL_CHECK'; then
+    fail "verify refused without naming the deliberate way past: $OUT"
+else
+    ok "a Prometheus query that did not answer is refused, not skipped"
+fi
+
 # ---------------------------------------------------------------------------
 # The load Job, rendered. Load comes from inference-perf -- the llm-d harness's
 # own generator -- so what the Pod is handed decides whether a run happens at
@@ -420,7 +448,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=24
+CASES_EXPECTED=26
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

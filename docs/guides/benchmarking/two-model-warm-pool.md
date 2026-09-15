@@ -82,8 +82,8 @@ in the bespoke client it replaced:
   tokenizer, so `INPUT_TOKENS` means input tokens for *both* of two different
   models. A generator that counts words is off by whatever the tokenizer does,
   differently per model — in a scenario whose whole point is comparing two.
-- **The schedule is data, not control flow.** Each phase is one inference-perf
-  `load.stages` entry, and anti-phase is the two profiles carrying **mirrored
+- **The schedule is data, not control flow.** Each phase becomes inference-perf
+  `load.stages` entries, and anti-phase is the two profiles carrying **mirrored
   ladders** over identical boundaries. `two_model_profile.py` renders both from
   one schedule, and writes that schedule next to the results; the report
   refuses two arms whose schedules differ.
@@ -109,10 +109,43 @@ replica, including an awake warm-pool Pod in the EPP's own backend list, did
 zero. The report refuses an arm where one engine did all the work, because every
 TTFT and GPU number from such a run describes a one-replica fleet.
 
-Results arrive as inference-perf's own `per_request_lifecycle_metrics.json` and
-`summary_lifecycle_metrics.json`, one directory per model;
-`harness_results.py` converts them to the `requests.jsonl` + `meta.json` pair
-the report compares, computing nothing the harness already measured.
+### Every latency is the generator's own, per stage
+
+inference-perf v0.6.1 reports `time_to_first_token` as a **per-stage
+distribution**. Its per-request records carry no token timestamps at all —
+measured on CoreWeave: 210 records, each with the raw response chunks and no
+time on any of them. Nothing can be re-cut into a window after the run.
+
+So **the rise window is a stage**. Every phase after the lead-in is split in two
+at `RISE_WINDOW` (default 90s) — an opening sub-stage and the remainder, at the
+same rate, so the load is unchanged — and the headline number is read straight
+out of `stage_N_lifecycle_metrics.json` for the opening stage of each rise. Both
+models are split at the same boundaries, so one stage index means one window for
+both, and the opening of a *falling* model's phase comes free as a control.
+
+Two consequences worth knowing before reading a table:
+
+- The report computes no percentiles. It prints the generator's, and refuses an
+  arm whose stage files do not cover the whole schedule — a run that stopped
+  short did not run the schedule the table would describe.
+- `start_time` in the per-request file is a **monotonic** clock (measured:
+  `10655087.75`, an uptime), so GPU samples are aligned against the driver's own
+  start barrier instead.
+
+Results arrive as inference-perf's `per_request_lifecycle_metrics.json`,
+`stage_N_lifecycle_metrics.json` and `summary_lifecycle_metrics.json`, one
+directory per model; `harness_results.py` converts them to the `requests.jsonl`
++ `meta.json` pair the report compares, computing nothing the harness already
+measured.
+
+### The endpoint must answer before the barrier
+
+Each container sends one real request and waits for a 200 before it reaches the
+start barrier. Not belt-and-braces: a smoke run lost **25 of 420 requests
+(6%)** to `ClientConnectorDNSError`, because the load Pod's istio sidecar was
+not ready when the app container began issuing. Those are the driver's failures,
+and 6% is three times the report's client-side loss threshold — the arm is
+refused, and 34 minutes of accelerators are spent to learn it.
 
 ## What makes the two arms comparable
 

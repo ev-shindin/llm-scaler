@@ -441,7 +441,11 @@ epp_restart() {
 # Where WVA reads its metrics, taken from the controller's OWN config so this
 # cannot drift from what the controller actually queries.
 prometheus_base_url() {
-    k get cm wva-manager-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
+    # WVA_NS, not NS. The controller's ConfigMap lives with the controller, and
+    # the two namespaces are only the same in a namespace-scoped install. Read
+    # from the model namespace on a cluster-scoped one and this finds nothing --
+    # which used to mean the flow-control check quietly passed.
+    kc -n "$WVA_NS" get cm wva-manager-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
         | sed -n 's/^PROMETHEUS_BASE_URL: *"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1
 }
 
@@ -453,10 +457,23 @@ prometheus_base_url() {
 # WVA's scheduler-queue query returned no series for either model through two
 # 34-minute arms. A config is a statement of intent; the series is the fact.
 verify_flow_control() {
+    # NOT KNOWING IS NOT PASSING. This check exists because the flow-control gate
+    # was present and correct in both EPP ConfigMaps while the metric it gates
+    # was never emitted, through two 34-minute arms, and nothing said so. A
+    # version of it that returns success when it could not look would have let
+    # exactly that run through -- so both unknowns below refuse, and
+    # SKIP_FLOW_CONTROL_CHECK=1 is the deliberate way past.
+    if [ "${SKIP_FLOW_CONTROL_CHECK:-0}" = "1" ]; then
+        warn "SKIP_FLOW_CONTROL_CHECK=1: not checking that WVA's scheduler-queue signal exists"
+        return 0
+    fi
     local url; url="$(prometheus_base_url)"
     if [ -z "$url" ]; then
-        warn "could not read PROMETHEUS_BASE_URL from wva-manager-config; skipping the flow-control check"
-        return 0
+        warn "could not read PROMETHEUS_BASE_URL from wva-manager-config in $WVA_NS."
+        warn "  Set WVA_NS if the controller runs elsewhere. Without it nothing establishes that"
+        warn "  WVA's scheduler-queue signal exists, and the run would scale on a metric that"
+        warn "  may not be emitted at all. SKIP_FLOW_CONTROL_CHECK=1 to proceed anyway."
+        return 1
     fi
     info "checking the EPP flow-control queue is a real series in $url"
     local q out pod
@@ -489,7 +506,11 @@ else:
     out="$(k logs "$pod" 2>&1)"
     k delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1
     case "$out" in
-        *QUERYFAIL*) warn "could not query Prometheus: $out"; return 0 ;;
+        *QUERYFAIL*)
+            warn "could not query Prometheus at $url: $out"
+            warn "  The same reasoning as above: an unanswered query says nothing about whether"
+            warn "  the signal exists. SKIP_FLOW_CONTROL_CHECK=1 to proceed anyway."
+            return 1 ;;
     esac
     local missing=""
     case "$out" in *"$MODEL_A"*) : ;; *) missing="$MODEL_A" ;; esac
@@ -1089,9 +1110,15 @@ verb_run() {
     local start_at=$(( $(date +%s) + PRELOAD_GRACE ))
 
     RUN_JOB="wva-two-model-load-$arm"
-    trap run_interrupted INT TERM
+    # EXIT and HUP as well as INT/TERM, because the leak this prevents is not
+    # hypothetical: an interrupted arm left its Job driving both models at their
+    # ceiling for 37 minutes on a shared cluster, unwatched. Every one of `die`,
+    # a closed terminal and a Ctrl-C has to take the Job with it. The handler is
+    # a no-op once RUN_JOB is cleared on the success path.
+    trap run_interrupted INT TERM HUP
+    trap run_cleanup EXIT
     k delete job "$RUN_JOB" --ignore-not-found >/dev/null 2>&1
-    render_load_job "$RUN_JOB" "$arm" "$start_at" > "$out_dir/job.yaml"
+    render_load_job "$RUN_JOB" "$arm" "$start_at" "$url_a" "$url_b" > "$out_dir/job.yaml"
     [ -s "$out_dir/job.yaml" ] || die "the load Job rendered empty"
     k apply -f "$out_dir/job.yaml" >/dev/null || die "could not create the load Job"
 
@@ -1150,7 +1177,7 @@ verb_run() {
         k cp "$pod:/results" "$out_dir/harness" -c load-a >/dev/null 2>&1 || \
             warn "could not copy the harness results out of $pod"
     fi
-    trap - INT TERM
+    trap - INT TERM HUP
     run_cleanup
     RUN_JOB=""
     capture_pod_work "$out_dir/podwork.after"
@@ -1161,6 +1188,7 @@ verb_run() {
         --results-a "$out_dir/harness/a" --results-b "$out_dir/harness/b" \
         --schedule "$out_dir/schedule.json" \
         --out "$out_dir/requests.jsonl" \
+        --t0 "$start_at" \
         --arm "$arm" --model-a "$MODEL_A" --model-b "$MODEL_B" \
         --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
         --seed "$SEED" --prefix-groups "$PREFIX_GROUPS" \
@@ -1170,7 +1198,7 @@ verb_run() {
 }
 
 render_load_job() {
-    local job="$1" arm="$2" start_at="$3"
+    local job="$1" arm="$2" start_at="$3" url_a="${4:-}" url_b="${5:-}"
     # TWO CONTAINERS, ONE POD, on purpose. The models have to burst against each
     # other, so their load must come from one scheduling unit on one node with
     # one image pull: two Pods start whenever the scheduler gets to each of
@@ -1197,8 +1225,8 @@ spec:
     spec:
       restartPolicy: Never
       containers:
-$(render_load_container a "$MODEL_A" "$start_at")
-$(render_load_container b "$MODEL_B" "$start_at")
+$(render_load_container a "$MODEL_A" "$start_at" "$url_a")
+$(render_load_container b "$MODEL_B" "$start_at" "$url_b")
 
       volumes:
         - name: profiles
@@ -1212,7 +1240,7 @@ YAML
 }
 
 render_load_container() {
-    local role="$1" tokenizer="$2" start_at="$3"
+    local role="$1" tokenizer="$2" start_at="$3" base_url="${4:-}"
     # CPU matters more than it looks: both containers share one Pod, and an
     # open-loop generator that cannot get on a core delays its own arrivals and
     # then reports the delay as the cluster's latency. The report refuses an arm
@@ -1227,6 +1255,10 @@ render_load_container() {
               value: "$role"
             - name: TOKENIZER
               value: "$tokenizer"
+            - name: MODEL
+              value: "$tokenizer"
+            - name: BASE_URL
+              value: "$base_url"
             - name: START_AT
               value: "$start_at"
             - name: HF_HOME

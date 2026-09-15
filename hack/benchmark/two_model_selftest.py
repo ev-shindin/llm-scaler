@@ -167,33 +167,54 @@ else:
     ok("each arrival is tagged with the phase it falls in")
 
 # ---------------------------------------------------------------------------
-# rise windows
+# rise windows -- which are STAGES, because the harness reports a latency
+# distribution per stage and nothing finer.
 # ---------------------------------------------------------------------------
-meta_sched = [{"start": s, "end": e, "rate_a": ra, "rate_b": rb} for s, e, ra, rb in sched]
+meta_stages = profile.schedule_json(profile.stage_map(sched, 90))
+meta_sched = meta_stages
 
-case("rise windows follow the model, not the phase index")
-wa = report.rise_windows(meta_sched, "a", 90)
-wb = report.rise_windows(meta_sched, "b", 90)
-if wa != [(600, 690), (1560, 1650)]:
-    fail("model A's rise windows are %s, expected the phases where A goes 2->12" % wa)
-elif wb != [(120, 210), (1080, 1170)]:
-    fail("model B's rise windows are %s, expected the phases where B goes 2->12" % wb)
+case("every phase after the lead-in opens with a rise-window stage")
+bounds = [(st["start"], st["end"]) for st in meta_stages]
+if bounds[0] != (0, 120):
+    fail("the lead-in was cut up: %s. Nothing rises into it, and splitting it only "
+         "spends stages." % (bounds[0],))
+elif (120, 210) not in bounds or (210, 600) not in bounds:
+    fail("phase 1 was not cut at the rise window: %s. TTFT is reported per stage, so an "
+         "uncut phase averages a 90s scale-up into 8 minutes of steady state." % bounds)
+elif sum(e - s for s, e in bounds) != sched[-1][1]:
+    fail("the stages do not tile the schedule: %s. Load was added or dropped by the cut, "
+         "which is not what a cut is for." % bounds)
 else:
-    ok("each model's windows are the phases where ITS OWN rate rose")
+    ok("each phase opens with its own rise-window stage, and the stages tile the run")
 
-case("a rise window never runs past its phase")
-w = report.rise_windows(meta_sched, "a", 10_000)
-if w[0][1] != 1080:
-    fail("an over-long window escaped its phase: %s. It would cover the NEXT phase, where "
-         "the rate fell, and report steady state as a rise." % w)
+case("rise stages follow the model, not the stage index")
+ia = report.rise_stages(meta_stages, "a")
+ib = report.rise_stages(meta_stages, "b")
+starts_a = [meta_stages[i]["start"] for i in ia]
+starts_b = [meta_stages[i]["start"] for i in ib]
+if starts_a != [600, 1560]:
+    fail("model A rises at %s, expected the stages where A goes 2->12" % starts_a)
+elif starts_b != [120, 1080]:
+    fail("model B rises at %s, expected the stages where B goes 2->12" % starts_b)
 else:
-    ok("a window longer than the phase is clipped to it")
+    ok("each model's rises are the stages where ITS OWN rate rose")
 
-case("a model that never rises yields no window")
-if report.rise_windows([{"start": 0, "end": 100, "rate_a": 2, "rate_b": 2}], "a", 60):
-    fail("a flat schedule produced a rise window")
+case("a rise stage is the window, not the whole phase")
+for i in ia:
+    st = meta_stages[i]
+    if st["end"] - st["start"] != 90:
+        fail("the rise stage at %ds is %ds long, not the 90s rise window: a scale-up "
+             "averaged over a whole phase is reported as steady state"
+             % (st["start"], st["end"] - st["start"]))
+        break
 else:
-    ok("no rise, no window")
+    ok("a rise stage is exactly the rise window")
+
+case("a model that never rises yields no rise stage")
+if report.rise_stages([{"start": 0, "end": 100, "rate_a": 2, "rate_b": 2}], "a"):
+    fail("a flat schedule produced a rise stage")
+else:
+    ok("no rise, no stage")
 
 # ---------------------------------------------------------------------------
 # the report's arithmetic
@@ -260,18 +281,30 @@ with tempfile.TemporaryDirectory() as d:
     else:
         ok("samples align to t0; idle and lent are told apart; the pool is in the total")
 
-case("a torn stream is a failure, not a fast success")
+case("a failed request is not a served one")
 rows = [
-    {"model": "a", "t_sched": 1.0, "ttft": 0.1, "error": None, "tokens": 200},
-    {"model": "a", "t_sched": 2.0, "ttft": 0.1, "error": "torn after 3 frames", "tokens": 3},
-    {"model": "a", "t_sched": 3.0, "ttft": None, "error": "deadline", "tokens": 0},
+    {"model": "a", "t_rel": 1.0, "error": ""},
+    {"model": "a", "t_rel": 2.0, "error": "ClientPayloadError: torn after 3 frames"},
+    {"model": "a", "t_rel": 3.0, "error": "TimeoutError: deadline"},
 ]
-s = report.summarize(rows, "a")
-if s["n"] != 1 or s["failed"] != 2:
-    fail("a truncated stream was counted as served (%s). Counting it as a success lets a "
-         "saturating arm shed its worst requests while its percentiles improve." % s)
+served, failed = report.served_and_failed(rows, "a")
+if len(served) != 1 or len(failed) != 2:
+    fail("%d served / %d failed, expected 1/2. Counting a torn response as a success lets "
+         "a saturating arm shed its worst requests while its percentiles improve."
+         % (len(served), len(failed)))
 else:
-    ok("only a complete response counts as served")
+    ok("only a request that did not fail counts as served")
+
+case("a window with no successes has no TTFT, not a zero one")
+w = harness.window_from({"successes": {"count": 0}, "failures": {"count": 12},
+                         "load_summary": {}})
+if w["p95"] is not None or w["p50"] is not None:
+    fail("a window where everything failed reported a TTFT of %s. Zero would make the "
+         "worst window in the run look like the best." % w["p95"])
+elif w["failed"] != 12:
+    fail("the failures were lost: %s" % w)
+else:
+    ok("a window that served nothing reports no latency")
 
 # ---------------------------------------------------------------------------
 # the refusals
@@ -599,83 +632,150 @@ else:
 
 # ---------------------------------------------------------------------------
 # the harness -> report conversion
+#
+# These fixtures are the SHAPE inference-perf v0.6.1 actually writes, read off a
+# real run on CoreWeave: per-request records with no token times at all, and a
+# `time_to_first_token` distribution per stage. A fixture invented from the
+# newer schema would make every case here pass against code that cannot read a
+# single real run.
 # ---------------------------------------------------------------------------
-def harness_dir(records, summary=True):
+def stage_doc(n, failed=0, p50=0.05, p95=0.09, delay_p95=0.004):
+    latency = {}
+    if n:
+        latency["time_to_first_token"] = {"median": p50, "p95": p95, "p99": p95 * 1.2,
+                                          "max": p95 * 1.5, "min": p50 * 0.8}
+    return {"load_summary": {"count": n + failed, "requested_rate": 3.0,
+                             "achieved_rate": 2.98,
+                             "schedule_delay": {"median": 0.0005, "p95": delay_p95}},
+            "successes": {"count": n, "latency": latency},
+            "failures": {"count": failed}}
+
+
+def rec(start, error=None, out_tokens=497):
+    """One per-request record, in the shape this harness version writes."""
+    return {"start_time": start, "end_time": start + 2.5,
+            "info": {"input_tokens": 999,
+                     "response_metrics": {"output_tokens": out_tokens,
+                                          "response_chunks": ["{}"]}},
+            "error": error}
+
+
+def harness_dir(records, stages, summary=True):
     d = tempfile.mkdtemp()
     with open(os.path.join(d, "per_request_lifecycle_metrics.json"), "w") as fh:
         json.dump(records, fh)
+    for i, st in enumerate(stages):
+        with open(os.path.join(d, "stage_%d_lifecycle_metrics.json" % i), "w") as fh:
+            json.dump(st, fh)
     if summary:
         with open(os.path.join(d, "summary_lifecycle_metrics.json"), "w") as fh:
-            json.dump({"load_summary": {"count": len(records),
-                                        "schedule_delay": {"p50": 0.001, "p95": 0.004}}}, fh)
+            json.dump(stage_doc(len(records), 0), fh)
     return d
 
 
-def rec(start, ttft=0.1, ntok=5, error=None):
-    times = [start + ttft + i * 0.01 for i in range(ntok)]
-    return {"start_time": start, "end_time": (times[-1] if times else start),
-            "info": {"output_token_times": times}, "error": error}
-
-
-case("TTFT is the first output token, measured from the request's own start")
-rows = harness.rows_from([rec(1000.0, ttft=0.25)], "a", 1000.0)
-if len(rows) != 1 or abs(rows[0]["ttft"] - 0.25) > 1e-9:
-    fail("TTFT came out as %s, not the 0.25s between the request and its first token"
-         % (rows[0]["ttft"] if rows else None))
-elif rows[0]["t_sched"] != 0.0:
-    fail("the arrival landed at t=%s rather than at the run's origin" % rows[0]["t_sched"])
+case("TTFT comes from the stage the harness measured, not from the rows")
+w = harness.window_from(stage_doc(120, failed=3, p50=0.048, p95=0.062))
+if w["n"] != 120 or w["failed"] != 3:
+    fail("counts are %s; successes and failures are separate fields and must not be pooled" % w)
+elif abs(w["p50"] - 0.048) > 1e-9 or abs(w["p95"] - 0.062) > 1e-9:
+    fail("TTFT read back as p50=%s p95=%s, not the distribution the harness wrote"
+         % (w["p50"], w["p95"]))
 else:
-    ok("TTFT and arrival are read from the harness's own timestamps")
+    ok("a window's latency is the generator's own time_to_first_token block")
 
-case("a response with no output tokens is a failure, not a fast success")
-rows = harness.rows_from([rec(1000.0, ntok=0)], "a", 1000.0)
-if rows[0]["ttft"] is not None or not rows[0]["error"]:
-    fail("a response that delivered no token was recorded as served (%s); an arm that "
-         "sheds its worst requests would improve its own percentiles" % rows[0])
+case("rows carry no latency, because this harness records none")
+rows = harness.rows_from([rec(10655087.75)], "a", 10655087.75)
+if "ttft" in rows[0]:
+    fail("a row carries a `ttft` field: there are no per-request token times in this "
+         "version, so any value there was invented")
+elif rows[0]["t_rel"] != 0.0 or rows[0]["output_tokens"] != 497:
+    fail("the row did not read the record: %s" % rows[0])
 else:
-    ok("no first token means no TTFT and a failure")
+    ok("rows carry counts and errors only")
 
-case("both models share one origin")
-a = harness_dir([rec(2000.0), rec(2100.0)])
-b = harness_dir([rec(2050.0), rec(2150.0)])
+case("inference-perf's own error_type survives into the row")
+rows = harness.rows_from([rec(1.0, error={"error_type": "ClientConnectorDNSError",
+                                          "error_msg": "Temporary failure in name resolution"})],
+                         "a", 1.0)
+if not rows[0]["error"].startswith("ClientConnectorDNSError"):
+    fail("the error came through as %r; the report classifies client-side failures by "
+         "the leading token, and a mangled type is a failure it cannot see"
+         % rows[0]["error"])
+else:
+    ok("the generator's own error_type leads the row's error")
+
+STAGES_FIXTURE = [{"start": 0, "end": 90, "rate_a": 1, "rate_b": 1},
+                  {"start": 90, "end": 200, "rate_a": 1, "rate_b": 1}]
 sched_file = os.path.join(tempfile.mkdtemp(), "schedule.json")
 with open(sched_file, "w") as fh:
-    json.dump([{"start": 0, "end": 200, "rate_a": 1, "rate_b": 1}], fh)
-out = os.path.join(tempfile.mkdtemp(), "requests.jsonl")
+    json.dump(STAGES_FIXTURE, fh)
 
 
 class _Args(object):
     pass
 
 
-args = _Args()
-args.results_a, args.results_b, args.schedule, args.out = a, b, sched_file, out
-args.arm, args.model_a, args.model_b = "pool", "A", "B"
-args.input_tokens, args.output_tokens, args.seed, args.prefix_groups = 1000, 500, 1729, 32
-conv_rows, conv_meta = harness.convert(args)
-if conv_meta["t0"] != 2000.0:
-    fail("the origin is %s; with one origin per model the two halves of an anti-phase "
-         "run land in different phases" % conv_meta["t0"])
-elif min(r["t_sched"] for r in conv_rows if r["model"] == "b") != 50.0:
-    fail("model B's first arrival is not measured from the shared origin")
-else:
-    ok("one origin for both models")
+def convert_args(a, b):
+    args = _Args()
+    args.results_a, args.results_b, args.schedule = a, b, sched_file
+    args.out = os.path.join(tempfile.mkdtemp(), "requests.jsonl")
+    args.t0, args.arm, args.model_a, args.model_b = 1789464860.0, "pool", "A", "B"
+    args.input_tokens, args.output_tokens = 1000, 500
+    args.seed, args.prefix_groups = 1729, 32
+    return args
 
-case("the driver's own queueing is carried through, not re-derived")
-if abs(conv_meta["queue_delay_p95"] - 0.004) > 1e-9:
-    fail("queue_delay_p95 is %s, not the harness's own p95 schedule_delay"
-         % conv_meta["queue_delay_p95"])
+
+two_stages = [stage_doc(24, failed=1), stage_doc(117, failed=2, delay_p95=0.02)]
+dir_a = harness_dir([rec(2000.0), rec(2100.0)], two_stages)
+dir_b = harness_dir([rec(2050.0), rec(2150.0)], two_stages)
+conv_rows, conv_meta = harness.convert(convert_args(dir_a, dir_b))
+
+case("the run's origin is the driver's barrier, not the harness's clock")
+if conv_meta["t0"] != 1789464860.0:
+    fail("t0 is %s. inference-perf's start_time is a MONOTONIC clock -- measured at "
+         "10655087.75, an uptime -- so using it would put every GPU sample tens of "
+         "thousands of hours away from the run." % conv_meta["t0"])
 else:
-    ok("driver queueing comes from the generator that would be at fault")
+    ok("t0 is the wall-clock barrier the driver set")
+
+case("one window per stage, in the schedule's order")
+if len(conv_meta["windows"]["a"]["stages"]) != len(STAGES_FIXTURE):
+    fail("%d windows for %d stages: stage N of the report would not be stage N of the run"
+         % (len(conv_meta["windows"]["a"]["stages"]), len(STAGES_FIXTURE)))
+elif conv_meta["windows"]["a"]["stages"][1]["n"] != 117:
+    fail("the stages came back out of order or misread: %s"
+         % conv_meta["windows"]["a"]["stages"])
+else:
+    ok("every stage of the schedule has its own window")
+
+case("a run that stopped short of the schedule is refused")
+short = harness_dir([rec(1.0)], [stage_doc(10)])
+if harness.main(["--results-a", short, "--results-b", short,
+                 "--schedule", sched_file, "--t0", "1",
+                 "--out", os.path.join(tempfile.mkdtemp(), "r.jsonl")]) != 2:
+    fail("an arm that wrote fewer stages than the profile asked for was accepted; the "
+         "windows the report describes would not be the windows that ran")
+else:
+    ok("a short run is refused, not padded")
+
+case("the driver's own queueing is the WORST it reported, not the average")
+if abs(conv_meta["queue_delay_p95"] - 0.02) > 1e-9:
+    fail("queue_delay_p95 is %s, not the 0.02 one stage reported. A driver that kept up "
+         "on average while falling behind through one burst was late exactly where it "
+         "mattered." % conv_meta["queue_delay_p95"])
+else:
+    ok("driver queueing is the worst stage, from the generator that would be at fault")
 
 case("a missing percentile never falls back to a LOWER one")
-if harness.pick_percentile({"p50": 0.001, "p99": 0.5}) != 0.5:
+if harness.pick_percentile({"median": 0.001, "p99": 0.5}) != 0.5:
     fail("p95 was unavailable and something other than a higher percentile was used; "
          "reading p50 where p95 was meant passes the very runs the guard exists to stop")
-elif harness.pick_percentile({"p50": 0.001}) is not None:
-    fail("only p50 was available and it was used as p95")
+elif harness.pick_percentile({"median": 0.001}) is not None:
+    fail("only the median was available and it was used as p95")
+elif harness.pick_percentile({"median": 0.007}, 50) != 0.007:
+    fail("the median is written as `median` by this generator and was not found")
 else:
-    ok("the fallback is upward or nothing")
+    ok("the fallback is upward or nothing, and `median` is p50")
 
 case("a run with no measured driver queueing is refused")
 no_qd = dict(BASE_META)
@@ -688,6 +788,19 @@ if run_report(BASE_META, no_qd, rows_b=bare) == 0:
          "failure the guard is for")
 else:
     ok("unmeasured driver queueing is a refusal, not a zero")
+
+case("the error type that ACTUALLY occurred is recognised as the driver's")
+# Not a hypothetical: a real run lost 25 of 420 requests to
+# ClientConnectorDNSError -- the load Pod's istio sidecar was not ready when
+# the app container started issuing -- and an exact "ClientConnectorError" in
+# the list did not match it, so 6% driver-side loss was charged to the cluster
+# and the table printed.
+if not report.is_client_side("ClientConnectorDNSError: Temporary failure in name resolution"):
+    fail("ClientConnectorDNSError was not recognised as client-side. The aiohttp connector "
+         "family has DNS, SSL and certificate variants; a list that names only the base "
+         "class silently lets the driver's own failures count as the cluster's")
+elif report.is_client_side("ClientResponseError: 500"):
+    fail("a server's response error was charged to the driver")
 
 case("aiohttp's client-side failures are recognised as the driver's")
 if not report.is_client_side("ClientConnectorError: cannot connect"):

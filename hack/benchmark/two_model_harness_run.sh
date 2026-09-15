@@ -24,6 +24,8 @@
 
 : "${ROLE:?ROLE must be a or b}"
 : "${TOKENIZER:?TOKENIZER must be the model id to tokenize with}"
+: "${MODEL:?MODEL must be the served model id}"
+: "${BASE_URL:?BASE_URL must be this stack's endpoint, with no route appended}"
 : "${START_AT:?START_AT must be the absolute epoch both containers start at}"
 : "${PROFILE:=/profiles/profile-${ROLE}.yaml}"
 : "${HOLD_SECONDS:=3600}"
@@ -49,6 +51,39 @@ if [ "$preload_rc" -ne 0 ]; then
     echo "PRELOAD-FAILED-$ROLE rc=$preload_rc"
     sleep "$HOLD_SECONDS"
     exit "$preload_rc"
+fi
+
+# The endpoint has to ANSWER before the barrier, not merely exist. Measured on
+# CoreWeave: 12 of 210 requests -- 6%, three times the report's client-side loss
+# threshold -- failed with ClientConnectorDNSError, "Temporary failure in name
+# resolution", because this Pod's istio sidecar was not ready when the app
+# container started issuing. Those are the DRIVER's failures; a run thinned by
+# them measures the survivors, not the scenario.
+python3 - "$BASE_URL" "$MODEL" "$ROLE" <<'PY'
+import json, sys, time, urllib.error, urllib.request
+base, model, role = sys.argv[1], sys.argv[2], sys.argv[3]
+body = json.dumps({"model": model, "prompt": "ping", "max_tokens": 1}).encode()
+deadline, last = time.time() + 300, None
+while time.time() < deadline:
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/v1/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status == 200:
+                print("endpoint answers: %s" % base, flush=True)
+                sys.exit(0)
+            last = "HTTP %s" % resp.status
+    except Exception as exc:          # noqa: BLE001 -- any failure means not ready
+        last = "%s: %s" % (type(exc).__name__, exc)
+    time.sleep(3)
+print("ENDPOINT-UNREACHABLE-%s %s (%s)" % (role, base, last), flush=True)
+sys.exit(1)
+PY
+probe_rc=$?
+if [ "$probe_rc" -ne 0 ]; then
+    echo "PRELOAD-FAILED-$ROLE rc=$probe_rc"
+    sleep "$HOLD_SECONDS"
+    exit "$probe_rc"
 fi
 echo "PRELOAD-DONE-$ROLE"
 
