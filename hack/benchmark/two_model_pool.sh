@@ -1094,10 +1094,24 @@ sample_gpus() {
     # A pool Pod that has been LENT carries the borrowing model's labels, so
     # lend and return are visible here without any metrics plumbing, which
     # matters on a cluster where Prometheus may not be reachable from this shell.
-    local out="$1" until_ts="$2"
+    local out="$1" until_ts="$2" want
     : > "$out"
     while [ "$(date +%s)" -lt "$until_ts" ]; do
-        k get pods -o json 2>/dev/null | jq -c --argjson now "$(date +%s)" '
+        # What the Deployments ASKED for, beside what is actually Running.
+        # Without this the arms cannot be told apart when one of them never got
+        # the replicas it was allowed -- measured: an arm whose Deployments
+        # scaled to 3 within four minutes and never had more than ONE replica
+        # Available for the whole 36 minutes, because the rest could not be
+        # placed. Its numbers described a one-replica fleet and nothing said so.
+        want="$(k get deploy -o json 2>/dev/null | jq -c '
+            [.items[] | select(.metadata.name | test("decode"))
+             | {(.metadata.name): (.spec.replicas // 0)}] | add // {}')"
+        # Explicit, not ${want:-{}}: the brace inside that expansion terminates
+        # it early in bash, jq then gets nothing, and every sample comes out
+        # empty -- which reads as a namespace holding no accelerators at all.
+        [ -n "$want" ] || want='{}'
+        k get pods -o json 2>/dev/null | jq -c --argjson now "$(date +%s)" \
+            --argjson want "$want" '
           {ts: $now,
            pods: [ .items[]
              | select(.status.phase=="Running")
@@ -1108,7 +1122,8 @@ sample_gpus() {
                 model: (.metadata.labels["llm-d.ai/model"] // ""),
                 pool:  (.metadata.labels["llm-d.ai/warm-pool"] // ""),
                 serving: (.metadata.labels["llm-d.ai/inferenceServing"] // "")}
-             | select(.gpus > 0) ]}' >> "$out" 2>/dev/null || true
+             | select(.gpus > 0) ],
+           desired: $want}' >> "$out" 2>/dev/null || true
         sleep "$GPU_SAMPLE_SECONDS"
     done
 }

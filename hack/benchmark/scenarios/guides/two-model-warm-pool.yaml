@@ -543,14 +543,29 @@ scenario:
     modelservice:
       decode:
         replicas: 1
+        # 8 CPU, not 16. FREE ACCELERATORS ARE NOT PLACEABLE ACCELERATORS, and
+        # 16 made most of this cluster's spare accelerators unusable: measured
+        # on CoreWeave, of 16 free accelerators only FOUR sat on a node with 16
+        # spare cores -- the rest had 7 and 15. A 90-minute A/B was voided by
+        # it. The nopool arm's Deployments scaled to 3 within four minutes of
+        # the first burst and never had more than ONE replica Available,
+        # because the other two could not be placed; the pool arm ran an hour
+        # later, got everything, and the comparison was between two different
+        # fleets.
+        #
+        # At 8 the same cluster takes 6 Pods, which is this run's peak, and at
+        # 16 it took 4. Nothing about the measurement changes: 8 cores is ample
+        # for an 8B model at 9 rps with maxNumSeq 32 -- the CPU goes on
+        # tokenization, detokenization and the API server, not the forward pass
+        # -- and whatever it costs, it costs both arms identically.
         resources:
           limits:
             memory: 64Gi
-            cpu: "16"
+            cpu: "8"
             nvidia.com/gpu: "1"
           requests:
             memory: 64Gi
-            cpu: "16"
+            cpu: "8"
             nvidia.com/gpu: "1"
 
     # The two stacks MUST price the same. variantCost is what WVA's solver uses
@@ -641,11 +656,11 @@ scenario:
         resources:
           limits:
             memory: 64Gi
-            cpu: "16"
+            cpu: "8"
             nvidia.com/gpu: "1"
           requests:
             memory: 64Gi
-            cpu: "16"
+            cpu: "8"
             nvidia.com/gpu: "1"
 
     wva:

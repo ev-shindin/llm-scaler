@@ -951,6 +951,62 @@ if run_report(BASE_META, served_meta) != 0:
 else:
     ok("a request the model answered badly is not counted as one that never arrived")
 
+# ---------------------------------------------------------------------------
+# an arm must have GOT the fleet it was allowed, not merely been allowed it
+# ---------------------------------------------------------------------------
+def gpus_file(samples):
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "gpus.jsonl")
+    with open(p, "w") as fh:
+        for s in samples:
+            fh.write(json.dumps(s) + "\n")
+    return p
+
+
+def sample(running_a, running_b, want_a, want_b):
+    pods = ([{"name": "dep-a-%d" % i, "gpus": 1, "pool": ""} for i in range(running_a)]
+            + [{"name": "dep-b-%d" % i, "gpus": 1, "pool": ""} for i in range(running_b)])
+    return {"ts": 0, "pods": pods, "desired": {"dep-a": want_a, "dep-b": want_b}}
+
+
+case("an arm short of its requested fleet is measured, not assumed fine")
+tot, short, worst = report.shortfall(gpus_file([sample(1, 1, 3, 3)] * 10))
+if (tot, short, worst) != (10, 10, 4):
+    fail("shortfall reported %s, expected all 10 samples short with a worst gap of 4. "
+         "A Pending replica holds no accelerator and serves nothing, so an arm whose "
+         "Deployments asked for 3 and ran 1 measured a one-replica fleet"
+         % ((tot, short, worst),))
+else:
+    ok("a fleet short of what its Deployments asked for is counted, per sample")
+
+case("an arm that got its fleet is not flagged")
+tot, short, _ = report.shortfall(gpus_file([sample(3, 3, 3, 3)] * 10))
+if short:
+    fail("%d of %d samples were called short while every requested replica was running"
+         % (short, tot))
+else:
+    ok("a fleet that got what it asked for raises nothing")
+
+case("the pool's own Pods are not counted toward a model's fleet")
+s = sample(1, 1, 3, 3)
+s["pods"] += [{"name": "wva-warm-pool-x", "gpus": 1, "pool": "twomodel"}]
+tot, short, worst = report.shortfall(gpus_file([s]))
+if worst != 4:
+    fail("a lent pool Pod was counted as one of the model's own replicas (worst gap %d, "
+         "expected 4). The pool is the thing being measured; counting it as the fleet "
+         "would hide exactly the shortfall this looks for" % worst)
+else:
+    ok("pool Pods are excluded from the model's own replica count")
+
+case("samples without the field are not a shortfall")
+# Stored runs predate it. Reporting 100% short on those would refuse every
+# archived arm rather than say the measurement is absent.
+old = [{"ts": 0, "pods": [{"name": "dep-a-0", "gpus": 1, "pool": ""}]}]
+if report.shortfall(gpus_file(old)) != (0, 0, 0):
+    fail("samples with no `desired` field were treated as a shortfall")
+else:
+    ok("a run recorded before the field existed reports no shortfall")
+
 case("drift is measured from the generator's own per-stage elapsed time")
 drifted = {"windows": {
     "a": {"overall": {}, "stages": [{"elapsed": 100.0}, {"elapsed": 100.0}]},

@@ -412,6 +412,51 @@ def driver_queueing(arm):
     return None
 
 
+def shortfall(path):
+    """(samples, short_samples, worst) -- how far an arm fell short of the fleet
+    its own Deployments asked for.
+
+    A Pod that is Pending holds no accelerator and serves nothing, so an arm
+    whose Deployments scaled to 3 while one replica ran is measuring a
+    one-replica fleet. Measured on CoreWeave exactly that: KEDA actuated
+    correctly within four minutes of the first burst, four Pods went Pending and
+    eight by the end, and the arm ran its whole schedule on one replica per
+    model. The other arm, an hour later, got everything it asked for. Nothing
+    compared the two fleets, so the report would have called the difference a
+    warm-pool result.
+
+    `budget.json` establishes what each arm was ALLOWED. This establishes what
+    it actually got.
+    """
+    if not os.path.exists(path):
+        return 0, 0, 0
+    total = short = worst = 0
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            s = json.loads(line)
+        except ValueError:
+            continue
+        want = s.get("desired")
+        if not want:
+            continue
+        running = {}
+        for p in s.get("pods", []):
+            if p.get("pool"):
+                continue
+            for dep in want:
+                if p.get("name", "").startswith(dep + "-"):
+                    running[dep] = running.get(dep, 0) + 1
+        gap = sum(max(0, n - running.get(dep, 0)) for dep, n in want.items())
+        total += 1
+        if gap > 0:
+            short += 1
+            worst = max(worst, gap)
+    return total, short, worst
+
+
 def phase_drift(arm):
     """How far the two models' stage boundaries diverge, in seconds.
 
@@ -444,7 +489,7 @@ def phase_drift(arm):
     return worst
 
 
-def admissible(a, b, max_queue_delay):
+def admissible(a, b, max_queue_delay, max_short=0.10):
     """Everything that makes the two arms comparable. Returns a list of reasons."""
     problems = []
     for arm in (a, b):
@@ -488,6 +533,15 @@ def admissible(a, b, max_queue_delay):
                             "not answers from the models. What is left is the survivors "
                             "of that, not the scenario."
                             % (arm["name"], netfail, issued, 100.0 * netfail / issued))
+        total, short, worst = shortfall(os.path.join(arm["dir"], "gpus.jsonl"))
+        arm["short"] = (total, short, worst)
+        if total and short > max_short * total:
+            problems.append("the %s arm spent %.0f%% of the run SHORT of the fleet its own "
+                            "Deployments asked for -- up to %d replica(s) Pending at once. "
+                            "Pending replicas hold no accelerator and serve nothing, so this "
+                            "arm measured a smaller fleet than it was allowed, and the other "
+                            "arm did not."
+                            % (arm["name"], 100.0 * short / total, worst))
         drift = phase_drift(arm)
         arm["drift"] = drift
         band = m.get("overlap_seconds")
@@ -524,6 +578,9 @@ def main(argv):
     p.add_argument("--model-b", default="B")
     p.add_argument("--max-queue-delay", type=float, default=0.25,
                    help="p95 driver queueing above which the arms are not comparable")
+    p.add_argument("--max-shortfall", type=float, default=0.10,
+                   help="fraction of the run an arm may spend with replicas Pending "
+                        "before it is no longer the fleet it was allowed")
     p.add_argument("--gap-limit", type=float, default=30.0,
                    help="a GPU sampling hole longer than this is reported")
     args = p.parse_args(argv)
@@ -541,7 +598,7 @@ def main(argv):
         })
     a, b = arms
 
-    problems = admissible(a, b, args.max_queue_delay)
+    problems = admissible(a, b, args.max_queue_delay, args.max_shortfall)
     if problems:
         print("ERROR: these two arms cannot be compared:", file=sys.stderr)
         for pr in problems:
@@ -565,6 +622,12 @@ def main(argv):
               ", ".join("%ds" % schedule[i]["start"] for i in rises[k]) or "never"))
     print("- driver queueing (p95): nopool %s ms, pool %s ms"
           % (fmt_ms(a["queue_p95"]), fmt_ms(b["queue_p95"])))
+    for arm in (a, b):
+        tot, sh, wst = arm.get("short", (0, 0, 0))
+        if tot:
+            print("- %s: %.0f%% of samples short of the requested fleet%s"
+                  % (arm["name"], 100.0 * sh / tot,
+                     " (up to %d Pending)" % wst if wst else ""))
     band = (a["meta"] or {}).get("overlap_seconds")
     print("- the two models drifted at most %s apart, against a %s band of both-low "
           "between bursts (a stage ends when its requests drain, and the bursting "
