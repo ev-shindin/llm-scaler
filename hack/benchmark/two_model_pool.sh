@@ -186,6 +186,84 @@ arm_max_replicas() {
 # ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
+decode_cpu() {
+    # The decode Pod's CPU request, from the live Deployment when the stacks are
+    # up and from the scenario otherwise -- preflight runs before standup.
+    local v
+    v="$(k get deploy -o json 2>/dev/null | jq -r '
+        [.items[] | select(.metadata.name|test("decode"))
+         | .spec.template.spec.containers[]?.resources.requests.cpu // empty] | .[0] // ""' 2>/dev/null)"
+    [ -z "$v" ] && v="$(scenario_value 'cpu')"
+    printf '%s' "${v:-16}"
+}
+
+decode_mem_gi() {
+    local v
+    v="$(k get deploy -o json 2>/dev/null | jq -r '
+        [.items[] | select(.metadata.name|test("decode"))
+         | .spec.template.spec.containers[]?.resources.requests.memory // empty] | .[0] // ""' 2>/dev/null)"
+    [ -z "$v" ] && v="$(scenario_value 'memory')"
+    printf '%s' "${v:-64Gi}" | sed 's/Gi$//'
+}
+
+scenario_value() {
+    # One decode resources.requests field out of the scenario spec, so preflight
+    # can answer before anything is deployed.
+    local key="$1" file="$ROOT/hack/benchmark/scenarios/$BENCH_SPEC.yaml"
+    [ -f "$file" ] || return 0
+    python3 - "$file" "$key" <<'PY' 2>/dev/null || true
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+key = sys.argv[2]
+# The decode block's requests, not the router's or the pool's: anchor on
+# `decode:` and take the first `requests:` under it.
+m = re.search(r"\n\s*decode:\n(.*?)(?=\n\s{0,6}\w+:\n)", text, re.S)
+block = m.group(1) if m else text
+r = re.search(r"requests:\n(.*?)(?=\n\s*\w+:|\Z)", block, re.S)
+if r:
+    v = re.search(r"\b%s:\s*\"?([^\"\n]+)\"?" % key, r.group(1))
+    if v:
+        print(v.group(1).strip().strip('"'))
+PY
+}
+
+placeable_slots() {
+    # How many whole decode Pods fit, node by node, in what is left of each
+    # node's CPU, memory and accelerators. Empty output when it cannot be
+    # computed, which the caller reports rather than treating as zero.
+    local cpu mem
+    cpu="$(decode_cpu)"; mem="$(decode_mem_gi)"
+    case "$cpu" in *m) cpu=$(( ${cpu%m} / 1000 )) ;; esac
+    [ "${cpu:-0}" -gt 0 ] 2>/dev/null || return 0
+    kc get pods -A -o json 2>/dev/null | jq -c '
+        [.items[] | select(.status.phase=="Running" or .status.phase=="Pending")
+         | {n: .spec.nodeName,
+            c: ([.spec.containers[].resources.requests.cpu // "0"
+                 | if test("m$") then (sub("m$";"") | tonumber / 1000) else tonumber end] | add),
+            m: ([.spec.containers[].resources.requests.memory // "0"
+                 | if test("Gi$") then (sub("Gi$";"") | tonumber)
+                   elif test("Mi$") then (sub("Mi$";"") | tonumber / 1024) else 0 end] | add),
+            g: ([.spec.containers[].resources.requests["nvidia.com/gpu"] // "0" | tonumber] | add)}]' \
+      > "${TMPDIR:-/tmp}/wva-pods.$$" 2>/dev/null || return 0
+    kc get nodes -o json 2>/dev/null | jq -r \
+        --slurpfile p "${TMPDIR:-/tmp}/wva-pods.$$" --argjson cpu "$cpu" --argjson mem "${mem:-64}" '
+        [ .items[]
+          | select(.spec.unschedulable != true)
+          | select([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length > 0)
+          | .metadata.name as $n
+          | (.status.allocatable.cpu
+             | if test("m$") then (sub("m$";"") | tonumber / 1000) else tonumber end) as $ac
+          | (.status.allocatable.memory | sub("Ki$";"") | tonumber / 1048576) as $am
+          | (.status.allocatable["nvidia.com/gpu"] // "0" | tonumber) as $ag
+          | select($ag > 0)
+          | ([$p[0][] | select(.n == $n) | .c] | add // 0) as $uc
+          | ([$p[0][] | select(.n == $n) | .m] | add // 0) as $um
+          | ([$p[0][] | select(.n == $n) | .g] | add // 0) as $ug
+          | [ ((($ac - $uc) / $cpu) | floor), ((($am - $um) / $mem) | floor), ($ag - $ug) ]
+          | min ] | add // 0' 2>/dev/null
+    rm -f "${TMPDIR:-/tmp}/wva-pods.$$"
+}
+
 verb_preflight() {
     need_ns
     local rc=0
@@ -212,8 +290,34 @@ verb_preflight() {
     info "accelerators: ${total:-?} schedulable, ${used:-?} requested, ${free} free; this run peaks at ${want}"
     info "  nopool arm: 2 models x ${MAX_REPLICAS} replicas"
     info "  pool arm:   2 models x $(arm_max_replicas pool) replicas + a ${POOL_REPLICAS}-Pod pool -- the same peak, which is what makes the arms comparable"
+
+    # FREE ACCELERATORS ARE NOT PLACEABLE ACCELERATORS, and the difference cost
+    # a whole 90-minute A/B.
+    #
+    # Measured on CoreWeave: preflight reported "11 free, this run peaks at 6"
+    # and passed. The run then sat with 4 replicas Pending for thirty minutes
+    # and 8 by the end, because a decode Pod asks for 16 CPU as well as its
+    # accelerator, and the nodes that HAD free accelerators had 7 and 15 free
+    # cores. Of 16 free accelerators, four were placeable. The nopool arm ran
+    # its whole schedule on one replica per model while its Deployments asked
+    # for three, and the arms were not comparable -- for a reason nothing
+    # checked.
+    #
+    # So this bin-packs: per node, how many whole Pods fit in the CPU, the
+    # memory AND the accelerators that node has left.
+    local slots
+    slots="$(placeable_slots)"
+    if [ -n "$slots" ]; then
+        info "  placeable: ${slots} Pod(s) of $(decode_cpu) CPU / $(decode_mem_gi)Gi / 1 accelerator fit on the nodes as they are now"
+    fi
     if [ "$free" -lt "$want" ]; then
         warn "only ${free} free and the run peaks at ${want}. Lower MAX_REPLICAS, or wait."
+        rc=1
+    elif [ -n "$slots" ] && [ "$slots" -lt "$want" ]; then
+        warn "${free} accelerators are free but only ${slots} of them can actually take a Pod: the"
+        warn "  run peaks at ${want}. The nodes with spare accelerators do not have $(decode_cpu) spare cores."
+        warn "  Replicas would sit Pending and the arm would measure a fleet it never got."
+        warn "  Lower the decode CPU request, lower MAX_REPLICAS, or use a cluster with room."
         rc=1
     fi
     if [ "$(arm_max_replicas pool)" -le "$MIN_REPLICAS" ]; then
@@ -1259,7 +1363,9 @@ verb_run() {
         --seed "$SEED" --prefix-groups "$PREFIX_GROUPS" \
         || die "could not convert the harness results for arm $arm. See $out_dir/loader.log"
     mv "$out_dir/requests.jsonl.meta.json" "$out_dir/meta.json"
-    ok "arm $arm: $(wc -l < "$out_dir/requests.jsonl") requests, $(wc -l < "$out_dir/gpus.jsonl" 2>/dev/null || echo 0) GPU samples in $out_dir"
+    # From the meta, not from requests.jsonl: that file is empty by design now,
+    # and "0 requests" on a healthy arm reads as a run that served nothing.
+    ok "arm $arm: $(python3 -c "import json;m=json.load(open('$out_dir/meta.json'));print('%d issued, %d served' % (m['issued'], sum(w['overall']['n'] for w in m['windows'].values())))" 2>/dev/null || echo "results written"), $(wc -l < "$out_dir/gpus.jsonl" 2>/dev/null || echo 0) GPU samples in $out_dir"
 }
 
 render_load_job() {
@@ -1386,8 +1492,12 @@ YAML
 # ---------------------------------------------------------------------------
 verb_report() {
     local a="$OUT_ROOT/nopool" b="$OUT_ROOT/pool"
-    [ -s "$a/requests.jsonl" ] || die "no nopool results in $a -- run both arms before reporting"
-    [ -s "$b/requests.jsonl" ] || die "no pool results in $b -- run both arms before reporting"
+    # meta.json, NOT requests.jsonl. Every number the report prints lives in the
+    # meta now that per-request reporting is off, and requests.jsonl is
+    # legitimately EMPTY -- so gating on it refused two complete arms, 90
+    # minutes of accelerators, after both had already run.
+    [ -s "$a/meta.json" ] || die "no nopool results in $a -- run both arms before reporting"
+    [ -s "$b/meta.json" ] || die "no pool results in $b -- run both arms before reporting"
     python3 "$HERE/two_model_report.py" \
         --nopool "$a" --pool "$b" \
         --model-a "$MODEL_A" --model-b "$MODEL_B" \

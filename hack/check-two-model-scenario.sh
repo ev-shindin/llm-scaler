@@ -131,13 +131,13 @@ case "$args" in
       n="${NODE_GPUS:-8}"
       if [ "${MIXED_ACCEL:-0}" = "1" ]; then
         echo '{"items":[
-          {"spec":{},"status":{"allocatable":{"nvidia.com/gpu":"'"$n"'"},"conditions":[{"type":"Ready","status":"True"}]},
-           "metadata":{"labels":{"gpu.nvidia.com/model":"H200"}}},
-          {"spec":{},"status":{"allocatable":{"nvidia.com/gpu":"'"$n"'"},"conditions":[{"type":"Ready","status":"True"}]},
-           "metadata":{"labels":{"gpu.nvidia.com/model":"A100"}}}]}'
+          {"spec":{},"status":{"allocatable":{"cpu":"'"${NODE_CPU:-127}"'","memory":"2000000000Ki","nvidia.com/gpu":"'"$n"'"},"conditions":[{"type":"Ready","status":"True"}]},
+           "metadata":{"name":"n1","labels":{"gpu.nvidia.com/model":"H200"}}},
+          {"spec":{},"status":{"allocatable":{"cpu":"'"${NODE_CPU:-127}"'","memory":"2000000000Ki","nvidia.com/gpu":"'"$n"'"},"conditions":[{"type":"Ready","status":"True"}]},
+           "metadata":{"name":"n2","labels":{"gpu.nvidia.com/model":"A100"}}}]}'
       else
-        echo '{"items":[{"spec":{},"status":{"allocatable":{"nvidia.com/gpu":"'"$n"'"},"conditions":[{"type":"Ready","status":"True"}]},
-           "metadata":{"labels":{"gpu.nvidia.com/model":"H200"}}}]}'
+        echo '{"items":[{"spec":{},"status":{"allocatable":{"cpu":"'"${NODE_CPU:-127}"'","memory":"2000000000Ki","nvidia.com/gpu":"'"$n"'"},"conditions":[{"type":"Ready","status":"True"}]},
+           "metadata":{"name":"n1","labels":{"gpu.nvidia.com/model":"H200"}}}]}'
       fi
       exit 0 ;;
   *"get pods -A -o json"*) echo '{"items":[]}' ; exit 0 ;;
@@ -469,6 +469,34 @@ else
     ok "tokenizers cache on the shared claim, under their own subPath"
 fi
 
+# FREE ACCELERATORS ARE NOT PLACEABLE ACCELERATORS. Measured: preflight said
+# "11 free, this run peaks at 6" and passed, and the run then sat with 4
+# replicas Pending for thirty minutes -- a decode Pod asks for 16 CPU as well as
+# its accelerator, and the nodes that HAD free accelerators had 7 and 15 free
+# cores. The nopool arm ran its whole schedule on one replica per model while
+# its Deployments asked for three, and 90 minutes of a shared cluster produced
+# a comparison between two different fleets.
+case_begin
+NODE_CPU=8 NODE_GPUS=8 run_verb preflight
+if printf '%s' "$OUT" | grep -q 'placeable: 0'; then
+    : # nodes too small to place anything at all is the same finding
+fi
+if [ "$RC" -eq 0 ]; then
+    fail "preflight passed on nodes with 8 cores each, where a 16-CPU decode Pod cannot be placed at all; the run would spend its bursts Pending and measure the scheduler"
+elif ! printf '%s' "$OUT" | grep -q 'can actually take a Pod'; then
+    fail "preflight refused without naming placeability as the reason: $OUT"
+else
+    ok "accelerators that no node can place a Pod on are refused, not counted as free"
+fi
+
+case_begin
+NODE_CPU=127 NODE_GPUS=8 run_verb preflight
+if printf '%s' "$OUT" | grep -q 'can actually take a Pod'; then
+    fail "preflight complained about placeability on nodes with 127 cores and 8 accelerators, where everything fits: $OUT"
+else
+    ok "roomy nodes raise no placeability complaint"
+fi
+
 # THE BURSTS MUST NOT OVERLAP. The two models cross a stage boundary at
 # different moments -- a stage ends when its requests drain and the bursting
 # model drains slower -- so the band is what keeps the drift from becoming time
@@ -504,7 +532,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=30
+CASES_EXPECTED=32
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else
