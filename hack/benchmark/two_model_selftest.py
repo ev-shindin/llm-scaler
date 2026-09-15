@@ -621,6 +621,16 @@ if rc != 2:
 else:
     ok("a flat rate is refused")
 
+case("a rise window as long as the phase is refused")
+rc, _ = render("a", ["--rise-window=480", "--phase-seconds=480"])
+if rc != 2:
+    fail("--rise-window equal to the phase was accepted, so no phase gets cut and there "
+         "is no rise stage. This harness reports latency per stage only, so every "
+         "scale-up would be averaged into eight minutes of steady state and reported "
+         "under a heading that says rise")
+else:
+    ok("a rise window that cuts nothing is refused")
+
 case("a single shared prefix is refused")
 rc, _ = render("a", ["--prefix-groups=1"])
 if rc != 2:

@@ -100,6 +100,10 @@ the difference would offset the ladders for the whole run. A container that
 reaches the barrier late prints `LATE-START` and `run` refuses the arm rather
 than reporting a run that was never anti-phase; raise `PRELOAD_GRACE` and rerun.
 
+`RISE_WINDOW` (default 90) is how much of each phase becomes its own stage, and
+must be shorter than `PHASE_SECONDS` — the profile generator refuses otherwise,
+because an uncut phase has no rise stage to read.
+
 `PREFIX_GROUPS` (default 32) is the number of distinct shared prefixes in the
 generated dataset, and it is **not** a detail. llm-d's shipped scheduling
 profile weights `prefix-cache-scorer` highest, so with a single prefix the first
@@ -138,14 +142,27 @@ directory per model; `harness_results.py` converts them to the `requests.jsonl`
 + `meta.json` pair the report compares, computing nothing the harness already
 measured.
 
-### The endpoint must answer before the barrier
+### The data path resolves nothing
 
-Each container sends one real request and waits for a 200 before it reaches the
-start barrier. Not belt-and-braces: a smoke run lost **25 of 420 requests
-(6%)** to `ClientConnectorDNSError`, because the load Pod's istio sidecar was
-not ready when the app container began issuing. Those are the driver's failures,
-and 6% is three times the report's client-side loss threshold — the arm is
-refused, and 34 minutes of accelerators are spent to learn it.
+The load addresses the gateway by **ClusterIP**, not by name. Measured twice on
+CoreWeave at only ~10 rps aggregate: **5.7% of requests** died of
+`ClientConnectorDNSError: Temporary failure in name resolution`, spread across
+the whole run rather than bunched at startup. aiohttp resolves once per
+connection, and the cluster default `ndots:5` makes a four-dot service name try
+every search domain before the absolute one — four lookups per connection. That
+is the driver's own loss, three times the report's client-side threshold, and it
+voids the arm.
+
+So: the driver reads the gateway's ClusterIP before the run and puts that in
+both profiles, the load Pod runs with `ndots:1`, and if the ClusterIP cannot be
+read the fallback is an **absolute** name (trailing dot), never a searched one.
+This is safe because the shared HTTPRoute matches on path and declares no
+hostnames; if that ever changes, the load has to carry a `Host` header instead.
+
+Each container also sends one real request and waits for a 200 before it reaches
+the start barrier — the load Pod's istio sidecar is not ready the instant the app
+container starts, and the first seconds of a run would otherwise be the driver
+failing to connect.
 
 ## What makes the two arms comparable
 

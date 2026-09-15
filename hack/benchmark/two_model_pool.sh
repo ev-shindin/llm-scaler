@@ -109,6 +109,12 @@ SEED="${SEED:-1729}"
 # one prefix the first replica to cache it wins every subsequent request and
 # the run measures a one-replica fleet no matter how much capacity is added.
 PREFIX_GROUPS="${PREFIX_GROUPS:-32}"
+# Seconds at the opening of each phase measured as their own stage. The harness
+# reports a latency distribution per STAGE and nothing finer, so this is what a
+# rise window can be -- and the rise window is this scenario's headline number.
+# Must be shorter than PHASE_SECONDS or the phase is not cut at all and every
+# scale-up is averaged into eight minutes of steady state.
+RISE_WINDOW="${RISE_WINDOW:-90}"
 # Seconds between creating the load Job and the instant both containers start
 # their ladders. It has to cover the image pull and the two tokenizer
 # downloads; each container reports whether it made it, and the driver refuses
@@ -398,14 +404,39 @@ decode_deploy_for() {
     k get deploy "${prefix}-decode" -o name >/dev/null 2>&1 && printf '%s' "${prefix}-decode"
 }
 
+gateway_ip() {
+    # The gateway Service's ClusterIP. Resolved ONCE, here, so the load never
+    # resolves anything.
+    #
+    # Measured twice on CoreWeave, at only ~10 rps aggregate: 5.7% of requests
+    # failed with `ClientConnectorDNSError: Temporary failure in name
+    # resolution`, spread across the whole run rather than bunched at startup --
+    # so waiting for the endpoint to answer first does not fix it. aiohttp
+    # resolves per connection, and with the default `ndots:5` a name of four
+    # dots is tried against every search domain before the absolute one, so each
+    # connection costs four lookups. That is the driver's own failure, three
+    # times the report's client-side loss threshold, and it voids the arm.
+    #
+    # A raw IP is safe here because the shared HTTPRoute matches on PATH and
+    # declares no hostnames -- checked: `hostnames=[]`. If that ever changes,
+    # this has to carry a Host header instead.
+    local svc="$1" ip
+    ip="$(k get svc "$svc" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+    case "$ip" in
+        ""|None) return 1 ;;
+    esac
+    printf '%s' "$ip"
+}
+
 base_url_for_stack() {
     # What inference-perf wants: the gateway plus this stack's path prefix, and
     # NOTHING else. Its client appends the route (`/v1/completions`) itself, so
     # a base_url that already carries one produces `/v1/completions/v1/
     # completions` -- a 404 from the gateway on every request, for a whole run.
-    local hostport="$1" stack="$2"
-    printf 'http://%s.%s.svc.cluster.local:%s/%s' \
-        "${hostport%%:*}" "$NS" "${hostport##*:}" "$stack"
+    local hostport="$1" stack="$2" host
+    host="$(gateway_ip "${hostport%%:*}")" || \
+        host="${hostport%%:*}.$NS.svc.cluster.local."
+    printf 'http://%s:%s/%s' "$host" "${hostport##*:}" "$stack"
 }
 endpoint_for_stack() {
     # The full completions URL, for the driver's own probes.
@@ -1082,6 +1113,7 @@ verb_run() {
             --low-rps "$LOW_RPS" --high-rps "$HIGH_RPS" \
             --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
             --prefix-groups "$PREFIX_GROUPS" --request-timeout "$REQUEST_TIMEOUT" \
+            --rise-window "$RISE_WINDOW" \
             --seed "$SEED" --results-root /results
     }
     local pyargs; pyargs="$(profile_args)"
@@ -1224,6 +1256,14 @@ spec:
         app.kubernetes.io/name: wva-two-model-load
     spec:
       restartPolicy: Never
+      # ndots:1, against the cluster default of 5. Belt and braces beside the
+      # ClusterIP base_url: anything else this Pod resolves -- the tokenizer
+      # download, most of all -- otherwise costs one lookup per search domain
+      # before the absolute one.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
       containers:
 $(render_load_container a "$MODEL_A" "$start_at" "$url_a")
 $(render_load_container b "$MODEL_B" "$start_at" "$url_b")

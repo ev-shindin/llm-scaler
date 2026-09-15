@@ -259,6 +259,13 @@ def main(argv):
         print("--high-rps must exceed --low-rps: the scenario is a burst, and "
               "with a flat rate no scale-up happens in either arm.", file=sys.stderr)
         return 2
+    if args.rise_window >= args.phase_seconds:
+        print("--rise-window (%d) must be shorter than --phase-seconds (%d): a phase that "
+              "is not cut has no rise stage, and this harness reports latency per stage "
+              "only -- so every scale-up would be averaged into the whole phase and "
+              "reported as steady state."
+              % (args.rise_window, args.phase_seconds), file=sys.stderr)
+        return 2
     if args.prefix_groups < 2:
         print("--prefix-groups must be at least 2: a single shared prefix makes "
               "the router's prefix-cache scorer pin every request to whichever "

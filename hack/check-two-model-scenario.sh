@@ -70,6 +70,7 @@ case "$args" in
                             {"metadata":{"name":"other-inference-gateway"},"spec":{"ports":[{"name":"http","port":80}]}}]}' ;;
       esac
       exit 0 ;;
+  *"get svc "*"jsonpath={.spec.clusterIP}"*) echo "${GW_IP-10.16.1.221}"; exit 0 ;;
   *"get deploy -o name"*)
       i=0
       while [ "$i" -lt "${EPP_COUNT:-2}" ]; do echo "deployment.apps/model$i-epp"; i=$((i+1)); done
@@ -403,6 +404,10 @@ fi
 # shellcheck disable=SC1090
 . "$SCRIPT" >/dev/null 2>&1
 NS=ns-under-test
+# The stub has to be on PATH here too: these functions call kubectl, and against
+# the REAL one they fail and take a fallback -- which is a pass for the wrong
+# reason on any case about what the normal path produces.
+PATH="$STUB:$PATH"
 
 case_begin
 url="$(base_url_for_stack gw-svc:80 llama-31-8b)"
@@ -412,6 +417,28 @@ elif ! printf '%s' "$url" | grep -q '/llama-31-8b$'; then
     fail "base_url_for_stack returned '$url', which does not end at the stack's path prefix; llm-d routes a multi-model stack by path and the requests would reach the wrong stack"
 else
     ok "the harness base_url is the gateway plus the stack prefix, with no route"
+fi
+
+# The DATA PATH must not resolve anything. Measured twice on CoreWeave at only
+# ~10 rps: 5.7% of requests died of ClientConnectorDNSError, spread across the
+# whole run rather than bunched at startup -- aiohttp resolves per connection,
+# and ndots:5 costs four lookups for each. That is the driver's own loss, three
+# times the report's threshold, and it voids the arm.
+case_begin
+if ! printf '%s' "$url" | grep -qE '^http://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:'; then
+    fail "base_url is '$url', a name the load Pod would resolve on every connection. The gateway's ClusterIP is knowable before the run, and resolving nothing is the point"
+else
+    ok "the load addresses the gateway by ClusterIP, so the data path resolves nothing"
+fi
+
+case_begin
+fallback="$(GW_IP="" base_url_for_stack gw-svc:80 llama-31-8b)"
+if printf '%s' "$fallback" | grep -qE '^http://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:'; then
+    fail "with no ClusterIP readable the fallback still produced an address: $fallback"
+elif ! printf '%s' "$fallback" | grep -q 'svc\.cluster\.local\.:'; then
+    fail "the DNS fallback '$fallback' is not an ABSOLUTE name. Without the trailing dot, ndots:5 makes the resolver try every search domain first -- four lookups per connection, which is the failure this is falling back from"
+else
+    ok "an unreadable ClusterIP falls back to an absolute name, not a searched one"
 fi
 
 case_begin
@@ -448,7 +475,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=26
+CASES_EXPECTED=28
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else
