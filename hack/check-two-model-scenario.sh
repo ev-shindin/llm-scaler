@@ -105,6 +105,13 @@ case "$args" in
   # attempts, two models, and the check takes twenty minutes to say nothing.
   *"get pod probe-"*"jsonpath={.status.phase}"*) echo "Succeeded"; exit 0 ;;
   *"logs probe-"*) echo "${PROBE_RESULT:-HTTP 200}"; exit 0 ;;
+  # The controller's own Prometheus URL, and the flow-control probe. FC_MODELS
+  # is what Prometheus answers: the model_name labels that actually have a
+  # flow-control series.
+  *"get cm wva-manager-config"*) echo "PROMETHEUS_BASE_URL: \"${PROM_URL:-https://prom.example:9090}\""; exit 0 ;;
+  *"get pod fcheck-"*"jsonpath={.status.phase}"*) echo "Succeeded"; exit 0 ;;
+  *"logs fcheck-"*) echo "MODELS ${FC_MODELS-unsloth/Meta-Llama-3.1-8B-Instruct Qwen/Qwen3-8B}"; exit 0 ;;
+  *"rollout restart"*|*"rollout status"*) exit 0 ;;
   *"get pvc"*) [ "${HAS_PVC:-1}" = "1" ] && exit 0; exit 1 ;;
   *"get pods -l llm-d.ai/warm-pool"*)
       [ "${POOL_EXISTS:-0}" = "1" ] && echo "wva-warm-pool-twomodel-abc"
@@ -331,6 +338,31 @@ else
     ok "a namespace with no HTTPRoute is refused"
 fi
 
+# THE ONE THAT COST AN ENTIRE A/B. `featureGates: [flowControl]` was present and
+# correct in both EPP ConfigMaps, and the metric it gates was never emitted: the
+# EPP reads that config ONCE at startup, the Helm update did not change the pod
+# template, and process_start_time_seconds showed both EPPs still running the
+# config they loaded 35 minutes before the gate existed. WVA's scheduler-queue
+# query returned no series for either model through two 34-minute arms, and
+# nothing said so. A config is a statement of intent; the series is the fact.
+case_begin
+FC_MODELS="" run_verb verify
+if [ "$RC" -eq 0 ]; then
+    fail "verify passed while the EPP flow-control queue had NO series: WVA's scheduler-queue signal would be absent for the whole run and the autoscaler would scale on a metric that does not exist"
+elif ! printf '%s' "$OUT" | grep -q 'rollout restart'; then
+    fail "verify refused without naming the fix (restart the EPPs so they re-read the config): $OUT"
+else
+    ok "a flow-control queue with no series is refused, naming the EPP restart"
+fi
+
+case_begin
+FC_MODELS="Qwen/Qwen3-8B" run_verb verify
+if [ "$RC" -eq 0 ]; then
+    fail "verify passed with a flow-control series for only ONE of the two models"
+else
+    ok "flow control live for one model but not the other is refused"
+fi
+
 # ---------------------------------------------------------------------------
 # The schedule and the report, executed.
 # ---------------------------------------------------------------------------
@@ -342,7 +374,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=19
+CASES_EXPECTED=21
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

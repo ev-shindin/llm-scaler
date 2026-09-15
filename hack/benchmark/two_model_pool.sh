@@ -301,6 +301,28 @@ verb_standup() {
     # models answer at their own prefixes. `verify` does the same job correctly:
     # it asks each model on the path the load will actually use.
     info "the standup's own smoketest was skipped (it cannot see a path-prefixed stack); 'verify' is the check that replaces it"
+
+    # ROLL THE EPPs, because the EndpointPickerConfig is a ConfigMap and the EPP
+    # reads it ONCE, at startup.
+    #
+    # Measured, and it cost a whole A/B: `featureGates: [flowControl]` was added
+    # to the scenario and a re-run of this standup wrote it into both EPP
+    # ConfigMaps -- verified on the cluster. The Deployment's pod template did
+    # not change, so nothing restarted the pods, and
+    # `process_start_time_seconds` showed both EPPs still running the config
+    # they had loaded 35 minutes BEFORE the gate existed. They stayed that way
+    # for the whole benchmark four hours later.
+    #
+    # The consequence is silent and total: no flow-control layer means no
+    # inference_extension_flow_control_queue_size, which is the series WVA's
+    # scheduler-queue query reads and the one scale-from-zero's queue fallback
+    # depends on. The controller scaled on a signal that was simply absent.
+    #
+    # Unconditional: a restart of an EPP that was already current costs about
+    # thirty seconds, and deciding whether one is needed means comparing a
+    # rendered config against a running process, which is the comparison that
+    # was got wrong in the first place.
+    epp_restart
     verb_status
     ok "stacks stood up. Run 'verify' before any load."
 }
@@ -360,6 +382,100 @@ endpoint_for_stack() {
     local hostport="$1" stack="$2"
     printf 'http://%s.%s.svc.cluster.local:%s/%s/v1/completions' \
         "${hostport%%:*}" "$NS" "${hostport##*:}" "$stack"
+}
+
+# The EPP Deployment behind each stack: the route's backendRef names the pool
+# (`<shortName>-router`), and the chart names its EPP `<shortName>-router-epp`.
+epp_deploys() {
+    local s backend
+    for s in "$STACK_A" "$STACK_B"; do
+        backend="$(stack_backend "$s")"
+        [ -n "$backend" ] || continue
+        k get deploy "${backend}-epp" -o name >/dev/null 2>&1 && printf '%s\n' "${backend}-epp"
+    done
+}
+
+epp_restart() {
+    local d any=0
+    for d in $(epp_deploys); do
+        any=1
+        info "restarting $d so it re-reads its EndpointPickerConfig"
+        k rollout restart "deploy/$d" >/dev/null || warn "could not restart $d"
+    done
+    [ "$any" = 1 ] || { warn "found no EPP Deployment to restart"; return 0; }
+    for d in $(epp_deploys); do
+        k rollout status "deploy/$d" --timeout=300s >/dev/null 2>&1 || \
+            warn "$d did not report a completed rollout; check it before trusting the queue signal"
+    done
+    ok "EPPs restarted"
+}
+
+# Where WVA reads its metrics, taken from the controller's OWN config so this
+# cannot drift from what the controller actually queries.
+prometheus_base_url() {
+    k get cm wva-manager-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
+        | sed -n 's/^PROMETHEUS_BASE_URL: *"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1
+}
+
+# THE FLOW-CONTROL QUEUE MUST EXIST AS A SERIES, not as a line in a ConfigMap.
+#
+# This is the check that was missing. `featureGates: [flowControl]` was present
+# and correct in both EPP ConfigMaps, `benchmark-deploy-wva`'s preflight was
+# satisfied by exactly that, and the metric it gates was never emitted -- so
+# WVA's scheduler-queue query returned no series for either model through two
+# 34-minute arms. A config is a statement of intent; the series is the fact.
+verify_flow_control() {
+    local url; url="$(prometheus_base_url)"
+    if [ -z "$url" ]; then
+        warn "could not read PROMETHEUS_BASE_URL from wva-manager-config; skipping the flow-control check"
+        return 0
+    fi
+    info "checking the EPP flow-control queue is a real series in $url"
+    local q out pod
+    q='sum by (model_name) (llm_d_epp_flow_control_queue_size) or sum by (model_name) (inference_extension_flow_control_queue_size)'
+    pod="fcheck-$(date +%s)-$RANDOM"
+    k run "$pod" --restart=Never --quiet --image="$(load_image)" --command -- \
+        python3 -c "
+import json,ssl,time,urllib.parse,urllib.request
+ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+url='$url'+'/api/v1/query?'+urllib.parse.urlencode({'query':'''$q'''})
+deadline=time.time()+180
+while time.time()<deadline:
+    try:
+        r=json.loads(urllib.request.urlopen(url, timeout=60, context=ctx).read().decode())
+        print('MODELS ' + ' '.join(sorted(s['metric'].get('model_name','?') for s in r['data']['result'])))
+        break
+    except Exception as e:
+        last=e; time.sleep(5)
+else:
+    print('QUERYFAIL', last)
+" >/dev/null 2>&1 || true
+    local waited=0
+    while [ "$waited" -lt 240 ]; do
+        case "$(k get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)" in
+            Succeeded|Failed) break ;;
+        esac
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+    out="$(k logs "$pod" 2>&1)"
+    k delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1
+    case "$out" in
+        *QUERYFAIL*) warn "could not query Prometheus: $out"; return 0 ;;
+    esac
+    local missing=""
+    case "$out" in *"$MODEL_A"*) : ;; *) missing="$MODEL_A" ;; esac
+    case "$out" in *"$MODEL_B"*) : ;; *) missing="$missing $MODEL_B" ;; esac
+    if [ -n "$missing" ]; then
+        warn "the EPP flow-control queue has NO series for:$missing"
+        warn "  Prometheus returned: ${out:-<nothing>}"
+        warn "  The gate is in the ConfigMap but the EPP is not running it -- it reads that config"
+        warn "  ONCE, at startup. WVA's scheduler-queue signal is absent, and the run would scale"
+        warn "  on a metric that does not exist. Restart the EPPs and check again:"
+        warn "      kubectl rollout restart deploy -n $NS $(epp_deploys | tr '\n' ' ')"
+        return 1
+    fi
+    ok "the EPP flow-control queue is live for both models"
 }
 
 verb_verify() {
@@ -437,6 +553,9 @@ verb_verify() {
         warn "the controller is logging metric-read errors; it may be pointed at a Prometheus that does not scrape this namespace:"
         printf '%s\n' "$errs" | sed 's/^/      /' >&2
     fi
+
+    verify_flow_control || \
+        die "the EPP flow-control queue is not being emitted, so WVA's scheduler-queue signal does not exist. Any comparison run now measures an autoscaler reading a metric that is absent."
 
     if k get deploy "wva-warm-pool-$POOL_NAME" >/dev/null 2>&1; then
         info "pool '$POOL_NAME':"
