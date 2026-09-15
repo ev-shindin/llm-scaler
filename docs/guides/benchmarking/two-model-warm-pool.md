@@ -22,15 +22,19 @@ without, and compared on time-to-first-token **and** on accelerator-seconds.
 
 ## The phases
 
-Default shape — a 2 minute lead-in, then four 8 minute phases (34 minutes):
+Default shape — a 2 minute lead-in, then four 8 minute phases separated by 30s
+bands where neither model bursts (36 minutes):
 
 | phase | window | model A | model B | what it is for |
 | --- | --- | --- | --- | --- |
 | lead-in | 0–120s | 3 rps | 3 rps | both stacks serve before anything is measured, so the first burst is a scale-up and not a first-request penalty |
 | 1 | 120–600s | 3 rps | **9 rps** | B rises. A is idle, and A's replicas are capacity B does not have |
-| 2 | 600–1080s | **9 rps** | 3 rps | A rises while B falls — the swap the pool is supposed to absorb |
-| 3 | 1080–1560s | 3 rps | **9 rps** | B rises again, with whatever state the first cycle left |
-| 4 | 1560–2040s | **9 rps** | 3 rps | A rises again |
+| band | 600–630s | 3 rps | 3 rps | neither model bursting, so the two cannot burst at once when they drain at different speeds |
+| 2 | 630–1110s | **9 rps** | 3 rps | A rises while B falls — the swap the pool is supposed to absorb |
+| band | 1110–1140s | 3 rps | 3 rps | |
+| 3 | 1140–1620s | 3 rps | **9 rps** | B rises again, with whatever state the first cycle left |
+| band | 1620–1650s | 3 rps | 3 rps | |
+| 4 | 1650–2130s | **9 rps** | 3 rps | A rises again |
 
 **Why 8 minutes and not 4.** Scale-down stabilization here is 300s — fast up,
 slow down, because under-provisioning costs TTFT irrecoverably while
@@ -108,6 +112,35 @@ immediately before every rise stage: queues drain and the autoscaler sees an
 idle fleet in exactly the seconds before the burst, understating every
 scale-up, and 240s of silence inside a 2040s run. It is `0` here, because a
 phase boundary is a change of rate, not a pause.
+
+### The two models' bursts must never overlap
+
+That is the whole premise — one pool covers many models *because* their peaks do
+not coincide — and it does not hold for free. **A stage ends when its in-flight
+requests drain, and the bursting model drains slower**, so the two models do not
+cross a boundary at the same instant. Measured on CoreWeave: per-stage drains of
+4–16s, and a cumulative divergence that reached **6.1s and changed sign** as the
+burst moved from one model to the other.
+
+Every second of that divergence is time when both models are bursting. A pool
+asked for two models at once can serve one — so it would be recorded as the pool
+failing at exactly the thing this scenario measures, when it is an artefact of
+the driver.
+
+So `OVERLAP_SECONDS` (default 30) inserts a band between consecutive bursts
+where **both** models sit at the low rate. Two things then hold:
+
+- No stage ever has both models high — checked on what the generator emits with
+  no arguments, because a band that appears only when someone passes a flag is
+  not a guarantee.
+- The report **refuses** a run whose measured drift exceeded the band, computed
+  from the generator's own per-stage elapsed time. Below the band, the drift
+  lands harmlessly inside it.
+
+The band costs the flat-sum premise `2 × LOW` instead of `LOW + HIGH` for its
+duration. That is a *dip* in total demand, not a rise, and scale-down
+stabilization is 300s — so at 30s no replica is given back because of it, and
+what the fleet does is unchanged.
 
 **Tokenizers are cached on the shared model claim.** Each arm would otherwise
 fetch both from the public internet, and a blip there costs the whole arm —

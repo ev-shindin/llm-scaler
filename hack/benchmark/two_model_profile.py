@@ -22,16 +22,25 @@ One profile per model, written from one schedule so the two cannot drift:
 `--emit schedule` prints that schedule as JSON for the report's meta, and
 `--emit profile --role a|b` prints the YAML for one side of it.
 
-Phases become STAGES, and every phase after the lead-in is cut in two at
+Phases become STAGES, and every phase a model RISES into is cut in two at
 `--rise-window`. inference-perf v0.6.1 reports `time_to_first_token` only as a
 per-stage distribution -- its per-request records carry no token timestamps --
 so the first 90s of a rise, which is this scenario's headline number, has to BE
 a stage or it cannot be measured at all. The cut does not change the load: both
 sub-stages run the same rate back to back.
 
+Between consecutive bursts sits an `--overlap` band where BOTH models are at
+the low rate. A stage ends when its in-flight requests drain and the bursting
+model drains slower, so the two models do not cross a boundary at the same
+instant -- measured, a divergence that reached 6.1s and changed sign with the
+burst. The band is what keeps that divergence from becoming time when both
+models burst at once, which a pool cannot serve and which would be recorded as
+the pool failing.
+
 A stage is time-boxed, so both models cross every boundary together as long as
 they start together -- which the Job's start barrier, not this file, is
-responsible for.
+responsible for -- and stay together only to within that drain difference,
+which is what the band absorbs.
 """
 
 import argparse
@@ -39,13 +48,30 @@ import json
 import sys
 
 
-def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in):
+def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in, overlap=0):
     """Anti-phase square wave: A low->high->low..., B high->low->high...
 
-    Identical to the schedule the previous bespoke loader built, deliberately:
-    the report's rise windows, the meta signature and the runbook's phase table
-    all key on this shape, and changing the load generator is already enough of
-    a change to be comparing.
+    `overlap` inserts a band between consecutive phases where BOTH models are
+    at the low rate, so their bursts cannot run into each other.
+
+    Why that band is needed at all: the two models do not cross a stage
+    boundary at the same instant. A stage ends when its in-flight requests
+    drain, and the model that is BURSTING drains slower -- measured on
+    CoreWeave, per-stage drains of 4-16s and a net divergence that reached
+    6.1s and CHANGED SIGN as the burst moved from one model to the other.
+    Without a band, that divergence is time when both models are bursting at
+    once. A pool asked for two models simultaneously can serve one, so it would
+    be recorded as the pool failing at the very thing this scenario measures,
+    when it is an artefact of the driver.
+
+    The band costs the flat-sum premise 2*low instead of low+high for its
+    duration. That is a dip in total demand, not a rise, and scale-down
+    stabilization here is 300s -- so at 30s no replica is given back because of
+    it, and what the fleet does is unchanged.
+
+    The lead-in and the phase shape are otherwise identical to the schedule the
+    previous bespoke loader built, deliberately: the report's rise windows, the
+    meta signature and the runbook's phase table all key on it.
     """
     phases = []
     t = 0
@@ -57,11 +83,17 @@ def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in):
         # penalty that has nothing to do with the pool.
         phases.append((t, t + lead_in, low_rps, low_rps))
         t += lead_in
-    for _ in range(cycles):
-        phases.append((t, t + phase_seconds, low_rps, high_rps))
-        t += phase_seconds
-        phases.append((t, t + phase_seconds, high_rps, low_rps))
-        t += phase_seconds
+    for cycle in range(cycles):
+        for first in (True, False):
+            if phases and overlap > 0:
+                # Not before the very first burst: the lead-in already is a
+                # both-low band, and a second one would only add dead time.
+                if not (cycle == 0 and first and lead_in > 0):
+                    phases.append((t, t + overlap, low_rps, low_rps))
+                    t += overlap
+            rates = (low_rps, high_rps) if first else (high_rps, low_rps)
+            phases.append((t, t + phase_seconds) + rates)
+            t += phase_seconds
     return phases
 
 
@@ -93,12 +125,14 @@ def stage_map(schedule, rise_window):
     of a falling model's phase is a useful control rather than a cost.
     """
     stages = []
+    prev = None
     for start, end, ra, rb in schedule:
-        if start == 0 and ra == rb:
-            # The lead-in: nothing rises into it, so there is nothing to cut out.
-            stages.append((start, end, ra, rb))
-            continue
-        if end - start > rise_window > 0:
+        # Cut only a phase some model RISES into. The lead-in and the both-low
+        # overlap bands have nothing to measure a rise window of, and splitting
+        # them would only spend stages.
+        rises = prev is not None and (ra > prev[0] or rb > prev[1])
+        prev = (ra, rb)
+        if rises and end - start > rise_window > 0:
             stages.append((start, start + rise_window, ra, rb))
             stages.append((start + rise_window, end, ra, rb))
         else:
@@ -247,6 +281,10 @@ def build_parser():
     p.add_argument("--high-rps", type=float, default=9)
     p.add_argument("--input-tokens", type=int, default=1000)
     p.add_argument("--output-tokens", type=int, default=500)
+    p.add_argument("--overlap", type=int, default=30,
+                   help="seconds of BOTH models at the low rate between phases, "
+                        "so their bursts cannot run into each other when the two "
+                        "drain at different speeds")
     p.add_argument("--rise-window", type=int, default=90,
                    help="seconds at the start of each phase measured as its own "
                         "stage; the harness reports TTFT per stage and nothing "
@@ -293,7 +331,8 @@ def main(argv):
         args.workers = default_workers(args.high_rps, args.request_timeout)
 
     schedule = build_schedule(args.phase_seconds, args.cycles,
-                              args.low_rps, args.high_rps, args.lead_in)
+                              args.low_rps, args.high_rps, args.lead_in,
+                              args.overlap)
     stages = stage_map(schedule, args.rise_window)
     if args.emit == "schedule":
         json.dump(schedule_json(stages), sys.stdout, indent=2)

@@ -173,6 +173,64 @@ else:
 meta_stages = profile.schedule_json(profile.stage_map(sched, 90))
 meta_sched = meta_stages
 
+# ---------------------------------------------------------------------------
+# the overlap band -- what keeps the two models' bursts from running into each
+# other when they cross a boundary at different moments
+# ---------------------------------------------------------------------------
+case("a both-low band sits between consecutive bursts")
+banded = profile.build_schedule(480, 2, 3, 9, 120, overlap=30)
+bursts = [i for i, p in enumerate(banded) if p[2] != p[3]]
+between = [(banded[x][1], banded[y][0]) for x, y in zip(bursts, bursts[1:])]
+gaps = [b - a for a, b in between]
+if not bursts:
+    fail("the schedule has no bursts at all")
+elif any(g != 30 for g in gaps):
+    fail("consecutive bursts are separated by %s, not the 30s band. A stage ends when "
+         "its requests DRAIN and the bursting model drains slower, so without a band "
+         "the two models burst at once for however far they have drifted -- which a "
+         "pool can only half serve, and which would be recorded as the pool failing"
+         % gaps)
+else:
+    ok("%d bursts, each pair separated by a 30s both-low band" % len(bursts))
+
+case("the band is at the LOW rate, so it is a dip in demand and not a rise")
+band_phases = [p for i, p in enumerate(banded) if p[2] == p[3] and i > 0]
+if not band_phases:
+    fail("no band phases were produced")
+elif any(p[2] != 3 for p in band_phases):
+    fail("a band runs at %s, not the low rate. Above it the band would be a burst of "
+         "its own and the fleet would scale for it" % [p[2] for p in band_phases])
+else:
+    ok("every band runs both models at the low rate")
+
+case("no band is wasted immediately after the lead-in")
+# The lead-in already is a both-low band; a second one would only be dead time
+# before the first burst.
+if banded[1][2] == banded[1][3]:
+    fail("a band was inserted straight after the lead-in: %s. The lead-in already holds "
+         "both models low" % (banded[1],))
+else:
+    ok("the first burst follows the lead-in directly")
+
+case("with no band the schedule is exactly what it was")
+if profile.build_schedule(480, 2, 3, 9, 120, overlap=0) != \
+        load.build_schedule(phase_seconds=480, cycles=2, low_rps=3, high_rps=9, lead_in=120):
+    fail("overlap=0 changed the schedule, so the band is not an addition but a rewrite "
+         "and no stored run is comparable to a new one")
+else:
+    ok("overlap=0 reproduces the original schedule exactly")
+
+case("a band is never cut into a rise window")
+band_stages = profile.stage_map(banded, 90)
+starts = [st[0] for st in band_stages]
+if len(set(starts)) != len(starts):
+    fail("two stages start at the same second: %s" % starts)
+elif any((st[1] - st[0]) == 90 and st[2] == st[3] for st in band_stages[1:]):
+    fail("a both-low band was cut at the rise window. Nothing rises into it, so the cut "
+         "only spends a stage: %s" % band_stages)
+else:
+    ok("only phases a model rises into are cut")
+
 case("every phase after the lead-in opens with a rise-window stage")
 bounds = [(st["start"], st["end"]) for st in meta_stages]
 if bounds[0] != (0, 120):
@@ -613,6 +671,37 @@ if doc["data"]["shared_prefix"]["seed"] == doc_b["data"]["shared_prefix"]["seed"
 else:
     ok("each model has its own data seed")
 
+case("THE TWO MODELS' BURSTS NEVER OVERLAP, BY DEFAULT")
+# The invariant the whole scenario rests on. Checked on what the generator
+# emits with NO arguments, because a band that only appears when someone passes
+# --overlap is not a guarantee: setting the default to 0 removed every band
+# from the schedule and every case that passed overlap=30 explicitly still
+# passed.
+_, text_d = render("a")
+_, text_d_b = render("b")
+la = yaml.safe_load(text_d)["load"]["stages"]
+lb = yaml.safe_load(text_d_b)["load"]["stages"]
+hi = max(s["rate"] for s in la)
+both_high = [i for i, (x, y) in enumerate(zip(la, lb))
+             if x["rate"] == hi and y["rate"] == hi]
+if len(la) != len(lb):
+    fail("the two ladders have %d and %d stages: they are not the same schedule"
+         % (len(la), len(lb)))
+elif both_high:
+    fail("stage(s) %s put BOTH models at the high rate. The scenario is that their peaks "
+         "do not coincide -- one pool covering many models is exactly the claim that "
+         "fails if they burst together" % both_high)
+else:
+    bands = [i for i, (x, y) in enumerate(zip(la, lb))
+             if x["rate"] == y["rate"] and i > 0]
+    if not bands:
+        fail("no both-equal band anywhere in the default schedule. The two models cross a "
+             "stage boundary at different moments -- the bursting one drains slower -- so "
+             "without a band the bursts run into each other by however far they drift")
+    else:
+        ok("no stage has both models high, and %d band(s) separate the bursts by default"
+           % len(bands))
+
 case("a flat 'burst' is refused by the profile generator")
 rc, _ = render("a", ["--low-rps=5", "--high-rps=5"])
 if rc != 2:
@@ -764,6 +853,7 @@ def convert_args(a, b):
     args.results_a, args.results_b, args.schedule = a, b, sched_file
     args.out = os.path.join(tempfile.mkdtemp(), "requests.jsonl")
     args.t0, args.arm, args.model_a, args.model_b = 1789464860.0, "pool", "A", "B"
+    args.overlap = 30
     args.input_tokens, args.output_tokens = 1000, 500
     args.seed, args.prefix_groups = 1729, 32
     return args
@@ -860,6 +950,39 @@ if run_report(BASE_META, served_meta) != 0:
          "answering, which is the thing being measured, not a driver that could not ask")
 else:
     ok("a request the model answered badly is not counted as one that never arrived")
+
+case("drift is measured from the generator's own per-stage elapsed time")
+drifted = {"windows": {
+    "a": {"overall": {}, "stages": [{"elapsed": 100.0}, {"elapsed": 100.0}]},
+    "b": {"overall": {}, "stages": [{"elapsed": 108.0}, {"elapsed": 112.0}]}}}
+d = report.phase_drift({"meta": drifted})
+if d is None or abs(d - 20.0) > 1e-9:
+    fail("drift came out as %s, not the 20s the two models' cumulative stage times "
+         "differ by. Drift accumulates: each stage ends when ITS requests drain, and "
+         "the bursting model drains slower" % d)
+else:
+    ok("drift is the worst cumulative divergence, not the last one")
+
+case("drift wider than the band is refused")
+wide = dict(BASE_META)
+wide["overlap_seconds"] = 5
+wide["windows"] = drifted["windows"]
+if run_report(BASE_META, wide) == 0:
+    fail("the two models drifted 20s apart with only a 5s band between bursts, so for "
+         "15s BOTH were bursting -- the one thing an anti-phase run must not contain, "
+         "and a pool asked for two models at once can serve one")
+else:
+    ok("drift the band cannot absorb is refused")
+
+case("drift inside the band is fine")
+narrow = dict(BASE_META)
+narrow["overlap_seconds"] = 30
+narrow["windows"] = drifted["windows"]
+if run_report(BASE_META, narrow) != 0:
+    fail("a 20s drift against a 30s band was refused; the band exists precisely to "
+         "absorb that")
+else:
+    ok("drift the band absorbs does not void the run")
 
 case("a run with no measured driver queueing is refused")
 no_qd = dict(BASE_META)

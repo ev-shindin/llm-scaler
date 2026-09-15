@@ -181,6 +181,11 @@ def window_from(doc):
         "max": ttft.get("max") if isinstance(ttft.get("max"), (int, float)) else None,
         "requested_rate": load_summary.get("requested_rate"),
         "achieved_rate": load_summary.get("achieved_rate"),
+        # The generator's own wall-clock span for this window. Summed per model
+        # it says how far each one has advanced, which is the only way to see
+        # the two drifting apart: a stage ends when its requests DRAIN, and the
+        # bursting model drains slower.
+        "elapsed": doc.get("benchmark_time_seconds"),
         "schedule_delay_p95": pick_percentile(load_summary.get("schedule_delay")),
     }
 
@@ -279,6 +284,7 @@ def convert(args):
         "output_tokens": args.output_tokens,
         "seed": args.seed,
         "prefix_groups": args.prefix_groups,
+        "overlap_seconds": args.overlap,
         "queue_delay_p95": queue_p95,
         "generator": "inference-perf",
         # {role: {label: count}}, summed over the run. What the report's loss
@@ -305,6 +311,9 @@ def main(argv):
     p.add_argument("--results-b", required=True, help="model B's inference-perf output dir")
     p.add_argument("--schedule", required=True, help="the stage table, as JSON")
     p.add_argument("--out", required=True, help="requests.jsonl to write")
+    p.add_argument("--overlap", type=int, default=0,
+                   help="the both-low band between bursts; the report refuses a run "
+                        "whose measured drift between the models exceeds it")
     p.add_argument("--t0", type=float, required=True,
                    help="epoch both containers started; the harness's own clock is monotonic")
     p.add_argument("--arm", default="unknown")

@@ -115,6 +115,15 @@ PREFIX_GROUPS="${PREFIX_GROUPS:-32}"
 # Must be shorter than PHASE_SECONDS or the phase is not cut at all and every
 # scale-up is averaged into eight minutes of steady state.
 RISE_WINDOW="${RISE_WINDOW:-90}"
+# Seconds of BOTH models at the low rate between consecutive bursts. A stage
+# ends when its in-flight requests drain and the BURSTING model drains slower,
+# so the two models do not cross a boundary together -- measured on CoreWeave,
+# per-stage drains of 4-16s and a net divergence that reached 6.1s and changed
+# sign with the burst. Without a band that divergence is time when both models
+# burst at once, which a pool can only half serve, and it would be recorded as
+# the pool failing at the thing this scenario measures. The report refuses a run
+# whose measured divergence exceeds this band.
+OVERLAP_SECONDS="${OVERLAP_SECONDS:-30}"
 # Seconds between creating the load Job and the instant both containers start
 # their ladders. It has to cover the image pull and the two tokenizer
 # downloads; each container reports whether it made it, and the driver refuses
@@ -1044,11 +1053,13 @@ print('%s %.0f' % ('$pod', tot))
 
 RUN_JOB=""
 RUN_SAMPLER=""
+RUN_WORKER=""
 run_cleanup() {
     # The JOB is the leak that matters: left behind it drives 12 rps at the
     # models' ceiling for the rest of the schedule, on a shared cluster, with
     # nobody watching. The sampler is a polling loop against the API server.
     [ -n "$RUN_SAMPLER" ] && kill "$RUN_SAMPLER" 2>/dev/null
+    [ -n "$RUN_WORKER" ] && kill "$RUN_WORKER" 2>/dev/null
     if [ -n "$RUN_JOB" ]; then
         kubectl ${KUBE_CONTEXT:+--context "$KUBE_CONTEXT"} -n "$NS" \
             delete job "$RUN_JOB" --ignore-not-found >/dev/null 2>&1
@@ -1113,7 +1124,7 @@ verb_run() {
             --low-rps "$LOW_RPS" --high-rps "$HIGH_RPS" \
             --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
             --prefix-groups "$PREFIX_GROUPS" --request-timeout "$REQUEST_TIMEOUT" \
-            --rise-window "$RISE_WINDOW" \
+            --rise-window "$RISE_WINDOW" --overlap "$OVERLAP_SECONDS" \
             --seed "$SEED" --results-root /results
     }
     local pyargs; pyargs="$(profile_args)"
@@ -1164,6 +1175,23 @@ verb_run() {
     sample_gpus "$out_dir/gpus.jsonl" "$until_ts" &
     RUN_SAMPLER=$!
 
+    # The per-engine capture has to happen WHILE THE ADDED REPLICAS STILL EXIST.
+    #
+    # It used to run after collection, and collection waits for inference-perf
+    # to write its report -- which took FOUR MINUTES of Hugging Face calls after
+    # the last request. By then KEDA had scaled the fleet back and the two
+    # replicas the run added were gone, so the capture showed only the two that
+    # had been there all along: the routing guard's evidence, deleted before it
+    # was read. Measured exactly that on a 9 rps arm that demonstrably scaled
+    # one model to three replicas.
+    #
+    # So it is timed off the schedule instead. The load ends at start_at+total
+    # whatever the report generator does afterwards.
+    local work_at=$(( start_at + total + 30 ))
+    ( while [ "$(date +%s)" -lt "$work_at" ]; do sleep 5; done
+      capture_pod_work "$out_dir/podwork.after" ) &
+    RUN_WORKER=$!
+
     # Waited on by the loader's OWN lines, not by the Job's completion, and on
     # BOTH of them: one container finishing means half a run. The Pod stays
     # alive afterwards on purpose -- `kubectl cp` is exec+tar and cannot run in
@@ -1212,7 +1240,12 @@ verb_run() {
     trap - INT TERM HUP
     run_cleanup
     RUN_JOB=""
-    capture_pod_work "$out_dir/podwork.after"
+    # The timed capture above is the one that matters. This only fills in when
+    # it did not run at all -- it never overwrites, because a late capture is
+    # precisely the one that has lost the added replicas.
+    wait "$RUN_WORKER" 2>/dev/null || true
+    RUN_WORKER=""
+    [ -s "$out_dir/podwork.after" ] || capture_pod_work "$out_dir/podwork.after"
 
     [ -d "$out_dir/harness/a" ] && [ -d "$out_dir/harness/b" ] || \
         die "no harness results for arm $arm. See $out_dir/loader.log"
@@ -1220,7 +1253,7 @@ verb_run() {
         --results-a "$out_dir/harness/a" --results-b "$out_dir/harness/b" \
         --schedule "$out_dir/schedule.json" \
         --out "$out_dir/requests.jsonl" \
-        --t0 "$start_at" \
+        --t0 "$start_at" --overlap "$OVERLAP_SECONDS" \
         --arm "$arm" --model-a "$MODEL_A" --model-b "$MODEL_B" \
         --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
         --seed "$SEED" --prefix-groups "$PREFIX_GROUPS" \

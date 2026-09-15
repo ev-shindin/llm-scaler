@@ -104,19 +104,32 @@ def rise_stages(schedule, model_key):
     return out
 
 
+_EMPTY_WINDOW = {"n": 0, "failed": 0, "p50": None, "p95": None, "p99": None, "max": None}
+
+
 def window_of(arm, model_key, index=None):
     """The harness's own distribution for one window of one model.
 
     `index` None means the whole run. Returns None when the arm's meta carries
     no such window -- a refusal upstream, never a zero here.
+
+    A window that IS present but missing a field reads as absent for that field
+    and prints as `-`. A KeyError here would take down the whole report over one
+    field of one window, after the run had already been paid for.
     """
     w = ((arm.get("meta") or {}).get("windows") or {}).get(model_key)
     if not w:
         return None
     if index is None:
-        return w.get("overall")
-    stages = w.get("stages") or []
-    return stages[index] if 0 <= index < len(stages) else None
+        found = w.get("overall")
+    else:
+        stages = w.get("stages") or []
+        found = stages[index] if 0 <= index < len(stages) else None
+    if found is None:
+        return None
+    full = dict(_EMPTY_WINDOW)
+    full.update(found)
+    return full
 
 
 def served_and_failed(rows, model_key):
@@ -399,6 +412,38 @@ def driver_queueing(arm):
     return None
 
 
+def phase_drift(arm):
+    """How far the two models' stage boundaries diverge, in seconds.
+
+    A stage ends when its in-flight requests drain, and the BURSTING model
+    drains slower -- so the two ladders do not cross a boundary together, and
+    the divergence changes sign as the burst moves from one model to the other.
+    Measured on CoreWeave: per-stage drains of 4-16s, peak divergence 6.1s.
+
+    That divergence is time when both models are bursting at once, which is the
+    one thing an anti-phase run must not contain: a pool asked for two models
+    simultaneously can serve one, and it would be recorded as the pool failing
+    at the thing being measured. The overlap band exists to absorb it; this is
+    what checks the band was big enough.
+
+    Returns None when the generator reported no per-stage timing.
+    """
+    windows = ((arm.get("meta") or {}).get("windows")) or {}
+    stages = {k: (windows.get(k) or {}).get("stages") or [] for k in ("a", "b")}
+    if not stages["a"] or len(stages["a"]) != len(stages["b"]):
+        return None
+    worst = 0.0
+    run = {"a": 0.0, "b": 0.0}
+    for sa, sb in zip(stages["a"], stages["b"]):
+        if not isinstance(sa.get("elapsed"), (int, float)) or \
+           not isinstance(sb.get("elapsed"), (int, float)):
+            return None
+        run["a"] += sa["elapsed"]
+        run["b"] += sb["elapsed"]
+        worst = max(worst, abs(run["a"] - run["b"]))
+    return worst
+
+
 def admissible(a, b, max_queue_delay):
     """Everything that makes the two arms comparable. Returns a list of reasons."""
     problems = []
@@ -443,6 +488,15 @@ def admissible(a, b, max_queue_delay):
                             "not answers from the models. What is left is the survivors "
                             "of that, not the scenario."
                             % (arm["name"], netfail, issued, 100.0 * netfail / issued))
+        drift = phase_drift(arm)
+        arm["drift"] = drift
+        band = m.get("overlap_seconds")
+        if drift is not None and band is not None and drift > band:
+            problems.append("the %s arm's two models drifted %.0fs apart, more than the "
+                            "%ds band between bursts: for %.0fs of it BOTH models were "
+                            "bursting, which is the one thing an anti-phase run must not "
+                            "contain. Raise OVERLAP_SECONDS."
+                            % (arm["name"], drift, band, drift - band))
         qd = driver_queueing(arm)
         arm["queue_p95"] = qd
         if qd is None:
@@ -511,6 +565,14 @@ def main(argv):
               ", ".join("%ds" % schedule[i]["start"] for i in rises[k]) or "never"))
     print("- driver queueing (p95): nopool %s ms, pool %s ms"
           % (fmt_ms(a["queue_p95"]), fmt_ms(b["queue_p95"])))
+    band = (a["meta"] or {}).get("overlap_seconds")
+    print("- the two models drifted at most %s apart, against a %s band of both-low "
+          "between bursts (a stage ends when its requests drain, and the bursting "
+          "model drains slower)"
+          % (" / ".join("%s %.0fs" % (arm["name"], arm["drift"])
+                        if arm.get("drift") is not None else "%s -" % arm["name"]
+                        for arm in (a, b)),
+             "%ds" % band if band is not None else "(unrecorded)"))
     print("")
 
     print("## Time to first token, whole run (ms)")

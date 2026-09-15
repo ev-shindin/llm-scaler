@@ -469,6 +469,22 @@ else
     ok "tokenizers cache on the shared claim, under their own subPath"
 fi
 
+# THE BURSTS MUST NOT OVERLAP. The two models cross a stage boundary at
+# different moments -- a stage ends when its requests drain and the bursting
+# model drains slower -- so the band is what keeps the drift from becoming time
+# when both are bursting. A pool asked for two models at once can serve one,
+# and that would be recorded as the pool failing at the thing being measured.
+case_begin
+if [ "${OVERLAP_SECONDS:-0}" -le 0 ]; then
+    fail "OVERLAP_SECONDS defaults to '${OVERLAP_SECONDS:-}', so there is no band between bursts and the two models' peaks run into each other by however far they drift"
+elif ! grep -q -- '--overlap "\$OVERLAP_SECONDS"' "$SCRIPT"; then
+    fail "OVERLAP_SECONDS is set but never reaches the profile generator, so the rendered schedule has no band whatever the knob says"
+elif ! grep -q -- '--overlap "\$OVERLAP_SECONDS"' "$SCRIPT" || ! grep -q 'overlap_seconds' "$ROOT/hack/benchmark/harness_results.py"; then
+    fail "the band is never recorded in the meta, so the report cannot check that the measured drift stayed inside it"
+else
+    ok "a ${OVERLAP_SECONDS}s band separates the bursts, and it reaches both the profiles and the meta"
+fi
+
 case_begin
 img="$(LOAD_IMAGE="" ROOT=/nonexistent load_image)"
 if ! printf '%s' "$img" | grep -q 'llm-d-benchmark'; then
@@ -488,7 +504,7 @@ else
 fi
 
 case_begin
-CASES_EXPECTED=29
+CASES_EXPECTED=30
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. Update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else
