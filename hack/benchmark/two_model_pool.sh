@@ -65,10 +65,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 NS="${BENCHMARK_NAMESPACE:-}"
-# The scenario spec defines both stacks. Its stack NAMES are the path prefixes
-# the shared HTTPRoute routes on (`/{stack}/v1/...`), and its per-stack
-# `model.shortName` is what every object in that stack is named after -- both
-# pinned there so nothing here has to reproduce the harness's name hash.
+# The scenario spec defines both stacks, and its stack NAMES are the path
+# prefixes the shared HTTPRoute routes on (`/{stack}/v1/...`) -- which is the
+# only name this driver can rely on. The objects in a stack are named after a
+# shortName the harness GENERATES and that the scenario cannot override, so
+# every lookup here goes through the route rather than through a name.
 BENCH_SPEC="${BENCH_SPEC:-guides/two-model-warm-pool}"
 STACK_A="${STACK_A:-llama-31-8b}"
 STACK_B="${STACK_B:-qwen3-8b}"
@@ -90,7 +91,7 @@ LEAD_IN="${LEAD_IN:-120}"
 LOW_RPS="${LOW_RPS:-2}"
 HIGH_RPS="${HIGH_RPS:-12}"
 INPUT_TOKENS="${INPUT_TOKENS:-1000}"
-OUTPUT_TOKENS="${OUTPUT_TOKENS:-200}"
+OUTPUT_TOKENS="${OUTPUT_TOKENS:-1000}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 SEED="${SEED:-1729}"
 
@@ -706,7 +707,21 @@ verb_reset() {
     for so in $sos; do
         pause_at "$so" "$MIN_REPLICAS" || warn "could not pin $so"
     done
-    info "pinned every model ScaledObject at $MIN_REPLICAS; waiting for the fleet to settle"
+    # PAUSE THEN SCALE. Pausing alone does not bring the fleet down: measured
+    # here, KEDA reported `Paused=True` and deleted the HPA while leaving the
+    # Deployment at the 3 replicas it had grown -- the pause FREEZES the count,
+    # it does not set it. Waiting on the annotation alone hung until the reset
+    # timed out, and an arm started from a frozen 3 would have begun with the
+    # capacity the previous arm built.
+    #
+    # The pause still matters, and has to come first: without it the HPA puts
+    # the replicas straight back within a cycle.
+    for s in "$STACK_A" "$STACK_B"; do
+        d="$(decode_deploy_for "$s")"
+        [ -n "$d" ] || { warn "no decode Deployment for stack $s"; continue; }
+        k scale deploy "$d" --replicas="$MIN_REPLICAS" >/dev/null || warn "could not scale $d"
+    done
+    info "pinned every model ScaledObject at $MIN_REPLICAS and scaled the fleet down; waiting for it to settle"
     waited=0
     while [ "$waited" -lt "$RESET_TIMEOUT" ]; do
         local settled=1

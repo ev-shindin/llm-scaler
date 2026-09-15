@@ -52,6 +52,12 @@
 #       refusal: the controller would otherwise scale on a degraded demand
 #       signal in BOTH arms, measuring something other than what this claims to.
 #
+#   model.maxNumSeq: 32, against a default of 256, and it is what makes this run
+#       scale at all. Measured on an H200: one replica of an 8B model absorbed
+#       40 rps of 1000-token requests without queueing, so neither arm ever
+#       added a replica and there was nothing to compare. See the note at the
+#       key for why it does not bias the comparison.
+#
 #   storage.modelPvc.accessModes: ReadWriteMany -- see the note at the block.
 #
 # The upstream header follows, and everything it says about the topology still
@@ -520,6 +526,19 @@ scenario:
       maxModelLen: 8192
       blockSize: 64
       gpuMemoryUtilization: 0.90
+      # THE CONCURRENCY CEILING PER REPLICA, and the reason this run scales
+      # at all. The default is 256: measured on an H200, one replica of an 8B
+      # model absorbed 40 rps of 1000-token requests without queueing, so
+      # NEITHER arm ever added a replica and the comparison had nothing to
+      # compare. A fleet that never scales cannot show a bridge.
+      #
+      # 32 is a normal production value -- operators cap concurrency to
+      # protect TTFT -- and it does not bias pool against nopool: what a pool
+      # bridges is a MODEL LOAD, whose cost is fixed by the weights and the
+      # storage, not by how many sequences a replica will batch. This changes
+      # when a scale-up is triggered, not how long the new replica takes to
+      # arrive, and it changes it identically in both arms.
+      maxNumSeq: 32
 
     modelservice:
       decode:
@@ -602,6 +621,19 @@ scenario:
       maxModelLen: 8192
       blockSize: 64
       gpuMemoryUtilization: 0.90
+      # THE CONCURRENCY CEILING PER REPLICA, and the reason this run scales
+      # at all. The default is 256: measured on an H200, one replica of an 8B
+      # model absorbed 40 rps of 1000-token requests without queueing, so
+      # NEITHER arm ever added a replica and the comparison had nothing to
+      # compare. A fleet that never scales cannot show a bridge.
+      #
+      # 32 is a normal production value -- operators cap concurrency to
+      # protect TTFT -- and it does not bias pool against nopool: what a pool
+      # bridges is a MODEL LOAD, whose cost is fixed by the weights and the
+      # storage, not by how many sequences a replica will batch. This changes
+      # when a scale-up is triggered, not how long the new replica takes to
+      # arrive, and it changes it identically in both arms.
+      maxNumSeq: 32
 
     modelservice:
       decode:

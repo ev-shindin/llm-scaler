@@ -43,6 +43,17 @@ The anti-phase property is **structural**, not written out: the generator builds
 B's rate from the opposite level of A's, so no edit can make the two models
 burst together while the file still claims they do not.
 
+**The load has to be heavy enough to force a scale-up, and that is not obvious.**
+Measured on an H200: one replica of an 8B model absorbed **40 rps** of
+1000-token requests without queueing, because `maxNumSeq` defaults to 256 — so
+neither arm ever added a replica and there was nothing to compare. The scenario
+caps concurrency at `maxNumSeq: 32`, which is a normal production value, and the
+defaults below (2 → 12 rps, 1000 input and 1000 output tokens) then take each
+model from one replica to three and back. Capping concurrency does not bias the
+comparison: what a pool bridges is a **model load**, whose cost is fixed by the
+weights and the storage, so this changes when a scale-up is triggered, not how
+long the new replica takes to arrive — identically in both arms.
+
 Arrivals are a **Poisson process at the phase's rate, open-loop** — issued
 whether or not earlier requests have returned. A closed-loop driver cannot
 measure this: when the server slows it sends less, so the queue never grows and
