@@ -42,6 +42,7 @@ RESERVE=1
 # Only a value the operator actually chose is written into the ScaledObject.
 POOL_TYPE=""
 MAX_HOLD=""
+MIN_HOLD=""
 MODELS=""
 MODEL_SIZE=""
 GPUS_PER_POD=1
@@ -128,6 +129,15 @@ create options:
                        pool exists for one model, or when the thing you are
                        avoiding is the churn rather than the cold start.
                        Omit it and the controller's own default applies.
+  --min-hold DURATION  how long a BRIDGE lends AT LEAST, e.g. 90s. A bridge is
+                       not handed back as excess until it has been lent this
+                       long, even once the ordinary replicas report Ready --
+                       a replica that has just passed its probe has an empty KV
+                       and prefix cache, so returning the bridge at that instant
+                       swaps a warm engine for a cold one at the crossover.
+                       Bounded by --max-hold, which always wins, and waived the
+                       moment another model is short, so it can never delay
+                       somebody else's lend. Omit it for the old behaviour.
   --max-hold DURATION  how long a BRIDGE lends before reclaiming, e.g. 5m.
                        Meaningless with --type retained, which is exactly the
                        switch that turns it off, so the two together are refused
@@ -346,6 +356,16 @@ cmd_create() {
     if ! printf '%s' "$MAX_HOLD" | grep -Eq '[1-9]'; then
       log_error "--max-hold must be greater than zero: a zero hold reclaims every lent Pod on the first pass, so the pool warms models and never bridges with them"
     fi
+  if [ -n "$MIN_HOLD" ]; then
+    if ! printf '%s' "$MIN_HOLD" | grep -Eq '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$'; then
+      log_error "--min-hold must be positive number+unit pairs, such as 90s, 1.5m or 1h30m, got '$MIN_HOLD'"
+    fi
+    if [ "$POOL_TYPE" = "retained" ]; then
+      # A retained pool has no handover to smooth: nothing is coming to replace
+      # the Pod, so a floor on the borrow is meaningless rather than harmless.
+      log_error "--min-hold is meaningless with --type retained: a retained pool has no ordinary replicas arriving, so there is no handover for a floor to cover"
+    fi
+  fi
     if [ "$POOL_TYPE" = "retained" ]; then
       # Refused, not ignored. Retention IS the absence of this timeout
       # (`expired := !cfg.Retained && now.Sub(borrowedAt) >= cfg.MaxHold`), so a
@@ -1296,6 +1316,9 @@ pool_trigger_extra() {
   elif [ "$POOL_TYPE" = "bridge" ]; then
     printf '        warmPoolRetained: "false"\n'
   fi
+  if [ -n "$MIN_HOLD" ]; then
+    printf '        warmPoolMinHold: "%s"\n' "$MIN_HOLD"
+  fi
   if [ -n "$MAX_HOLD" ]; then
     printf '        warmPoolMaxHold: "%s"\n' "$MAX_HOLD"
   fi
@@ -1516,6 +1539,7 @@ while [ $# -gt 0 ]; do
     --reserve)       RESERVE="$2"; shift 2 ;;
     --type)          POOL_TYPE="$2"; shift 2 ;;
     --max-hold)      MAX_HOLD="$2"; shift 2 ;;
+    --min-hold)      MIN_HOLD="$2"; shift 2 ;;
     --proxy-image)   PROXY_IMAGE="$2"; shift 2 ;;
     --wva-namespace) WVA_NAMESPACE="$2"; shift 2 ;;
     --monitoring-namespace) MONITORING_NAMESPACE="$2"; shift 2 ;;

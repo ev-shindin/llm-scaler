@@ -210,6 +210,18 @@ const (
 	// returned regardless, so a scale-up that never arrives cannot turn the
 	// reserve into permanent capacity for one variant. A Go duration.
 	WarmPoolMaxHoldKey = "warmPoolMaxHold"
+	// WarmPoolMinHoldKey FLOORS how long a borrowed Pod serves: it is not handed
+	// back as excess until it has been lent this long, even once the ordinary
+	// replicas report Ready.
+	//
+	// Ready is not the same as useful -- a replica that has just passed its
+	// probe has an empty KV and prefix cache -- so returning the bridge at that
+	// instant swaps a warm Pod for a cold one at the crossover. A Go duration;
+	// absent or zero leaves the behaviour unchanged.
+	//
+	// It is bounded by warmPoolMaxHold, which always wins, and waived entirely
+	// while another variant is short.
+	WarmPoolMinHoldKey = "warmPoolMinHold"
 	// WarmPoolRetainedKey makes the pool the workload's SERVING capacity rather
 	// than a bridge over a scale-up.
 	//
@@ -258,6 +270,7 @@ type PoolMeta struct {
 	Name         string
 	SleepMinSize *int
 	MaxHold      *time.Duration
+	MinHold      *time.Duration
 	// Retained makes the pool serving capacity rather than a bridge. See
 	// WarmPoolRetainedKey.
 	Retained *bool
@@ -299,6 +312,14 @@ func ParsePoolMeta(metadata map[string]string) (PoolMeta, error) {
 				WarmPoolMaxHoldKey, raw)
 		}
 		out.MaxHold = &d
+	}
+	if raw := metadata[WarmPoolMinHoldKey]; raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			return PoolMeta{}, fmt.Errorf("trigger metadata %q must be a non-negative duration such as 90s, got %q",
+				WarmPoolMinHoldKey, raw)
+		}
+		out.MinHold = &d
 	}
 	if raw := metadata[WarmPoolRetainedKey]; raw != "" {
 		v, err := strconv.ParseBool(raw)
