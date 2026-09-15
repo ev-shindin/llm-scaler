@@ -105,7 +105,18 @@ LOW_RPS="${LOW_RPS:-3}"
 # models' capacity, and for the slower one the run measured which arm was less
 # broken rather than what a bridge is worth. 6 sits inside both models' capacity
 # at two replicas while still needing a scale-up from one.
-HIGH_RPS="${HIGH_RPS:-6}"
+HIGH_RPS="${HIGH_RPS:-9}"
+# Model B's burst rate, separately, because the two models do not have the same
+# per-replica capacity. MEASURED: at 9 rps Llama served comfortably once scaled
+# (steady-state p50 83ms) while Qwen drowned (steady-state p50 5717ms, an
+# unbounded queue rather than a transient); at 6 rps Qwen was exercised properly
+# and Llama never needed a second replica at all -- its rise window was
+# indistinguishable from its steady state. One rate cannot do both.
+#
+# It also serves the premise rather than bending it: the claim is that the SUM
+# OF DEMAND is flat, and with equal request rates against unequal capacity the
+# sum of ACCELERATOR demand is not.
+HIGH_RPS_B="${HIGH_RPS_B:-8}"
 INPUT_TOKENS="${INPUT_TOKENS:-1000}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-500}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
@@ -156,6 +167,19 @@ POOL_REPLICAS="${POOL_REPLICAS:-2}"
 # A pool with replicas == reserve can never warm anything: the reserve is what
 # it refuses to lend.
 POOL_RESERVE="${POOL_RESERVE:-1}"
+# The bridge's hold FLOOR and CEILING.
+#
+# Empty leaves the controller's defaults, which is the old behaviour. Setting
+# only the floor would do nothing: MEASURED, bridges were already held 93s, 106s,
+# 106s and 119s against the controller's 2m ceiling, so a floor under 120s never
+# binds. The ceiling has to move with it.
+#
+# What the floor buys: a bridge is otherwise handed back 7-19s after the replica
+# it covers reports Ready, and Ready is not useful -- that replica has an empty
+# KV and prefix cache, and llm-d weights the prefix-cache scorer highest, so it
+# serves slower AND is chosen less while it warms.
+POOL_MIN_HOLD="${POOL_MIN_HOLD:-}"
+POOL_MAX_HOLD="${POOL_MAX_HOLD:-}"
 GPU_SAMPLE_SECONDS="${GPU_SAMPLE_SECONDS:-5}"
 OUT_ROOT="${OUT_ROOT:-$ROOT/two-model-results}"
 LOAD_IMAGE="${LOAD_IMAGE:-}"
@@ -895,6 +919,8 @@ verb_pool_create() {
         --cache-claim "$CACHE_CLAIM" \
         --wva-namespace "$WVA_NS" \
         --accelerator "$accel" \
+        ${POOL_MIN_HOLD:+--min-hold "$POOL_MIN_HOLD"} \
+        ${POOL_MAX_HOLD:+--max-hold "$POOL_MAX_HOLD"} \
         ${MONITORING_NS:+--monitoring-namespace "$MONITORING_NS"} \
         || die "pool creation failed"
     ok "pool created. An idle pool Pod reports NotReady ON PURPOSE -- that is what keeps it out of the InferencePool. Do not wait on readyReplicas."
@@ -1265,7 +1291,7 @@ verb_run() {
             --model-a "$MODEL_A" --model-b "$MODEL_B" \
             --endpoint-a "$url_a" --endpoint-b "$url_b" \
             --phase-seconds "$PHASE_SECONDS" --cycles "$CYCLES" --lead-in "$LEAD_IN" \
-            --low-rps "$LOW_RPS" --high-rps "$HIGH_RPS" \
+            --low-rps "$LOW_RPS" --high-rps "$HIGH_RPS" --high-rps-b "$HIGH_RPS_B" \
             --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
             --prefix-groups "$PREFIX_GROUPS" --request-timeout "$REQUEST_TIMEOUT" \
             --rise-window "$RISE_WINDOW" --overlap "$OVERLAP_SECONDS" \

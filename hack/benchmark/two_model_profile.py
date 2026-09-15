@@ -48,7 +48,8 @@ import json
 import sys
 
 
-def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in, overlap=0):
+def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in, overlap=0,
+                   high_rps_b=None):
     """Anti-phase square wave: A low->high->low..., B high->low->high...
 
     `overlap` inserts a band between consecutive phases where BOTH models are
@@ -73,6 +74,18 @@ def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in, overlap=0)
     previous bespoke loader built, deliberately: the report's rise windows, the
     meta signature and the runbook's phase table all key on it.
     """
+    # The two models do not have the same capacity, so one burst rate cannot
+    # exercise both. MEASURED: at 9 rps Llama served comfortably once scaled
+    # (steady p50 83ms) while Qwen drowned (steady p50 5717ms); at 6 rps Qwen
+    # needed a second replica and showed a real rise penalty while Llama never
+    # needed one and its rise window was indistinguishable from steady state.
+    #
+    # This also serves the premise better rather than worse. The claim is that
+    # the SUM OF DEMAND is flat; with equal request rates and unequal capacity
+    # the sum of ACCELERATOR demand is not, because one model's 6 rps costs two
+    # replicas and the other's costs one.
+    if high_rps_b is None:
+        high_rps_b = high_rps
     phases = []
     t = 0
     if lead_in > 0:
@@ -91,7 +104,7 @@ def build_schedule(phase_seconds, cycles, low_rps, high_rps, lead_in, overlap=0)
                 if not (cycle == 0 and first and lead_in > 0):
                     phases.append((t, t + overlap, low_rps, low_rps))
                     t += overlap
-            rates = (low_rps, high_rps) if first else (high_rps, low_rps)
+            rates = (low_rps, high_rps_b) if first else (high_rps, low_rps)
             phases.append((t, t + phase_seconds) + rates)
             t += phase_seconds
     return phases
@@ -278,7 +291,11 @@ def build_parser():
     p.add_argument("--cycles", type=int, default=2)
     p.add_argument("--lead-in", type=int, default=120)
     p.add_argument("--low-rps", type=float, default=3)
-    p.add_argument("--high-rps", type=float, default=6)
+    p.add_argument("--high-rps", type=float, default=9,
+                   help="model A's burst rate")
+    p.add_argument("--high-rps-b", type=float, default=None,
+                   help="model B's burst rate; defaults to --high-rps. The two "
+                        "models rarely have the same per-replica capacity")
     p.add_argument("--input-tokens", type=int, default=1000)
     p.add_argument("--output-tokens", type=int, default=500)
     p.add_argument("--overlap", type=int, default=90,
@@ -310,9 +327,11 @@ def main(argv):
               "and there is nothing for a warm pool to be measured against.",
               file=sys.stderr)
         return 2
-    if args.high_rps <= args.low_rps:
-        print("--high-rps must exceed --low-rps: the scenario is a burst, and "
-              "with a flat rate no scale-up happens in either arm.", file=sys.stderr)
+    if args.high_rps <= args.low_rps or (args.high_rps_b is not None
+                                        and args.high_rps_b <= args.low_rps):
+        print("--high-rps and --high-rps-b must exceed --low-rps: the scenario is a "
+              "burst, and with a flat rate no scale-up happens in either arm.",
+              file=sys.stderr)
         return 2
     if args.rise_window >= args.phase_seconds:
         print("--rise-window (%d) must be shorter than --phase-seconds (%d): a phase that "
@@ -332,7 +351,7 @@ def main(argv):
 
     schedule = build_schedule(args.phase_seconds, args.cycles,
                               args.low_rps, args.high_rps, args.lead_in,
-                              args.overlap)
+                              args.overlap, args.high_rps_b)
     stages = stage_map(schedule, args.rise_window)
     if args.emit == "schedule":
         json.dump(schedule_json(stages), sys.stdout, indent=2)

@@ -514,12 +514,21 @@ def burst_overlap(arm):
             out.append((t, t + e, st["rate_a"] if role == "a" else st["rate_b"]))
             t += e
         spans[role] = out
-    rates = [r for out in spans.values() for _, _, r in out]
-    if not rates:
-        return None
-    high = max(rates)
-    bursts = {role: [(s, e) for s, e, r in spans[role] if r == high]
-              for role in ("a", "b")}
+    # PER MODEL. A single global max would stop seeing model B's bursts the
+    # moment the two models are given different rates -- 9 and 8, say -- and the
+    # overlap would silently read as zero for the very configuration that makes
+    # the two models comparable.
+    bursts = {}
+    for role in ("a", "b"):
+        rates = [r for _, _, r in spans[role]]
+        if not rates:
+            return None
+        high = max(rates)
+        if high <= min(rates):
+            # This model never bursts, so it cannot overlap with anything.
+            bursts[role] = []
+            continue
+        bursts[role] = [(s, e) for s, e, r in spans[role] if r == high]
     total = 0.0
     for s1, e1 in bursts["a"]:
         for s2, e2 in bursts["b"]:
