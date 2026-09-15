@@ -227,9 +227,75 @@ def budget_problem(a, b):
     return None
 
 
+def pod_work(d):
+    """{pod: prompt tokens done during the arm}, from the before/after captures.
+
+    Empty when the captures are missing, which is reported rather than assumed
+    to be fine.
+    """
+    def read(name):
+        p = os.path.join(d, name)
+        out = {}
+        if not os.path.exists(p):
+            return None
+        for line in open(p):
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    out[parts[0]] = float(parts[1])
+                except ValueError:
+                    pass
+        return out
+
+    before, after = read("podwork.before"), read("podwork.after")
+    if before is None or after is None:
+        return None
+    work = {}
+    for pod, end in after.items():
+        work[pod] = max(0.0, end - before.get(pod, 0.0))
+    return work
+
+
+def routing_problem(arm):
+    """Did the load actually reach more than one replica?
+
+    THE GUARD THAT WAS MISSING. Measured on CoreWeave: one Qwen replica did
+    6,000,692 prompt tokens while every other replica the autoscaler added did
+    ZERO -- including an awake, Ready warm-pool Pod that was in the EPP's own
+    backend list. With one shared prompt prefix, llm-d's prefix-cache scorer is
+    the highest-weighted scorer in the shipped profile, so the first replica to
+    cache the prefix wins every later request regardless of its queue, and the
+    others never receive one. Capacity cannot help when it is never used, and
+    every TTFT and GPU number from such a run describes a one-replica fleet.
+    """
+    work = arm.get("work")
+    if work is None:
+        return ("the %s arm has no per-engine work capture, so nothing establishes that the "
+                "load reached more than one replica" % arm["name"])
+    busy = {p: v for p, v in work.items() if v > 0}
+    if len(busy) <= 1 and len(work) > 1:
+        top = max(work.items(), key=lambda kv: kv[1]) if work else ("?", 0)
+        return ("in the %s arm only %d engine(s) did any work at all, out of %d seen: %s did "
+                "%.0f prompt tokens and the rest did none. Added capacity was never routed to, "
+                "so this run measures a one-replica fleet."
+                % (arm["name"], len(busy), len(work), top[0], top[1]))
+    total = sum(work.values())
+    if total > 0 and len(busy) > 1:
+        share = max(work.values()) / total
+        if share > 0.95:
+            return ("in the %s arm one engine did %.0f%% of all prompt tokens; the other "
+                    "replicas were effectively unused, so added capacity cannot have affected "
+                    "TTFT" % (arm["name"], 100 * share))
+    return None
+
+
 def admissible(a, b, max_queue_delay):
     """Everything that makes the two arms comparable. Returns a list of reasons."""
     problems = []
+    for arm in (a, b):
+        rp = routing_problem(arm)
+        if rp:
+            problems.append(rp)
     bp = budget_problem(a, b)
     if bp:
         problems.append(bp)
@@ -300,6 +366,7 @@ def main(argv):
             "rows": load_rows(os.path.join(d, "requests.jsonl")),
             "gpus": gpu_series(os.path.join(d, "gpus.jsonl"), (meta or {}).get("t0", 0)),
             "budget": load_budget(d),
+            "work": pod_work(d),
             "queue_p95": None,
         })
     a, b = arms

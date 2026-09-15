@@ -143,6 +143,30 @@ def plan_arrivals(schedule, model_key, seed):
     return out
 
 
+PREFIX_WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo "
+                "lima mike november oscar papa quebec romeo sierra tango uniform "
+                "victor whiskey xray yankee zulu").split()
+
+
+def build_prefix_groups(seed, groups, input_tokens):
+    """`groups` distinct shared prefixes, deterministic from the seed.
+
+    inference-perf's `shared_prefix` data type calls this num_groups, and the
+    suite's own profiles default it to 32. ONE group is the degenerate case that
+    invalidated three runs here: with a single shared prefix, llm-d's EPP scores
+    on prefix-cache hit above queue depth, so the first replica to cache it wins
+    every later request regardless of load, and no other replica ever receives
+    one -- measured, 6,000,692 prompt tokens on one Qwen replica and zero on
+    every other, including an awake warm-pool Pod in the EPP's backend list.
+    """
+    per_prefix = max(1, input_tokens // 2)
+    out = []
+    for g in range(max(1, groups)):
+        rng = random.Random(seed * 1000003 + g)
+        out.append(" ".join(rng.choice(PREFIX_WORDS) for _ in range(per_prefix)))
+    return out
+
+
 class Recorder:
     """Per-request rows, written once at the end.
 
@@ -381,16 +405,34 @@ def drive(args):
     total = schedule[-1][1]
     rec = Recorder()
 
-    # A SHARED PREFIX plus a per-arrival suffix. One reused prompt makes every
-    # request after the first a full prefix-cache hit, which engineers away
-    # prefill -- the exact cost a freshly scaled-up replica pays, and the thing
-    # a bridge is supposed to spare. A fully random prompt is the other extreme,
-    # a 100% miss that no real workload has. The suffix is derived from the
-    # arrival index, so both arms send byte-identical traffic.
-    prefix = ("benchmark " * max(1, args.input_tokens // 2)).strip()
+    # MANY DISTINCT PREFIXES, not one shared one.
+    #
+    # This is the single most damaging thing this file got wrong, and it
+    # invalidated three runs. With ONE shared prefix, llm-d's EPP scores every
+    # request with `prefix-cache-scorer` -- the HIGHEST-weighted scorer in the
+    # shipped profile (weight 3, against 2 for queue and 2 for KV) -- and the
+    # first replica to cache that prefix wins every subsequent request
+    # REGARDLESS OF ITS QUEUE. The other replicas then never receive a request,
+    # so they never cache the prefix, so they can never start winning. It is a
+    # self-reinforcing lock-in.
+    #
+    # Measured on CoreWeave: across a whole 34-minute arm, ONE Qwen replica did
+    # 6,000,692 prompt tokens and every other replica the autoscaler added did
+    # exactly ZERO -- including a warm-pool Pod that was awake, Ready, in the
+    # EndpointSlice and in the EPP's own backend list. Adding capacity could not
+    # improve TTFT because none of it was ever used.
+    #
+    # So: a family of distinct prefixes, assigned by arrival index. Reuse is
+    # realistic -- a real fleet serves many conversations, each with its own
+    # history -- while no single replica can own the whole workload. Both the
+    # families and the assignment are derived from --seed, so the two arms still
+    # send byte-identical traffic.
+    families = build_prefix_groups(args.seed, args.prefix_groups, args.input_tokens)
 
     def prompt_for(key, i):
-        return "%s [%s-%d]" % (prefix, key, i)
+        # The family is chosen by arrival index so it is reproducible, and the
+        # suffix keeps every request distinct even within a family.
+        return "%s [%s-%d]" % (families[i % len(families)], key, i)
 
     plans = {k: plan_arrivals(schedule, k, args.seed + off)
              for k, off in (("a", 0), ("b", 1))}
@@ -487,6 +529,7 @@ def drive(args):
         "input_tokens": args.input_tokens,
         "output_tokens": args.output_tokens,
         "seed": args.seed,
+        "prefix_groups": args.prefix_groups,
         "resolved": addrs,
     }
     with open(args.out + ".meta.json", "w") as fh:
@@ -521,6 +564,23 @@ def main(argv):
     p.add_argument("--output-tokens", type=int, default=200)
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--max-workers", type=int, default=1024)
+    # Named and defaulted to match inference-perf's own `shared_prefix` data
+    # type, which the suite's profiles use
+    # (workload/profiles/inference-perf/shared_prefix_synthetic.yaml.in):
+    #
+    #     num_groups: 32            # Number of distinct shared prefixes
+    #     num_prompts_per_group: 32 # Number of unique questions per prefix
+    #
+    # This generator exists because the harness runs ONE model per treatment and
+    # cannot express two models bursting out of phase. That is a scheduling
+    # limitation, not a licence to invent a different workload -- and inventing
+    # one is precisely what went wrong: hand-rolled, this was num_groups=1, and
+    # a single shared prefix hands every request to whichever replica cached it
+    # first. Keep the shape the harness uses, so a result here can be compared
+    # with one from the suite's own profiles.
+    p.add_argument("--prefix-groups", type=int, default=32,
+                   help="distinct shared prefixes (inference-perf num_groups); 1 "
+                        "reproduces the lock-in that sends every request to one replica")
     p.add_argument("--warmup-timeout", type=int, default=300,
                    help="how long to wait for both endpoints to answer before t0")
     p.add_argument("--seed", type=int, default=1729)

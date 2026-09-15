@@ -285,10 +285,15 @@ BUDGET_P = {"arm": "pool", "max_replicas_per_model": 2, "pool_replicas": 2,
             "gpus_per_replica": 1}
 
 
+WORK_OK = {"pod-1": 5000.0, "pod-2": 4800.0}
+
+
 def run_report(meta_a, meta_b, rows_a=None, rows_b=None,
-               budget_a=None, budget_b=None):
+               budget_a=None, budget_b=None, work_a=None, work_b=None):
     """report.main over two fixture directories; returns its exit code."""
     d = tempfile.mkdtemp()
+    works = {"nopool": WORK_OK if work_a is None else work_a,
+             "pool": WORK_OK if work_b is None else work_b}
     for name, meta, rows, bud in (("nopool", meta_a, rows_a or BASE_ROWS, BUDGET_N if budget_a is None else budget_a),
                                   ("pool", meta_b, rows_b or BASE_ROWS, BUDGET_P if budget_b is None else budget_b)):
         sub = os.path.join(d, name)
@@ -301,6 +306,15 @@ def run_report(meta_a, meta_b, rows_a=None, rows_b=None,
         if bud != "omit":
             with open(os.path.join(sub, "budget.json"), "w") as fh:
                 json.dump(bud, fh)
+        w = works[name]
+        if w != "omit":
+            # before is empty, so after IS the work done during the arm.
+            with open(os.path.join(sub, "podwork.before"), "w") as fh:
+                for pod in w:
+                    fh.write("%s 0\n" % pod)
+            with open(os.path.join(sub, "podwork.after"), "w") as fh:
+                for pod, v in w.items():
+                    fh.write("%s %.0f\n" % (pod, v))
     # The table goes nowhere: these cases are about the RETURN CODE, and a full
     # report printed into the middle of a check makes its own `ok` lines
     # unfindable.
@@ -364,6 +378,63 @@ if run_report(BASE_META, dict(BASE_META), rows_b=few) != 0:
     fail("one client-side error in 200 voided the run; the threshold is too tight to ever pass")
 else:
     ok("an occasional client-side error does not void the run")
+
+case("prompt prefixes are distinct across groups")
+# THE DEFECT THAT INVALIDATED THREE RUNS. One shared prefix hands every request
+# to whichever replica cached it first, because llm-d's EPP weights the
+# prefix-cache scorer above queue depth. Measured: 6,000,692 prompt tokens on one
+# replica and ZERO on every other, including an awake warm-pool Pod.
+groups = load.build_prefix_groups(1729, 32, 1000)
+firsts = {g.split()[0] for g in groups}
+if len(groups) != 32:
+    fail("asked for 32 prefix groups and got %d" % len(groups))
+elif len(set(groups)) != 32:
+    fail("the prefix groups are not distinct: %d unique of 32" % len(set(groups)))
+elif len(firsts) < 5:
+    fail("the groups share a first token (%d distinct openings of 32): prefix-cache "
+         "scoring keys on the leading tokens, so near-identical openings recreate the "
+         "lock-in" % len(firsts))
+elif load.build_prefix_groups(1729, 32, 1000) != groups:
+    fail("the groups are not reproducible from the seed, so the two arms would send "
+         "different traffic")
+else:
+    ok("32 distinct prefix groups, %d distinct openings, reproducible from the seed" % len(firsts))
+
+case("one group reproduces the lock-in, and is the documented degenerate case")
+one = load.build_prefix_groups(1729, 1, 1000)
+if len(one) != 1:
+    fail("--prefix-groups 1 produced %d groups" % len(one))
+else:
+    ok("--prefix-groups 1 is a single shared prefix, the shape that caused the lock-in")
+
+case("a run where one engine did all the work is refused")
+# The guard that was missing entirely. Capacity that is never routed to cannot
+# affect TTFT, so a table built from such a run describes a one-replica fleet.
+one_busy = dict(BASE_META)
+rc = run_report(BASE_META, one_busy,
+                work_a={"pod-a": 1000.0, "pod-b": 900.0, "pod-c": 850.0},
+                work_b={"pod-x": 6000692.0, "pod-y": 0.0, "pod-z": 0.0})
+if rc == 0:
+    fail("the report tabulated an arm in which one engine did every prompt token and "
+         "the other replicas did none")
+else:
+    ok("an arm where only one engine did any work is refused")
+
+case("a run with no per-engine capture is refused")
+if run_report(BASE_META, dict(BASE_META), work_a="omit", work_b="omit") == 0:
+    fail("the report ran with no podwork capture, so nothing established that the load "
+         "reached more than one replica")
+else:
+    ok("a missing per-engine work capture is refused")
+
+case("work spread across replicas is accepted")
+if run_report(BASE_META, dict(BASE_META),
+              work_a={"pod-a": 1000.0, "pod-b": 900.0},
+              work_b={"pod-x": 1000.0, "pod-y": 950.0}) != 0:
+    fail("a run with work spread over two engines was refused; the guard is too tight "
+         "to ever pass")
+else:
+    ok("work spread across replicas is accepted")
 
 case("a missing meta is refused rather than assumed")
 d = tempfile.mkdtemp()

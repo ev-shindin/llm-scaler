@@ -912,6 +912,48 @@ sample_gpus() {
     done
 }
 
+# WHICH REPLICAS ACTUALLY DID THE WORK.
+#
+# Nothing measured this, and it invalidated three runs. Measured on CoreWeave:
+# across a whole arm ONE Qwen replica did 6,000,692 prompt tokens and every
+# other replica the autoscaler added did exactly ZERO -- including a warm-pool
+# Pod that was awake, Ready, in the EndpointSlice and in the EPP's own backend
+# list. Adding capacity cannot improve TTFT when none of it is used, so every
+# number the run produced was about a one-replica fleet.
+#
+# Read from each engine's OWN cumulative counter, before and after, so the delta
+# is the work done during this arm. `vllm:prompt_tokens_total` rather than a
+# request count: it is monotonic, cheap, and present on every engine here.
+capture_pod_work() {
+    local out="$1" pod port
+    : > "$out"
+    for pod in $(k get pods -o json 2>/dev/null | jq -r '
+        .items[] | select(.status.phase=="Running")
+        | select((.metadata.name|test("decode")) or (.metadata.labels["llm-d.ai/warm-pool"] != null))
+        | .metadata.name'); do
+        # A decode engine serves on the port the chart gave it; a pool Pod's warm
+        # engine listens on the supervisor-assigned port. 8200 covers the former,
+        # 9001 the first of the latter -- both are read, and whichever answers is
+        # the engine.
+        for port in 8200 9001; do
+            k exec "$pod" -- python3 -c "
+import re,sys,urllib.request
+try:
+    m=urllib.request.urlopen('http://127.0.0.1:$port/metrics',timeout=10).read().decode()
+except Exception:
+    sys.exit(1)
+tot=0.0
+for l in m.splitlines():
+    if l.startswith('vllm:prompt_tokens_total'):
+        try: tot+=float(l.rsplit(' ',1)[1])
+        except Exception: pass
+print('%s %.0f' % ('$pod', tot))
+" 2>/dev/null >> "$out" && break
+        done
+    done
+    [ -s "$out" ] || warn "could not read per-engine work from any Pod; the distribution guard will not run"
+}
+
 RUN_JOB=""
 RUN_SAMPLER=""
 run_cleanup() {
@@ -985,6 +1027,9 @@ verb_run() {
     [ -s "$out_dir/job.yaml" ] || die "the load Job rendered empty"
     k apply -f "$out_dir/job.yaml" >/dev/null || die "could not create the load Job"
 
+    # The per-engine baseline, BEFORE any load, so the delta is this arm's work.
+    capture_pod_work "$out_dir/podwork.before"
+
     local until_ts=$(( $(date +%s) + total + 300 ))
     sample_gpus "$out_dir/gpus.jsonl" "$until_ts" &
     RUN_SAMPLER=$!
@@ -1021,6 +1066,7 @@ verb_run() {
     trap - INT TERM
     run_cleanup
     RUN_JOB=""
+    capture_pod_work "$out_dir/podwork.after"
     [ -s "$out_dir/requests.jsonl" ] || \
         die "no requests were recorded for arm $arm. See $out_dir/loader.log"
     ok "arm $arm: $(wc -l < "$out_dir/requests.jsonl") requests, $(wc -l < "$out_dir/gpus.jsonl" 2>/dev/null || echo 0) GPU samples in $out_dir"
