@@ -1114,7 +1114,12 @@ sample_gpus() {
         # it early in bash, jq then gets nothing, and every sample comes out
         # empty -- which reads as a namespace holding no accelerators at all.
         [ -n "$want" ] || want='{}'
-        k get pods -o json 2>/dev/null | jq -c --argjson now "$(date +%s)" \
+        # A poll that FAILS must leave a mark. `|| true` on its own made every
+        # failure invisible: one arm lost 587s of a 2310s run to failed polls
+        # and the file simply had no lines for it, which is indistinguishable
+        # from a namespace that held no accelerators. The report then priced
+        # that arm at a fraction of the other's and printed the ratio.
+        if ! k get pods -o json 2>/dev/null | jq -c --argjson now "$(date +%s)" \
             --argjson want "$want" '
           {ts: $now,
            pods: [ .items[]
@@ -1127,7 +1132,9 @@ sample_gpus() {
                 pool:  (.metadata.labels["llm-d.ai/warm-pool"] // ""),
                 serving: (.metadata.labels["llm-d.ai/inferenceServing"] // "")}
              | select(.gpus > 0) ],
-           desired: $want}' >> "$out" 2>/dev/null || true
+           desired: $want}' >> "$out" 2>/dev/null; then
+            printf '{"ts": %s, "failed": true}\n' "$(date +%s)" >> "$out"
+        fi
         sleep "$GPU_SAMPLE_SECONDS"
     done
 }

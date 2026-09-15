@@ -385,7 +385,8 @@ WORK_OK = {"pod-1": 5000.0, "pod-2": 4800.0}
 
 
 def run_report(meta_a, meta_b, rows_a=None, rows_b=None,
-               budget_a=None, budget_b=None, work_a=None, work_b=None):
+               budget_a=None, budget_b=None, work_a=None, work_b=None,
+               gpus_a=None, gpus_b=None):
     """report.main over two fixture directories; returns its exit code."""
     d = tempfile.mkdtemp()
     works = {"nopool": WORK_OK if work_a is None else work_a,
@@ -402,6 +403,11 @@ def run_report(meta_a, meta_b, rows_a=None, rows_b=None,
         if bud != "omit":
             with open(os.path.join(sub, "budget.json"), "w") as fh:
                 json.dump(bud, fh)
+        gp = {"nopool": gpus_a, "pool": gpus_b}[name]
+        if gp:
+            with open(os.path.join(sub, "gpus.jsonl"), "w") as fh:
+                for smp in gp:
+                    fh.write(json.dumps(smp) + chr(10))
         w = works[name]
         if w != "omit":
             # before is empty, so after IS the work done during the arm.
@@ -1098,6 +1104,42 @@ else:
 # `burst_overlap` measures directly and the cases above cover. Drift is
 # still computed and printed, as the diagnostic that says how much band
 # the next run needs.
+case("accelerator sampling with holes in it is refused")
+# Accelerator-seconds are HALF of what this scenario reports -- insurance is a
+# cost claim -- and they are integrated from the sampler, so a hole is priced as
+# whatever the sample before it held. Measured: one arm lost 587s of a 2310s
+# window to failed polls, came out at 1654 accelerator-seconds against the
+# other's 14284, and the report printed "the pool arm spent 763% more" with a
+# footnote about holes rather than refusing.
+dense = [{"ts": 1000 + i * 5, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}
+         for i in range(100)]
+holed = ([{"ts": 1000 + i * 5, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}
+          for i in range(10)]
+         + [{"ts": 1000 + 400 + i * 5, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}
+            for i in range(10)])
+if run_report(BASE_META, dict(BASE_META), gpus_a=holed, gpus_b=dense) == 0:
+    fail("an arm whose accelerator sampling was 70%% holes was priced anyway; the cost "
+         "half of the comparison is what the pool is judged on")
+else:
+    ok("a sampled series with holes is not a measurement of accelerators")
+
+case("a dense series is not flagged")
+if run_report(BASE_META, dict(BASE_META), gpus_a=dense, gpus_b=dense) != 0:
+    fail("two complete accelerator series were refused")
+else:
+    ok("complete sampling raises no coverage complaint")
+
+case("a failed poll is recorded, not skipped")
+mixed = [{"ts": 1000, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]},
+         {"ts": 1005, "failed": True},
+         {"ts": 1010, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}]
+ser = report.gpu_series(gpus_file(mixed), 1000)
+if len(ser) != 2:
+    fail("a failed-poll marker was read as a sample with no accelerators (%d entries); "
+         "it would price the namespace at zero for that interval" % len(ser))
+else:
+    ok("a failed poll is skipped by the integrator, not counted as zero")
+
 case("a run with no measured driver queueing is refused")
 no_qd = dict(BASE_META)
 bare = [dict(r) for r in BASE_ROWS]

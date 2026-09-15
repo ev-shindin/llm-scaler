@@ -172,7 +172,7 @@ def gpu_series(path, t0):
         except ValueError:
             continue
         ts = s.get("ts")
-        if ts is None:
+        if ts is None or s.get("failed"):
             continue
         total = pool = lent = 0
         for p in s.get("pods", []):
@@ -559,7 +559,8 @@ def phase_drift(arm):
     return worst
 
 
-def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0):
+def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0,
+               max_gap=0.05, args_gap_limit=30.0):
     """Everything that makes the two arms comparable. Returns a list of reasons."""
     problems = []
     for arm in (a, b):
@@ -612,6 +613,25 @@ def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0):
                             "replicas hold no accelerator and serve nothing, so this arm "
                             "measured a smaller fleet than it was allowed."
                             % (arm["name"], longest, worst, max_short))
+        # A SAMPLED SERIES WITH HOLES IS NOT A MEASUREMENT. Accelerator-seconds
+        # are half of what this scenario reports -- insurance is a cost claim --
+        # and they are integrated from the sampler, so a hole is silently priced
+        # as whatever the sample before it held. Measured: one arm lost 587s of a
+        # 2310s run to failed polls, came out at 1654 accelerator-seconds against
+        # the other's 14284, and the report printed "the pool arm spent 763% more"
+        # with a note about holes rather than refusing.
+        ser = arm["gpus"]
+        if len(ser) >= 2:
+            span = ser[-1][0] - ser[0][0]
+            _, gapped = integrate(ser, 1, args_gap_limit)
+            arm["coverage_gap"] = (gapped, span)
+            if span > 0 and gapped > max_gap * span:
+                problems.append("the %s arm's accelerator sampling has %.0fs of holes in a "
+                                "%.0fs window (%.0f%%). Accelerator-seconds are integrated "
+                                "from those samples, so a hole is priced as whatever the "
+                                "sample before it held -- and the cost half of this "
+                                "comparison is what the pool is being judged on."
+                                % (arm["name"], gapped, span, 100.0 * gapped / span))
         drift = phase_drift(arm)
         arm["drift"] = drift
         overlap = burst_overlap(arm)
@@ -658,6 +678,9 @@ def main(argv):
                         "study, not a defect")
     p.add_argument("--max-overlap", type=float, default=0.0,
                    help="seconds both models may be bursting at once")
+    p.add_argument("--max-sampling-gap", type=float, default=0.05,
+                   help="fraction of an arm's window that may be missing from the "
+                        "accelerator sampling before its GPU-seconds mean nothing")
     p.add_argument("--gap-limit", type=float, default=30.0,
                    help="a GPU sampling hole longer than this is reported")
     args = p.parse_args(argv)
@@ -676,7 +699,7 @@ def main(argv):
     a, b = arms
 
     problems = admissible(a, b, args.max_queue_delay, args.max_shortfall,
-                          args.max_overlap)
+                          args.max_overlap, args.max_sampling_gap, args.gap_limit)
     if problems:
         print("ERROR: these two arms cannot be compared:", file=sys.stderr)
         for pr in problems:
