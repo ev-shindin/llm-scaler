@@ -413,8 +413,20 @@ def driver_queueing(arm):
 
 
 def shortfall(path):
-    """(samples, short_samples, worst) -- how far an arm fell short of the fleet
-    its own Deployments asked for.
+    """(samples, short_samples, worst, longest_short_seconds).
+
+    How far, and for how long CONTINUOUSLY, an arm fell short of the fleet its
+    own Deployments asked for.
+
+    The duration is what decides, not the fraction. A Deployment is short for as
+    long as a new replica takes to boot, and on a healthy run with four
+    scale-ups that is ~12% of the samples -- which a fraction-based threshold
+    calls starvation. It is the opposite: that gap is the phenomenon this whole
+    scenario exists to measure, and it is exactly what a warm pool bridges.
+    Refusing it would refuse every run where the pool had anything to do.
+
+    What is NOT normal is a gap that never closes. The run this guard was
+    written for stayed short for THIRTY MINUTES.
 
     A Pod that is Pending holds no accelerator and serves nothing, so an arm
     whose Deployments scaled to 3 while one replica ran is measuring a
@@ -429,8 +441,11 @@ def shortfall(path):
     it actually got.
     """
     if not os.path.exists(path):
-        return 0, 0, 0
+        return 0, 0, 0, 0.0
     total = short = worst = 0
+    longest = 0.0
+    run_start = None
+    last_ts = None
     for line in open(path):
         line = line.strip()
         if not line:
@@ -451,10 +466,65 @@ def shortfall(path):
                     running[dep] = running.get(dep, 0) + 1
         gap = sum(max(0, n - running.get(dep, 0)) for dep, n in want.items())
         total += 1
+        ts = s.get("ts")
         if gap > 0:
             short += 1
             worst = max(worst, gap)
-    return total, short, worst
+            if run_start is None:
+                run_start = ts
+            if ts is not None and run_start is not None:
+                longest = max(longest, ts - run_start)
+        else:
+            run_start = None
+        last_ts = ts
+    return total, short, worst, longest
+
+
+def burst_overlap(arm):
+    """Seconds during which BOTH models were at their high rate.
+
+    THE thing an anti-phase run must not contain, measured directly rather than
+    through a proxy. Each model's real wall-clock stage boundaries are
+    reconstructed from its OWN per-stage elapsed times -- the two do not cross a
+    boundary together, because a stage ends when its in-flight requests drain
+    and the bursting model drains slower -- and the high-rate intervals are
+    intersected.
+
+    Cumulative drift was the previous measure and it overstates: measured on one
+    run, 59s of drift but only 32s where the bursts truly overlapped, because
+    part of the divergence is absorbed by the band exactly as intended. What
+    matters is the intersection, not the offset.
+
+    Returns None when the generator reported no per-stage timing.
+    """
+    meta = arm.get("meta") or {}
+    schedule = meta.get("schedule") or []
+    windows = meta.get("windows") or {}
+    spans = {}
+    for role in ("a", "b"):
+        stages = (windows.get(role) or {}).get("stages") or []
+        if len(stages) != len(schedule) or not stages:
+            return None
+        t = 0.0
+        out = []
+        for st, w in zip(schedule, stages):
+            e = w.get("elapsed")
+            if not isinstance(e, (int, float)):
+                return None
+            out.append((t, t + e, st["rate_a"] if role == "a" else st["rate_b"]))
+            t += e
+        spans[role] = out
+    rates = [r for out in spans.values() for _, _, r in out]
+    if not rates:
+        return None
+    high = max(rates)
+    bursts = {role: [(s, e) for s, e, r in spans[role] if r == high]
+              for role in ("a", "b")}
+    total = 0.0
+    for s1, e1 in bursts["a"]:
+        for s2, e2 in bursts["b"]:
+            total += max(0.0, min(e1, e2) - max(s1, s2))
+    return total
 
 
 def phase_drift(arm):
@@ -489,7 +559,7 @@ def phase_drift(arm):
     return worst
 
 
-def admissible(a, b, max_queue_delay, max_short=0.10):
+def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0):
     """Everything that makes the two arms comparable. Returns a list of reasons."""
     problems = []
     for arm in (a, b):
@@ -533,24 +603,27 @@ def admissible(a, b, max_queue_delay, max_short=0.10):
                             "not answers from the models. What is left is the survivors "
                             "of that, not the scenario."
                             % (arm["name"], netfail, issued, 100.0 * netfail / issued))
-        total, short, worst = shortfall(os.path.join(arm["dir"], "gpus.jsonl"))
-        arm["short"] = (total, short, worst)
-        if total and short > max_short * total:
-            problems.append("the %s arm spent %.0f%% of the run SHORT of the fleet its own "
-                            "Deployments asked for -- up to %d replica(s) Pending at once. "
-                            "Pending replicas hold no accelerator and serve nothing, so this "
-                            "arm measured a smaller fleet than it was allowed, and the other "
-                            "arm did not."
-                            % (arm["name"], 100.0 * short / total, worst))
+        total, short, worst, longest = shortfall(os.path.join(arm["dir"], "gpus.jsonl"))
+        arm["short"] = (total, short, worst, longest)
+        if longest > max_short:
+            problems.append("the %s arm went %.0fs CONTINUOUSLY short of the fleet its own "
+                            "Deployments asked for -- up to %d replica(s) Pending at once, "
+                            "against a %.0fs allowance for a replica to boot. Pending "
+                            "replicas hold no accelerator and serve nothing, so this arm "
+                            "measured a smaller fleet than it was allowed."
+                            % (arm["name"], longest, worst, max_short))
         drift = phase_drift(arm)
         arm["drift"] = drift
-        band = m.get("overlap_seconds")
-        if drift is not None and band is not None and drift > band:
-            problems.append("the %s arm's two models drifted %.0fs apart, more than the "
-                            "%ds band between bursts: for %.0fs of it BOTH models were "
-                            "bursting, which is the one thing an anti-phase run must not "
-                            "contain. Raise OVERLAP_SECONDS."
-                            % (arm["name"], drift, band, drift - band))
+        overlap = burst_overlap(arm)
+        arm["overlap"] = overlap
+        if overlap is not None and overlap > max_overlap:
+            problems.append("in the %s arm BOTH models were bursting at once for %.0fs "
+                            "(limit %.0fs). One pool covering many models is the claim "
+                            "under test, and it rests on their peaks not coinciding -- a "
+                            "pool asked for two models at once can serve one, and would "
+                            "be recorded as failing. Raise OVERLAP_SECONDS above the "
+                            "%.0fs the two ladders drifted apart."
+                            % (arm["name"], overlap, max_overlap, drift or 0.0))
         qd = driver_queueing(arm)
         arm["queue_p95"] = qd
         if qd is None:
@@ -578,9 +651,13 @@ def main(argv):
     p.add_argument("--model-b", default="B")
     p.add_argument("--max-queue-delay", type=float, default=0.25,
                    help="p95 driver queueing above which the arms are not comparable")
-    p.add_argument("--max-shortfall", type=float, default=0.10,
-                   help="fraction of the run an arm may spend with replicas Pending "
-                        "before it is no longer the fleet it was allowed")
+    p.add_argument("--max-shortfall", type=float, default=300.0,
+                   help="seconds an arm may go CONTINUOUSLY short of the fleet its "
+                        "Deployments asked for. A scale-up is short for as long as the "
+                        "new replica takes to boot -- that gap is the phenomenon under "
+                        "study, not a defect")
+    p.add_argument("--max-overlap", type=float, default=0.0,
+                   help="seconds both models may be bursting at once")
     p.add_argument("--gap-limit", type=float, default=30.0,
                    help="a GPU sampling hole longer than this is reported")
     args = p.parse_args(argv)
@@ -598,7 +675,8 @@ def main(argv):
         })
     a, b = arms
 
-    problems = admissible(a, b, args.max_queue_delay, args.max_shortfall)
+    problems = admissible(a, b, args.max_queue_delay, args.max_shortfall,
+                          args.max_overlap)
     if problems:
         print("ERROR: these two arms cannot be compared:", file=sys.stderr)
         for pr in problems:
@@ -623,12 +701,17 @@ def main(argv):
     print("- driver queueing (p95): nopool %s ms, pool %s ms"
           % (fmt_ms(a["queue_p95"]), fmt_ms(b["queue_p95"])))
     for arm in (a, b):
-        tot, sh, wst = arm.get("short", (0, 0, 0))
+        tot, sh, wst, lng = arm.get("short", (0, 0, 0, 0.0))
         if tot:
-            print("- %s: %.0f%% of samples short of the requested fleet%s"
-                  % (arm["name"], 100.0 * sh / tot,
+            print("- %s: short of the requested fleet in %.0f%% of samples, longest "
+                  "continuous stretch %.0fs%s -- a scale-up is short until the new "
+                  "replica boots, which is the gap a pool exists to bridge"
+                  % (arm["name"], 100.0 * sh / tot, lng,
                      " (up to %d Pending)" % wst if wst else ""))
     band = (a["meta"] or {}).get("overlap_seconds")
+    for arm in (a, b):
+        if arm.get("overlap") is not None:
+            print("- %s: both models bursting at once for %.0fs" % (arm["name"], arm["overlap"]))
     print("- the two models drifted at most %s apart, against a %s band of both-low "
           "between bursts (a stage ends when its requests drain, and the bursting "
           "model drains slower)"

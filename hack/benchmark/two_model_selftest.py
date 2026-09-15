@@ -970,7 +970,7 @@ def sample(running_a, running_b, want_a, want_b):
 
 
 case("an arm short of its requested fleet is measured, not assumed fine")
-tot, short, worst = report.shortfall(gpus_file([sample(1, 1, 3, 3)] * 10))
+tot, short, worst, _ = report.shortfall(gpus_file([sample(1, 1, 3, 3)] * 10))
 if (tot, short, worst) != (10, 10, 4):
     fail("shortfall reported %s, expected all 10 samples short with a worst gap of 4. "
          "A Pending replica holds no accelerator and serves nothing, so an arm whose "
@@ -980,7 +980,7 @@ else:
     ok("a fleet short of what its Deployments asked for is counted, per sample")
 
 case("an arm that got its fleet is not flagged")
-tot, short, _ = report.shortfall(gpus_file([sample(3, 3, 3, 3)] * 10))
+tot, short, _, _ = report.shortfall(gpus_file([sample(3, 3, 3, 3)] * 10))
 if short:
     fail("%d of %d samples were called short while every requested replica was running"
          % (short, tot))
@@ -990,7 +990,7 @@ else:
 case("the pool's own Pods are not counted toward a model's fleet")
 s = sample(1, 1, 3, 3)
 s["pods"] += [{"name": "wva-warm-pool-x", "gpus": 1, "pool": "twomodel"}]
-tot, short, worst = report.shortfall(gpus_file([s]))
+tot, short, worst, _ = report.shortfall(gpus_file([s]))
 if worst != 4:
     fail("a lent pool Pod was counted as one of the model's own replicas (worst gap %d, "
          "expected 4). The pool is the thing being measured; counting it as the fleet "
@@ -1002,10 +1002,84 @@ case("samples without the field are not a shortfall")
 # Stored runs predate it. Reporting 100% short on those would refuse every
 # archived arm rather than say the measurement is absent.
 old = [{"ts": 0, "pods": [{"name": "dep-a-0", "gpus": 1, "pool": ""}]}]
-if report.shortfall(gpus_file(old)) != (0, 0, 0):
+if report.shortfall(gpus_file(old)) != (0, 0, 0, 0.0):
     fail("samples with no `desired` field were treated as a shortfall")
 else:
     ok("a run recorded before the field existed reports no shortfall")
+
+case("burst overlap is measured directly, not inferred from drift")
+# The two models' REAL wall-clock boundaries come from their own per-stage
+# elapsed times, and what matters is whether their high-rate intervals
+# intersect. Cumulative drift overstates it: measured on a real run, 59s of
+# drift but only 32s where the bursts truly overlapped, because the band
+# absorbed the rest exactly as intended.
+lapped = {"schedule": [{"start": 0, "end": 100, "rate_a": 9, "rate_b": 3},
+                       {"start": 100, "end": 200, "rate_a": 3, "rate_b": 9}],
+          "windows": {"a": {"stages": [{"elapsed": 100.0}, {"elapsed": 100.0}]},
+                      "b": {"stages": [{"elapsed": 130.0}, {"elapsed": 100.0}]}}}
+# A bursts 0-100; B's low stage runs 0-130 and its burst 130-230, so they do
+# NOT intersect -- B is merely late.
+ov = report.burst_overlap({"meta": lapped})
+if ov is None:
+    fail("burst overlap could not be computed from per-stage elapsed times")
+elif ov != 0:
+    fail("reported %.0fs of overlap where the two bursts do not intersect at all; "
+         "drift is not overlap" % ov)
+else:
+    ok("a model running late is not a model bursting at the same time as the other")
+
+case("bursts that really do intersect are measured")
+crossed = {"schedule": [{"start": 0, "end": 100, "rate_a": 3, "rate_b": 9},
+                        {"start": 100, "end": 200, "rate_a": 9, "rate_b": 3}],
+           "windows": {"a": {"stages": [{"elapsed": 80.0}, {"elapsed": 100.0}]},
+                       "b": {"stages": [{"elapsed": 100.0}, {"elapsed": 100.0}]}}}
+# A's burst starts at 80; B's burst runs 0-100. They overlap for 20s.
+ov = report.burst_overlap({"meta": crossed})
+if ov is None or abs(ov - 20.0) > 1e-9:
+    fail("overlap came out as %s, not the 20s the two bursts share. A pool asked for "
+         "two models at once can serve one, and would be recorded as failing" % ov)
+else:
+    ok("simultaneous bursts are counted, to the second")
+
+case("an arm whose bursts overlapped is refused")
+bad = dict(BASE_META)
+bad.update(crossed)
+bad["overlap_seconds"] = 90
+if run_report(BASE_META, bad) == 0:
+    fail("an arm where both models burst at once for 20s was compared; the scenario's "
+         "whole premise is that their peaks do not coincide")
+else:
+    ok("overlapping bursts void the arm")
+
+case("a SCALE-UP is not a shortfall")
+# A healthy run with four scale-ups is short for as long as each new replica
+# takes to boot -- ~12% of samples, measured. A fraction-based threshold called
+# that starvation, which would refuse every run where the pool had work to do.
+# What is not normal is a gap that never closes: the run this guard was written
+# for stayed short for thirty minutes.
+brief = []
+for i in range(40):
+    running = 1 if 10 <= i < 16 else 3          # short for 6 samples of 40
+    brief.append({"ts": i * 10, "pods": [{"name": "dep-a-%d" % k, "gpus": 1, "pool": ""}
+                                         for k in range(running)],
+                  "desired": {"dep-a": 3}})
+tot, sh, worst, longest = report.shortfall(gpus_file(brief))
+if longest > 300:
+    fail("a 60s scale-up gap was measured as %.0fs continuous" % longest)
+elif sh == 0:
+    fail("the scale-up gap was not noticed at all")
+else:
+    ok("a %ds scale-up gap is recorded (%d/%d samples) and is under the allowance"
+       % (longest, sh, tot))
+
+case("a gap that never closes is refused")
+stuck = [{"ts": i * 10, "pods": [{"name": "dep-a-0", "gpus": 1, "pool": ""}],
+          "desired": {"dep-a": 3}} for i in range(100)]
+_, _, _, longest = report.shortfall(gpus_file(stuck))
+if longest < 900:
+    fail("a fleet short for the whole run measured only %.0fs continuous" % longest)
+else:
+    ok("a fleet that never gets its replicas is %ds continuously short" % longest)
 
 case("drift is measured from the generator's own per-stage elapsed time")
 drifted = {"windows": {
@@ -1019,27 +1093,11 @@ if d is None or abs(d - 20.0) > 1e-9:
 else:
     ok("drift is the worst cumulative divergence, not the last one")
 
-case("drift wider than the band is refused")
-wide = dict(BASE_META)
-wide["overlap_seconds"] = 5
-wide["windows"] = drifted["windows"]
-if run_report(BASE_META, wide) == 0:
-    fail("the two models drifted 20s apart with only a 5s band between bursts, so for "
-         "15s BOTH were bursting -- the one thing an anti-phase run must not contain, "
-         "and a pool asked for two models at once can serve one")
-else:
-    ok("drift the band cannot absorb is refused")
-
-case("drift inside the band is fine")
-narrow = dict(BASE_META)
-narrow["overlap_seconds"] = 30
-narrow["windows"] = drifted["windows"]
-if run_report(BASE_META, narrow) != 0:
-    fail("a 20s drift against a 30s band was refused; the band exists precisely to "
-         "absorb that")
-else:
-    ok("drift the band absorbs does not void the run")
-
+# The drift-vs-band refusal is gone: drift is a PROXY and it overstates.
+# What voids a run is the bursts actually intersecting, which
+# `burst_overlap` measures directly and the cases above cover. Drift is
+# still computed and printed, as the diagnostic that says how much band
+# the next run needs.
 case("a run with no measured driver queueing is refused")
 no_qd = dict(BASE_META)
 bare = [dict(r) for r in BASE_ROWS]

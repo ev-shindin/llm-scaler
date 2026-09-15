@@ -281,7 +281,7 @@ def build_parser():
     p.add_argument("--high-rps", type=float, default=9)
     p.add_argument("--input-tokens", type=int, default=1000)
     p.add_argument("--output-tokens", type=int, default=500)
-    p.add_argument("--overlap", type=int, default=30,
+    p.add_argument("--overlap", type=int, default=90,
                    help="seconds of BOTH models at the low rate between phases, "
                         "so their bursts cannot run into each other when the two "
                         "drain at different speeds")

@@ -115,7 +115,11 @@ PREFIX_GROUPS="${PREFIX_GROUPS:-32}"
 # Must be shorter than PHASE_SECONDS or the phase is not cut at all and every
 # scale-up is averaged into eight minutes of steady state.
 RISE_WINDOW="${RISE_WINDOW:-90}"
-# Seconds of BOTH models at the low rate between consecutive bursts. A stage
+# Seconds of BOTH models at the low rate between consecutive bursts. 90, sized
+# from measurement: at 30 the two ladders drifted 59s apart over a 2130s run and
+# the bursts genuinely overlapped for 32s. The drift ACCUMULATES -- it does not
+# reset at a boundary -- so the band has to clear the whole run's divergence,
+# not one stage's. A stage
 # ends when its in-flight requests drain and the BURSTING model drains slower,
 # so the two models do not cross a boundary together -- measured on CoreWeave,
 # per-stage drains of 4-16s and a net divergence that reached 6.1s and changed
@@ -123,7 +127,7 @@ RISE_WINDOW="${RISE_WINDOW:-90}"
 # burst at once, which a pool can only half serve, and it would be recorded as
 # the pool failing at the thing this scenario measures. The report refuses a run
 # whose measured divergence exceeds this band.
-OVERLAP_SECONDS="${OVERLAP_SECONDS:-30}"
+OVERLAP_SECONDS="${OVERLAP_SECONDS:-90}"
 # Seconds between creating the load Job and the instant both containers start
 # their ladders. It has to cover the image pull and the two tokenizer
 # downloads; each container reports whether it made it, and the driver refuses
