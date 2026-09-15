@@ -258,7 +258,7 @@ with tempfile.TemporaryDirectory() as d:
 case("a torn stream is a failure, not a fast success")
 rows = [
     {"model": "a", "t_sched": 1.0, "ttft": 0.1, "error": None, "tokens": 200},
-    {"model": "a", "t_sched": 2.0, "ttft": 0.1, "error": "truncated 3/200", "tokens": 3},
+    {"model": "a", "t_sched": 2.0, "ttft": 0.1, "error": "torn after 3 frames", "tokens": 3},
     {"model": "a", "t_sched": 3.0, "ttft": None, "error": "deadline", "tokens": 0},
 ]
 s = report.summarize(rows, "a")

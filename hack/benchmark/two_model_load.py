@@ -306,11 +306,20 @@ def one_request(rec, model_key, base_url, model_id, prompt, max_tokens,
         if row["error"] is None:
             if row["ttft"] is None:
                 row["error"] = "no token"
-            elif not row["done"] or row["tokens"] < max_tokens:
-                # A TORN stream: a real TTFT and a short body. Counted as a
-                # success it would let a saturating arm shed its worst requests
-                # into a footnote while its percentiles improved.
-                row["error"] = "truncated %d/%d" % (row["tokens"], max_tokens)
+            elif not row["done"]:
+                # A TORN stream: a real TTFT and a body that stopped without the
+                # server ever saying it was finished. Counted as a success it
+                # would let a saturating arm shed its worst requests into a
+                # footnote while its percentiles improved.
+                #
+                # The test is the explicit [DONE], NOT the chunk count. `tokens`
+                # counts SSE frames carrying text, and a frame can carry more
+                # than one token: measured, 3,689 of 23,573 responses arrived
+                # with 497-499 frames for 500 tokens, every one of them with
+                # [DONE] and HTTP 200. Comparing frames against max_tokens
+                # marked 16% of a healthy run as torn and dropped them from
+                # every percentile.
+                row["error"] = "torn after %d frames" % row["tokens"]
         if conn is not None:
             try:
                 conn.close()
