@@ -97,28 +97,23 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 	// A non-disaggregated fleet has no prefill role, so this is the full set.
 	generating := generatingReplicas(input)
 
-	lambda := input.ArrivalRate
-	if lambda <= 0 {
-		// The EPP is the only source of a model-level arrival rate. Without it,
-		// fall back to what the engines completed: at steady state a queue that
-		// is neither growing nor shrinking makes completion rate equal arrival
-		// rate. That equality fails exactly when a queue is building, and
-		// completions are then capped by capacity — so this understates λ
-		// precisely when demand is highest.
-		//
-		// Tolerable because a building queue is the case OCCUPANCY reads well,
-		// so the floor is not what carries that decision. That reasoning needs
-		// the queue term to exist, though: with flow control disabled AND the
-		// EPP absent, occupancy has no queue component either and both signals
-		// understate together. Nothing here detects that combination.
-		//
-		// Summed over the generating replicas only. A P/D request completes on
-		// its prefill replica AND on its decode replica, so summing every
-		// replica's completion rate counts each request twice.
-		for _, rm := range generating {
-			lambda += rm.RequestRate
-		}
-	}
+	// The EPP is the only source of a model-level arrival rate. Without it,
+	// offeredArrivalRate falls back to what the engines completed: at steady
+	// state a queue that is neither growing nor shrinking makes completion
+	// rate equal arrival rate. That equality fails exactly when a queue is
+	// building, and completions are then capped by capacity — so this
+	// understates λ precisely when demand is highest.
+	//
+	// Tolerable because a building queue is the case OCCUPANCY reads well,
+	// so the floor is not what carries that decision. That reasoning needs
+	// the queue term to exist, though: with flow control disabled AND the
+	// EPP absent, occupancy has no queue component either and both signals
+	// understate together. Nothing here detects that combination.
+	//
+	// The fallback sums the generating replicas only. A P/D request completes
+	// on its prefill replica AND on its decode replica, so summing every
+	// replica's completion rate counts each request twice.
+	lambda := offeredArrivalRate(input)
 	if lambda <= 0 {
 		return arrivalFloor{Reason: "no arrival rate (EPP absent and no completions)"}
 	}

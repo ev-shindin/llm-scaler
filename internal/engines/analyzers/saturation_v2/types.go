@@ -64,6 +64,12 @@ type ReplicaCapacity struct {
 	// aggregation can put its demand in and keep its capacity out. See
 	// domain.ReplicaMetrics.FromWarmPool.
 	FromWarmPool bool
+
+	// SaturatedThroughput is the completion rate (requests/s) one replica of
+	// this bucket sustains when its queue is saturated, from the history
+	// recorded beside k2; 0 when no saturation has been observed for the
+	// bucket. Read by the throughput floor (throughput_floor.go).
+	SaturatedThroughput float64
 }
 
 // classifyOutputLength returns a workload bucket name based on average

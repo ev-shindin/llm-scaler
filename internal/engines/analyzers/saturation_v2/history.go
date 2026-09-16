@@ -46,6 +46,20 @@ func (r *rollingAverage) Len() int {
 	return len(r.values)
 }
 
+// Max returns the largest stored value, or 0 if empty. The saturated
+// throughput window reads this rather than Average: see
+// recordSaturatedThroughput for why a completion rate under saturation can
+// only under-read.
+func (r *rollingAverage) Max() float64 {
+	var m float64
+	for _, v := range r.values {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
 // Stale reports whether nothing has been added within the timeout.
 //
 // EvictStaleHistory sweeps whole entries on the same measure, but it has no

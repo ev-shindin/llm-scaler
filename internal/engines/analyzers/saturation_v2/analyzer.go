@@ -57,7 +57,14 @@ type SaturationAnalyzer struct {
 	// coarse -- and still strictly better than alternating between a real estimate
 	// and k1 every time a replica lands elsewhere.
 	lastAccelerator map[string]acceleratorMemo
-	capacityStore   *CapacityKnowledgeStore
+	// saturatedThroughput stores rolling averages of the per-replica completion
+	// rate (requests/s) observed while the replica's queue was saturated, keyed
+	// exactly like computeCapacityHistory. It is what the throughput floor
+	// (throughput_floor.go) divides the arrival rate by: k2 says how much KV a
+	// saturated replica HOLDS, this says how fast it COMPLETES, and only the
+	// latter tells how many replicas a given arrival rate needs.
+	saturatedThroughput map[string]*rollingAverage
+	capacityStore       *CapacityKnowledgeStore
 }
 
 // acceleratorMemo is the last accelerator that resolved for a variant, with the
@@ -74,6 +81,7 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore) *SaturationAnalyzer {
 	return &SaturationAnalyzer{
 		computeCapacityHistory: make(map[string]*rollingAverage),
 		lastAccelerator:        make(map[string]acceleratorMemo),
+		saturatedThroughput:    make(map[string]*rollingAverage),
 		capacityStore:          store,
 	}
 }
@@ -107,6 +115,13 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	for key, memo := range a.lastAccelerator {
 		if time.Since(memo.lastUsed) > timeout {
 			delete(a.lastAccelerator, key)
+		}
+	}
+	// The saturated-throughput windows live and die with the k2 windows they
+	// were recorded beside: same key, same observation, same timeout.
+	for key, ra := range a.saturatedThroughput {
+		if time.Since(ra.lastUpdated) > timeout {
+			delete(a.saturatedThroughput, key)
 		}
 	}
 	return evicted
@@ -233,6 +248,17 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 			"modelID", input.ModelID, "namespace", input.Namespace, "reason", floor.Reason)
 	}
 
+	// Floor it again at what the load requires in THROUGHPUT
+	// (throughput_floor.go). The floor above prices the load at the service
+	// time of the moment, which shrinks with the fleet -- measured 2.0s at six
+	// replicas against 26-52s at one, same load, same shape -- so it cannot
+	// hold a fleet that has just caught up. This one divides the arrival rate
+	// by what a saturated replica of each role was seen to complete, which
+	// does not move when replicas are added. Applied last so it sits on top of
+	// whatever the arrival floor already raised; both only ever raise.
+	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
+		totalDemand, roleDemand, logger)
+
 	result := &domain.AnalyzerResult{
 		AnalyzerName:      a.Name(),
 		ModelID:           input.ModelID,
@@ -282,9 +308,11 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	if rec := a.capacityStore.Get(namespace, modelID, rm.VariantName); rec != nil {
 		engineParams = rec.EngineParams
 	}
+	historyKey := a.historyKey(modelID, namespace, rm.VariantName, accelerator, gpuCount, role,
+		rm.AvgOutputTokens, config.QueueLengthThreshold)
 	k2, k2Priority := a.computeK2(
-		modelID, namespace, rm.VariantName, accelerator,
-		gpuCount,
+		historyKey,
+		modelID, namespace, rm.VariantName,
 		rm.QueueLength, rm.TokensInUse,
 		rm.AvgOutputTokens, rm.AvgInputTokens,
 		config.QueueLengthThreshold,
@@ -294,6 +322,21 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		role,
 		logger,
 	)
+	// The same saturated moment that yields a k2 observation yields the
+	// replica's saturated THROUGHPUT: with the queue over the threshold the
+	// engine is completing requests as fast as it can, so its completion rate
+	// in that window is what one replica can sustain for this shape. Recorded
+	// under the same key, and read back below for the throughput floor.
+	//
+	// Ready pods only. A pod that is still failing its readiness probe can
+	// report completions -- the collector drops its timing for exactly that
+	// reason (replica_metrics.go) but leaves its completion rate, which other
+	// consumers sum as real work. A per-replica RATE from such a pod is not a
+	// capacity, and the floor divides by it.
+	if k2Priority == k2SrcObserved && rm.Ready {
+		a.recordSaturatedThroughput(historyKey, rm.RequestRate)
+	}
+	saturatedThroughput := a.saturatedThroughputFor(historyKey)
 
 	effectiveCapacity := k1
 	bound := "k1-memory"
@@ -313,7 +356,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		"k1MemoryBound", k1, "k2ComputeBound", k2, "k2Source", k2Labels[k2Priority],
 		"effectiveCapacity", effectiveCapacity, "boundBy", bound,
 		"tokensInUse", rm.TokensInUse, "localQueueDemand", localQueueDemand, "replicaDemand", replicaDemand,
-		"queueLength", rm.QueueLength, "queueThreshold", config.QueueLengthThreshold)
+		"queueLength", rm.QueueLength, "queueThreshold", config.QueueLengthThreshold,
+		"saturatedThroughput", saturatedThroughput)
 
 	// Update capacity store with live data, preserving EngineParams from any
 	// existing record (parsed from deployment args and needed for FindCompatible).
@@ -344,6 +388,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		EffectiveCapacity:     effectiveCapacity,
 		ReplicaDemand:         replicaDemand,
 		FromWarmPool:          rm.FromWarmPool,
+		SaturatedThroughput:   saturatedThroughput,
 	}
 }
 
@@ -435,15 +480,49 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 	}
 }
 
+// historyKey is the bucket a replica's saturated observations (k2, and the
+// throughput recorded beside it) are stored and read under.
+//
+// Scoped by role, not just model/accelerator/bucket: prefill's own
+// avgOutputTokens is always ~0-1 (it hands off to decode before
+// generating anything), so it always lands in the "short" bucket -- the
+// same bucket a cold/fresh decode replica lands in before it's served
+// real traffic. Without the role in the key, one role's P1-obs seeds
+// history the other role then reads back via P2-hist, silently reusing
+// an unrelated role's occupancy reading as its own capacity estimate.
+//
+// The queue threshold is in the key because it DEFINES what a P1 observation
+// means: k2 is recorded as the occupancy seen when the queue was considered
+// saturated, so a reading taken at threshold 2 is not a capacity estimate at
+// threshold 100. Nothing else invalidates history -- EvictStaleHistory is
+// age-based and knows nothing about policy -- so without this an operator
+// retuning queueLengthThreshold keeps being sized by observations recorded
+// under the old one. Measured: a k2 of 2 learned under a low threshold kept
+// a variant at utilization 1.0 under a threshold of 100, where P1 could not
+// fire at all.
+func (a *SaturationAnalyzer) historyKey(
+	modelID, namespace, variantName, accelerator string,
+	gpuCount int,
+	role string,
+	avgOutput float64,
+	queueThreshold float64,
+) string {
+	return fmt.Sprintf("%s|%s|%d|%s|%s|q%g",
+		modelID, a.stableAccelerator(namespace, variantName, accelerator),
+		gpuCount, canonicalRole(role), classifyOutputLength(avgOutput), queueThreshold)
+}
+
 // computeK2 determines the compute-bound capacity using a priority chain:
 // 1. Observed (queue saturated) → use tokensInUse as k2
 // 2. Historical → rolling average from previous observations
 // 3. Derived (from deployment args) → formula-based estimate
 // 4. Fallback → k1 (memory-bound only)
 // Returns the k2 value and the priority level (1–4) that produced it.
+// historyKey is the replica's bucket from historyKey(); modelID, namespace
+// and variantName are for the log lines only.
 func (a *SaturationAnalyzer) computeK2(
-	modelID, namespace, variantName, accelerator string,
-	gpuCount int,
+	historyKey string,
+	modelID, namespace, variantName string,
 	queueLen int, tokensInUse int64,
 	avgOutput, avgInput float64,
 	queueThreshold float64,
@@ -453,28 +532,6 @@ func (a *SaturationAnalyzer) computeK2(
 	role string,
 	logger logr.Logger,
 ) (int64, k2Source) {
-	outputBucket := classifyOutputLength(avgOutput)
-	// Scoped by role, not just model/accelerator/bucket: prefill's own
-	// avgOutputTokens is always ~0-1 (it hands off to decode before
-	// generating anything), so it always lands in the "short" bucket -- the
-	// same bucket a cold/fresh decode replica lands in before it's served
-	// real traffic. Without the role in the key, one role's P1-obs seeds
-	// history the other role then reads back via P2-hist, silently reusing
-	// an unrelated role's occupancy reading as its own capacity estimate.
-	//
-	// The queue threshold is in the key because it DEFINES what a P1 observation
-	// means: k2 is recorded as the occupancy seen when the queue was considered
-	// saturated, so a reading taken at threshold 2 is not a capacity estimate at
-	// threshold 100. Nothing else invalidates history -- EvictStaleHistory is
-	// age-based and knows nothing about policy -- so without this an operator
-	// retuning queueLengthThreshold keeps being sized by observations recorded
-	// under the old one. Measured: a k2 of 2 learned under a low threshold kept
-	// a variant at utilization 1.0 under a threshold of 100, where P1 could not
-	// fire at all.
-	historyKey := fmt.Sprintf("%s|%s|%d|%s|%s|q%g",
-		modelID, a.stableAccelerator(namespace, variantName, accelerator),
-		gpuCount, canonicalRole(role), outputBucket, queueThreshold)
-
 	// Priority 1: Observed (queue saturated)
 	//
 	// A reading above the KV cache's PHYSICAL ceiling is a scrape artifact
