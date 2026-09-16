@@ -444,6 +444,9 @@ make benchmark-two-model-status      # confirm nothing still holds an accelerato
 
 ## Reading the result
 
+A complete three-arm run, with its tables and plots, is on the well-lit path:
+[What a warm pool buys, measured](../../well-lit-paths/warm-pool-bridge/measured.md).
+
 **TTFT over the whole run** is the least interesting. Most of a run is steady
 state, where the pool does nothing but hold accelerators.
 
