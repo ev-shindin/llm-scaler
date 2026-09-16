@@ -3,6 +3,7 @@ package saturation_v2
 import (
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/go-logr/logr"
 
@@ -107,15 +108,94 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 }
 
 // saturatedThroughputFor returns the saturated completion rate on record for
-// key, or 0 when saturation has never been observed for the bucket.
-func (a *SaturationAnalyzer) saturatedThroughputFor(key string) float64 {
+// key, and the bucket it came from. When the key's own bucket has no reading
+// it borrows the nearest output-length bucket's under the same key prefix
+// (see nearestSaturatedThroughput); the returned bucket names which, so the
+// log can say the figure is borrowed. Returns 0 and "" when no bucket has one.
+func (a *SaturationAnalyzer) saturatedThroughputFor(key string) (float64, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	ra, ok := a.saturatedThroughput[key]
-	if !ok {
-		return 0
+	if ra, ok := a.saturatedThroughput[key]; ok {
+		return ra.Max(), bucketOf(key)
 	}
-	return ra.Max()
+	return a.nearestSaturatedThroughput(key)
+}
+
+// nearestSaturatedThroughput finds the reading in the output-length bucket
+// closest to key's, on the same model, accelerator, GPU count, role and queue
+// threshold. Caller holds a.mu.
+//
+// A shape the fleet has not yet been seen saturated under has no throughput
+// of its own, and without this the floor would simply vanish on the first
+// cycle of a new shape -- which is the moment a floor is for. Measured on the
+// shape-swap benchmark: the switch from 1000 to 4000 output tokens landed in
+// an empty bucket, occupancy read 400k at three replicas, and the target went
+// from 3 towards 1 in one cycle, where the shared bucket it replaced would
+// at least have held two.
+//
+// The neighbour's figure is wrong in a known direction. Throughput falls with
+// output length, so a shorter shape's mu is too high and holds too few
+// replicas (the fleet then saturates and learns its own, exactly once); a
+// longer shape's mu is too low and holds too many, which the cap bounds at
+// the fleet's own size. Either is better than no floor. The borrowed figure
+// is used only until the bucket has a reading of its own: a fresh window
+// takes over the first cycle it exists, so it is never masked by the
+// neighbour's max.
+//
+// Ties between an equally distant shorter and longer bucket go to the shorter
+// one -- the under-hold, which occupancy corrects, rather than the over-hold,
+// which only the cap does.
+func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, string) {
+	prefix, bucket, suffix, ok := splitHistoryKey(key)
+	if !ok {
+		return 0, ""
+	}
+	own := -1
+	for i, b := range outputBuckets {
+		if b == bucket {
+			own = i
+		}
+	}
+	if own < 0 {
+		return 0, ""
+	}
+	for dist := 1; dist < len(outputBuckets); dist++ {
+		for _, i := range []int{own - dist, own + dist} {
+			if i < 0 || i >= len(outputBuckets) {
+				continue
+			}
+			if ra, found := a.saturatedThroughput[prefix+outputBuckets[i]+suffix]; found {
+				return ra.Max(), outputBuckets[i]
+			}
+		}
+	}
+	return 0, ""
+}
+
+// splitHistoryKey takes a key of the form built by historyKey --
+// model|accelerator|gpus|role|bucket|qN -- apart around its bucket. The
+// model ID may itself contain "|"-free "/" and other characters but never
+// "|", so counting from the right is safe: the bucket is the second-to-last
+// field.
+func splitHistoryKey(key string) (prefix, bucket, suffix string, ok bool) {
+	last := strings.LastIndexByte(key, '|')
+	if last < 0 {
+		return "", "", "", false
+	}
+	prev := strings.LastIndexByte(key[:last], '|')
+	if prev < 0 {
+		return "", "", "", false
+	}
+	return key[:prev+1], key[prev+1 : last], key[last:], true
+}
+
+// bucketOf returns the output-length bucket a history key was built with.
+func bucketOf(key string) string {
+	_, bucket, _, ok := splitHistoryKey(key)
+	if !ok {
+		return ""
+	}
+	return bucket
 }
 
 // estimateThroughputDemand computes the per-role floor from lambda and the

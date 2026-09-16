@@ -72,6 +72,11 @@ type ReplicaCapacity struct {
 	SaturatedThroughput float64
 }
 
+// outputBuckets lists the output-length buckets in ascending order of length.
+// The order is what the throughput floor walks when a bucket has no reading
+// of its own (see nearestSaturatedThroughput).
+var outputBuckets = []string{"short", "medium", "long", "xlong", "xxlong", "huge"}
+
 // classifyOutputLength returns a workload bucket name based on average
 // output token length. The buckets are used to key compute-capacity (k2)
 // history, since k2 depends heavily on generation length.

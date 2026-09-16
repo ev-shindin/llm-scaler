@@ -308,7 +308,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	if k2Priority == k2SrcObserved && rm.Ready && !rm.FromWarmPool {
 		a.recordSaturatedThroughput(historyKey, rm.RequestRate)
 	}
-	saturatedThroughput := a.saturatedThroughputFor(historyKey)
+	saturatedThroughput, throughputBucket := a.saturatedThroughputFor(historyKey)
 
 	effectiveCapacity := k1
 	bound := "k1-memory"
@@ -329,7 +329,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		"effectiveCapacity", effectiveCapacity, "boundBy", bound,
 		"tokensInUse", rm.TokensInUse, "localQueueDemand", localQueueDemand, "replicaDemand", replicaDemand,
 		"queueLength", rm.QueueLength, "queueThreshold", config.QueueLengthThreshold,
-		"saturatedThroughput", saturatedThroughput)
+		"saturatedThroughput", saturatedThroughput, "saturatedThroughputBucket", throughputBucket)
 
 	// Update capacity store with live data, preserving EngineParams from any
 	// existing record (parsed from deployment args and needed for FindCompatible).

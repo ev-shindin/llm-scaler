@@ -120,11 +120,53 @@ var _ = Describe("the saturated-throughput window", func() {
 		// pressure with preemptions. The mean would be 4.07 and imply 1.47
 		// replicas; the replica was demonstrably completing 5.4.
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-		a.recordSaturatedThroughput("k", 5.4)
-		a.recordSaturatedThroughput("k", 3.3)
-		a.recordSaturatedThroughput("k", 3.5)
-		Expect(a.saturatedThroughputFor("k")).To(Equal(5.4))
-		Expect(a.saturatedThroughputFor("other")).To(BeZero())
+		k := "m|H200|1|decode|long|q5"
+		a.recordSaturatedThroughput(k, 5.4)
+		a.recordSaturatedThroughput(k, 3.3)
+		a.recordSaturatedThroughput(k, 3.5)
+		mu, bucket := a.saturatedThroughputFor(k)
+		Expect(mu).To(Equal(5.4))
+		Expect(bucket).To(Equal("long"))
+		mu, bucket = a.saturatedThroughputFor("other|H200|1|decode|long|q5")
+		Expect(mu).To(BeZero())
+		Expect(bucket).To(BeEmpty())
+	})
+
+	It("borrows the nearest output-length bucket's reading until it has its own", func() {
+		// The shape-swap benchmark's second phase: 4000-token outputs land in
+		// "xxlong", which has never been seen saturated, while "long" holds the
+		// 1000-token shape's 4.8. Without the borrow the floor vanished on the
+		// first cycle of the new shape and a three-replica fleet was sized to
+		// one from 400k tokens of occupancy.
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a.recordSaturatedThroughput("m|H200|1|decode|long|q5", 4.8)
+		mu, bucket := a.saturatedThroughputFor("m|H200|1|decode|xxlong|q5")
+		Expect(mu).To(Equal(4.8))
+		Expect(bucket).To(Equal("long"), "the figure is borrowed, and the log has to say from where")
+
+		By("preferring the nearer bucket, and the shorter on a tie")
+		a.recordSaturatedThroughput("m|H200|1|decode|huge|q5", 1.0)
+		mu, bucket = a.saturatedThroughputFor("m|H200|1|decode|xxlong|q5")
+		Expect(bucket).To(Equal("huge"), "huge is one step away, long is two")
+		Expect(mu).To(Equal(1.0))
+		a.recordSaturatedThroughput("m|H200|1|decode|xlong|q5", 3.0)
+		mu, bucket = a.saturatedThroughputFor("m|H200|1|decode|xxlong|q5")
+		Expect(bucket).To(Equal("xlong"), "equally distant: the shorter shape's under-hold wins")
+		Expect(mu).To(Equal(3.0))
+
+		By("and the bucket's own reading takes over the moment it exists, unmasked")
+		a.recordSaturatedThroughput("m|H200|1|decode|xxlong|q5", 2.75)
+		mu, bucket = a.saturatedThroughputFor("m|H200|1|decode|xxlong|q5")
+		Expect(mu).To(Equal(2.75))
+		Expect(bucket).To(Equal("xxlong"))
+
+		By("never crossing a role, accelerator or threshold boundary")
+		mu, _ = a.saturatedThroughputFor("m|H200|1|prefill|xxlong|q5")
+		Expect(mu).To(BeZero())
+		mu, _ = a.saturatedThroughputFor("m|H100|1|decode|xxlong|q5")
+		Expect(mu).To(BeZero())
+		mu, _ = a.saturatedThroughputFor("m|H200|1|decode|xxlong|q100")
+		Expect(mu).To(BeZero())
 	})
 
 	It("ignores a non-positive reading and is evicted with the k2 history", func() {
