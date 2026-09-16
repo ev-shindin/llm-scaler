@@ -1229,6 +1229,37 @@ print('%s %.0f' % ('$pod', tot))
     [ -s "$out" ] || warn "could not read per-engine work from any Pod; the distribution guard will not run"
 }
 
+# Fold one capture into the running record, keeping the HIGHER reading per
+# Pod. The counter is monotonic, so a lower reading is a stale or partial
+# read, never new information -- and a Pod absent from the new capture keeps
+# what it had, which is how a replica scaled away mid-arm stays in evidence.
+merge_pod_work() {
+    local into="$1" new="$2"
+    [ -s "$new" ] || return 0
+    python3 - "$into" "$new" <<'PY'
+import os, sys
+into, new = sys.argv[1], sys.argv[2]
+best = {}
+for path in (into, new):
+    if not os.path.exists(path):
+        continue
+    for line in open(path):
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            v = float(parts[1])
+        except ValueError:
+            continue
+        best[parts[0]] = max(best.get(parts[0], 0.0), v)
+tmp = into + ".tmp"
+with open(tmp, "w") as fh:
+    for pod in sorted(best):
+        fh.write("%s %.0f\n" % (pod, best[pod]))
+os.replace(tmp, into)
+PY
+}
+
 RUN_JOB=""
 RUN_SAMPLER=""
 RUN_WORKER=""
@@ -1287,9 +1318,6 @@ verb_run() {
         "$arm" "$ceiling" "$([ "$arm" = pool ] && echo "$POOL_REPLICAS" || echo 0)" "$GPUS_PER_REPLICA" \
         > "$out_dir/budget.json"
 
-    local total=$(( LEAD_IN + 2 * CYCLES * PHASE_SECONDS ))
-    info "arm=$arm  ${total}s of load"
-
     # The two inference-perf profiles and the phase table they were built from,
     # rendered here and kept with the results. The report refuses two arms whose
     # schedules differ, and it can only do that if the schedule the load
@@ -1316,6 +1344,18 @@ verb_run() {
             > "$out_dir/profile-$role.yaml" || die "could not render profile $role"
         [ -s "$out_dir/profile-$role.yaml" ] || die "profile $role rendered empty"
     done
+    # The arm's length is READ FROM THE SCHEDULE, not re-derived here. It used
+    # to be LEAD_IN + 2 x CYCLES x PHASE_SECONDS, which forgets the both-low
+    # bands between bursts: 2040s for a ladder that runs 2310s. Everything
+    # timed off it was 270s early -- the per-engine capture fired while the
+    # last phase still had four minutes to run, and read 0 from a replica that
+    # was Running but not yet Ready and went on to serve 1.39M tokens, so the
+    # routing guard refused a valid arm. The GPU sampler cleared the real end
+    # by 30s of slack, by luck.
+    local total
+    total="$(python3 -c "import json,sys; print(int(max(s['end'] for s in json.load(open(sys.argv[1])))))" "$out_dir/schedule.json")" \
+        || die "could not read the arm's length from $out_dir/schedule.json"
+    info "arm=$arm  ${total}s of load"
 
     # Profiles go in as a ConfigMap rather than baked into an image: an edit
     # would otherwise need a build and a registry push between it and a run.
@@ -1366,9 +1406,22 @@ verb_run() {
     #
     # So it is timed off the schedule instead. The load ends at start_at+total
     # whatever the report generator does afterwards.
+    #
+    # And it is PERIODIC, keeping each engine's HIGHEST reading. One capture at
+    # the end, however well timed, only sees the replicas alive at that instant:
+    # the two a model grew for its first rise are scaled away long before its
+    # second, and their work vanished with them -- the nopool arm's Llama total
+    # was 12.69M tokens and the end capture accounted for 7.79M. The counter is
+    # monotonic, so a Pod's last reading before it is deleted IS its work for
+    # the arm, and the merge below can never make a Pod's number shrink.
     local work_at=$(( start_at + total + 30 ))
-    ( while [ "$(date +%s)" -lt "$work_at" ]; do sleep 5; done
-      capture_pod_work "$out_dir/podwork.after" ) &
+    ( while :; do
+          capture_pod_work "$out_dir/podwork.sample" 2>/dev/null
+          merge_pod_work "$out_dir/podwork.after" "$out_dir/podwork.sample"
+          [ "$(date +%s)" -lt "$work_at" ] || break
+          sleep 60
+      done
+      rm -f "$out_dir/podwork.sample" ) &
     RUN_WORKER=$!
 
     # Waited on by the loader's OWN lines, not by the Job's completion, and on
