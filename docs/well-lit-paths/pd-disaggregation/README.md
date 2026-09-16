@@ -1,12 +1,11 @@
 # Scale a P/D-disaggregated model
 
 > **Experimental.** The scenario stands up and runs, WVA's role handling is
-> covered end to end, and the shape now has a published benchmark -- the
-> shape-swap run below, before and after the fix it prompted. What is still
-> short: the second phase of that benchmark oscillates by two replicas (the
-> cause is known and named under *Measured*), and there is no P/D-specific
-> steady-state e2e spec. Take it as a working recipe with one open item, not a
-> settled default.
+> covered end to end, and the shape has a published benchmark (below). What is
+> still short: on a shape change within one output-length bucket the fleet
+> oscillates by two replicas (named under *Measured*), and there is no
+> P/D-specific steady-state e2e spec. Take it as a working recipe with one open
+> item, not a settled default.
 
 Prefill and decode have different shapes — prefill is compute-bound, decode is
 memory-bandwidth-bound — so llm-d can run them as separate deployments connected
@@ -129,40 +128,37 @@ causes it, so check `kubectl create deployment` works in your namespace first.
 
 ## Measured
 
-Both runs: the scenario, trace, policy and HPA behaviour above, on CoreWeave
-8 x H200 nodes (k1 = 929,894 tokens per decode replica in both). *Before* is
-run `biran-20260915-102548-571` on the code at `llm-scaler/main` 67229a01;
-*after* is the same trace on the branch that fixed it, one day later, on a
-sibling cluster. The analysis that connects the two is
-[Sizing a backlog](../../proposals/backlog-sizing.md); the mechanism is in
-[the demand floors](../../developer-guide/saturation-demand-floor.md).
+The scenario, trace, policy and HPA behaviour above, on CoreWeave 8 x H200
+nodes (k1 = 929,894 tokens per decode replica), against the controller image
+built from this tree. Results directory:
+`results/guidellm-1789563884-wm9k0y_1` of the 2026-09-16 run; the graphs and
+tables are the ones `post_run_analyze.sh` writes.
 
-| | before | after |
-|---|---|---|
-| decode replicas ordered over the run | 1 → 7 → 1 → **9** → 3 → 2 → 6 | 1 → 2 → 3 → **2 (held)** → 3 → 4 → 3 → 2 → 3 → 4 |
-| prefill replicas ordered | 1 → 4 → 1 → 6 → 1 | 1 throughout |
-| max ordered, decode + prefill | 9 + 6 (the cluster had 9 GPUs for it) | 4 + 1 |
-| ready replicas, both roles, mean / max | 4.05 / 9 | 3.32 / 5 |
-| TTFT p50 / p95 / p99 | 103 ms / **45.4 s** / — | 112 ms / **218 ms** / 3.1 s |
-| ITL p50 / p95 | 5.4 / 39.7 ms | 12.2 / 21.2 ms |
-| request latency p50 / p95 | 21.6 / 90.4 s | 17.0 / 80.1 s |
-| requests / errors | 13,288 / 0 | 13,288 / 0 |
+| | |
+|---|---|
+| decode replicas over the run | 1 → 2 → 3 → **2 (held through phase 1)** → 3 → 4 → 3 → 2 → 3 → 4 |
+| prefill replicas | 1 throughout |
+| ready replicas, both roles, mean / max | 3.32 / 5 |
+| TTFT p50 / p95 / p99 | 112 ms / 218 ms / 3.1 s |
+| ITL p50 / p95 | 12.2 / 21.2 ms |
+| request latency p50 / p95 | 17.0 / 80.1 s |
+| requests / errors | 13,288 / 0 |
+| GPU-minutes (mean replicas x run length) | 90.7 |
 
-**Before** -- the fleet is sized from occupancy, which falls as replicas are
-added; at six replicas the load reads as one replica's worth, the fleet goes
-to one, that one saturates inside a minute, and the flow-control queue that
-builds is charged as if every queued request had to be resident at once:
+![pipeline: replicas, demand vs capacity, KV, running, waiting, EPP queue](shape-swap-rps6-pipeline.png)
 
-![before](shape-swap-rps6-before.png)
+![replica status over the run](shape-swap-rps6-replicas.png)
 
-**After** -- the same load. The throughput floor holds decode at λ/μ = 6.2/4.87
-≈ 1.3 replicas' worth through the first phase (the dashed target never drops
-to one), prefill is never charged the queue's prompts, and the only queue in
-the run is the 46-request blip while the second replica boots:
-
-![after](shape-swap-rps6-after.png)
-
-![after, replica status](shape-swap-rps6-after-replicas.png)
+How to read it. In the first phase the KV occupancy of the fleet is a fraction
+of one replica (the second panel, and 5-15% KV in the third) -- the reading
+that, taken alone, would size the fleet to one. The dashed target holds at two
+because the analyzer floors each role's demand at what the load requires in
+throughput: the arrival rate over the completion rate one replica sustained
+when it was last seen saturated (λ/μ = 6.2/4.87 ≈ 1.3 replicas' worth; the
+`throughput-demand-floor` line in the controller log carries the terms). Prefill
+holds at one because its own occupancy never justifies more and nothing else is
+charged to it. The one queue in the run is the 46-request blip at the start
+while the second decode replica boots.
 
 What still moves: in the second phase the fleet goes 2 → 3 → 4 → 2 → 3 → 4.
 Both shapes share the `long` output-length bucket that keys the learned
@@ -170,13 +166,12 @@ throughput, so the floor keeps holding the first shape's two replicas while
 the second needs three; occupancy then climbs, the arrival floor over-corrects
 to four, and the 50%/120s scale-down takes it back to two in one step. The fix
 is a finer key for μ; until it lands, expect that amplitude on a shape change
-within one bucket. The p50 ITL is higher *after* for the reason the replica
-counts show: two replicas carrying what six carried before.
+within one bucket. The p50 ITL is what two replicas at a high batch cost; the
+p95 tail is what holding them buys.
 
-Differences between the two runs that are not the code: the *after*
-controller started with no k2 history (the *before* one carried eight prior
-observations); a decode pod took 90s to Ready rather than 145-160s; and the
-*after* cluster had 44 free GPUs, so nothing ordered was refused.
+The measurement that motivated the throughput floor, and the run it was
+compared against, are in [Sizing a backlog](../../proposals/backlog-sizing.md);
+the mechanism is in [the demand floors](../../developer-guide/saturation-demand-floor.md).
 
 ## How it is tested
 
