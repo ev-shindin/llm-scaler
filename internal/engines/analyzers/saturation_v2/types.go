@@ -76,18 +76,27 @@ type ReplicaCapacity struct {
 // output token length. The buckets are used to key compute-capacity (k2)
 // history, since k2 depends heavily on generation length.
 //
-// Buckets:
+// Buckets (the thresholds and why they sit where they do are in constants.go):
 //
 //	"short"  — avgOutput in [0, 100)
 //	"medium" — avgOutput in [100, 500)
-//	"long"   — avgOutput >= 500
+//	"long"   — avgOutput in [500, 1500)
+//	"xlong"  — avgOutput in [1500, 3000)
+//	"xxlong" — avgOutput in [3000, 6000)
+//	"huge"   — avgOutput >= 6000
 func classifyOutputLength(avgOutputTokens float64) string {
 	switch {
 	case avgOutputTokens < ShortOutputThreshold:
 		return "short"
 	case avgOutputTokens < MediumOutputThreshold:
 		return "medium"
-	default:
+	case avgOutputTokens < LongOutputThreshold:
 		return "long"
+	case avgOutputTokens < ExtraLongOutputThreshold:
+		return "xlong"
+	case avgOutputTokens < VeryLongOutputThreshold:
+		return "xxlong"
+	default:
+		return "huge"
 	}
 }

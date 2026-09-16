@@ -38,4 +38,28 @@ const (
 	// MediumOutputThreshold is the upper bound (exclusive) for the "medium"
 	// output-length bucket used for k2 history keying.
 	MediumOutputThreshold = 500
+
+	// LongOutputThreshold is the upper bound (exclusive) for the "long"
+	// output-length bucket. Above 500 the buckets are a factor of two wide,
+	// because what the key protects is a factor-of-two quantity: the
+	// completion rate a saturated replica sustains falls roughly with output
+	// length, so a 1000-token and a 4000-token shape sharing one bucket share
+	// one throughput window, and the max the window keeps is the shorter
+	// shape's -- which then holds a fleet at the shorter shape's size while
+	// the longer one is served. Measured on the shape-swap benchmark
+	// (docs/proposals/backlog-sizing.md), where the two shared "long".
+	//
+	// The boundaries deliberately avoid the round numbers benchmarks use as
+	// fixed output lengths (1000, 2000, 4000): a mean that sits on a boundary
+	// would move between two buckets on measurement noise and split its
+	// history in half.
+	LongOutputThreshold = 1500
+
+	// ExtraLongOutputThreshold is the upper bound (exclusive) for the "xlong"
+	// output-length bucket.
+	ExtraLongOutputThreshold = 3000
+
+	// VeryLongOutputThreshold is the upper bound (exclusive) for the "xxlong"
+	// output-length bucket; anything at or above it is "huge".
+	VeryLongOutputThreshold = 6000
 )
