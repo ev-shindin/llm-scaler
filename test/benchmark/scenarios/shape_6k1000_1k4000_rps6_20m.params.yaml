@@ -1,0 +1,33 @@
+# Two-stage shape-swap experiment: same RPS throughout (6 req/s), request
+# shape flips from prefill-heavy (6000/1000) to decode-heavy (1000/4000)
+# halfway through. Isolates shape as the variable, since load never changes.
+#
+# The rps6 sibling of shape_6k1000_1k4000_rps4_12m: the rate at which one
+# H200 decode replica of Qwen3-0.6B is just short (it sustains ~5.4 req/s at
+# 6000/1000), so the fleet has to hold at two and then three replicas rather
+# than one. This is the shape and rate of run biran-20260915-102548-571,
+# analysed in docs/proposals/backlog-sizing.md; 1100s per phase reproduces
+# its 18.3-minute phases.
+
+seed: 42
+arrival_distribution: poisson
+length_distribution: constant   # min=max per phase -- fixed lengths, no spread
+
+output:
+  path: shape_6k1000_1k4000_rps6_20m.jsonl
+  timestamp_column: timestamp
+  prompt_tokens_column: input_length
+  output_tokens_column: output_length
+
+phases:
+  - name: 6k1000-rps6
+    duration_s: 1100
+    rate_rps: 6
+    input_tokens:  { mean: 6000 }
+    output_tokens: { mean: 1000 }
+
+  - name: 1k4000-rps6
+    duration_s: 1100
+    rate_rps: 6
+    input_tokens:  { mean: 1000 }
+    output_tokens: { mean: 4000 }

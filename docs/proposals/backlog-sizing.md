@@ -1,9 +1,11 @@
 # Sizing a backlog: what the shape-swap run showed
 
 **Status:** analysis of one run, three fixes landed on `fix/shape-swap-overprovision`
-(the third of them a new floor), and one open design question with a proposed
-direction. Nothing here has been re-run on a cluster; every "would have" below
-is arithmetic on the values the controller logged, and says so.
+(the third of them a new floor), one open design question with a proposed
+direction -- and a re-run of the same trace with the fixes, in
+[Re-run with the fixes](#re-run-with-the-fixes-2026-09-16-kermit) at the end.
+Every "would have" in the analysis sections is arithmetic on the values the
+controller logged, and says so; the re-run is measured.
 
 Run: `biran-20260915-102548-571/results/guidellm-1789457189-u8bjb3_1` on the
 `benchmark-data/shape-swap-6k1000-1k4000-rps6-2026-09-15` branch. P/D
@@ -232,3 +234,101 @@ completions on its variant's bucket rather than its own would close it.
   (7.3MB / 213 requests = 8,565 tokens against a 6000-token prompt). The
   count x avgInput estimate was closer and lost to the max. 43% high, on a
   term that is itself the open question above.
+
+## Re-run with the fixes, 2026-09-16, kermit
+
+The same trace (`shape_6k1000_1k4000_rps6_20m.jsonl`, seed 42: 6693 + 6595 =
+13288 requests, exactly the counts Ofer's summary implies), the same
+scenario (`guides/pd-disaggregation`, Qwen3-0.6B, one variant per role, H200),
+the same scaling policy (0.8 / 5 / 0.85 / 0.7, 15s) and the same HPA
+behaviour as the original run (scale-up 100%/5s, window 0; scale-down
+50%/120s, window 180s -- Ofer's `fix/scaledown-defaults`, applied by patching
+the two ScaledObjects), against the image built from this branch at
+`367bd76b`. CoreWeave **kermit** rather than waldorf, which was in use; both
+are 8 x H200 nodes, and k1 came out identical (929,894 / 919,449).
+Results: `evgensh-20260916-kermit-shapeswap/results/guidellm-1789563884-wm9k0y_1`
+(not committed; 500MB of raw scrapes).
+
+What differs from the original and is NOT the code: the controller started
+with no k2 history (Ofer's carried `historyWindowLen: 8` from earlier runs);
+a decode pod took 90s to Ready here against 145-160s there, so the first
+replica was alone for less time; kermit had 44 free GPUs, so nothing the
+controller asked for was refused; and the routing sidecar is pinned to
+v0.9.0 (see the scenario file -- `latest` had moved past the chart pin and
+every decode pod crash-looped on the first standup).
+
+### Decode replicas over the run
+
+```
+                  original (waldorf, 09-15)      this branch (kermit, 09-16)
+load starts       1                              1
+first saturation  3 -> 7  (one replica alone)    2 -> 3  (46 queued for one cycle)
+phase 1 steady    7 -> 1  (collapse, 07:35-38)   3 -> 2, HELD at 2 for 11 min
+re-saturation     1 -> 9  (second peak)          none
+phase 2           3 -> 2 -> 6 at the end         2 -> 3 -> 4 -> 2 -> 3 -> 4
+prefill           1 -> 4 -> 1 -> 6 -> 1          1 throughout
+max ordered       9 decode + 6 prefill           4 decode + 1 prefill
+```
+
+The throughput floor is what held phase 1. From the log at 13:12:46, with
+three replicas Ready and occupancy at 136k tokens (one seventh of a replica,
+the reading that took the original fleet to one):
+
+```
+throughput-demand-floor  role=decode  occupancyDemand=135695  flooredTo=1184659
+                         arrivalRate=6.2  saturatedThroughput=4.87
+                         replicasImplied=1.27  heldAtFleet=false
+```
+
+mu was recorded at 4.87 req/s from the one P1 observation at 13:08 (the pod's
+first saturated minute -- Ofer's pod, saturated for longer, reached 5.4), so
+the floor asked for 1.27 replicas' worth and the scale-down stopped at 2.
+The arrival floor bound in the same cycles at 134k tokens, occupancy restated,
+exactly as the measurement in the guide predicts.
+
+Phase 2 is the weaker half, as the analysis said it would be. 1000/4000 shares
+the `long` output bucket with 6000/1000, so the floor kept holding 2 with
+phase 1's mu while the shape needed 3; occupancy then climbed to 770k per
+replica, the arrival floor (W = 80s) ordered 4, the fleet settled to 3, and
+the 50%/120s scale-down took it straight back to 2 (4 x 0.5 = 2 in one
+period), where the cycle repeated once more before the load ended. Amplitude
+2-4, against 2-6 at the end of the original; the fix is a mu key that tells
+the two shapes apart (`ShortOutputThreshold` / `MediumOutputThreshold` are
+too coarse for it), listed under the open questions.
+
+### What the load saw
+
+| | original (waldorf) | this branch (kermit) |
+|---|---|---|
+| requests / errors | 13288 / 0 | 13288 / 0 |
+| TTFT p50 / p95 / p99 | 103 ms / **45.4 s** / -- | 112 ms / **218 ms** / 3.1 s |
+| ITL p50 / p95 | 5.4 / 39.7 ms | 12.2 / 21.2 ms |
+| request latency p50 / p95 | 21.6 / 90.4 s | 17.0 / 80.1 s |
+| concurrency p50 / mean | 134 / 200 | 105 / 179 |
+| ready replicas, both roles, mean / max | 4.05 / 9 | 3.32 / 5 |
+| decode ordered, max | 9 (6 ever Ready) | 4 (4 Ready) |
+| GPU-minutes (avg replicas x run) | -- | 90.7 |
+
+The p95 TTFT is the two saturation episodes in the original and the absence
+of a second one here. The higher p50 ITL here is the fleet running at a
+higher batch on fewer replicas -- two instead of six for most of phase 1 --
+which is the point: the same load served on a third of the GPUs, with the
+p95 tail 200x lower.
+
+### Also found while running it
+
+- **`guides/pd-disaggregation` could not stand up on main.** The scenario
+  overrode the routing sidecar to `latest`, `patch_harness.sh` pins the
+  modelservice chart to v0.4.15, and the two had drifted apart: every decode
+  pod crash-looped on `unknown flag: --connector`. Pinned to v0.9.0, the
+  sidecar the chart pin was made for, with the reasoning in the scenario.
+- The harness's final `kubectl cp` of the 500MB results directory died with
+  `read message: %!w(<nil>)` on this cluster, and the run was reported FAILED
+  after 3108s of successful load. The results were still on the workload PVC;
+  streamed off as a gzip in 40MB chunks with per-chunk checksums, which
+  worked first time. Worth a retry-with-chunks in the harness.
+- fozzie, the emptier CoreWeave cluster, could not create ANY pod from a
+  Deployment on 2026-09-16: its kueue pod webhook denied every one with
+  `Deployment.apps ... not found` (a newer kueue revision was crash-looping
+  beside the old one). Not touched; noted so nobody spends an hour on it.
+
