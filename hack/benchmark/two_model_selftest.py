@@ -377,7 +377,9 @@ BASE_META = {"schedule": meta_sched, "input_tokens": 1000, "output_tokens": 200,
 
 BUDGET_N = {"arm": "nopool", "max_replicas_per_model": 3, "pool_replicas": 0,
             "gpus_per_replica": 1}
-BUDGET_P = {"arm": "pool", "max_replicas_per_model": 2, "pool_replicas": 2,
+# The SAME per-model ceiling as nopool, with the pool on top. The cost of the
+# pool is measured in accelerator-seconds, not imposed by lowering the cap.
+BUDGET_P = {"arm": "pool", "max_replicas_per_model": 3, "pool_replicas": 2,
             "gpus_per_replica": 1}
 
 
@@ -550,14 +552,22 @@ if report.main(["--nopool", os.path.join(d, "nopool"), "--pool", os.path.join(d,
 else:
     ok("a missing meta.json is refused")
 
-case("an arm allowed more cluster is refused")
-fat = dict(BUDGET_P); fat["max_replicas_per_model"] = 3      # pool AND the full ceiling
-if run_report(BASE_META, dict(BASE_META), budget_b=fat) == 0:
-    fail("the report compared an arm that held a pool AND the same per-model ceiling. That "
-         "is a bigger cluster, not a pool, and it wins on TTFT for a reason that has "
-         "nothing to do with lending.")
+case("an arm whose models were capped differently is refused")
+# The ceiling is the same in every arm and the insurance sits on top of it; its
+# cost is MEASURED in accelerator-seconds. An earlier version lowered the pool
+# arm's cap by the pool's share to force "the same peak", which also stopped
+# that arm from ever holding three real replicas and a bridge -- a fleet nobody
+# would run. What must still be refused is a model capped at 2 in one arm and
+# 3 in the other: that arm's TTFT differs for a reason unrelated to the pool.
+thin = dict(BUDGET_P); thin["max_replicas_per_model"] = 2
+if run_report(BASE_META, dict(BASE_META), budget_b=thin) == 0:
+    fail("the report compared a pool arm whose models were capped at 2 against a nopool "
+         "arm capped at 3")
+elif run_report(BASE_META, dict(BASE_META)) != 0:
+    fail("a pool arm with the SAME per-model ceiling as nopool, and the pool on top, was "
+         "refused; that is the configuration the scenario runs")
 else:
-    ok("a pool arm that was allowed more accelerators is refused")
+    ok("a different per-model ceiling is refused; the pool on top of the same one is not")
 
 case("an arm with no recorded budget is refused")
 if run_report(BASE_META, dict(BASE_META), budget_b="omit") == 0:

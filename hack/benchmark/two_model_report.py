@@ -237,12 +237,15 @@ def load_budget(d):
 
 
 def budget_problem(a, b):
-    """The arms must not differ in how much cluster they were allowed.
+    """The arms must have been allowed the same per-model ceiling.
 
-    The whole cost argument for a warm pool is that insurance LOWERS your
-    maximum fleet. An arm that holds a pool AND the same per-model ceiling is
-    not this pool being measured, it is a bigger cluster being measured -- and
-    it wins on TTFT for a reason that has nothing to do with lending.
+    Every model gets the same maxReplicaCount in every arm -- as much as it
+    asks for, up to what the cluster can place -- and the pool sits ON TOP of
+    that in the pool arm. The cost of the insurance is not imposed through the
+    ceiling; it is MEASURED, in accelerator-seconds, which is the number the
+    report prices each arm on. What this guard refuses is an arm whose models
+    were capped differently from nopool's: that arm's TTFT differs for a reason
+    that has nothing to do with the insurance under test.
     """
     ba, bb = a.get("budget"), b.get("budget")
     if not ba or not bb:
@@ -255,13 +258,13 @@ def budget_problem(a, b):
         return ("the floor arm's floor (%s per model) is no higher than the nopool "
                 "arm's (%s); it was not the floor arm"
                 % (bb.get("min_replicas_per_model"), ba.get("min_replicas_per_model", 1)))
-    peak_n = 2 * ba["max_replicas_per_model"] * ba["gpus_per_replica"]
-    peak_p = (2 * bb["max_replicas_per_model"] * bb["gpus_per_replica"]
-              + bb.get("pool_replicas", 0) * bb["gpus_per_replica"])
-    if peak_p > peak_n:
-        return ("the %s arm could reach %d accelerators against the nopool arm's %d. "
-                "It was allowed more cluster, not just faster cluster."
-                % (b["name"], peak_p, peak_n))
+    if (bb["max_replicas_per_model"] != ba["max_replicas_per_model"]
+            or bb["gpus_per_replica"] != ba["gpus_per_replica"]):
+        return ("the %s arm capped each model at %d replicas of %d accelerator(s) against "
+                "the nopool arm's %d of %d: its models were allowed a different ceiling, "
+                "so its TTFT differs for a reason that is not the insurance under test."
+                % (b["name"], bb["max_replicas_per_model"], bb["gpus_per_replica"],
+                   ba["max_replicas_per_model"], ba["gpus_per_replica"]))
     return None
 
 

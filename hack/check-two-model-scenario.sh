@@ -241,10 +241,15 @@ case_begin
 run_verb preflight
 if ! printf '%s' "$OUT" | grep -q 'peaks at 6'; then
     fail "preflight did not report the peak this run needs (2 models x 3 replicas = 6): $OUT"
-elif ! printf '%s' "$OUT" | grep -q 'pool arm:.*2 replicas'; then
-    fail "preflight did not state the pool arm's LOWER model ceiling, which is what makes the two arms comparable: $OUT"
+elif ! printf '%s' "$OUT" | grep -q 'pool arm:.*1\.\.3 replicas.*on top'; then
+    # The SAME ceiling in every arm, with the pool on top. The old check wanted
+    # the pool arm's ceiling LOWERED by the pool's share; that stopped the pool
+    # arm from ever holding three real replicas and a bridge.
+    fail "preflight did not state that the pool arm keeps the same per-model ceiling with the pool on top: $OUT"
+elif ! printf '%s' "$OUT" | grep -q 'floor arm:.*2\.\.3 replicas'; then
+    fail "preflight did not state the floor arm's range: $OUT"
 else
-    ok "preflight states both arms' budgets and that they match"
+    ok "preflight states every arm's range, and that the ceiling is the same in all of them"
 fi
 
 case_begin

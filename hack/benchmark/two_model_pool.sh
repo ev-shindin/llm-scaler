@@ -233,25 +233,21 @@ need_ns() { [ -n "$NS" ] || die "BENCHMARK_NAMESPACE is required."; }
 # construction -- that is the point.
 #
 #   nopool: 2 models x MAX_REPLICAS
-#   pool:   2 models x (MAX_REPLICAS - the pool's share) + the pool itself
+#   pool:   2 models x MAX_REPLICAS + the pool itself
 #   floor:  2 models x MAX_REPLICAS, never below FLOOR_REPLICAS each
 #
-# "Insurance lowers your maximum fleet by N" is the whole cost argument for a
-# warm pool, so an arm that holds the pool AND the same model ceiling is not
-# the pool being compared -- it is a bigger cluster being compared.
-pool_share_per_model() { echo $(( (POOL_REPLICAS + 1) / 2 )); }
-
+# The SAME per-model ceiling in every arm, and the insurance on top of it. An
+# earlier version lowered the pool arm's cap by the pool's share so the arms
+# would "peak at the same number of accelerators" -- which also stopped that
+# arm from ever holding three real replicas AND a bridge, a fleet nobody would
+# run. The cost of an insurance is not imposed through the cap; it is
+# MEASURED, in accelerator-seconds, and that is what every arm is priced on.
+# Set MAX_REPLICAS to as many replicas as the models could ask for.
 peak_gpus() { echo $(( 2 * MAX_REPLICAS * GPUS_PER_REPLICA )); }
 
-arm_max_replicas() {
-    case "$1" in
-        pool)
-            local m=$(( MAX_REPLICAS - $(pool_share_per_model) ))
-            [ "$m" -lt "$MIN_REPLICAS" ] && m="$MIN_REPLICAS"
-            echo "$m" ;;
-        *) echo "$MAX_REPLICAS" ;;
-    esac
-}
+pool_gpus() { echo $(( POOL_REPLICAS * GPUS_PER_REPLICA )); }
+
+arm_max_replicas() { echo "$MAX_REPLICAS"; }
 
 # ---------------------------------------------------------------------------
 # preflight
@@ -358,8 +354,9 @@ verb_preflight() {
     free=$(( ${total:-0} - ${used:-0} ))
     want="$(peak_gpus)"
     info "accelerators: ${total:-?} schedulable, ${used:-?} requested, ${free} free; this run peaks at ${want}"
-    info "  nopool arm: 2 models x ${MAX_REPLICAS} replicas"
-    info "  pool arm:   2 models x $(arm_max_replicas pool) replicas + a ${POOL_REPLICAS}-Pod pool -- the same peak, which is what makes the arms comparable"
+    info "  nopool arm: 2 models x 1..${MAX_REPLICAS} replicas"
+    info "  floor arm:  2 models x ${FLOOR_REPLICAS}..${MAX_REPLICAS} replicas"
+    info "  pool arm:   2 models x 1..${MAX_REPLICAS} replicas + a ${POOL_REPLICAS}-Pod pool on top -- the same ceiling in every arm; the insurance is priced in GPU-seconds"
 
     # FREE ACCELERATORS ARE NOT PLACEABLE ACCELERATORS, and the difference cost
     # a whole 90-minute A/B.
@@ -390,11 +387,12 @@ verb_preflight() {
         warn "  Lower the decode CPU request, lower MAX_REPLICAS, or use a cluster with room."
         rc=1
     fi
-    if [ "$(arm_max_replicas pool)" -le "$MIN_REPLICAS" ]; then
-        warn "with MAX_REPLICAS=$MAX_REPLICAS and a ${POOL_REPLICAS}-Pod pool, the pool arm's ceiling"
-        warn "  collapses to the floor ($MIN_REPLICAS): that arm cannot scale at all, so the run would"
-        warn "  compare autoscaling against a pinned fleet. Raise MAX_REPLICAS to at least $(( MIN_REPLICAS + $(pool_share_per_model) + 1 ))."
-        rc=1
+    # The pool arm holds its Pods ON TOP of the models' ceiling. Reported, not
+    # refused: both models at MAX_REPLICAS at the same instant is the case the
+    # anti-phase schedule exists to avoid, so this only binds if it happens.
+    if [ -n "$slots" ] && [ "$slots" -lt $(( want + $(pool_gpus) )) ]; then
+        warn "the pool arm's theoretical peak is $(( want + $(pool_gpus) )) (models at MAX_REPLICAS plus the pool) against ${slots} placeable;"
+        warn "  it binds only if BOTH models reach MAX_REPLICAS at once, which the anti-phase schedule avoids."
     fi
 
     # ONE accelerator kind. A warm copy is only reusable on the accelerator it

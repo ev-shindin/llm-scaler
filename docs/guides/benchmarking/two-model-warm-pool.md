@@ -17,8 +17,27 @@ rise, at the same moment the other model is giving capacity back. With a pool,
 one Pod bridges whichever model is rising and is handed back in time for the
 other.
 
-The run is done twice with the same traffic, once with the pool and once
-without, and compared on time-to-first-token **and** on accelerator-seconds.
+The run is done with the same traffic once per **arm**, and the arms are
+compared on time-to-first-token **and** on accelerator-seconds:
+
+| arm | what it is | the insurance it pays |
+| --- | --- | --- |
+| `nopool` | autoscaling alone, each model between 1 and `MAX_REPLICAS` | none — every rise pays a cold model load |
+| `pool` | the same, plus a 2-Pod warm pool with both models resident | 2 accelerators held for the whole run |
+| `floor` | no pool, each model **held at 2 or more** for the whole run | 2 extra replicas held for the whole run |
+
+`nopool` is the baseline; `pool` is the claim under test; `floor` is what a pool
+competes against in practice — over-provisioning — and the question the third
+arm answers is which insurance is cheaper for what it buys.
+
+**Every model gets the same ceiling in every arm** — as many replicas as it
+asks for, up to what the cluster can place — and the pool sits on top of that.
+An earlier version lowered the pool arm's cap by the pool's share so that the
+arms would "peak at the same number of accelerators"; that also stopped the
+pool arm from ever holding three real replicas *and* a bridge, which is a fleet
+nobody would run. The cost of each insurance is not imposed through the cap; it
+is **measured**, in accelerator-seconds, and that is the number every arm is
+priced on.
 
 ## The phases
 
@@ -245,26 +264,30 @@ the start barrier — the load Pod's istio sidecar is not ready the instant the 
 container starts, and the first seconds of a run would otherwise be the driver
 failing to connect.
 
-## What makes the two arms comparable
+## What makes the arms comparable
 
 Six ways they can silently stop being, each of which still produces a complete
 and plausible table. The tooling enforces every one rather than trusting it:
 
 | | enforced by |
 | --- | --- |
-| The pool arm must not be allowed **more cluster**. Insurance lowers the ceiling, so each model is capped at `MAX_REPLICAS - ⌈POOL_REPLICAS/2⌉` in the pool arm and `MAX_REPLICAS` without it — the same peak either way. | `run` writes `budget.json`; the report **refuses** if the pool arm could reach more accelerators |
+| Every model must have the **same ceiling** in every arm. A model capped at 2 in one arm and 3 in another differs in TTFT for a reason that is not the insurance under test. | `run` writes `budget.json` (ceiling, floor, pool size); the report **refuses** an arm whose per-model ceiling differs from nopool's, a `pool` arm with no pool, or a `floor` arm whose floor is no higher than nopool's |
 | The fleet must start at the floor. With 300s scale-down stabilization and one arm always running first, the second would start on an already-scaled fleet and pay no cold load at all. | `reset` pins both ScaledObjects at `MIN_REPLICAS`, waits for it, then releases them |
 | The pool must be **warm**. A cold pool pays a model load *into* the pool on the first burst, on top of the replica's own — a true measurement of a pool nobody would operate that way. | `warm` pins a copy of each model and waits; `run ARM=pool` re-checks |
 | The traffic must be identical. | both arms render the same inference-perf profiles from `SEED`; the report refuses if the seeds or the schedule differ |
-| The load must reach **more than one replica**. Capacity that is never routed to cannot affect TTFT, so a run where the router pinned everything to one engine measures a one-replica fleet in both arms. | `run` captures per-engine prompt tokens before and after; the report **refuses** if one engine did all the work |
+| The load must reach **more than one replica**. Capacity that is never routed to cannot affect TTFT, so a run where the router pinned everything to one engine measures a one-replica fleet in every arm. | `run` reads each engine's own prompt-token counter every 60 s for the whole arm and keeps the highest reading, so a replica scaled away mid-run stays in evidence; the report **refuses** if, per model, one engine did nearly all the work |
 | The **driver** must not be the queue being measured. | inference-perf reports its own `schedule_delay`; the report refuses above 250 ms at p95, and refuses an arm that reports none |
 
 ## What it needs
 
-- **Free accelerators for the peak**: `2 × MAX_REPLICAS × GPUS_PER_REPLICA`. At
-  the defaults that is **6**, and it is the same for both arms. `preflight`
-  counts what is actually free on schedulable, Ready nodes and refuses below it,
-  because a run that spends its bursts Pending measures the scheduler.
+- **Free accelerators for the peak**: `2 × MAX_REPLICAS × GPUS_PER_REPLICA`,
+  plus `POOL_REPLICAS × GPUS_PER_REPLICA` for the pool arm. `preflight` counts
+  what is actually *placeable* — free accelerators on schedulable, Ready nodes
+  that also have the CPU and memory a replica asks for — and refuses below the
+  models' peak, because a run that spends its bursts Pending measures the
+  scheduler. Set `MAX_REPLICAS` to as many replicas as the models could ask
+  for, not to a cap you want to impose: the ceiling is the same in every arm,
+  and the insurance's cost is measured, not capped.
 - **One accelerator kind.** A warm copy is only reusable on the accelerator it
   was loaded on. `preflight` refuses if the cluster advertises more than one and
   `ACCELERATOR` is not set — a pool pinned to the wrong product is never
@@ -371,19 +394,41 @@ make benchmark-two-model-reset
 make benchmark-two-model-run ARM=pool
 ```
 
-Refuses if no pool is present, re-checks residency (the pool can lose a copy
-between `warm` and `run`), and lowers each model's ceiling so the two arms peak
-at the same number of accelerators.
+Refuses if no pool is present and re-checks residency (the pool can lose a copy
+between `warm` and `run`). The models keep the same ceiling as in every other
+arm; the pool's two accelerators are on top, and show up in the GPU-seconds.
 
 `SKIP_WARM_GATE=1` says explicitly that a cold pool is what you meant to measure.
 
-**8. Report.**
+**8. Third arm — over-provisioned, no pool.** Optional, and the one that
+prices the pool against the alternative.
+
+```bash
+make benchmark-two-model-pool-delete
+make benchmark-two-model-reset
+make benchmark-two-model-run ARM=floor
+```
+
+Refuses if a pool is present. Sets `minReplicaCount` to `FLOOR_REPLICAS`
+(default 2) on both ScaledObjects — a Deployment scaled by hand would not hold,
+because at the low rate the controller recommends 1 and KEDA puts it back —
+waits for both models to be at the floor, then drives the same load. The next
+`reset` puts the floor back to 1, so it cannot leak into another arm.
+
+**9. Report.**
 
 ```bash
 make benchmark-two-model-report
 ```
 
-**9. Tear down — it is a shared cluster.**
+Compares every arm that ran against `nopool`, and when both `pool` and
+`floor` ran, prices the two insurances against each other. Beside the results
+it writes `report.md`, `report.json` (every number in the tables) and three
+SVG plots — p95/p50 per rise window, GPU-seconds per arm, and the fleet
+timeline — from the standard library alone, so they can be regenerated on any
+machine with `hack/benchmark/two_model_plots.py --json report.json --out .`.
+
+**10. Tear down — it is a shared cluster.**
 
 ```bash
 make benchmark-two-model-teardown
