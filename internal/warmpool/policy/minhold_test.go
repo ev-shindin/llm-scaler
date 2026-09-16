@@ -25,9 +25,8 @@ const (
 	other  = "variant-other"
 )
 
-func podName(n string) types.NamespacedName {
-	return types.NamespacedName{Namespace: "ns", Name: n}
-}
+// lentPod is the one Pod these cases lend; every input shape has exactly one.
+var lentPod = types.NamespacedName{Namespace: "ns", Name: "pool-0"}
 
 // held builds the one input shape these tests need: one Pod lent to `lender`,
 // borrowed `age` ago, with `lender` no longer short.
@@ -39,12 +38,12 @@ func held(age time.Duration, others []VariantDemand) (VariantDemand, []pool.Memb
 		Ready:   2, // the ordinary replica has arrived: the bridge is excess
 	}
 	lent := []pool.Membership{{
-		Pod:   podName("pool-0"),
+		Pod:   lentPod,
 		Model: pool.ModelRef{Variant: lender},
 	}}
 	in := Input{
 		Variants:   append([]VariantDemand{v}, others...),
-		BorrowedAt: map[Borrow]time.Time{{Pod: podName("pool-0"), Variant: lender}: now.Add(-age)},
+		BorrowedAt: map[Borrow]time.Time{{Pod: lentPod, Variant: lender}: now.Add(-age)},
 		Now:        now,
 	}
 	return v, lent, in
@@ -159,10 +158,10 @@ func TestZeroMinHoldIsTheOldBehaviour(t *testing.T) {
 func TestAStillNeededBridgeIsNeverReturned(t *testing.T) {
 	now := time.Now()
 	v := VariantDemand{Model: pool.ModelRef{Variant: lender}, Desired: 3, Ready: 1}
-	lent := []pool.Membership{{Pod: podName("pool-0"), Model: pool.ModelRef{Variant: lender}}}
+	lent := []pool.Membership{{Pod: lentPod, Model: pool.ModelRef{Variant: lender}}}
 	in := Input{
 		Variants:   []VariantDemand{v},
-		BorrowedAt: map[Borrow]time.Time{{Pod: podName("pool-0"), Variant: lender}: now.Add(-time.Minute)},
+		BorrowedAt: map[Borrow]time.Time{{Pod: lentPod, Variant: lender}: now.Add(-time.Minute)},
 		Now:        now,
 	}
 	cfg := Config{MaxHold: 5 * time.Minute}
