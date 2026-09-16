@@ -27,4 +27,8 @@ spec:
       # from an empty dashboard.
     - port: modelserver
       path: /metrics
-      interval: 30s
+      # 10s, to match the pool's PodMonitor: the scale-up signal is a queue at
+      # the engine and moves only when Prometheus holds a sample showing it,
+      # so the interval is jitter on every decision. Measured: decision lags
+      # 25/56/56/87s at 30s, 15/60/60/76s at 10s.
+      interval: 10s
