@@ -896,8 +896,8 @@ func TestTheDrainYieldsToTheDeadlineRatherThanStrandingThePod(t *testing.T) {
 	// Deactivate drains the proxy FIRST, so a timeout inside the wait leaves
 	// the Pod NotReady, still carrying its InferencePool labels, and with its
 	// engine awake holding the GPU. The next pass reads a draining proxy as
-	// Waking, which still counts as lent, and schedules the same Deactivate --
-	// which fails at the same point again. The Pod never returns to the
+	// Waking -- an orphan, which it returns by scheduling the same Deactivate
+	// -- and that fails at the same point again. The Pod never returns to the
 	// reserve.
 	//
 	// That livelock is reachable purely by configuration, because DrainWait

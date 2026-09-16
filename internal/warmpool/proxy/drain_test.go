@@ -86,6 +86,24 @@ func TestANewPointEndsTheDrain(t *testing.T) {
 	}
 }
 
+func TestDrainingTwiceReportsNothingNewToDrain(t *testing.T) {
+	// A retry of a hand-back that drained and then failed comes back through
+	// Drain. The Pod has been NotReady since the first drain, so the caller is
+	// told "nothing to drain" and skips a wait the EPP satisfied long ago --
+	// while the draining state itself is kept.
+	a := engine(t, "modelA")
+	s := New(wideConfig())
+	mustSetUpstream(t, s, a)
+	if !s.Drain() {
+		t.Fatal("first drain must report true")
+	}
+	rec := httptest.NewRecorder()
+	s.DrainHandler(rec, httptest.NewRequest(http.MethodPost, DrainPath, nil))
+	if rec.Code != http.StatusNoContent || !s.Draining() {
+		t.Fatalf("second drain: want 204 and still draining, got %d / %v", rec.Code, s.Draining())
+	}
+}
+
 func TestDrainingNothingIsNotAnError(t *testing.T) {
 	// A hand-back of a Pod that is already out of service: nothing to drain,
 	// and the caller can tell (204) without asking twice.

@@ -236,18 +236,26 @@ func (s *Server) SetUpstream(addr string) error {
 // kept and every request that still arrives is served. Clearing the upstream
 // afterwards -- once the EPP has had time to notice -- is then safe.
 //
-// Draining with no upstream is a no-op that reports false: there is nothing
-// to hand back, and readiness is failing already.
+// Draining with no upstream, or a Pod ALREADY draining, reports false: in
+// both there is nothing new to hand back and readiness is failing already.
+// The second matters on a retry: a hand-back that drained and then failed
+// (clear, unlabel, a cancelled wait) comes back through here, and the caller
+// uses "nothing to drain" to skip a wait the EPP has long since satisfied.
 //
-// The flag is set and then the upstream re-read: a clear landing between the
-// check and the store would otherwise leave draining=true on an empty proxy
-// and a 200 with no address. Setting first and undoing makes that interleaving
-// resolve to "nothing to drain" too.
+// The flag is set and then the upstream re-read, so a clear landing between
+// the check and the store resolves to "nothing to drain" rather than leaving
+// draining=true on an empty proxy. A concurrent POINT is not covered -- the
+// reconciler serialises a Pod's activate and deactivate, so it cannot happen
+// through the controller; from the control port by hand, a point during a
+// drain ends the drain (SetUpstream clears the flag), which is the right
+// outcome either way.
 func (s *Server) Drain() bool {
 	if s.Upstream() == "" {
 		return false
 	}
-	s.draining.Store(true)
+	if !s.draining.CompareAndSwap(false, true) {
+		return false // already draining: nothing new to hand back
+	}
 	if s.Upstream() == "" {
 		s.draining.Store(false)
 		return false

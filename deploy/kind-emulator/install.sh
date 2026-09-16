@@ -38,7 +38,7 @@ SIM_IMAGE=${SIM_IMAGE:-"ghcr.io/llm-d/llm-d-inference-sim:v0.9.0"}
 # env var and default as the suite's own WarmPoolProxyImage (test/e2e/config.go),
 # so overriding one overrides what is pre-loaded.
 WARMPOOL_EMULATOR_IMAGE=${WARMPOOL_EMULATOR_IMAGE:-"registry.access.redhat.com/ubi9/python-311:latest"}
-WARMPOOL_PROXY_IMAGE=${WARMPOOL_PROXY_IMAGE:-"ghcr.io/ev-shindin/warmpool-proxy:v10"}
+WARMPOOL_PROXY_IMAGE=${WARMPOOL_PROXY_IMAGE:-"ghcr.io/ev-shindin/warmpool-proxy:v11"}
 
 # WVA Configuration
 WVA_RECONCILE_INTERVAL=${WVA_RECONCILE_INTERVAL:-"60s"} # WVA controller reconcile interval - tests set 30s interval

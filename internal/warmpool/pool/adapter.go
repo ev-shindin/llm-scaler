@@ -728,9 +728,9 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 // calls AFTER it are the ones that matter. Deactivate drains the proxy first,
 // so a timeout inside the wait leaves the Pod NotReady, still carrying its
 // InferencePool labels, and with its engine still awake holding the GPU. The
-// next pass reads a draining proxy as Waking, which still counts as lent, and
-// schedules the same Deactivate -- which fails at the same point again. The
-// Pod never returns to the reserve.
+// next pass reads a draining proxy as Waking -- an orphan, which it returns by
+// scheduling the same Deactivate -- and that fails at the same point again.
+// The Pod never returns to the reserve.
 //
 // That is a livelock reachable purely by configuration: DrainWait lives on this
 // Adapter and the deadline comes from the reconciler's ActTimeout, two knobs in
