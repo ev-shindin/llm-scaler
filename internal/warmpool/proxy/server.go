@@ -563,7 +563,7 @@ type upstreamBody struct {
 func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, upstreamBody{Address: s.Upstream(), Draining: s.Draining()})
+		writeOK(w, upstreamBody{Address: s.Upstream(), Draining: s.Draining()})
 	case http.MethodPut:
 		var body upstreamBody
 		// Bounded: an unbounded decode on a control endpoint is an OOM waiting
@@ -577,7 +577,7 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 			// first would reject it -- there is no host:port in "" -- which
 			// silently removed a documented way to take a Pod out of service.
 			_ = s.SetUpstream("")
-			writeJSON(w, http.StatusOK, upstreamBody{Address: ""})
+			writeOK(w, upstreamBody{Address: ""})
 			return
 		}
 		if err := validUpstream(body.Address, s.cfg.MinUpstreamPort, s.cfg.UpstreamPortCount); err != nil {
@@ -611,7 +611,7 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 		// readiness uses to clear the flag. Without this, every probe after an
 		// earlier failure spends a live request re-establishing it.
 		s.degraded.Store(false)
-		writeJSON(w, http.StatusOK, upstreamBody{Address: s.Upstream()})
+		writeOK(w, upstreamBody{Address: s.Upstream()})
 	case http.MethodDelete:
 		_ = s.SetUpstream("")
 		w.WriteHeader(http.StatusNoContent)
@@ -633,11 +633,13 @@ func (s *Server) DrainHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	writeJSON(w, http.StatusOK, upstreamBody{Address: s.Upstream(), Draining: true})
+	writeOK(w, upstreamBody{Address: s.Upstream(), Draining: true})
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+// writeOK answers 200 with a JSON body. Every success on the control endpoint
+// is a 200; the failures go through http.Error.
+func writeOK(w http.ResponseWriter, body any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(body)
 }

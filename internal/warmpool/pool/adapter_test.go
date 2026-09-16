@@ -31,6 +31,9 @@ import (
 
 const testNamespace = "pool-ns"
 
+// lentUpstream is where a lent Pod's proxy points: the pool's first engine port.
+const lentUpstream = "127.0.0.1:9001"
+
 // deadAddr is an address proven to have nothing behind it: bound and closed, so
 // the kernel confirmed it was free rather than the test guessing a port.
 var deadAddr = func() string {
@@ -386,7 +389,7 @@ func TestActivateLabelsBeforeWaking(t *testing.T) {
 		t.Fatalf("endpoint = %+v, want the instance's own port", ep)
 	}
 	h.journal.inOrder(t, "label", "wake", "point")
-	if got := h.upstream; got != "127.0.0.1:9001" {
+	if got := h.upstream; got != lentUpstream {
 		t.Errorf("proxy must be pointed at the Pod-local address, got %q", got)
 	}
 }
@@ -448,7 +451,7 @@ func TestDeactivateDrainsThenClearsBeforeSleeping(t *testing.T) {
 	// dispatched in that window with "no model is awake in this Pod" --
 	// measured: one to two per hand-back, none anywhere else.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
-	h.upstream = "127.0.0.1:9001" // lent: the proxy points at the model being handed back
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 
 	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err != nil {
 		t.Fatalf("Deactivate: %v", err)
@@ -518,7 +521,7 @@ func TestListWarmDiscoversStateRatherThanRemembering(t *testing.T) {
 	// Awake and pointed at means serving; awake and not pointed at means the
 	// wake is still in flight.
 	h.asleep = false
-	h.upstream = "127.0.0.1:9001"
+	h.upstream = lentUpstream
 	if got, _ = h.adapter.ListWarm(context.Background()); got[0].State != Serving {
 		t.Errorf("state = %q, want serving", got[0].State)
 	}
@@ -736,7 +739,7 @@ func TestDeactivateFallsBackToClearingFirstOnAnOlderProxy(t *testing.T) {
 	// still complete -- with the old order and its old window -- rather than
 	// leave a Pod lent forever because the controller was upgraded first.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
-	h.upstream = "127.0.0.1:9001" // lent: the proxy points at the model being handed back
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.drainUnsupported = true
 
 	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err != nil {
@@ -751,7 +754,7 @@ func TestDeactivateDoesNotSleepAModelStillTakingTraffic(t *testing.T) {
 	// still Ready and still in its InferencePool, so sleeping anyway is the
 	// Ready-but-asleep window -- every request routed there 503s.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
-	h.upstream = "127.0.0.1:9001" // lent: the proxy points at the model being handed back
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.clearFails = true
 
 	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err == nil {
@@ -774,7 +777,7 @@ func TestDeactivateDoesNotSleepAModelStillInItsInferencePool(t *testing.T) {
 	// EPP's endpoint set. Sleeping while it is still listed is a 503 for as long
 	// as the EPP takes to notice.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
-	h.upstream = "127.0.0.1:9001" // lent: the proxy points at the model being handed back
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.k8s = refusePatches(t, h.k8s)
 	h.adapter.client = h.k8s
 
@@ -806,7 +809,7 @@ func TestDeactivateGivesUpTheDrainWithTheContext(t *testing.T) {
 	// with the context rather than hold the loop open, and it must not go on to
 	// sleep an engine whose Pod it can no longer observe.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
-	h.upstream = "127.0.0.1:9001" // lent: the proxy points at the model being handed back
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.adapter.DrainWait = time.Minute
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -871,7 +874,7 @@ func TestTheDrainYieldsToTheDeadlineRatherThanStrandingThePod(t *testing.T) {
 	// ActTimeout: two knobs in two packages with nothing tying them together.
 	// The drain yields instead.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
-	h.upstream = "127.0.0.1:9001" // lent: the proxy points at the model being handed back
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.adapter.DrainWait = time.Hour
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
