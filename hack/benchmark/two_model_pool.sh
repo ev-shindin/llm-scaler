@@ -431,11 +431,22 @@ verb_preflight() {
         warn "no PVC named $CACHE_CLAIM in $NS -- it is created by standup; run this again after"
     fi
 
-    # The phase has to outlast scale-down stabilization or the premise fails.
-    if [ "$PHASE_SECONDS" -lt 420 ]; then
-        warn "PHASE_SECONDS=$PHASE_SECONDS is shorter than scale-down stabilization (300s) plus a ramp."
+    # The phase has to outlast scale-down stabilization or the premise fails --
+    # UNLESS the both-low band between bursts is itself longer than
+    # stabilization. Then the falling model has given its replicas back before
+    # the other model rises whatever the burst length, and short bursts with
+    # long quiet stretches are a legitimate shape: it is the one where a held
+    # floor is paid for mostly idle, which is the cost question a pool exists
+    # to answer.
+    if [ "$PHASE_SECONDS" -lt 420 ] && [ "$OVERLAP_SECONDS" -lt 300 ]; then
+        warn "PHASE_SECONDS=$PHASE_SECONDS is shorter than scale-down stabilization (300s) plus a ramp,"
+        warn "  and the both-low band (OVERLAP_SECONDS=$OVERLAP_SECONDS) is shorter than stabilization."
         warn "  A model then holds the replicas it grew through most of the OTHER model's rise, so"
-        warn "  the two never compete and the anti-phase premise is not exercised."
+        warn "  the two never compete and the anti-phase premise is not exercised. Lengthen one of them."
+        rc=1
+    fi
+    if [ "$RISE_WINDOW" -ge "$PHASE_SECONDS" ]; then
+        warn "RISE_WINDOW=$RISE_WINDOW is not shorter than PHASE_SECONDS=$PHASE_SECONDS; the profile will refuse to render."
         rc=1
     fi
 
