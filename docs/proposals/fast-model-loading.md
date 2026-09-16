@@ -415,15 +415,23 @@ concentrated in the wake mechanism itself.
 
 ### 3.4 Ordering is load-bearing
 
-Clear the proxy (readiness follows it) -> wait for the drain -> unlabel ->
-`/sleep`. Sleeping first leaves a Ready-but-asleep window, which *is* the 503
-condition. On wake the label goes FIRST, then `/wake_up`, then the proxy is
-pointed: labelling early costs nothing and takes the EPP's measured ~462 ms
-admit off the critical path.
+Drain the proxy (readiness fails, forwarding continues) -> wait for the drain
+-> clear the proxy -> unlabel -> `/sleep`. Sleeping first leaves a
+Ready-but-asleep window, which *is* the 503 condition. On wake the label goes
+FIRST, then `/wake_up`, then the proxy is pointed: labelling early costs
+nothing and takes the EPP's measured ~462 ms admit off the critical path.
 
 This is cheap to get right and expensive to get wrong — and the wait is longer
 than it looks. It has to cover the kubelet noticing the probe fail and the Pod
 leaving its EndpointSlice, not just the ~630 ms the EPP itself takes to drain.
+
+The first version *cleared* the proxy as its first step, on the reasoning that
+the proxy is the gate. It is — but a gate that slams answers 503 to whatever is
+already in the doorway: measured on a two-model run, one to two requests at
+every hand-back failed with the proxy's own `no model is awake in this Pod`,
+and none anywhere else. Draining is the same gate closed *after* the EPP has
+stopped sending, which is why it is a distinct step with its own control
+endpoint.
 
 ### 3.5 Large models weaken the technique, whatever the mechanism
 

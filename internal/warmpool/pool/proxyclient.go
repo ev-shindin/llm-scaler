@@ -3,7 +3,9 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -48,11 +50,44 @@ func (p *Proxy) Point(ctx context.Context, ep Endpoint) error {
 	return err
 }
 
+// ErrDrainUnsupported says the proxy predates the drain step. The caller falls
+// back to clearing first, which is the old sequence and its old 503 window.
+var ErrDrainUnsupported = errors.New("this proxy image has no drain endpoint")
+
+// Drain starts the hand-back: /readyz fails from now on, so the kubelet marks
+// the Pod NotReady and the EPP stops dispatching to it, while the proxy keeps
+// forwarding whatever the EPP still sends in the meantime. Reports false when
+// there was nothing to drain (no upstream).
+//
+// This is the FIRST step of putting a model to sleep. Clear comes after the
+// EPP has had time to notice -- see Adapter.Deactivate -- because clearing
+// first answered every request in that window with a 503.
+func (p *Proxy) Drain(ctx context.Context) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+proxy.DrainPath, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNoContent:
+		return false, nil
+	case http.StatusNotFound:
+		return false, ErrDrainUnsupported
+	default:
+		return false, fmt.Errorf("drain: %s answered %d", proxy.DrainPath, resp.StatusCode)
+	}
+}
+
 // Clear takes the Pod out of service: no upstream, so /readyz fails and the
 // kubelet marks the Pod NotReady, and the EPP stops dispatching within about
-// 630 ms (measured drain).
-//
-// This is the FIRST step of putting a model to sleep, not the last.
+// 630 ms (measured drain). Requests that reach the Pod after this are refused.
 func (p *Proxy) Clear(ctx context.Context) error {
 	_, err := doJSON(ctx, p.client, http.MethodDelete, p.baseURL+proxy.UpstreamPath, nil)
 	return err

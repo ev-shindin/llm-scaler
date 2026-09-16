@@ -658,10 +658,31 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 		return err
 	}
 
-	// Clear the proxy FIRST: it is the gate. /readyz then fails, the kubelet
-	// marks the Pod NotReady, and the EPP drains within the measured ~630 ms.
-	if err := a.newProxy(p.Status.PodIP).Clear(ctx); err != nil {
-		return fmt.Errorf("take %s out of service: %w", pod, err)
+	// DRAIN first, clear after. Draining fails /readyz -- the kubelet marks
+	// the Pod NotReady and the EPP stops dispatching within the measured
+	// ~630 ms -- while the proxy keeps forwarding what the EPP still sends
+	// during that window. The upstream is cleared only once that window has
+	// passed, so no request ever meets a proxy with nothing behind it.
+	//
+	// It used to clear first, on the reasoning that the proxy is the gate.
+	// It is, but a gate that slams answers 503 to whatever was already in the
+	// doorway: measured on a two-model run, one to two requests at EVERY
+	// hand-back failed with the proxy's own "no model is awake in this Pod",
+	// and none failed anywhere else.
+	//
+	// A proxy image without the drain endpoint gets the old order, and says
+	// so: the pool still works, with the window it always had.
+	px := a.newProxy(p.Status.PodIP)
+	if _, err := px.Drain(ctx); err != nil {
+		if !errors.Is(err, ErrDrainUnsupported) {
+			return fmt.Errorf("drain %s: %w", pod, err)
+		}
+		log.FromContext(ctx).V(logging.DEFAULT).Info(
+			"pool proxy predates the drain step; clearing first, which can 503 in-flight requests",
+			"pod", pod.String())
+		if err := px.Clear(ctx); err != nil {
+			return fmt.Errorf("take %s out of service: %w", pod, err)
+		}
 	}
 	if wait := a.drainFor(ctx); wait > 0 {
 		select {
@@ -669,6 +690,12 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	// Cleared whatever the drain reported -- "nothing to drain" included --
+	// so that unlabel and sleep never follow a proxy that still has an
+	// upstream. Idempotent on a proxy already cleared.
+	if err := px.Clear(ctx); err != nil {
+		return fmt.Errorf("take %s out of service: %w", pod, err)
 	}
 	if err := a.removeLabels(ctx, p, model.PoolLabels); err != nil {
 		return fmt.Errorf("leave the InferencePool for %s: %w", model.Variant, err)

@@ -72,6 +72,7 @@ func run() int {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(proxy.UpstreamPath, server.UpstreamHandler)
+	mux.HandleFunc(proxy.DrainPath, server.DrainHandler)
 	// Readiness: ready exactly when a model is awake here. The kubelet then
 	// keeps the Pod out of its InferencePool while it sleeps, with no Pod-status
 	// write and so no extra permission for the controller.
