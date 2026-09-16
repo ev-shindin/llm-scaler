@@ -333,7 +333,16 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// reason (replica_metrics.go) but leaves its completion rate, which other
 	// consumers sum as real work. A per-replica RATE from such a pod is not a
 	// capacity, and the floor divides by it.
-	if k2Priority == k2SrcObserved && rm.Ready {
+	//
+	// Own replicas only, too. A warm-pool bridge is recorded under the
+	// VARIANT it is lent to (same VariantName, same history key), and it runs
+	// its engine on the pool's terms -- a lower --gpu-memory-utilization, a
+	// different batch ceiling -- so its saturated rate is not a reading of
+	// what one of this variant's replicas does. The window keeps a max, so
+	// one such reading would price the whole variant for the rest of the
+	// window; the read side already leaves bridges out
+	// (estimateThroughputDemand), and the write side has to match it.
+	if k2Priority == k2SrcObserved && rm.Ready && !rm.FromWarmPool {
 		a.recordSaturatedThroughput(historyKey, rm.RequestRate)
 	}
 	saturatedThroughput := a.saturatedThroughputFor(historyKey)

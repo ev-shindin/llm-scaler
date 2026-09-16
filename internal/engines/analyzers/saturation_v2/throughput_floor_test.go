@@ -2,6 +2,7 @@ package saturation_v2
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -20,6 +21,8 @@ const (
 	runMu         = 5.4
 	runK1         = int64(929_792) // 1,162,240 x 0.8
 	runKvCapacity = int64(1_162_240)
+
+	decodeVariant = "decode-v"
 )
 
 var _ = Describe("estimateThroughputDemand", func() {
@@ -115,8 +118,43 @@ var _ = Describe("the saturated-throughput window", func() {
 		a.recordSaturatedThroughput("k", 0)
 		Expect(a.saturatedThroughput).To(BeEmpty())
 		a.recordSaturatedThroughput("k", 2)
-		a.EvictStaleHistory(0)
+		// Age the window explicitly rather than evicting with a zero timeout:
+		// a zero timeout asks whether any time at all has passed, which on a
+		// coarse clock it may not have.
+		a.saturatedThroughput["k"].lastUpdated = time.Now().Add(-2 * time.Hour)
+		a.EvictStaleHistory(time.Hour)
 		Expect(a.saturatedThroughput).To(BeEmpty())
+	})
+})
+
+var _ = Describe("estimateThroughputDemand with mixed readings", func() {
+	It("takes the median cost across a role's replicas, not the mean or an extreme", func() {
+		// Two variants of one role priced differently: an H200 at 930k tokens
+		// completing 5.4/s and a slower card at 600k completing 2.0/s. Costs
+		// (P/mu) are 172k and 300k tokens per req/s; with four replicas split
+		// two and two the median averages the central pair, 236k. The mean of
+		// costs is the same here by symmetry, so the third reading breaks it.
+		variants := []domain.VariantCapacity{
+			{VariantName: "fast", Role: domain.RoleDecode, ReplicaCount: 3, PerReplicaCapacity: 930_000},
+			{VariantName: "slow", Role: domain.RoleDecode, ReplicaCount: 2, PerReplicaCapacity: 600_000},
+		}
+		replicas := []ReplicaCapacity{
+			{VariantName: "fast", SaturatedThroughput: 5.4},
+			{VariantName: "fast", SaturatedThroughput: 5.4},
+			{VariantName: "fast", SaturatedThroughput: 5.4},
+			{VariantName: "slow", SaturatedThroughput: 2.0},
+			{VariantName: "slow", SaturatedThroughput: 2.0},
+		}
+		f := estimateThroughputDemand(6, replicas, variants, 0)
+		fastCost := 930_000 / 5.4
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 6*fastCost, 1e-6),
+			"five readings, three of them the fast card's: the median is the fast card's cost")
+		Expect(f.Terms[domain.RoleDecode].Mu).To(Equal(5.4))
+
+		By("averaging the central pair on an even count")
+		f = estimateThroughputDemand(6, replicas[1:], variants, 0)
+		slowCost := 600_000 / 2.0
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 6*(fastCost+slowCost)/2, 1e-6))
 	})
 })
 
@@ -133,7 +171,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	})
 
 	decode := func(pod string, tokensInUse int64, queue int, rate float64) domain.ReplicaMetrics {
-		rm := makeReplicaMetrics(pod, "decode-v", tokensInUse, runKvCapacity, queue, 6000, 1000)
+		rm := makeReplicaMetrics(pod, decodeVariant, tokensInUse, runKvCapacity, queue, 6000, 1000)
 		rm.RequestRate = rate
 		rm.Ready = true
 		return rm
@@ -146,7 +184,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	}
 	states := func(decodeN, prefillN int) []domain.VariantReplicaState {
 		return []domain.VariantReplicaState{
-			{VariantName: "decode-v", Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: decodeN, GPUsPerReplica: 1},
+			{VariantName: decodeVariant, Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: decodeN, GPUsPerReplica: 1},
 			{VariantName: "prefill-v", Role: domain.RolePrefill, AcceleratorName: "H200", CurrentReplicas: prefillN, GPUsPerReplica: 1},
 		}
 	}
@@ -181,7 +219,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 
 		var decodeP float64
 		for _, vc := range result.VariantCapacities {
-			if vc.VariantName == "decode-v" {
+			if vc.VariantName == decodeVariant {
 				decodeP = vc.PerReplicaCapacity
 			}
 		}
@@ -215,12 +253,77 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(err).NotTo(HaveOccurred())
 		var decodeP float64
 		for _, vc := range result.VariantCapacities {
-			if vc.VariantName == "decode-v" {
+			if vc.VariantName == decodeVariant {
 				decodeP = vc.PerReplicaCapacity
 			}
 		}
 		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 0.85*decodeP, 1))
 		Expect(aggregation.SumTotalAnticipatedSupply(result.VariantCapacities)).To(BeNumerically(">", 0))
+	})
+
+	It("does not record a bridge's throughput under the variant it is lent to", func() {
+		// A warm-pool bridge is recorded with the borrowing variant's name, so
+		// it lands on the same history key as the variant's own replicas. Its
+		// engine runs on the pool's terms; its saturated rate must not price
+		// the variant -- and the window is a max, so one reading would.
+		in := makeAnalyzerInput(
+			[]domain.ReplicaMetrics{decode("bridge-0", 1_158_912, 10, 9.9)},
+			states(1, 0)[:1])
+		in.ReplicaMetrics[0].FromWarmPool = true
+		_, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.saturatedThroughput).To(BeEmpty())
+
+		By("while the variant's own replica on the same key is recorded")
+		in = makeAnalyzerInput(
+			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 10, runMu)},
+			states(1, 0)[:1])
+		_, err = analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.saturatedThroughput).To(HaveLen(1))
+		for _, ra := range analyzer.saturatedThroughput {
+			Expect(ra.Max()).To(Equal(runMu), "the bridge's 9.9 must not be in the window")
+		}
+	})
+
+	It("composes on top of the arrival floor in the same cycle, and keeps the sums consistent", func() {
+		saturate()
+		// Six replicas, each reporting the uncontended service time the run
+		// measured at that size (2.0s), so the arrival floor binds first at
+		// 6 x 2.0 x 7000 = 84k tokens -- above the ~20k occupancy, far below
+		// what the load needs. The throughput floor must then raise decode on
+		// top of that, and TotalDemand must move by the same amount.
+		rm := make([]domain.ReplicaMetrics, 0, 7)
+		for i := 0; i < 6; i++ {
+			r := decode(string(rune('a'+i)), 3_000, 0, 1.0)
+			r.AvgServiceTime = 2.0
+			rm = append(rm, r)
+		}
+		p := prefill("p", 0)
+		p.AvgServiceTime = 0.11
+		rm = append(rm, p)
+		in := makeAnalyzerInput(rm, states(6, 1))
+		in.ArrivalRate = runLambda
+		result, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+
+		var decodeP float64
+		for _, vc := range result.VariantCapacities {
+			if vc.VariantName == decodeVariant {
+				decodeP = vc.PerReplicaCapacity
+			}
+		}
+		arrival := runLambda * 2.0 * 7000
+		Expect(arrival).To(BeNumerically(">", 6*3_000), "the arrival floor must bind for this case to mean anything")
+		want := runLambda / runMu * decodeP
+		Expect(want).To(BeNumerically(">", arrival), "and the throughput floor must sit above it")
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
+		var sum float64
+		for _, v := range result.RoleDemand {
+			sum += v
+		}
+		Expect(result.TotalDemand).To(BeNumerically("~", sum, 1),
+			"TotalDemand and RoleDemand must move together after both floors")
 	})
 
 	It("does not record a throughput from a pod that is not Ready", func() {

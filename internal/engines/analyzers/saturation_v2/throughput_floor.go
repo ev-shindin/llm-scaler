@@ -1,12 +1,15 @@
 package saturation_v2
 
 import (
+	"maps"
+	"slices"
 	"sort"
 
 	"github.com/go-logr/logr"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 )
 
 // The arrival-rate floor in arrival_demand.go sizes the fleet by Little's law
@@ -141,13 +144,14 @@ func estimateThroughputDemand(
 
 	perReplica := make(map[string]float64, len(variants))
 	roleOf := make(map[string]string, len(variants))
-	anticipated := make(map[string]float64)
 	for _, vc := range variants {
 		perReplica[vc.VariantName] = vc.PerReplicaCapacity
-		role := canonicalRole(vc.Role)
-		roleOf[vc.VariantName] = role
-		anticipated[role] += float64(vc.ReplicaCount+vc.PendingReplicas) * vc.PerReplicaCapacity
+		roleOf[vc.VariantName] = canonicalRole(vc.Role)
 	}
+	// The per-role anticipated supply the cap is measured against, from the
+	// one place that defines it: the engine reads the same figure through the
+	// same helper, so the cap and the RC it exists to zero cannot drift apart.
+	anticipated := aggregation.AggregateByRole(variants)
 
 	// tokens per unit of arrival rate, per role: P / mu for each replica that
 	// can price it.
@@ -177,7 +181,7 @@ func estimateThroughputDemand(
 		floor := lambda * cost
 		term := throughputTerm{Mu: mu, PerReplica: cost * mu, Replicas: lambda / mu}
 		if scaleUp > 0 {
-			if hold := scaleUp * anticipated[role]; floor > hold {
+			if hold := scaleUp * anticipated[role].TotalAnticipatedSupply; floor > hold {
 				floor = hold
 				term.Capped = true
 			}
@@ -218,11 +222,7 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 		return totalDemand
 	}
 	// Roles in a stable order, so a two-role fleet logs the same way each cycle.
-	roles := make([]string, 0, len(floor.ByRole))
-	for role := range floor.ByRole {
-		roles = append(roles, role)
-	}
-	sort.Strings(roles)
+	roles := slices.Sorted(maps.Keys(floor.ByRole))
 
 	for _, role := range roles {
 		tokens := floor.ByRole[role]

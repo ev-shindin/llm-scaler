@@ -705,7 +705,9 @@ var _ = Describe("SaturationAnalyzer", func() {
 		It("reports no pending replicas while condemned replicas outnumber the target", func() {
 			// An in-flight scale-down: the target is at 1 with 3 rows still
 			// reporting. The engine's clamp caps supply at the target's count;
-			// pending must be zero here, not the target's stale not-ready figure.
+			// pending must be zero here, not the target's stale not-ready figure
+			// -- which is set to a nonzero value so that the old code (pending =
+			// vs.PendingReplicas) and the new one give different answers.
 			input := makeAnalyzerInput(
 				[]domain.ReplicaMetrics{
 					makeReplicaMetrics("pod-1", "variant-a", 1000, 16000, 0, 100, 50),
@@ -713,7 +715,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 					makeReplicaMetrics("pod-3", "variant-a", 1000, 16000, 0, 100, 50),
 				},
 				[]domain.VariantReplicaState{
-					{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, PendingReplicas: 0, GPUsPerReplica: 1},
+					{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, PendingReplicas: 5, GPUsPerReplica: 1},
 				},
 			)
 			result, err := analyzer.Analyze(ctx, input)
