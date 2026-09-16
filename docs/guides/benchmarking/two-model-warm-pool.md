@@ -41,19 +41,26 @@ priced on.
 
 ## The phases
 
-Default shape — a 2 minute lead-in, then four 8 minute phases separated by 30s
-bands where neither model bursts (36 minutes):
+Default shape — a 2 minute lead-in, then four 8 minute phases separated by 90s
+bands where neither model bursts (2310s, 38.5 minutes). Model A (Llama) bursts
+to `HIGH_RPS` = 9, model B (Qwen) to `HIGH_RPS_B` = 8 — the two do not have
+the same per-replica capacity, see below. Each phase is split at
+`RISE_WINDOW` = 240s into the rise stage the report keys on and the remainder:
 
 | phase | window | model A | model B | what it is for |
 | --- | --- | --- | --- | --- |
 | lead-in | 0–120s | 3 rps | 3 rps | both stacks serve before anything is measured, so the first burst is a scale-up and not a first-request penalty |
-| 1 | 120–600s | 3 rps | **9 rps** | B rises. A is idle, and A's replicas are capacity B does not have |
-| band | 600–630s | 3 rps | 3 rps | neither model bursting, so the two cannot burst at once when they drain at different speeds |
-| 2 | 630–1110s | **9 rps** | 3 rps | A rises while B falls — the swap the pool is supposed to absorb |
-| band | 1110–1140s | 3 rps | 3 rps | |
-| 3 | 1140–1620s | 3 rps | **9 rps** | B rises again, with whatever state the first cycle left |
-| band | 1620–1650s | 3 rps | 3 rps | |
-| 4 | 1650–2130s | **9 rps** | 3 rps | A rises again |
+| 1 | 120–600s | 3 rps | **8 rps** | B rises (rise stage 120–360s). A is idle, and A's replicas are capacity B does not have |
+| band | 600–690s | 3 rps | 3 rps | neither model bursting, so the two cannot burst at once when they drain at different speeds |
+| 2 | 690–1170s | **9 rps** | 3 rps | A rises (690–930s) while B falls — the swap the pool is supposed to absorb |
+| band | 1170–1260s | 3 rps | 3 rps | |
+| 3 | 1260–1740s | 3 rps | **8 rps** | B rises again (1260–1500s), with whatever state the first cycle left |
+| band | 1740–1830s | 3 rps | 3 rps | |
+| 4 | 1830–2310s | **9 rps** | 3 rps | A rises again (1830–2070s) |
+
+The table is derived from the same generator that renders the load, so the
+report's windows and these boundaries cannot drift apart: `python3
+hack/benchmark/two_model_profile.py --emit schedule` prints the live one.
 
 **Why 8 minutes and not 4.** Scale-down stabilization here is 300s — fast up,
 slow down, because under-provisioning costs TTFT irrecoverably while
@@ -146,7 +153,7 @@ asked for two models at once can serve one — so it would be recorded as the po
 failing at exactly the thing this scenario measures, when it is an artefact of
 the driver.
 
-So `OVERLAP_SECONDS` (default 30) inserts a band between consecutive bursts
+So `OVERLAP_SECONDS` (default 90) inserts a band between consecutive bursts
 where **both** models sit at the low rate. Two things then hold:
 
 - No stage ever has both models high — checked on what the generator emits with
@@ -158,7 +165,7 @@ where **both** models sit at the low rate. Two things then hold:
 
 The band costs the flat-sum premise `2 × LOW` instead of `LOW + HIGH` for its
 duration. That is a *dip* in total demand, not a rise, and scale-down
-stabilization is 300s — so at 30s no replica is given back because of it, and
+stabilization is 300s — so at 90s no replica is given back because of it, and
 what the fleet does is unchanged.
 
 **Tokenizers are cached on the shared model claim.** Each arm would otherwise
@@ -214,7 +221,7 @@ measured on CoreWeave: 210 records, each with the raw response chunks and no
 time on any of them. Nothing can be re-cut into a window after the run.
 
 So **the rise window is a stage**. Every phase after the lead-in is split in two
-at `RISE_WINDOW` (default 90s) — an opening sub-stage and the remainder, at the
+at `RISE_WINDOW` (default 240s) — an opening sub-stage and the remainder, at the
 same rate, so the load is unchanged — and the headline number is read straight
 out of `stage_N_lifecycle_metrics.json` for the opening stage of each rise. Both
 models are split at the same boundaries, so one stage index means one window for
@@ -357,7 +364,7 @@ make benchmark-two-model-reset
 make benchmark-two-model-run ARM=nopool
 ```
 
-Refuses if a pool is present. ~34 minutes at the defaults.
+Refuses if a pool is present. ~45 minutes at the defaults (7 minutes of preload, 38.5 of load).
 
 **5. Create the pool.**
 
@@ -440,7 +447,7 @@ make benchmark-two-model-status      # confirm nothing still holds an accelerato
 **TTFT over the whole run** is the least interesting. Most of a run is steady
 state, where the pool does nothing but hold accelerators.
 
-**TTFT per rise** — the first 90s after a model's rate goes up — is where a
+**TTFT per rise** — the first `RISE_WINDOW` (240s) after a model's rate goes up — is where a
 bridge can matter. It is printed **one row per rise**, not pooled, because each
 rise is a *single scale-up event*: the hundreds of requests inside it are not
 independent samples, and pooling them yields a number that looks like n=700 and

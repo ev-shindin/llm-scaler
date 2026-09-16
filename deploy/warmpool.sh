@@ -356,6 +356,18 @@ cmd_create() {
     if ! printf '%s' "$MAX_HOLD" | grep -Eq '[1-9]'; then
       log_error "--max-hold must be greater than zero: a zero hold reclaims every lent Pod on the first pass, so the pool warms models and never bridges with them"
     fi
+    if [ "$POOL_TYPE" = "retained" ]; then
+      # Refused, not ignored. Retention IS the absence of this timeout
+      # (`expired := !cfg.Retained && now.Sub(borrowedAt) >= cfg.MaxHold`), so a
+      # pool carrying both reads as "reclaims after 5m" and never reclaims.
+      log_error "--max-hold is meaningless with --type retained: retention is precisely what switches the hold timeout off. Drop one."
+    fi
+  fi
+  # Its own block, NOT nested in --max-hold's. It was, by an indentation slip,
+  # so `--min-hold 5x5m` with no --max-hold rendered `warmPoolMinHold: "5x5m"`
+  # unchallenged; ParsePoolMeta then rejected the trigger and the pool ran on
+  # its fallback config -- the silent misconfiguration this check exists to
+  # prevent, reachable by the most natural way of setting the flag.
   if [ -n "$MIN_HOLD" ]; then
     if ! printf '%s' "$MIN_HOLD" | grep -Eq '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$'; then
       log_error "--min-hold must be positive number+unit pairs, such as 90s, 1.5m or 1h30m, got '$MIN_HOLD'"
@@ -364,13 +376,6 @@ cmd_create() {
       # A retained pool has no handover to smooth: nothing is coming to replace
       # the Pod, so a floor on the borrow is meaningless rather than harmless.
       log_error "--min-hold is meaningless with --type retained: a retained pool has no ordinary replicas arriving, so there is no handover for a floor to cover"
-    fi
-  fi
-    if [ "$POOL_TYPE" = "retained" ]; then
-      # Refused, not ignored. Retention IS the absence of this timeout
-      # (`expired := !cfg.Retained && now.Sub(borrowedAt) >= cfg.MaxHold`), so a
-      # pool carrying both reads as "reclaims after 5m" and never reclaims.
-      log_error "--max-hold is meaningless with --type retained: retention is precisely what switches the hold timeout off. Drop one."
     fi
   fi
   if [ -n "$POOL_TYPE" ]; then

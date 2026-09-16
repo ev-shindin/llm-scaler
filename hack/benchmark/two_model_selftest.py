@@ -307,6 +307,28 @@ elif report.integrate([(0, 3, 0, 0)], 1)[0] is not None:
 else:
     ok("GPU-seconds integrate forward, and one sample is not a duration")
 
+case("accelerator-seconds are the run's, not the sampler's")
+# The sampler starts before the start barrier and stops after the ladder, so
+# the raw series carries the standing fleet at both ends -- and in the pool
+# arm those ends include the pool's Pods. MEASURED: the pool arm's series
+# began 404s before the load at 4 accelerators against nopool's 2, ~800 GPU-s
+# the pool never spent during the run. Clipped to [0, t_end], with the
+# straddling samples carried to the boundaries.
+raw = [(-400, 4, 2, 0), (-100, 4, 2, 0), (50, 6, 2, 1), (150, 5, 2, 0), (260, 5, 2, 0)]
+clipped = report.clip_series(raw, 200)
+total, _ = report.integrate(clipped, 1)
+# [0,50) at 4 (carried from -100), [50,150) at 6, [150,200] at 5 = 200+600+250
+if clipped[0][0] != 0.0 or clipped[-1][0] != 200.0:
+    fail("clipped series does not span exactly [0, t_end]: %r" % clipped)
+elif total != 1050.0:
+    fail("clipped GPU-seconds %s, expected 1050 (4x50 + 6x100 + 5x50)" % total)
+elif report.integrate(raw, 1)[0] == total:
+    fail("clipping changed nothing, so the tails were not in the raw total to begin with")
+elif report.clip_series([(-30, 3, 0, 0)], 100) != [(0.0, 3, 0, 0), (100.0, 3, 0, 0)]:
+    fail("a series entirely before the window is not held across it")
+else:
+    ok("GPU-seconds are integrated over [0, %ds] only; the tails held %.0f more" % (200, report.integrate(raw, 1)[0] - total))
+
 case("a hole in the sampling is reported, not hidden")
 holed = [(0, 4, 0, 0), (120, 4, 0, 0)]
 _, gapped = report.integrate(holed, 1, gap_limit=30)
@@ -1110,14 +1132,25 @@ else:
     ok("simultaneous bursts are counted, to the second")
 
 case("an arm whose bursts overlapped is refused")
+# The SAME schedule as the baseline, with only model A's lead-in running 60s
+# short, so A's first burst starts while B's is still on. An earlier version
+# of this case swapped in a different schedule, which the signature check
+# refused before the overlap guard was ever consulted -- neutering the guard
+# left the case green. Now only the overlap can refuse it.
+nominal = [s["end"] - s["start"] for s in BASE_META["schedule"]]
 bad = dict(BASE_META)
-bad.update(crossed)
+bad["windows"] = {"a": {"stages": [{"elapsed": float(nominal[0] - 60)}]
+                        + [{"elapsed": float(d)} for d in nominal[1:]]},
+                  "b": {"stages": [{"elapsed": float(d)} for d in nominal]}}
 bad["overlap_seconds"] = 90
-if run_report(BASE_META, bad) == 0:
-    fail("an arm where both models burst at once for 20s was compared; the scenario's "
-         "whole premise is that their peaks do not coincide")
+ov = report.burst_overlap({"meta": bad})
+if not ov or ov <= 0:
+    fail("the fixture does not overlap (%s); the case would test nothing" % ov)
+elif run_report(BASE_META, bad) == 0:
+    fail("an arm where both models burst at once for %.0fs was compared; the scenario's "
+         "whole premise is that their peaks do not coincide" % ov)
 else:
-    ok("overlapping bursts void the arm")
+    ok("overlapping bursts (%.0fs, same schedule) void the arm" % ov)
 
 case("a SCALE-UP is not a shortfall")
 # A healthy run with four scale-ups is short for as long as each new replica
@@ -1173,15 +1206,22 @@ case("accelerator sampling with holes in it is refused")
 # window to failed polls, came out at 1654 accelerator-seconds against the
 # other's 14284, and the report printed "the pool arm spent 763% more" with a
 # footnote about holes rather than refusing.
+#
+# Both series cover the WHOLE schedule. Accelerator-seconds are integrated
+# over [0, t_end] and a series that stops early is held across the rest --
+# which is a hole, and is reported as one. An earlier fixture sampled 495s of
+# a 2130s run and passed, because the integral then covered only what was
+# sampled.
+run_len = BASE_META["schedule"][-1]["end"]
 dense = [{"ts": 1000 + i * 5, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}
-         for i in range(100)]
-holed = ([{"ts": 1000 + i * 5, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}
-          for i in range(10)]
-         + [{"ts": 1000 + 400 + i * 5, "pods": [{"name": "d-0", "gpus": 1, "pool": ""}]}
-            for i in range(10)])
+         for i in range(run_len // 5 + 2)]
+holed = [s for s in dense if not (50 <= s["ts"] - 1000 < 450)]      # a 400s hole
 if run_report(BASE_META, dict(BASE_META), gpus_a=holed, gpus_b=dense) == 0:
-    fail("an arm whose accelerator sampling was 70%% holes was priced anyway; the cost "
-         "half of the comparison is what the pool is judged on")
+    fail("an arm whose accelerator sampling had a 400s hole in %ds was priced anyway; "
+         "the cost half of the comparison is what the pool is judged on" % run_len)
+elif run_report(BASE_META, dict(BASE_META), gpus_a=dense[:100], gpus_b=dense) == 0:
+    fail("an arm whose sampling stopped at %ds of a %ds run was priced anyway"
+         % (dense[99]["ts"] - 1000, run_len))
 else:
     ok("a sampled series with holes is not a measurement of accelerators")
 

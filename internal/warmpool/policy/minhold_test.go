@@ -94,9 +94,11 @@ func TestAnotherVariantBeingShortWaivesTheFloor(t *testing.T) {
 	}
 }
 
-func TestAParkedVariantAlsoWaivesTheFloor(t *testing.T) {
-	// Parked is the case with no alternative: no replicas at all to fall back on,
-	// so its wake is more urgent than another model's warm-up, not less.
+func TestAnIdleParkedVariantDoesNotWaiveTheFloor(t *testing.T) {
+	// Parked is desired 0, ready 0: an idle scale-to-zero model that wants
+	// nothing right now. An earlier version treated it as short, and in any
+	// pool shared with one parked model the floor was waived on every pass --
+	// MinHold was inert in exactly the multi-model pool it was built for.
 	v, lent, in := held(10*time.Second, []VariantDemand{{
 		Model:   pool.ModelRef{Variant: other},
 		Desired: 0,
@@ -105,8 +107,26 @@ func TestAParkedVariantAlsoWaivesTheFloor(t *testing.T) {
 	}})
 	cfg := Config{MaxHold: 5 * time.Minute, MinHold: 90 * time.Second}
 
+	if got := returnsFor(v, lent, in, cfg); len(got) != 0 {
+		t.Fatalf("an idle parked variant waived the floor: %v. It wants nothing; the "+
+			"floor should still be covering the lender's warm-up.", got)
+	}
+}
+
+func TestAParkedVariantThatWakesWaivesTheFloor(t *testing.T) {
+	// The moment a parked model is asked for a replica it reads desired 1,
+	// ready 0 -- short, with no replica at all to fall back on -- and that is
+	// what outranks the floor, not the parked flag.
+	v, lent, in := held(10*time.Second, []VariantDemand{{
+		Model:   pool.ModelRef{Variant: other},
+		Desired: 1,
+		Ready:   0,
+		Parked:  false,
+	}})
+	cfg := Config{MaxHold: 5 * time.Minute, MinHold: 90 * time.Second}
+
 	if got := returnsFor(v, lent, in, cfg); len(got) != 1 {
-		t.Fatalf("the floor held a Pod while a parked variant wanted one: %v", got)
+		t.Fatalf("the floor held a Pod while a waking variant had nothing to serve with: %v", got)
 	}
 }
 

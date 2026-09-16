@@ -415,18 +415,25 @@ func returnsFor(v VariantDemand, lent []pool.Membership, in Input, cfg Config) [
 }
 
 // anotherVariantIsShort reports whether any variant other than `self` has fewer
-// ordinary replicas Ready than it wants, or is parked.
+// ordinary replicas Ready than it wants.
 //
 // This is what makes MinHold safe to turn on. The floor exists to cover a cold
 // replica's warm-up, not to claim the pool; the instant another model is short,
-// its need outranks that. A PARKED variant counts as short because its wake is
-// the case with no alternative -- it has no replicas at all to fall back on.
+// its need outranks that.
+//
+// A PARKED variant is NOT short. Parked is `desired == 0 && ready == 0` with a
+// decision behind it -- an idle scale-to-zero model that wants nothing right
+// now. An earlier version counted it as short, on the reasoning that its wake
+// has no fallback; but a parked model that wakes reads `Desired > Ready` and
+// is caught here anyway, while an idle one waived the floor on every pass, so
+// in any pool shared with one parked model MinHold was inert -- exactly the
+// multi-model pool it was built for.
 func anotherVariantIsShort(in Input, self string) bool {
 	for _, o := range in.Variants {
 		if o.Model.Variant == self {
 			continue
 		}
-		if o.Parked || o.Desired > o.Ready {
+		if o.Desired > o.Ready {
 			return true
 		}
 	}

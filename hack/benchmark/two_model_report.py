@@ -212,6 +212,44 @@ def integrate(series, index, gap_limit=None):
     return total, gapped
 
 
+def clip_series(series, t_end):
+    """The samples inside [0, t_end], with the boundaries held exactly.
+
+    The sampler starts before the start barrier and stops after the ladder,
+    so the raw series carries ~7 minutes of the standing fleet at each end --
+    and in the pool arm those minutes include the pool's Pods. MEASURED on
+    the first valid A/B: the pool arm's series began 404s before the load, at
+    4 accelerators against nopool's 2, which charged the pool ~800 GPU-s it
+    did not spend during the run and inflated its excess from +39% to +44%.
+    Accelerator-seconds are the run's, so the window is the schedule's.
+
+    The sample straddling each boundary is carried to the boundary at its own
+    value, so the integral covers exactly [0, t_end] with nothing dropped and
+    nothing invented.
+    """
+    if not series or t_end is None:
+        return series
+    out = []
+    prev = None
+    for row in series:
+        t = row[0]
+        if t < 0:
+            prev = row
+            continue
+        if t > t_end:
+            break
+        if not out and prev is not None and t > 0:
+            out.append((0.0,) + tuple(prev[1:]))
+        out.append(row)
+        prev = row
+    if out and out[-1][0] < t_end and prev is not None:
+        out.append((float(t_end),) + tuple(prev[1:]))
+    elif not out and prev is not None:
+        # every sample was outside the window: hold the last one across it
+        out = [(0.0,) + tuple(prev[1:]), (float(t_end),) + tuple(prev[1:])]
+    return out
+
+
 def schedule_signature(meta):
     if not meta:
         return None
@@ -451,8 +489,8 @@ def driver_queueing(arm):
     return None
 
 
-def shortfall(path):
-    """(samples, short_samples, worst, longest_short_seconds).
+def shortfall(path, t0=None, t_end=None):
+    """(samples, short_samples, worst, longest_short_seconds), inside the run.
 
     How far, and for how long CONTINUOUSLY, an arm fell short of the fleet its
     own Deployments asked for.
@@ -496,6 +534,12 @@ def shortfall(path):
         want = s.get("desired")
         if not want:
             continue
+        # Only the run itself: the sampler also covers the preload and the
+        # report-writing tail, when the fleet is standing still by design.
+        if t0 is not None and s.get("ts") is not None:
+            off = s["ts"] - t0
+            if off < 0 or (t_end is not None and off > t_end):
+                continue
         running = {}
         for p in s.get("pods", []):
             if p.get("pool"):
@@ -659,7 +703,10 @@ def admissible(arms, max_queue_delay, max_short=300.0, max_overlap=0.0,
                             "not answers from the models. What is left is the survivors "
                             "of that, not the scenario."
                             % (arm["name"], netfail, issued, 100.0 * netfail / issued))
-        total, short, worst, longest = shortfall(os.path.join(arm["dir"], "gpus.jsonl"))
+        sched = m.get("schedule") or []
+        total, short, worst, longest = shortfall(
+            os.path.join(arm["dir"], "gpus.jsonl"), m.get("t0"),
+            sched[-1]["end"] if sched else None)
         arm["short"] = (total, short, worst, longest)
         if longest > max_short:
             problems.append("the %s arm went %.0fs CONTINUOUSLY short of the fleet its own "
@@ -757,10 +804,12 @@ def main(argv):
         if not d:
             continue
         meta = load_meta(d)
+        sched = (meta or {}).get("schedule") or []
         arms.append({
             "name": name, "dir": d, "meta": meta,
             "rows": load_rows(os.path.join(d, "requests.jsonl")),
-            "gpus": gpu_series(os.path.join(d, "gpus.jsonl"), (meta or {}).get("t0", 0)),
+            "gpus": clip_series(gpu_series(os.path.join(d, "gpus.jsonl"), (meta or {}).get("t0", 0)),
+                                sched[-1]["end"] if sched else None),
             "budget": load_budget(d),
             "work": pod_work(d),
             "queue_p95": None,
@@ -939,17 +988,20 @@ def main(argv):
     by_name = {arm["name"]: arm for arm in arms}
     if "pool" in by_name and "floor" in by_name and totals.get("pool") and totals.get("floor"):
         gp, gf = totals["pool"], totals["floor"]
-        worse = 0
+        worse = compared = 0
         for key in ("a", "b"):
             for i in rises[key]:
                 wp = window_of(by_name["pool"], key, i)
                 wf = window_of(by_name["floor"], key, i)
-                if wp and wf and wp["p95"] is not None and wf["p95"] is not None and wp["p95"] > wf["p95"]:
+                if not (wp and wf and wp["p95"] is not None and wf["p95"] is not None):
+                    continue
+                compared += 1
+                if wp["p95"] > wf["p95"]:
                     worse += 1
         print("- **Pool against floor**: the pool arm spent %.0f GPU-seconds and the floor "
               "arm %.0f (%+.1f%% for the pool); the pool's rise p95 was higher than the "
-              "floor's in %d of %d rises."
-              % (gp, gf, 100.0 * (gp - gf) / gf, worse, len(rises["a"]) + len(rises["b"])))
+              "floor's in %d of the %d rises both served."
+              % (gp, gf, 100.0 * (gp - gf) / gf, worse, compared))
     # The limit of the evidence, printed every time, because a table invites a
     # conclusion the sample size does not support.
     n_rises = len(rises["a"]) + len(rises["b"])

@@ -489,6 +489,19 @@ else
   fail "--max-hold 1h30m was refused or mangled; ParseDuration accepts it"
 fi
 check_refusal "meaningless with --type retained" --type retained --max-hold 5m
+# --min-hold ON ITS OWN, without --max-hold. The validation block was nested
+# inside --max-hold's by an indentation slip, so the most natural way of
+# setting the flag skipped every check on it: `--min-hold 5x5m` rendered
+# `warmPoolMinHold: "5x5m"` unchallenged and the pool ran on its fallback
+# config. Both refusals below passed only when --max-hold was ALSO given.
+check_refusal "number+unit pairs" --type bridge --min-hold 5x5m
+check_refusal "meaningless with --type retained" --type retained --min-hold 90s
+FLOOR_ONLY="$(render --type bridge --min-hold 90s)"
+if [ "$(TRIGGER_GET "$FLOOR_ONLY" warmPoolMinHold)" = "90s" ]; then
+  ok "--min-hold on its own is validated and reaches the trigger"
+else
+  fail "--min-hold 90s alone was refused or mangled"
+fi
 
 if [ "$FAILED" -eq 0 ]; then
   echo "Warm pool manifest checks passed."

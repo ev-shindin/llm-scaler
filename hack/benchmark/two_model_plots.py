@@ -111,7 +111,13 @@ def plot_ttft(data, out):
     def y_of(ms):
         return top + ph - (ms / ymax) * ph
 
-    svg.text(left, 22, "Time to first token in each rise window (first 90s after the rate goes up)", 14, weight="bold")
+    # The window's width comes from the schedule, not a constant: RISE_WINDOW
+    # is a knob, and a title that says 90s over a 240s window mislabels every
+    # default run.
+    widths = sorted({int(data["schedule"][i]["end"] - data["schedule"][i]["start"])
+                     for k in ("a", "b") for i in data["rises"][k]})
+    span = "/".join("%d" % w for w in widths) if widths else "?"
+    svg.text(left, 22, "Time to first token in each rise window (first %ss after the rate goes up)" % span, 14, weight="bold")
     svg.text(left, 38, "bar = p95, tick = p50; one group per scale-up event, one run each", 11, fill="#555")
     for i in range(6):
         v = ymax * i / 5
