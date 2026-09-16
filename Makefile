@@ -2179,15 +2179,15 @@ benchmark-two-model-residency: ## Two-model pool run: print what each pool Pod i
 	@$(TWO_MODEL) residency
 
 .PHONY: benchmark-two-model-run
-benchmark-two-model-run: ## Two-model pool run: drive the anti-phase load for one arm (ARM=pool|nopool)
+benchmark-two-model-run: ## Two-model pool run: drive the anti-phase load for one arm (ARM=nopool|pool|floor)
 	@if [ -z "$(ARM)" ]; then \
-		echo "ERROR: ARM is required. Usage: make benchmark-two-model-run ARM=nopool  (then ARM=pool)"; \
+		echo "ERROR: ARM is required. Usage: make benchmark-two-model-run ARM=nopool  (then ARM=pool; ARM=floor for the over-provisioned baseline)"; \
 		exit 1; \
 	fi
 	@$(TWO_MODEL) run $(ARM)
 
 .PHONY: benchmark-two-model-report
-benchmark-two-model-report: ## Two-model pool run: compare the two arms
+benchmark-two-model-report: ## Two-model pool run: compare every arm that ran against nopool
 	@$(TWO_MODEL) report
 
 .PHONY: benchmark-two-model-status

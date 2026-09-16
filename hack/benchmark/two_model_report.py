@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-two_model_report.py -- compare the pool and nopool arms of the two-model
+two_model_report.py -- compare the arms of the two-model
 anti-phase run.
 
 It reports four things, and the last two decide the question.
@@ -246,17 +246,22 @@ def budget_problem(a, b):
     """
     ba, bb = a.get("budget"), b.get("budget")
     if not ba or not bb:
-        return ("neither arm recorded its replica budget (budget.json), so nothing "
-                "establishes that the pool arm was not simply allowed more cluster")
-    if bb.get("pool_replicas", 0) <= 0:
+        return ("the %s arm or the nopool arm did not record its replica budget "
+                "(budget.json), so nothing establishes that it was not simply allowed "
+                "more cluster" % b["name"])
+    if b["name"] == "pool" and bb.get("pool_replicas", 0) <= 0:
         return "the pool arm recorded no pool Pods; it was not the pool arm"
+    if b["name"] == "floor" and bb.get("min_replicas_per_model", 0) <= ba.get("min_replicas_per_model", 1):
+        return ("the floor arm's floor (%s per model) is no higher than the nopool "
+                "arm's (%s); it was not the floor arm"
+                % (bb.get("min_replicas_per_model"), ba.get("min_replicas_per_model", 1)))
     peak_n = 2 * ba["max_replicas_per_model"] * ba["gpus_per_replica"]
     peak_p = (2 * bb["max_replicas_per_model"] * bb["gpus_per_replica"]
-              + bb["pool_replicas"] * bb["gpus_per_replica"])
+              + bb.get("pool_replicas", 0) * bb["gpus_per_replica"])
     if peak_p > peak_n:
-        return ("the pool arm could reach %d accelerators against the nopool arm's %d. "
+        return ("the %s arm could reach %d accelerators against the nopool arm's %d. "
                 "It was allowed more cluster, not just faster cluster."
-                % (peak_p, peak_n))
+                % (b["name"], peak_p, peak_n))
     return None
 
 
@@ -599,30 +604,37 @@ def phase_drift(arm):
     return worst
 
 
-def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0,
+def admissible(arms, max_queue_delay, max_short=300.0, max_overlap=0.0,
                max_gap=0.05, args_gap_limit=30.0):
-    """Everything that makes the two arms comparable. Returns a list of reasons."""
+    """Everything that makes the arms comparable. Returns a list of reasons.
+
+    arms[0] is the nopool baseline; every other arm is judged against it.
+    """
     problems = []
-    for arm in (a, b):
+    a = arms[0]
+    for arm in arms:
         rp = routing_problem(arm)
         if rp:
             problems.append(rp)
-    bp = budget_problem(a, b)
-    if bp:
-        problems.append(bp)
-    if a["meta"] is None or b["meta"] is None:
-        problems.append("one arm has no meta.json, so nothing can check that the two "
+    for b in arms[1:]:
+        bp = budget_problem(a, b)
+        if bp:
+            problems.append(bp)
+    if any(arm["meta"] is None for arm in arms):
+        problems.append("an arm has no meta.json, so nothing can check that the "
                         "runs used the same schedule")
         return problems
-    if schedule_signature(a["meta"]) != schedule_signature(b["meta"]):
-        diffs = []
-        for k in ("input_tokens", "output_tokens", "model_a", "model_b", "seed", "data"):
-            if a["meta"].get(k) != b["meta"].get(k):
-                diffs.append("%s: nopool=%s pool=%s" % (k, a["meta"].get(k), b["meta"].get(k)))
-        if a["meta"].get("schedule") != b["meta"].get("schedule"):
-            diffs.append("the schedule itself (phases, rates or durations)")
-        problems.append("the arms did not run the same scenario -- " + "; ".join(diffs))
-    for arm in (a, b):
+    for b in arms[1:]:
+        if schedule_signature(a["meta"]) != schedule_signature(b["meta"]):
+            diffs = []
+            for k in ("input_tokens", "output_tokens", "model_a", "model_b", "seed", "data"):
+                if a["meta"].get(k) != b["meta"].get(k):
+                    diffs.append("%s: nopool=%s %s=%s" % (k, a["meta"].get(k), b["name"], b["meta"].get(k)))
+            if a["meta"].get("schedule") != b["meta"].get("schedule"):
+                diffs.append("the schedule itself (phases, rates or durations)")
+            problems.append("the nopool and %s arms did not run the same scenario -- %s"
+                            % (b["name"], "; ".join(diffs)))
+    for arm in arms:
         m = arm["meta"]
         if m.get("issued", 0) < m.get("planned", 0):
             problems.append("the %s arm issued %d of %d planned arrivals: the DRIVER was "
@@ -702,11 +714,18 @@ def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0,
     return problems
 
 
+def arm_ceiling(bud):
+    return (2 * bud["max_replicas_per_model"] * bud["gpus_per_replica"]
+            + bud.get("pool_replicas", 0) * bud["gpus_per_replica"])
+
+
 def main(argv):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--nopool", required=True)
-    p.add_argument("--pool", required=True)
+    p.add_argument("--nopool", required=True, help="the baseline arm's results directory")
+    p.add_argument("--pool", help="the warm-pool arm's results directory")
+    p.add_argument("--floor", help="the over-provisioned arm's results directory: no pool, "
+                                   "every model held at a floor of replicas for the whole run")
     p.add_argument("--model-a", default="A")
     p.add_argument("--model-b", default="B")
     p.add_argument("--max-queue-delay", type=float, default=0.25,
@@ -723,10 +742,17 @@ def main(argv):
                         "accelerator sampling before its GPU-seconds mean nothing")
     p.add_argument("--gap-limit", type=float, default=30.0,
                    help="a GPU sampling hole longer than this is reported")
+    p.add_argument("--json", help="also write every number the tables hold to this file, "
+                                  "for the plots and for anyone comparing runs")
     args = p.parse_args(argv)
 
+    if not args.pool and not args.floor:
+        print("nothing to compare nopool against: give --pool and/or --floor", file=sys.stderr)
+        return 2
     arms = []
-    for d, name in ((args.nopool, "nopool"), (args.pool, "pool")):
+    for d, name in ((args.nopool, "nopool"), (args.pool, "pool"), (args.floor, "floor")):
+        if not d:
+            continue
         meta = load_meta(d)
         arms.append({
             "name": name, "dir": d, "meta": meta,
@@ -736,21 +762,24 @@ def main(argv):
             "work": pod_work(d),
             "queue_p95": None,
         })
-    a, b = arms
+    a = arms[0]
+    others = arms[1:]
 
-    problems = admissible(a, b, args.max_queue_delay, args.max_shortfall,
+    problems = admissible(arms, args.max_queue_delay, args.max_shortfall,
                           args.max_overlap, args.max_sampling_gap, args.gap_limit)
     if problems:
-        print("ERROR: these two arms cannot be compared:", file=sys.stderr)
+        print("ERROR: these arms cannot be compared:", file=sys.stderr)
         for pr in problems:
             print("  - " + pr, file=sys.stderr)
         return 2
 
     schedule = a["meta"]["schedule"]
     rises = {"a": rise_stages(schedule, "a"), "b": rise_stages(schedule, "b")}
+    out = {"models": {"a": args.model_a, "b": args.model_b}, "schedule": schedule,
+           "rises": rises, "arms": {}}
 
     print("")
-    print("# Two models, anti-phase bursts, warm pool on and off")
+    print("# Two models, anti-phase bursts: %s" % " vs ".join(arm["name"] for arm in arms))
     print("")
     print("- model A: `%s`" % args.model_a)
     print("- model B: `%s`" % args.model_b)
@@ -761,9 +790,9 @@ def main(argv):
     for k, label in (("a", args.model_a), ("b", args.model_b)):
         print("- %s rises at: %s" % (label,
               ", ".join("%ds" % schedule[i]["start"] for i in rises[k]) or "never"))
-    print("- driver queueing (p95): nopool %s ms, pool %s ms"
-          % (fmt_ms(a["queue_p95"]), fmt_ms(b["queue_p95"])))
-    for arm in (a, b):
+    print("- driver queueing (p95): %s"
+          % ", ".join("%s %s ms" % (arm["name"], fmt_ms(arm["queue_p95"])) for arm in arms))
+    for arm in arms:
         tot, sh, wst, lng = arm.get("short", (0, 0, 0, 0.0))
         if tot:
             print("- %s: short of the requested fleet in %.0f%% of samples, longest "
@@ -772,7 +801,7 @@ def main(argv):
                   % (arm["name"], 100.0 * sh / tot, lng,
                      " (up to %d Pending)" % wst if wst else ""))
     band = (a["meta"] or {}).get("overlap_seconds")
-    for arm in (a, b):
+    for arm in arms:
         if arm.get("overlap") is not None:
             print("- %s: both models bursting at once for %.0fs" % (arm["name"], arm["overlap"]))
     print("- the two models drifted at most %s apart, against a %s band of both-low "
@@ -780,7 +809,7 @@ def main(argv):
           "model drains slower)"
           % (" / ".join("%s %.0fs" % (arm["name"], arm["drift"])
                         if arm.get("drift") is not None else "%s -" % arm["name"]
-                        for arm in (a, b)),
+                        for arm in arms),
              "%ds" % band if band is not None else "(unrecorded)"))
     print("")
 
@@ -789,21 +818,23 @@ def main(argv):
     print("| model | arm | served | failed | p50 | p95 | p99 | max |")
     print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for key, label in (("a", args.model_a), ("b", args.model_b)):
-        for arm in (a, b):
+        for arm in arms:
             w = window_of(arm, key)
+            rec = out["arms"].setdefault(arm["name"], {"whole": {}, "rises": {}})
             if w is None:
                 print("| %s | %s | - | - | - | - | - | - |" % (label, arm["name"]))
                 continue
+            rec["whole"][key] = w
             print("| %s | %s | %d | %d | %s | %s | %s | %s |" % (
                 label, arm["name"], w["n"], w["failed"],
                 fmt_ms(w["p50"]), fmt_ms(w["p95"]), fmt_ms(w["p99"]), fmt_ms(w["max"])))
     print("")
-    if any(arm.get("failure_kinds") for arm in (a, b)):
+    if any(arm.get("failure_kinds") for arm in arms):
         print("Failures by kind, as the load generator grouped them. A request that never "
               "received a response is a failure, not a fast success -- counting one as a "
               "success lets a saturating arm improve its own percentiles:")
         print("")
-        for arm in (a, b):
+        for arm in arms:
             kk = arm.get("failure_kinds") or {}
             if kk:
                 print("- %s: %s" % (arm["name"],
@@ -820,11 +851,12 @@ def main(argv):
     for key, label in (("a", args.model_a), ("b", args.model_b)):
         for i in rises[key]:
             lo = schedule[i]["start"]
-            for arm in (a, b):
+            for arm in arms:
                 w = window_of(arm, key, i)
                 if w is None:
                     print("| %s | %ds | %s | - | - | - | - | - |" % (label, lo, arm["name"]))
                     continue
+                out["arms"][arm["name"]]["rises"]["%s@%d" % (key, lo)] = w
                 print("| %s | %ds | %s | %d | %d | %s | %s | %s |" % (
                     label, lo, arm["name"], w["n"], w["failed"],
                     fmt_ms(w["p50"]), fmt_ms(w["p95"]), fmt_ms(w["max"])))
@@ -832,19 +864,24 @@ def main(argv):
 
     print("## Accelerators")
     print("")
-    for arm in (a, b):
+    for arm in arms:
         bud = arm["budget"]
         if bud:
-            print("- %s: each model capped at %d replicas, pool %d Pod(s) -- ceiling %d accelerators"
-                  % (arm["name"], bud["max_replicas_per_model"], bud.get("pool_replicas", 0),
-                     2 * bud["max_replicas_per_model"] * bud["gpus_per_replica"]
-                     + bud.get("pool_replicas", 0) * bud["gpus_per_replica"]))
+            floor = bud.get("min_replicas_per_model")
+            print("- %s: each model %s %d replicas, pool %d Pod(s) -- ceiling %d accelerators"
+                  % (arm["name"],
+                     "held between %d and" % floor if floor else "capped at",
+                     bud["max_replicas_per_model"], bud.get("pool_replicas", 0),
+                     arm_ceiling(bud)))
     print("")
     print("| arm | GPU-seconds (all) | of which pool | peak GPUs | pool lent (GPU-s) | sampling holes |")
     print("| --- | ---: | ---: | ---: | ---: | ---: |")
     totals = {}
-    for arm in (a, b):
+    for arm in arms:
         ser = arm["gpus"]
+        rec = out["arms"].setdefault(arm["name"], {"whole": {}, "rises": {}})
+        rec["budget"] = arm["budget"]
+        rec["gpu_series"] = ser
         if len(ser) < 2:
             print("| %s | - | - | - | - | no samples |" % arm["name"])
             totals[arm["name"]] = None
@@ -853,6 +890,8 @@ def main(argv):
         poolgpu, _ = integrate(ser, 2)
         lent, _ = integrate(ser, 3)
         totals[arm["name"]] = tot
+        rec["gpu_seconds"] = {"all": tot, "pool": poolgpu, "lent": lent,
+                              "peak": max(r[1] for r in ser)}
         print("| %s | %.0f | %.0f | %d | %.0f | %s |" % (
             arm["name"], tot, poolgpu, max(r[1] for r in ser), lent,
             "-" if gapped == 0 else "%.0fs" % gapped))
@@ -860,35 +899,54 @@ def main(argv):
 
     print("## What this says")
     print("")
-    for key, label in (("a", args.model_a), ("b", args.model_b)):
-        for i in rises[key]:
-            lo = schedule[i]["start"]
-            sn = window_of(a, key, i) or {"p95": None, "n": 0, "failed": 0}
-            sp = window_of(b, key, i) or {"p95": None, "n": 0, "failed": 0}
-            if sn["p95"] is None or sp["p95"] is None:
-                print("- **%s**, rise at %ds: one arm served nothing in the window." % (label, lo))
-                continue
-            delta = (sn["p95"] - sp["p95"]) * 1000.0
-            print("- **%s**, rise at %ds: p95 TTFT %.0f ms %s with the pool "
-                  "(%s -> %s ms; n=%d vs %d served, %d vs %d failed)."
-                  % (label, lo, abs(delta), "lower" if delta > 0 else "higher",
-                     fmt_ms(sn["p95"]), fmt_ms(sp["p95"]),
-                     sn["n"], sp["n"], sn["failed"], sp["failed"]))
-    gt_n, gt_p = totals.get("nopool"), totals.get("pool")
-    if gt_n and gt_p:
-        diff = gt_p - gt_n
-        if diff > 0:
-            print("- The pool arm spent **%.0f more GPU-seconds** (%.1f%%). Note this "
-                  "EXCLUDES the pool's warm-up, which happens before the run starts, so "
-                  "it understates the cost of holding one."
-                  % (diff, 100.0 * diff / gt_n))
+    for b in others:
+        what = "with the pool" if b["name"] == "pool" else "with the floor"
+        for key, label in (("a", args.model_a), ("b", args.model_b)):
+            for i in rises[key]:
+                lo = schedule[i]["start"]
+                sn = window_of(a, key, i) or {"p95": None, "n": 0, "failed": 0}
+                sp = window_of(b, key, i) or {"p95": None, "n": 0, "failed": 0}
+                if sn["p95"] is None or sp["p95"] is None:
+                    print("- **%s**, rise at %ds: one arm served nothing in the window." % (label, lo))
+                    continue
+                delta = (sn["p95"] - sp["p95"]) * 1000.0
+                print("- **%s**, rise at %ds: p95 TTFT %.0f ms %s %s "
+                      "(%s -> %s ms; n=%d vs %d served, %d vs %d failed)."
+                      % (label, lo, abs(delta), "lower" if delta > 0 else "higher", what,
+                         fmt_ms(sn["p95"]), fmt_ms(sp["p95"]),
+                         sn["n"], sp["n"], sn["failed"], sp["failed"]))
+        gt_n, gt_p = totals.get("nopool"), totals.get(b["name"])
+        if gt_n and gt_p:
+            diff = gt_p - gt_n
+            if diff > 0:
+                print("- The %s arm spent **%.0f more GPU-seconds** than nopool (%.1f%%).%s"
+                      % (b["name"], diff, 100.0 * diff / gt_n,
+                         " Note this EXCLUDES the pool's warm-up, which happens before the "
+                         "run starts, so it understates the cost of holding one."
+                         if b["name"] == "pool" else ""))
+            else:
+                print("- The %s arm spent **%.0f fewer GPU-seconds** than nopool (%.1f%%)."
+                      % (b["name"], -diff, 100.0 * -diff / gt_n))
         else:
-            print("- The pool arm spent **%.0f fewer GPU-seconds** (%.1f%%): each model "
-                  "held less standing headroom because the pool covered its rises."
-                  % (-diff, 100.0 * -diff / gt_n))
-    else:
-        print("- GPU-seconds are missing for at least one arm, so the cost side of this "
-              "comparison is **not** established; the TTFT numbers alone do not settle it.")
+            print("- GPU-seconds are missing for the nopool or %s arm, so the cost side of "
+                  "that comparison is **not** established; the TTFT numbers alone do not "
+                  "settle it." % b["name"])
+    # The comparison the third arm exists for: two kinds of insurance, priced
+    # against each other on what they bought.
+    by_name = {arm["name"]: arm for arm in arms}
+    if "pool" in by_name and "floor" in by_name and totals.get("pool") and totals.get("floor"):
+        gp, gf = totals["pool"], totals["floor"]
+        worse = 0
+        for key in ("a", "b"):
+            for i in rises[key]:
+                wp = window_of(by_name["pool"], key, i)
+                wf = window_of(by_name["floor"], key, i)
+                if wp and wf and wp["p95"] is not None and wf["p95"] is not None and wp["p95"] > wf["p95"]:
+                    worse += 1
+        print("- **Pool against floor**: the pool arm spent %.0f GPU-seconds and the floor "
+              "arm %.0f (%+.1f%% for the pool); the pool's rise p95 was higher than the "
+              "floor's in %d of %d rises."
+              % (gp, gf, 100.0 * (gp - gf) / gf, worse, len(rises["a"]) + len(rises["b"])))
     # The limit of the evidence, printed every time, because a table invites a
     # conclusion the sample size does not support.
     n_rises = len(rises["a"]) + len(rises["b"])
@@ -898,6 +956,9 @@ def main(argv):
           "between the two rises of the same model is not a result. To claim a direction, "
           "repeat the pair and check that the sign is stable." % n_rises)
     print("")
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(out, fh, indent=1, default=float)
     return 0
 
 

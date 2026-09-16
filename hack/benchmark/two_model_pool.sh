@@ -62,7 +62,12 @@
 #   two_model_pool.sh warm          pin BOTH models resident, and wait
 #   two_model_pool.sh reset         both models back to MIN_REPLICAS, quiesced
 #   two_model_pool.sh run <arm>     drive the load, sample GPUs, collect
-#   two_model_pool.sh report        compare the arms
+#                                   arms: nopool (the baseline), pool, and
+#                                   floor -- no pool, every model held at
+#                                   FLOOR_REPLICAS, the over-provisioning a
+#                                   pool competes against
+#   two_model_pool.sh report        compare every arm that ran against nopool;
+#                                   writes report.md, report.json and SVG plots
 #   two_model_pool.sh status        what exists, and what holds accelerators
 #   two_model_pool.sh teardown      remove everything this created
 #
@@ -169,6 +174,13 @@ PRELOAD_GRACE="${PRELOAD_GRACE:-420}"
 
 MAX_REPLICAS="${MAX_REPLICAS:-3}"
 MIN_REPLICAS="${MIN_REPLICAS:-1}"
+# The THIRD arm. `floor` is what a pool competes against in practice: no pool,
+# but every model kept at FLOOR_REPLICAS at all times -- over-provisioning as
+# insurance. It pays for the extra replicas for the whole run, in the way the
+# pool pays for its Pods, and the question is which insurance is cheaper for
+# what it buys. Its ceiling is MAX_REPLICAS, the same 2 x MAX x GPUS peak as
+# the other two arms.
+FLOOR_REPLICAS="${FLOOR_REPLICAS:-2}"
 GPUS_PER_REPLICA="${GPUS_PER_REPLICA:-1}"
 POOL_NAME="${POOL_NAME:-twomodel}"
 POOL_REPLICAS="${POOL_REPLICAS:-2}"
@@ -193,6 +205,13 @@ OUT_ROOT="${OUT_ROOT:-$ROOT/two-model-results}"
 LOAD_IMAGE="${LOAD_IMAGE:-}"
 CACHE_CLAIM="${CACHE_CLAIM:-model-pvc}"
 WVA_NS="${WVA_NS:-$NS}"
+# Where Prometheus runs, so the pool's Pods are scraped like every other engine.
+# Empty means "derive it from the controller's own PROMETHEUS_BASE_URL" at
+# pool-create. It matters twice: a lent Pod's load is otherwise invisible to
+# the controller (the model reads as having LESS demand while the pool covers
+# it), and a failure inside a pool Pod is otherwise invisible to the report --
+# seven 503s in one arm's rise were traced to the pool Pod at the moment of the
+# lend and no further, because nothing had scraped its engine.
 MONITORING_NS="${MONITORING_NS:-}"
 ACCELERATOR="${ACCELERATOR:-}"
 RESET_TIMEOUT="${RESET_TIMEOUT:-600}"
@@ -215,6 +234,7 @@ need_ns() { [ -n "$NS" ] || die "BENCHMARK_NAMESPACE is required."; }
 #
 #   nopool: 2 models x MAX_REPLICAS
 #   pool:   2 models x (MAX_REPLICAS - the pool's share) + the pool itself
+#   floor:  2 models x MAX_REPLICAS, never below FLOOR_REPLICAS each
 #
 # "Insurance lowers your maximum fleet by N" is the whole cost argument for a
 # warm pool, so an arm that holds the pool AND the same model ceiling is not
@@ -907,6 +927,12 @@ verb_pool_create() {
              | select(. != null and . != "")] | unique | if length == 1 then .[0] else "" end')"
     fi
     [ -n "$accel" ] || die "set ACCELERATOR=<product as the node label spells it>: this cluster does not advertise exactly one, and a pool on the wrong accelerator is never eligible to lend."
+    if [ -z "$MONITORING_NS" ]; then
+        # prometheus-operated.<ns>.svc... -- the namespace is the second label.
+        MONITORING_NS="$(prometheus_base_url | sed -n 's|^https\{0,1\}://[^.]*\.\([^.:/]*\)\..*$|\1|p')"
+        [ -n "$MONITORING_NS" ] && info "pool will be scraped from $MONITORING_NS (from the controller's PROMETHEUS_BASE_URL; set MONITORING_NS to override)" \
+            || warn "could not derive the monitoring namespace from the controller's PROMETHEUS_BASE_URL; the pool will NOT be scraped. Set MONITORING_NS."
+    fi
     info "creating pool '$POOL_NAME': ${POOL_REPLICAS} Pods, reserve ${POOL_RESERVE}, ${GPUS_PER_REPLICA} GPU each, on ${accel}"
     # --max EQUAL to --replicas: the pool's own ScaledObject must not resize it
     # during a run, or the pool's accelerators move under the measurement and
@@ -1076,6 +1102,8 @@ verb_reset() {
     sos="$(k get scaledobject -o json 2>/dev/null | jq -r '
         [.items[] | select([.spec.triggers[]?.metadata.warmPoolName] | all(. == null)) | .metadata.name] | .[]')"
     [ -n "$sos" ] || die "no model ScaledObjects in $NS; there is nothing to reset."
+    # A floor arm raised minReplicaCount; every arm starts from MIN_REPLICAS.
+    set_fleet_floor "$MIN_REPLICAS"
     for so in $sos; do
         pause_at "$so" "$MIN_REPLICAS" || warn "could not pin $so"
     done
@@ -1114,6 +1142,41 @@ verb_reset() {
     done
     for so in $sos; do unpause "$so"; done
     die "the fleet did not settle at $MIN_REPLICAS within ${RESET_TIMEOUT}s. Starting an arm from a fleet the previous arm left scaled makes the two incomparable."
+}
+
+model_scaledobjects() {
+    k get scaledobject -o json 2>/dev/null | jq -r '
+        [.items[] | select([.spec.triggers[]?.metadata.warmPoolName] | all(. == null)) | .metadata.name] | .[]'
+}
+
+# The fleet's floor, on the ScaledObjects. A Deployment scaled by hand does
+# not hold: the HPA KEDA generates puts it back to the controller's target
+# within a cycle, and at the low rate that target is 1.
+set_fleet_floor() {
+    local n="$1" so
+    for so in $(model_scaledobjects); do
+        k patch scaledobject "$so" --type=merge \
+            -p "{\"spec\":{\"minReplicaCount\":$n}}" >/dev/null || warn "could not set minReplicaCount on $so"
+    done
+    info "minReplicaCount=$n on every model ScaledObject"
+}
+
+wait_fleet_at() {
+    local n="$1" waited=0 s d cur ready
+    while [ "$waited" -lt "$RESET_TIMEOUT" ]; do
+        local settled=1
+        for s in "$STACK_A" "$STACK_B"; do
+            d="$(decode_deploy_for "$s")"
+            [ -n "$d" ] || { settled=0; continue; }
+            cur="$(k get deploy "$d" -o jsonpath='{.status.replicas}' 2>/dev/null)"
+            ready="$(k get deploy "$d" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)"
+            [ "${cur:-0}" = "$n" ] && [ "${ready:-0}" = "$n" ] || settled=0
+        done
+        [ "$settled" = 1 ] && { ok "both models are at $n and ready"; return 0; }
+        sleep 10
+        waited=$(( waited + 10 ))
+    done
+    return 1
 }
 
 set_arm_ceiling() {
@@ -1284,16 +1347,27 @@ verb_run() {
     need_ns
     local arm="${1:-}"
     case "$arm" in
-        pool|nopool) ;;
-        *) die "run takes an arm: pool or nopool (got '${arm:-<none>}')" ;;
+        pool|nopool|floor) ;;
+        *) die "run takes an arm: nopool, pool or floor (got '${arm:-<none>}')" ;;
     esac
     local have_pool=0
     k get deploy "wva-warm-pool-$POOL_NAME" >/dev/null 2>&1 && have_pool=1
     if [ "$arm" = "pool" ] && [ "$have_pool" -eq 0 ]; then
         die "arm 'pool' but no pool named $POOL_NAME exists. Run pool-create first."
     fi
-    if [ "$arm" = "nopool" ] && [ "$have_pool" -eq 1 ]; then
-        die "arm 'nopool' but pool $POOL_NAME is present and holding accelerators. Run pool-delete first."
+    if [ "$arm" != "pool" ] && [ "$have_pool" -eq 1 ]; then
+        die "arm '$arm' but pool $POOL_NAME is present and holding accelerators. Run pool-delete first."
+    fi
+    # The floor arm's insurance is replicas that never go away. Set on the
+    # ScaledObject, not by scaling the Deployment: the controller recommends 1
+    # at the low rate and KEDA would take the fleet straight back down. The
+    # next `reset` puts minReplicaCount back, so a floor never leaks into the
+    # arm that follows.
+    local floor="$MIN_REPLICAS"
+    if [ "$arm" = "floor" ]; then
+        floor="$FLOOR_REPLICAS"
+        set_fleet_floor "$floor"
+        wait_fleet_at "$floor" || die "the fleet did not reach the floor of $floor per model"
     fi
     # A pool arm on a COLD pool is the worst result this scenario can produce:
     # it runs to completion, produces a full table, and reports the cost of a
@@ -1314,8 +1388,8 @@ verb_run() {
 
     local out_dir="$OUT_ROOT/$arm"
     mkdir -p "$out_dir"
-    printf '{"arm":"%s","max_replicas_per_model":%s,"pool_replicas":%s,"gpus_per_replica":%s}\n' \
-        "$arm" "$ceiling" "$([ "$arm" = pool ] && echo "$POOL_REPLICAS" || echo 0)" "$GPUS_PER_REPLICA" \
+    printf '{"arm":"%s","max_replicas_per_model":%s,"min_replicas_per_model":%s,"pool_replicas":%s,"gpus_per_replica":%s}\n' \
+        "$arm" "$ceiling" "$floor" "$([ "$arm" = pool ] && echo "$POOL_REPLICAS" || echo 0)" "$GPUS_PER_REPLICA" \
         > "$out_dir/budget.json"
 
     # The two inference-perf profiles and the phase table they were built from,
@@ -1469,6 +1543,19 @@ verb_run() {
 
     if [ -n "$pod" ]; then
         k logs "$pod" --all-containers --prefix > "$out_dir/loader.log" 2>&1 || true
+    fi
+    # The pool Pods' own logs, taken NOW: pool-delete follows this arm, and
+    # with it goes the only record of what the proxy and supervisor did at
+    # each lend and return. Seven 503s in one rise were traced to the pool Pod
+    # at the moment of the lend and no further, because this file did not
+    # exist.
+    if [ "$arm" = "pool" ]; then
+        : > "$out_dir/pool-pods.log"
+        for pp in $(pool_pods); do
+            k logs "$pp" --all-containers --prefix >> "$out_dir/pool-pods.log" 2>&1 || true
+        done
+        k logs -n "$WVA_NS" deploy/wva-controller-manager --since="$(( total + PRELOAD_GRACE + 300 ))s" \
+            > "$out_dir/wva.log" 2>&1 || true
     fi
     # A container that reached the barrier after it had passed ran its ladder
     # offset from the other one's for the whole run. That is not anti-phase, and
@@ -1650,12 +1737,23 @@ verb_report() {
     # meta now that per-request reporting is off, and requests.jsonl is
     # legitimately EMPTY -- so gating on it refused two complete arms, 90
     # minutes of accelerators, after both had already run.
-    [ -s "$a/meta.json" ] || die "no nopool results in $a -- run both arms before reporting"
-    [ -s "$b/meta.json" ] || die "no pool results in $b -- run both arms before reporting"
+    local f="$OUT_ROOT/floor"
+    [ -s "$a/meta.json" ] || die "no nopool results in $a -- the nopool arm is the baseline every other arm is compared against"
+    local extra=()
+    [ -s "$b/meta.json" ] && extra+=(--pool "$b")
+    [ -s "$f/meta.json" ] && extra+=(--floor "$f")
+    [ "${#extra[@]}" -gt 0 ] || die "only the nopool arm has results in $OUT_ROOT; run the pool and/or floor arm first"
+    # Written beside the results, so the tables can be regenerated and plotted
+    # without the cluster.
     python3 "$HERE/two_model_report.py" \
-        --nopool "$a" --pool "$b" \
+        --nopool "$a" "${extra[@]}" \
         --model-a "$MODEL_A" --model-b "$MODEL_B" \
-        || die "the report failed"
+        --json "$OUT_ROOT/report.json" \
+        | tee "$OUT_ROOT/report.md"
+    [ "${PIPESTATUS[0]}" -eq 0 ] || die "the report failed"
+    python3 "$HERE/two_model_plots.py" --json "$OUT_ROOT/report.json" --out "$OUT_ROOT" \
+        && ok "report.md, report.json and the SVG plots are in $OUT_ROOT" \
+        || warn "the plots failed; the report itself is in $OUT_ROOT/report.md"
 }
 
 verb_status() {
