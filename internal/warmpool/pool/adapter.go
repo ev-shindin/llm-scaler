@@ -230,9 +230,17 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 	// Unknown is its own answer. The Pod drops out of this observation, exactly
 	// as it does when the supervisor will not answer, and the next pass looks
 	// again.
-	upstream, err := a.newProxy(p.Status.PodIP).Upstream(ctx)
+	upstream, draining, err := a.newProxy(p.Status.PodIP).State(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read the proxy's upstream in %s: %w", p.Name, err)
+	}
+	// A draining proxy is a hand-back that did not finish: it points at an
+	// engine, but the Pod is NotReady and takes no traffic. Reading it as
+	// serving would count the Pod as covering its variant for ever. Read with
+	// no upstream instead, the awake engine is Waking -- an orphan the next
+	// pass returns, which completes the hand-back.
+	if draining {
+		upstream = ""
 	}
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
@@ -673,18 +681,25 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 	// A proxy image without the drain endpoint gets the old order, and says
 	// so: the pool still works, with the window it always had.
 	px := a.newProxy(p.Status.PodIP)
-	if _, err := px.Drain(ctx); err != nil {
-		if !errors.Is(err, ErrDrainUnsupported) {
-			return fmt.Errorf("drain %s: %w", pod, err)
-		}
+	// Whether there is traffic to drain. A retry after a clear that already
+	// landed, or a Pod whose proxy has nothing behind it, is NotReady already:
+	// waiting then protects nothing and spends the budget the retry path has.
+	leaving := true
+	drained, err := px.Drain(ctx)
+	switch {
+	case errors.Is(err, ErrDrainUnsupported):
 		log.FromContext(ctx).V(logging.DEFAULT).Info(
 			"pool proxy predates the drain step; clearing first, which can 503 in-flight requests",
 			"pod", pod.String())
 		if err := px.Clear(ctx); err != nil {
 			return fmt.Errorf("take %s out of service: %w", pod, err)
 		}
+	case err != nil:
+		return fmt.Errorf("drain %s: %w", pod, err)
+	default:
+		leaving = drained
 	}
-	if wait := a.drainFor(ctx); wait > 0 {
+	if wait := a.drainFor(ctx); leaving && wait > 0 {
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():
@@ -709,13 +724,13 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 // drainFor is how long to let in-flight work finish, bounded by the time the
 // context actually has left.
 //
-// The drain must never be allowed to consume the whole budget, because the two
-// calls AFTER it are the ones that matter. Deactivate clears the proxy first, so
-// a timeout inside the drain leaves the Pod NotReady, still carrying its
+// The drain must never be allowed to consume the whole budget, because the
+// calls AFTER it are the ones that matter. Deactivate drains the proxy first,
+// so a timeout inside the wait leaves the Pod NotReady, still carrying its
 // InferencePool labels, and with its engine still awake holding the GPU. The
-// next pass reads that as Waking, which still counts as lent, and schedules the
-// same Deactivate -- which fails at the same point again. The Pod never returns
-// to the reserve.
+// next pass reads a draining proxy as Waking, which still counts as lent, and
+// schedules the same Deactivate -- which fails at the same point again. The
+// Pod never returns to the reserve.
 //
 // That is a livelock reachable purely by configuration: DrainWait lives on this
 // Adapter and the deadline comes from the reconciler's ActTimeout, two knobs in

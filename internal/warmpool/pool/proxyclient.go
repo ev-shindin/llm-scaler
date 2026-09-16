@@ -96,15 +96,31 @@ func (p *Proxy) Clear(ctx context.Context) error {
 // Upstream reports where the Pod is currently sending traffic, or "" if nothing
 // is awake. Used to reconcile after a restart rather than to remember.
 func (p *Proxy) Upstream(ctx context.Context) (string, error) {
+	addr, _, err := p.State(ctx)
+	return addr, err
+}
+
+// State reports the upstream and whether a hand-back is in progress.
+//
+// Draining has to be visible here. A hand-back that drained and then failed
+// -- the controller restarted in the drain wait, the clear or the unlabel
+// errored -- leaves the proxy pointed at an awake engine that no longer
+// takes traffic. Read as "serving", that Pod would count as covering its
+// variant and never be returned; read as draining it is an orphan, and the
+// next pass finishes the hand-back. Before the drain step existed the first
+// action was the clear itself, so the same failures read as Waking and were
+// reclaimed that way; this keeps that property.
+func (p *Proxy) State(ctx context.Context) (upstream string, draining bool, err error) {
 	body, err := doJSON(ctx, p.client, http.MethodGet, p.baseURL+proxy.UpstreamPath, nil)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	var answer struct {
-		Address string `json:"address"`
+		Address  string `json:"address"`
+		Draining bool   `json:"draining"`
 	}
 	if err := json.Unmarshal(body, &answer); err != nil {
-		return "", fmt.Errorf("decode upstream: %w", err)
+		return "", false, fmt.Errorf("decode upstream: %w", err)
 	}
-	return answer.Address, nil
+	return answer.Address, answer.Draining, nil
 }

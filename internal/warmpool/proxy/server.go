@@ -238,11 +238,20 @@ func (s *Server) SetUpstream(addr string) error {
 //
 // Draining with no upstream is a no-op that reports false: there is nothing
 // to hand back, and readiness is failing already.
+//
+// The flag is set and then the upstream re-read: a clear landing between the
+// check and the store would otherwise leave draining=true on an empty proxy
+// and a 200 with no address. Setting first and undoing makes that interleaving
+// resolve to "nothing to drain" too.
 func (s *Server) Drain() bool {
 	if s.Upstream() == "" {
 		return false
 	}
 	s.draining.Store(true)
+	if s.Upstream() == "" {
+		s.draining.Store(false)
+		return false
+	}
 	return true
 }
 
