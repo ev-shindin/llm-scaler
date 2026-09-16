@@ -674,6 +674,53 @@ var _ = Describe("SaturationAnalyzer", func() {
 			Expect(aggregation.SumTotalAnticipatedSupply(result.VariantCapacities)).To(BeNumerically(">", aggregation.SumTotalSupply(result.VariantCapacities)))
 		})
 
+		It("counts a Ready replica that has not been scraped yet as arriving, not as absent", func() {
+			// From the shape-swap P/D run at 07:30:23: the decode target reported
+			// 4 replicas with 2 Ready, and one metrics row -- the second Ready
+			// pod passed its probe one second before the cycle. The target's own
+			// pending count (4 - 2 = 2) excludes it and the live rows exclude it,
+			// so anticipated supply counted 3 replicas and the role was sized to
+			// 7 instead of 6.
+			input := makeAnalyzerInput(
+				[]domain.ReplicaMetrics{
+					makeReplicaMetrics("decode-0", "decode-v", 1_149_823, 1_162_240, 137, 6000, 1000),
+				},
+				[]domain.VariantReplicaState{
+					{VariantName: "decode-v", Role: domain.RoleDecode, AcceleratorName: "H200",
+						CurrentReplicas: 4, PendingReplicas: 2, GPUsPerReplica: 1},
+				},
+			)
+
+			result, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.VariantCapacities).To(HaveLen(1))
+			vc := result.VariantCapacities[0]
+			Expect(vc.ReplicaCount).To(Equal(1), "supply is what reported")
+			Expect(vc.PendingReplicas).To(Equal(3), "everything else the target owns is arriving")
+			Expect(aggregation.SumTotalAnticipatedSupply(result.VariantCapacities)).
+				To(BeNumerically("~", 4*vc.PerReplicaCapacity, 1e-6),
+					"anticipated supply must be the whole fleet the target already has")
+		})
+
+		It("reports no pending replicas while condemned replicas outnumber the target", func() {
+			// An in-flight scale-down: the target is at 1 with 3 rows still
+			// reporting. The engine's clamp caps supply at the target's count;
+			// pending must be zero here, not the target's stale not-ready figure.
+			input := makeAnalyzerInput(
+				[]domain.ReplicaMetrics{
+					makeReplicaMetrics("pod-1", "variant-a", 1000, 16000, 0, 100, 50),
+					makeReplicaMetrics("pod-2", "variant-a", 1000, 16000, 0, 100, 50),
+					makeReplicaMetrics("pod-3", "variant-a", 1000, 16000, 0, 100, 50),
+				},
+				[]domain.VariantReplicaState{
+					{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, PendingReplicas: 0, GPUsPerReplica: 1},
+				},
+			)
+			result, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.VariantCapacities[0].PendingReplicas).To(BeZero())
+		})
+
 		It("should NOT include pending replicas in scale-down calculation", func() {
 			input := makeAnalyzerInput(
 				[]domain.ReplicaMetrics{

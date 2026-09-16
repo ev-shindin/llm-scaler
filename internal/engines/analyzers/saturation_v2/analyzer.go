@@ -741,6 +741,32 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 			// Prefer the live count over readyCount: it is what actually reported
 			// capacity this cycle, where readyCount is (lagging) scale-target status.
 			replicaCount = ownReplicas
+			// And keep the ARRIVING count in step with it. Pending is everything
+			// the scale target owns that did not report this cycle -- not just
+			// the pods the target itself calls not-ready. A replica that turned
+			// Ready between the last scrape and this optimize cycle is in neither
+			// set: it is ready, so the target's PendingReplicas excludes it, and
+			// it has no metrics row yet, so ownReplicas excludes it too. Counting
+			// it nowhere drops it from anticipated supply, which is sized as
+			// (ReplicaCount + PendingReplicas) x P, and the shortfall that
+			// remains orders a replica that already exists.
+			//
+			// Measured on the shape-swap P/D run (biran-20260915-102548-571,
+			// 07:30:23): the target reported 4 replicas, 2 Ready, and one row
+			// scraped -- the second Ready pod had passed its probe one second
+			// earlier. Anticipated supply counted 3, the decode role was sized
+			// to 7 instead of 6, and the extra replica stayed: the next cycle
+			// took the 7 as its starting point and nothing asked for it back
+			// until spare capacity did, minutes later.
+			//
+			// CurrentReplicas - ownReplicas covers both cases with one figure:
+			// the target's own not-ready pods, and its ready-but-unscraped ones.
+			// It is never negative in effect -- replicas still reporting after
+			// an in-flight scale-down make it so, and the engine's clamp
+			// (steadystate.clampReplicaCountToScaleTarget) already caps
+			// ReplicaCount at CurrentReplicas for exactly that case, so pending
+			// is zero there rather than the target's stale not-ready count.
+			pendingCount = max(0, vs.CurrentReplicas-ownReplicas)
 		} else if rec := a.capacityStore.Get(namespace, modelID, vs.VariantName); rec != nil && rec.EffectiveCapacity > 0 {
 			// No ready replicas — use stored capacity, enhanced with k2 derivation
 			// for deployment-derived records when workload data is available.
