@@ -330,22 +330,17 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		}
 	})
 
-	It("composes on top of the arrival floor in the same cycle, and keeps the sums consistent", func() {
+	It("keeps TotalDemand and the RoleDemand sum moving together when it binds", func() {
 		saturate()
-		// Six replicas, each reporting the uncontended service time the run
-		// measured at that size (2.0s), so the arrival floor binds first at
-		// 6 x 2.0 x 7000 = 84k tokens -- above the ~20k occupancy, far below
-		// what the load needs. The throughput floor must then raise decode on
-		// top of that, and TotalDemand must move by the same amount.
+		// Six replicas at a fraction of a replica's occupancy each. The floor
+		// raises decode; TotalDemand must move by the same amount, since the
+		// optimizer reads the per-role figure for a P/D fleet and the
+		// model-level one everywhere else.
 		rm := make([]domain.ReplicaMetrics, 0, 7)
 		for i := 0; i < 6; i++ {
-			r := decode(string(rune('a'+i)), 3_000, 0, 1.0)
-			r.AvgServiceTime = 2.0
-			rm = append(rm, r)
+			rm = append(rm, decode(string(rune('a'+i)), 3_000, 0, 1.0))
 		}
-		p := prefill("p", 0)
-		p.AvgServiceTime = 0.11
-		rm = append(rm, p)
+		rm = append(rm, prefill("p", 0))
 		in := makeAnalyzerInput(rm, states(6, 1))
 		in.ArrivalRate = runLambda
 		result, err := analyzer.Analyze(ctx, in)
@@ -357,17 +352,33 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 				decodeP = vc.PerReplicaCapacity
 			}
 		}
-		arrival := runLambda * 2.0 * 7000
-		Expect(arrival).To(BeNumerically(">", 6*3_000), "the arrival floor must bind for this case to mean anything")
 		want := runLambda / runMu * decodeP
-		Expect(want).To(BeNumerically(">", arrival), "and the throughput floor must sit above it")
 		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
 		var sum float64
 		for _, v := range result.RoleDemand {
 			sum += v
 		}
 		Expect(result.TotalDemand).To(BeNumerically("~", sum, 1),
-			"TotalDemand and RoleDemand must move together after both floors")
+			"TotalDemand and RoleDemand must move together after the floor")
+	})
+
+	It("counts each request once in the arrival-rate fallback on a P/D fleet", func() {
+		// A request completes on its prefill replica and again on its decode
+		// replica. Summing every replica's completion rate would report 2λ.
+		rm := []domain.ReplicaMetrics{
+			{VariantName: "prefill-v", AvgInputTokens: 6000, AvgOutputTokens: 1, RequestRate: 6},
+			{VariantName: decodeVariant, AvgInputTokens: 6000, AvgOutputTokens: 1000, RequestRate: 6},
+		}
+		in := domain.AnalyzerInput{ReplicaMetrics: rm, VariantStates: states(1, 1)}
+		Expect(offeredArrivalRate(in)).To(Equal(6.0))
+
+		By("and prefers the scheduler's figure when there is one")
+		in.ArrivalRate = 9
+		Expect(offeredArrivalRate(in)).To(Equal(9.0))
+
+		By("and falls back to every replica when the decode side reports nothing")
+		in = domain.AnalyzerInput{ReplicaMetrics: rm[:1], VariantStates: states(1, 1)}
+		Expect(offeredArrivalRate(in)).To(Equal(6.0), "a poor estimate beats silently declining")
 	})
 
 	It("does not record a throughput from a pod that is not Ready", func() {

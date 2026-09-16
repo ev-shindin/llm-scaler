@@ -233,7 +233,7 @@ What NOT to do meanwhile, for the avoidance of re-litigating:
    handed back to a replica that has passed a probe and is not yet doing the
    work.
 5. **Arrival rate into the pool.** Lambda is already estimated per variant
-   (`arrivalFloor.Lambda`, by Little's law) and used for scaling. It does not
+   (`offeredArrivalRate` in saturation_v2) and used for scaling. It does not
    reach the pool, and nothing turns it into a probability of needing a model
    soon -- which is what eviction and any demand-led switch are missing.
 6. **Placement rules**, once there is a demand signal to place against. The two

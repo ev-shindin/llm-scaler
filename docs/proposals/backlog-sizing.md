@@ -150,14 +150,9 @@ the run ended with an order for 6.
    read the `short` bucket); two is enough, the floor takes the median over
    the replicas that have one.
 
-   Phase 2 is weaker. 1000/4000 shares the `long` output bucket with
-   6000/1000, so the window still holds the 5.4 readings when the scale-down
-   3 -> 2 happens at 07:57, and the floor holds 2, not 3. The P1 observations
-   from 08:03 record mu = 2.5, and once they have pushed the phase-1 readings
-   out of the 10-sample window -- about five cycles at two replicas -- the
-   floor is 6/2.5 = 2.4 replicas' worth and holds 3. A key that told the two
-   shapes apart would catch it at 07:57; the bucket boundaries are
-   `ShortOutputThreshold` / `MediumOutputThreshold` in `constants.go`.
+   Phase 2 is weaker, and the re-run below showed the reason to be different
+   from the one first written here (a shared output bucket). See
+   [Phase 2, investigated](#phase-2-investigated).
 
    What this does not change: the peaks. The floor only raises, and at the
    peaks the queue charge is already far above it.
@@ -286,15 +281,9 @@ the floor asked for 1.27 replicas' worth and the scale-down stopped at 2.
 The arrival floor bound in the same cycles at 134k tokens, occupancy restated,
 exactly as the measurement in the guide predicts.
 
-Phase 2 is the weaker half, as the analysis said it would be. 1000/4000 shares
-the `long` output bucket with 6000/1000, so the floor kept holding 2 with
-phase 1's mu while the shape needed 3; occupancy then climbed to 770k per
-replica, the arrival floor (W = 80s) ordered 4, the fleet settled to 3, and
-the 50%/120s scale-down took it straight back to 2 (4 x 0.5 = 2 in one
-period), where the cycle repeated once more before the load ended. Amplitude
-2-4, against 2-6 at the end of the original; the fix is a mu key that tells
-the two shapes apart (`ShortOutputThreshold` / `MediumOutputThreshold` are
-too coarse for it), listed under the open questions.
+Phase 2 oscillated 2 -> 3 -> 4 -> 2 -> 3 -> 4 with a ten-minute period,
+against 2 -> 6 at the end of the original. [Phase 2, investigated](#phase-2-investigated)
+is what the log says about it.
 
 ### What the load saw
 
@@ -332,3 +321,63 @@ p95 tail 200x lower.
   `Deployment.apps ... not found` (a newer kueue revision was crash-looping
   beside the old one). Not touched; noted so nobody spends an hour on it.
 
+## Phase 2, investigated
+
+The controller log of the re-run, cycle by cycle, with the two decode pods'
+own counters beside it (per minute, from the raw scrapes):
+
+```
+time      N  KVinUse   W(s)  arrival floor   throughput floor   decision       pod batch  ITL    completions
+13:24:32  2   514k     22     910k           1.18M (mu 4.87)    hold 2          75       5.8 ms  2.1 /s each
+13:25:47  2   750k     36    1.29M           --                 order 3rd
+13:26:10  2   993k     50    1.79M           --                 (3rd booting)  184      15.1     2.4
+13:28:32  2  1.37M     77    2.50M           --                 order 4th      229      19.9     2.75
+13:29:32  3  1.94M     84    2.14M           --                 hold 4
+13:31:02  3   885k     43    1.27M           --                 4 -> 3
+13:32:02  4   560k     26     731k           1.08M (mu 4.87)    4 -> 2
+13:34:42  2   ...                                               (HPA: 4 -> 2 in one 50% step)
+13:37:47  2   994k     57    1.65M           --                 order 3rd      178      14.9
+13:40:32  3  1.37M     76    2.41M           --                 order 4th      223      18.9
+13:43:02  4   316k     47     580k           --                 4 -> 1 (load ended)
+```
+
+Two things the earlier explanation got wrong.
+
+**mu was never re-learned, and the bucket is not why.** P1 fires on
+`waiting >= queueLengthThreshold`, and nothing waited: the two replicas took
+their batch from 75 to 229 (against `max-num-seqs` 256) admitting everything,
+while completions per pod went 2.1 -> 2.75 req/s -- 5.5 between them against
+6 arriving. They were falling behind inside the running batch, not in the
+queue, and by the queue's definition never saturated. The `mu` column is
+phase 1's 4.87 throughout because there was no phase-2 reading to mask, in
+any bucket. The batch would have reached the ceiling and queued within
+another minute or two; it never got there, because:
+
+**Every scale-up in phase 2 was the arrival floor's.** The occupancy
+threshold for a third replica is D > 0.85 x 1.86M = 1.58M; occupancy was
+0.75M at 13:25:47 and 1.37M at 13:28:32. What crossed the line was the
+Little's-law floor at the inflated W of a fleet that was behind: 1.29M at
+W=36s, 2.50M at W=77s. Those replicas arrived, took W back to 15s, the same
+floor read 400-450k, and the fleet went back to two -- where W climbed again.
+Two self-consistent states, each ordering the other. And because the orders
+landed before the batch reached the ceiling, the saturation that would have
+taught the throughput floor `mu = 2.75` never happened.
+
+What was done (branch `fix/phase2-oscillation`):
+
+- **The arrival-rate floor is retired.** Its purpose -- damping the collapse
+  -- is what the throughput floor does with a term that does not move with
+  the fleet; what it did beyond that was order replicas on a W it had no
+  business pricing with. `docs/developer-guide/saturation-demand-floor.md`
+  keeps the measurement.
+- **Output-length buckets are a factor of two wide above 500 tokens** (1500 /
+  3000 / 6000), so that when phase 2 does saturate its first `mu` is not
+  masked by phase 1's max in a shared window.
+
+What the log implies for the re-run, before it is run: at two replicas
+occupancy keeps climbing, the batch reaches 256, `waiting` crosses 5, P1
+records `mu` ~ 2.75-3.0 in the `xxlong` bucket, and occupancy plus the queue
+order the third replica; at three, the floor is 6/2.9 x 930k = 1.92M and
+spare is 2.79M - 1.92M/0.7 = 0.05M, less than a replica: **held at 3.** The
+cost is the two minutes at two replicas with W near 80s before the queue
+forms, which is the price of scaling on saturation rather than on latency.

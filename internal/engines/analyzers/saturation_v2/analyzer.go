@@ -195,67 +195,30 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// The builder pairs this with the per-role supply it recomputes.
 	roleDemand := a.aggregateRoleDemand(variantCapacities, queueDemand.byRole)
 
-	// Floor the demand at what the offered load requires (arrival_demand.go).
+	// Floor the demand at what the load requires in THROUGHPUT
+	// (throughput_floor.go).
 	//
-	// Everything above measures occupancy, which falls as capacity rises: a fleet
-	// that is keeping up looks idle, and the target follows the signal down. The
-	// floor is computed from arrival rate, request shape and per-token cost --
-	// none of which move when replicas are added -- so it holds the fleet at the
-	// size the LOAD implies once occupancy stops implying anything.
+	// Everything above measures occupancy, which falls as capacity rises: a
+	// fleet that is keeping up looks idle, and the target follows the signal
+	// down. The floor divides the arrival rate by what a saturated replica of
+	// each role was seen to complete -- a per-replica constant that does not
+	// move when replicas are added -- so it holds the fleet at the size the
+	// LOAD implies once occupancy stops implying anything.
 	//
-	// Strictly a floor. It never lowers demand, so it cannot authorise a
-	// scale-down that occupancy would not already have authorised on its own.
-	if floor := estimateArrivalDemand(input); floor.Tokens > totalDemand {
-		logger.Info("arrival-demand-floor",
-			"modelID", input.ModelID, "namespace", input.Namespace,
-			"occupancyDemand", totalDemand, "flooredTo", floor.Tokens,
-			"arrivalRate", floor.Lambda, "serviceTimeSec", floor.W, "serviceTimeFrom", floor.WSource,
-			"tokensPerRequest", floor.TokensPerRequest)
-		totalDemand = floor.Tokens
-		raiseRoleDemandTo(roleDemand, totalDemand)
-	} else if floor.Reason != "" && (floor.HasArrivalSignal || totalDemand > 0) {
-		// Not an error: a model with no traffic has no arrival rate, and a fleet
-		// nobody is using should not be held up by a fabricated floor. Logged so
-		// that "the floor never binds" can be told apart from "the floor could
-		// never be computed", which look identical from the outside.
-		//
-		// At DEFAULT, because that is the only level that ships: -v defaults to
-		// logging.DEFAULT, so a V(DEBUG) line here would be invisible in every
-		// real deployment and this comment would be describing something that
-		// never happens.
-		//
-		// The gate is two-sided, because the two ways this declines to answer
-		// need opposite treatment.
-		//
-		// HasArrivalSignal means load IS arriving and could not be sized -- a
-		// real gap, worth saying however quiet the fleet looks. Gating that on
-		// occupancy would lose it exactly when it matters: a sample landing
-		// between completions, or a replica still warming, reads zero occupancy
-		// while requests are demonstrably arriving.
-		//
-		// Occupancy covers the other side, where nothing is arriving at all.
-		// Note that gating on len(ReplicaMetrics) instead would NOT work: an idle
-		// pod still reports metrics -- the engine publishes 0 rather than nothing
-		// -- so a model parked at minReplicaCount 1 would log every cycle
-		// forever. Occupancy drains to zero within the metric's own 1m window, so
-		// this self-extinguishes a few lines after traffic stops.
-		//
-		// It does not bound every case: a fleet that is genuinely serving on an
-		// engine publishing neither timing keeps Reason set indefinitely. That is
-		// a misconfiguration worth shouting about rather than one worth
-		// suppressing, so it is left loud.
-		logger.V(logging.DEFAULT).Info("arrival-demand-floor unavailable",
-			"modelID", input.ModelID, "namespace", input.Namespace, "reason", floor.Reason)
-	}
-
-	// Floor it again at what the load requires in THROUGHPUT
-	// (throughput_floor.go). The floor above prices the load at the service
-	// time of the moment, which shrinks with the fleet -- measured 2.0s at six
-	// replicas against 26-52s at one, same load, same shape -- so it cannot
-	// hold a fleet that has just caught up. This one divides the arrival rate
-	// by what a saturated replica of each role was seen to complete, which
-	// does not move when replicas are added. Applied last so it sits on top of
-	// whatever the arrival floor already raised; both only ever raise.
+	// Strictly a floor, and a hold rather than an order: it never lowers
+	// demand, and it is capped so it cannot ask for a replica the fleet does
+	// not have. Scale-up stays with occupancy and the queues.
+	//
+	// There used to be a second floor here, from Little's law on the service
+	// time the engines report. It was retired: service time is ITL x output
+	// length and ITL grows with the batch, so the floor priced the same load at
+	// 2.5M tokens on two replicas and 450k on four, ordered replicas while the
+	// fleet was behind and released them once they arrived -- a positive
+	// feedback loop, measured as a 2-4 replica oscillation with a ten-minute
+	// period (docs/proposals/backlog-sizing.md, "Phase 2"). Worse, it ordered
+	// them BEFORE any replica reached saturation, so the throughput this floor
+	// depends on was never observed. The evidence, and what this floor does
+	// that one could not, are in docs/developer-guide/saturation-demand-floor.md.
 	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
 		totalDemand, roleDemand, logger)
 
@@ -1351,13 +1314,10 @@ func k2SourceLabel(replicas []ReplicaCapacity) string {
 // median returns the median value from a sorted slice of int64 values.
 // Returns 0 if the slice is empty.
 //
-// Averages the central pair on an even count, which is NOT what medianOf in
-// arrival_demand.go does -- it takes the lower of the two. The difference is
-// deliberate and follows from what each input is: this one blends learned
+// Averages the central pair on an even count: this blends learned
 // per-replica capacities, where every reading is trusted and the midpoint is
-// the better estimate, while medianOf exists to survive a reading that should
-// not be trusted at all. See medianOf's doc comment for the two-replica case
-// that decides it.
+// the better estimate. medianFloat in throughput_floor.go follows the same
+// convention for the same reason.
 func median(values []int64) int64 {
 	n := len(values)
 	if n == 0 {

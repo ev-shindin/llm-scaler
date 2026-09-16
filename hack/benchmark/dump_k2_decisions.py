@@ -24,9 +24,6 @@ Reads the following log lines:
                                     live / derived / stored-fallback estimate
   - scheduler-queue-demand         (saturation_v2) per model, per cycle: the
                                     EPP flow-control queue's token demand
-  - arrival-demand-floor           (saturation_v2) per model, per cycle when
-                                    it binds: demand raised to what the
-                                    arrival rate implies by Little's law
   - throughput-demand-floor        (saturation_v2) per role, per cycle when
                                     it binds: demand held at lambda / mu
                                     replicas' worth, mu being the saturated
@@ -81,27 +78,24 @@ DECISION_MSG = "Applied saturation decision via shared cache"
 K2_MSG = "k2-decision"
 RC_MSG = "replica-capacity-decision"
 SQ_MSG = "scheduler-queue-demand"
-# The arrival-rate demand floor. FLOOR_MSG fires only when the floor actually
-# raises demand, so its presence in a dump marks the cycles where the scaling
-# decision came from the offered load rather than from measured occupancy --
-# which is the first thing to check when a target looks higher than the fleet
-# appears to warrant. FLOOR_NA_MSG is its counterpart: the floor could not be
-# computed at all, and names the input that was missing.
-FLOOR_MSG = "arrival-demand-floor"
-FLOOR_NA_MSG = "arrival-demand-floor unavailable"
-# The throughput floor (saturation_v2/throughput_floor.go): the same shape as
-# FLOOR_MSG, per role, and the cycles it fires on are the ones where the fleet
-# was HELD at lambda / mu replicas after occupancy had stopped asking for them.
-# It carries replicasImplied and heldAtFleet, which together say whether the
-# hold was the load's or the cap's.
+# The throughput floor (saturation_v2/throughput_floor.go). TFLOOR_MSG fires
+# only when the floor actually raises demand, so its presence in a dump marks
+# the cycles where the fleet was HELD at lambda / mu replicas after occupancy
+# had stopped asking for them -- the first thing to check when a target looks
+# higher than the fleet appears to warrant. It carries replicasImplied and
+# heldAtFleet, which together say whether the hold was the load's or the cap's.
+#
+# Logs from before the throughput floor carry an "arrival-demand-floor" line
+# instead (a Little's-law floor on the reported service time, retired for
+# oscillating: see docs/developer-guide/saturation-demand-floor.md). Not
+# collected: nothing in this report rendered it, and a line no build emits
+# should not look like one the report expects.
 TFLOOR_MSG = "throughput-demand-floor"
 
 MESSAGES = {
     K2_MSG,
     RC_MSG,
     SQ_MSG,
-    FLOOR_MSG,
-    FLOOR_NA_MSG,
     TFLOOR_MSG,
     "replica-capacity-skipped",
     "replica-capacity-store-fallback",
