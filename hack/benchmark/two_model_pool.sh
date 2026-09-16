@@ -1507,7 +1507,13 @@ verb_run() {
     while [ "$(date +%s)" -lt "$deadline" ]; do
         pod="$(k get pods -l "job-name=$RUN_JOB" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
         if [ -n "$pod" ]; then
-            log="$(k logs "$pod" --all-containers 2>/dev/null)"
+            # Bounded. A log stream that stalls on the API server otherwise
+            # holds this loop open past its budget: MEASURED, the loop's
+            # budget ended at 18:59 and it exited at 19:26, without ever
+            # having seen the two markers that were in the log the whole
+            # time. The Pod holds its results for an hour after the run and
+            # they were still there when the loop gave up.
+            log="$(k logs "$pod" --all-containers --request-timeout=60s 2>/dev/null)"
             if printf '%s' "$log" | grep -q 'RESULTS-WRITTEN-a' &&
                printf '%s' "$log" | grep -q 'RESULTS-WRITTEN-b'; then done=1; break; fi
             if printf '%s' "$log" | grep -q 'PRELOAD-FAILED\|RUN-FAILED'; then
@@ -1540,7 +1546,18 @@ verb_run() {
     kill "$RUN_SAMPLER" 2>/dev/null; RUN_SAMPLER=""
 
     if [ -n "$pod" ]; then
-        k logs "$pod" --all-containers --prefix > "$out_dir/loader.log" 2>&1 || true
+        k logs "$pod" --all-containers --prefix --request-timeout=120s > "$out_dir/loader.log" 2>&1 || true
+    fi
+    # THE FULL LOG IS THE AUTHORITY, not the loop. If the loop gave up but the
+    # log it just fetched carries both markers, the results exist and the Pod
+    # is still holding them: copy them. An arm of 24,420 requests was thrown
+    # away with both RESULTS-WRITTEN lines sitting in loader.log because this
+    # decision was made from the loop's last (stalled) read instead.
+    if [ "$done" -eq 0 ] && [ -s "$out_dir/loader.log" ] &&
+       grep -q 'RESULTS-WRITTEN-a' "$out_dir/loader.log" &&
+       grep -q 'RESULTS-WRITTEN-b' "$out_dir/loader.log"; then
+        warn "the wait loop gave up, but the loader log shows both results written; collecting them"
+        done=1
     fi
     # The pool Pods' own logs, taken NOW: pool-delete follows this arm, and
     # with it goes the only record of what the proxy and supervisor did at
