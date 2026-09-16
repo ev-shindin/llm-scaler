@@ -167,7 +167,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	}
 
 	// Add scheduler queue demand (requests queued upstream in llm-d flow control).
-	queueDemand := estimateSchedulerQueueDemand(input.SchedulerQueue, input.ReplicaMetrics, activeRoles)
+	queueDemand := estimateSchedulerQueueDemand(input.SchedulerQueue, input.ReplicaMetrics, rolesByVariant, activeRoles)
 	totalDemand += queueDemand.total
 	if input.SchedulerQueue != nil {
 		logger.Info("scheduler-queue-demand",
@@ -638,7 +638,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 
 	// Compute model-level workload averages from live replica metrics.
 	// Used for capacity estimation of zero-replica variants with deployment-derived params.
-	modelAvgInput, modelAvgOutput, _ := computeModelWorkloadAverages(inputMetrics)
+	modelAvgInput, modelAvgOutput, _ := computeModelWorkloadAverages(inputMetrics, rolesFromStates(variantStates))
 
 	result := make([]domain.VariantCapacity, 0, len(variantStates))
 	for _, vs := range variantStates {
@@ -960,22 +960,65 @@ func estimateCapacityFromParams(params *EngineParams, avgInput, avgOutput float6
 // output tokens, and prefix cache hit rate from replica metrics across all
 // variants. These averages enable capacity estimation for zero-replica variants
 // using the k2 derivation formula, and scheduler queue demand estimation.
-func computeModelWorkloadAverages(replicaMetrics []domain.ReplicaMetrics) (avgInput, avgOutput, avgHitRate float64) {
-	var count int
+//
+// The output length is averaged over the replicas that GENERATE output, which
+// on a P/D fleet excludes prefill. A prefill replica completes every request
+// after one token (it hands off to decode), so its own
+// vllm:request_generation_tokens averages ~1 -- not a measurement of the
+// workload's output length but a property of the role. Folding it into an
+// unweighted mean halves the model's output length at one prefill per decode
+// replica and quarters it at three, and everything priced per queued request
+// downstream (the scheduler queue's output-token charge, the zero-replica k2
+// derivation) shrinks with it. Measured on a P/D run: 213 requests queued at
+// the scheduler were charged 500 output tokens each against a 1000-token
+// workload, because the one prefill replica's ~1 averaged against the one
+// decode replica's 1000.
+//
+// Input tokens and the prefix-cache hit rate are still averaged over every
+// replica: both roles see the same prompts, and in a P/D deployment the prefix
+// cache that a queued prompt can hit lives on the prefill side.
+//
+// rolesByVariant maps variant name to its P/D role; a variant absent from it
+// is treated as domain.RoleBoth, so a non-disaggregated fleet averages over
+// every replica exactly as before.
+func computeModelWorkloadAverages(replicaMetrics []domain.ReplicaMetrics, rolesByVariant map[string]string) (avgInput, avgOutput, avgHitRate float64) {
+	var count, outputCount int
 	for _, rm := range replicaMetrics {
 		if rm.AvgInputTokens > 0 || rm.AvgOutputTokens > 0 {
 			avgInput += rm.AvgInputTokens
-			avgOutput += rm.AvgOutputTokens
 			avgHitRate += rm.PrefixCacheHitRate
 			count++
+			if generatesOutput(rm, rolesByVariant) {
+				avgOutput += rm.AvgOutputTokens
+				outputCount++
+			}
 		}
 	}
 	if count > 0 {
 		avgInput /= float64(count)
-		avgOutput /= float64(count)
 		avgHitRate /= float64(count)
 	}
+	if outputCount > 0 {
+		avgOutput /= float64(outputCount)
+	}
 	return avgInput, avgOutput, avgHitRate
+}
+
+// rolesFromStates builds the variant-name -> role lookup the per-role helpers
+// take, from the variant states an Analyze call carries.
+func rolesFromStates(states []domain.VariantReplicaState) map[string]string {
+	roles := make(map[string]string, len(states))
+	for _, vs := range states {
+		roles[vs.VariantName] = vs.Role
+	}
+	return roles
+}
+
+// generatesOutput reports whether a replica is one whose completions carry
+// the workload's real output length and service time: every role but prefill.
+// A variant with no recorded role is domain.RoleBoth, which generates.
+func generatesOutput(rm domain.ReplicaMetrics, rolesByVariant map[string]string) bool {
+	return canonicalRole(rolesByVariant[rm.VariantName]) != domain.RolePrefill
 }
 
 // canonicalRole normalizes an empty variant role to domain.RoleBoth, matching
@@ -1145,14 +1188,18 @@ type schedulerQueueDemand struct {
 func estimateSchedulerQueueDemand(
 	sq *domain.SchedulerQueueMetrics,
 	replicaMetrics []domain.ReplicaMetrics,
+	rolesByVariant map[string]string,
 	activeRoles map[string]bool,
 ) schedulerQueueDemand {
 	if sq == nil || (sq.QueueSize == 0 && sq.QueueBytes == 0) {
 		return schedulerQueueDemand{}
 	}
 
-	// Compute model-level averages from replica metrics
-	avgInput, avgOutput, avgHitRate := computeModelWorkloadAverages(replicaMetrics)
+	// Compute model-level averages from replica metrics. The output length
+	// comes from the replicas that generate output (see
+	// computeModelWorkloadAverages): a prefill replica's ~1 must not dilute the
+	// per-request charge below.
+	avgInput, avgOutput, avgHitRate := computeModelWorkloadAverages(replicaMetrics, rolesByVariant)
 
 	// Estimate input tokens from two signals, take the max for robustness
 	tokensFromBytes := float64(sq.QueueBytes) / BytesPerToken

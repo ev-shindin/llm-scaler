@@ -212,6 +212,63 @@ var _ = Describe("estimateArrivalDemand", func() {
 		Expect(f.WSource).To(Equal("itl"))
 		Expect(f.W).To(BeNumerically("~", measuredService, 0.01))
 	})
+
+	// The P/D cases below use the readings from a live run at one replica per
+	// role (shape 6000 in / 1000 out): the prefill replica's own service time
+	// was 0.11s and its output length 1, against 3.0s and 1000 on decode at
+	// that moment.
+	pdFleet := func(prefill, decode int) ([]domain.ReplicaMetrics, []domain.VariantReplicaState) {
+		rm := make([]domain.ReplicaMetrics, 0, prefill+decode)
+		for i := 0; i < prefill; i++ {
+			rm = append(rm, domain.ReplicaMetrics{VariantName: "prefill-v",
+				AvgInputTokens: 6000, AvgOutputTokens: 1, AvgServiceTime: 0.11, RequestRate: 6})
+		}
+		for i := 0; i < decode; i++ {
+			rm = append(rm, domain.ReplicaMetrics{VariantName: "decode-v",
+				AvgInputTokens: 6000, AvgOutputTokens: 1000, AvgServiceTime: 3.0, RequestRate: 6})
+		}
+		vs := []domain.VariantReplicaState{
+			{VariantName: "prefill-v", Role: domain.RolePrefill, CurrentReplicas: prefill},
+			{VariantName: "decode-v", Role: domain.RoleDecode, CurrentReplicas: decode},
+		}
+		return rm, vs
+	}
+
+	It("reads service time and output length from the decode side of a P/D fleet", func() {
+		// With as many prefill replicas as decode ones the lower median of the
+		// mixed set IS a prefill reading, and the floor built on it was
+		// 6 x 0.11 x 6001 = ~4k tokens against a load occupying ~1M. Measured:
+		// the floor stopped binding for the whole window in which the decode
+		// side was re-saturating.
+		rm, vs := pdFleet(1, 1)
+		f := estimateArrivalDemand(domain.AnalyzerInput{ArrivalRate: 6, ReplicaMetrics: rm, VariantStates: vs})
+		Expect(f.Reason).To(BeEmpty())
+		Expect(f.W).To(BeNumerically("~", 3.0, 1e-9), "the prefill replica's 0.11s must not be the median")
+		Expect(f.TokensPerRequest).To(BeNumerically("~", 7000, 1e-9), "the prefill replica's output length of 1 must not be the median")
+		Expect(f.Tokens).To(BeNumerically("~", 6*3.0*7000, 1e-6))
+
+		By("and does not move when prefill outnumbers decode")
+		rm, vs = pdFleet(3, 1)
+		g := estimateArrivalDemand(domain.AnalyzerInput{ArrivalRate: 6, ReplicaMetrics: rm, VariantStates: vs})
+		Expect(g.Tokens).To(BeNumerically("~", f.Tokens, 1e-6))
+	})
+
+	It("counts each request once in the completion-rate fallback on a P/D fleet", func() {
+		// A request completes on its prefill replica and again on its decode
+		// replica. Summing every replica's completion rate reported 2λ.
+		rm, vs := pdFleet(1, 1)
+		f := estimateArrivalDemand(domain.AnalyzerInput{ReplicaMetrics: rm, VariantStates: vs})
+		Expect(f.Reason).To(BeEmpty())
+		Expect(f.Lambda).To(Equal(6.0))
+	})
+
+	It("falls back to every replica when the decode side reports nothing", func() {
+		// A poor estimate beats silently declining on a fleet that is serving.
+		rm, vs := pdFleet(1, 0)
+		f := estimateArrivalDemand(domain.AnalyzerInput{ArrivalRate: 6, ReplicaMetrics: rm, VariantStates: vs})
+		Expect(f.Reason).To(BeEmpty())
+		Expect(f.W).To(BeNumerically("~", 0.11, 1e-9))
+	})
 })
 
 var _ = Describe("raiseRoleDemandTo", func() {
