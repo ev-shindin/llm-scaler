@@ -290,9 +290,9 @@ def budget_problem(a, b):
         return ("the %s arm or the nopool arm did not record its replica budget "
                 "(budget.json), so nothing establishes that it was not simply allowed "
                 "more cluster" % b["name"])
-    if b["name"] == "pool" and bb.get("pool_replicas", 0) <= 0:
+    if b["name"].startswith("pool") and bb.get("pool_replicas", 0) <= 0:
         return "the pool arm recorded no pool Pods; it was not the pool arm"
-    if b["name"] == "floor" and bb.get("min_replicas_per_model", 0) <= ba.get("min_replicas_per_model", 1):
+    if b["name"].startswith("floor") and bb.get("min_replicas_per_model", 0) <= ba.get("min_replicas_per_model", 1):
         return ("the floor arm's floor (%s per model) is no higher than the nopool "
                 "arm's (%s); it was not the floor arm"
                 % (bb.get("min_replicas_per_model"), ba.get("min_replicas_per_model", 1)))
@@ -776,6 +776,10 @@ def main(argv):
     p.add_argument("--pool", help="the warm-pool arm's results directory")
     p.add_argument("--floor", help="the over-provisioned arm's results directory: no pool, "
                                    "every model held at a floor of replicas for the whole run")
+    p.add_argument("--arm", action="append", default=[], metavar="NAME=DIR",
+                   help="any further arm, e.g. pool1=<dir> for a differently sized pool. A "
+                        "name starting with 'pool' is held to the pool arm's rules, one "
+                        "starting with 'floor' to the floor arm's")
     p.add_argument("--model-a", default="A")
     p.add_argument("--model-b", default="B")
     p.add_argument("--max-queue-delay", type=float, default=0.25,
@@ -796,11 +800,21 @@ def main(argv):
                                   "for the plots and for anyone comparing runs")
     args = p.parse_args(argv)
 
-    if not args.pool and not args.floor:
-        print("nothing to compare nopool against: give --pool and/or --floor", file=sys.stderr)
+    extra = []
+    for spec in args.arm:
+        if "=" not in spec:
+            print("--arm takes NAME=DIR, got %r" % spec, file=sys.stderr)
+            return 2
+        name, d = spec.split("=", 1)
+        if name in ("nopool", "pool", "floor") or not name:
+            print("--arm name %r collides with a built-in arm; pick another" % name, file=sys.stderr)
+            return 2
+        extra.append((d, name))
+    if not args.pool and not args.floor and not extra:
+        print("nothing to compare nopool against: give --pool, --floor and/or --arm", file=sys.stderr)
         return 2
     arms = []
-    for d, name in ((args.nopool, "nopool"), (args.pool, "pool"), (args.floor, "floor")):
+    for d, name in [(args.nopool, "nopool"), (args.pool, "pool"), (args.floor, "floor")] + extra:
         if not d:
             continue
         meta = load_meta(d)
@@ -952,7 +966,7 @@ def main(argv):
     print("## What this says")
     print("")
     for b in others:
-        what = "with the pool" if b["name"] == "pool" else "with the floor"
+        what = "with %s" % ("the pool" if b["name"] == "pool" else "the floor" if b["name"] == "floor" else b["name"])
         for key, label in (("a", args.model_a), ("b", args.model_b)):
             for i in rises[key]:
                 lo = schedule[i]["start"]
@@ -975,7 +989,7 @@ def main(argv):
                       % (b["name"], diff, 100.0 * diff / gt_n,
                          " Note this EXCLUDES the pool's warm-up, which happens before the "
                          "run starts, so it understates the cost of holding one."
-                         if b["name"] == "pool" else ""))
+                         if b["name"].startswith("pool") else ""))
             else:
                 print("- The %s arm spent **%.0f fewer GPU-seconds** than nopool (%.1f%%)."
                       % (b["name"], -diff, 100.0 * -diff / gt_n))

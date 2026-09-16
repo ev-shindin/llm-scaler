@@ -1740,6 +1740,14 @@ verb_report() {
     local extra=()
     [ -s "$b/meta.json" ] && extra+=(--pool "$b")
     [ -s "$f/meta.json" ] && extra+=(--floor "$f")
+    # Any other arm someone ran into this OUT_ROOT (a `run pool` under a
+    # different POOL_REPLICAS, copied in as pool1/, say) goes in by name.
+    local d name
+    for d in "$OUT_ROOT"/*/; do
+        name="$(basename "$d")"
+        case "$name" in nopool|pool|floor) continue ;; esac
+        [ -s "$d/meta.json" ] && extra+=(--arm "$name=${d%/}")
+    done
     [ "${#extra[@]}" -gt 0 ] || die "only the nopool arm has results in $OUT_ROOT; run the pool and/or floor arm first"
     # Written beside the results, so the tables can be regenerated and plotted
     # without the cluster.

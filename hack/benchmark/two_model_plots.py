@@ -22,7 +22,15 @@ import json
 import os
 import sys
 
-COLORS = {"nopool": "#7f7f7f", "pool": "#1f77b4", "floor": "#ff7f0e"}
+COLORS = {"nopool": "#7f7f7f", "pool": "#1f77b4", "floor": "#ff7f0e", "pool1": "#2ca02c"}
+EXTRA_COLORS = ["#9467bd", "#8c564b", "#e377c2", "#17becf"]
+
+
+def color(arm):
+    """A stable colour per arm name; unknown names take the next spare."""
+    if arm not in COLORS:
+        COLORS[arm] = EXTRA_COLORS[len(COLORS) % len(EXTRA_COLORS)]
+    return COLORS[arm]
 FONT = "font-family='Helvetica, Arial, sans-serif'"
 
 
@@ -138,7 +146,7 @@ def plot_ttft(data, out):
                 continue
             p95 = w["p95"] * 1000
             p50 = (w.get("p50") or 0) * 1000
-            svg.rect(x + 2, y_of(p95), bw - 4, y_of(0) - y_of(p95), COLORS.get(arm, "#999"),
+            svg.rect(x + 2, y_of(p95), bw - 4, y_of(0) - y_of(p95), color(arm),
                      title="%s %s: p95 %.0f ms, p50 %.0f ms, %d served, %d failed"
                            % (arm, rise_label(models, k), p95, p50, w.get("n", 0), w.get("failed", 0)))
             svg.line(x + 2, y_of(p50), x + bw - 2, y_of(p50), "#111", 2.0)
@@ -147,7 +155,7 @@ def plot_ttft(data, out):
                 svg.text(x + bw / 2, H - bottom + 32, "%d failed" % w["failed"], 10, anchor="middle", fill="#c00")
     lx = left
     for arm in arms:
-        svg.rect(lx, H - 22, 12, 12, COLORS.get(arm, "#999"))
+        svg.rect(lx, H - 22, 12, 12, color(arm))
         svg.text(lx + 16, H - 12, arm, 11)
         lx += 80
     svg.write(os.path.join(out, "ttft-rises.svg"))
@@ -182,7 +190,7 @@ def plot_gpu_seconds(data, out):
         x = left + ai * gw + 30
         bw = gw - 60
         models_part = g["all"] - g["pool"]
-        col = COLORS.get(arm, "#999")
+        col = color(arm)
         svg.rect(x, y_of(models_part), bw, y_of(0) - y_of(models_part), col,
                  title="%s: model replicas %.0f GPU-s" % (arm, models_part))
         if g["pool"] > 0:
@@ -250,10 +258,10 @@ def plot_timeline(data, out):
                 pts.append((x_of(t), y_of(prev)))
             pts.append((x_of(t), y_of(total)))
             prev = total
-        svg.path(pts, COLORS.get(arm, "#999"), 1.8)
+        svg.path(pts, color(arm), 1.8)
     lx = left
     for arm in arms:
-        svg.line(lx, H - 14, lx + 20, H - 14, COLORS.get(arm, "#999"), 3)
+        svg.line(lx, H - 14, lx + 20, H - 14, color(arm), 3)
         svg.text(lx + 26, H - 10, arm, 11)
         lx += 90
     svg.write(os.path.join(out, "fleet-timeline.svg"))
