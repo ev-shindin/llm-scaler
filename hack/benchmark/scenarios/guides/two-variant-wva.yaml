@@ -253,7 +253,11 @@ shared:
         enabled: true
         portName: metrics
         path: /metrics
-        interval: 30s
+        # 10s: the scale-up signal is a queue at the engine and moves only when
+        # Prometheus holds a sample showing it, so 30s is 0-30s of jitter on
+        # the decision. Measured: lags 25/56/56/87s at 30s, 15/60/60/76s at
+        # 10s -- the jitter goes; the queue's own formation time does not.
+        interval: 10s
         labels:
           release: llmd
 

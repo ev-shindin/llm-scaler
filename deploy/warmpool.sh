@@ -1102,7 +1102,16 @@ spec:
   podMetricsEndpoints:
     - port: serving
       path: /metrics
-      interval: 30s
+      # 10s, not the 30s usual for a PodMonitor. The controller's scale-up
+      # signal is a queue at the engine, and it moves only when Prometheus
+      # holds a sample showing it, so the interval is 0-30s of jitter on top
+      # of the time the queue takes to form. MEASURED on a two-model run,
+      # decision lag after each rate step: 25/56/56/87s at 30s, 15/60/60/76s
+      # at 10s -- the jitter is gone, the queue's own ~60s is not, which is a
+      # signal question rather than a scrape one. Cheap, and it also puts a
+      # lent pool Pod's load in front of the controller as promptly as the
+      # model's own.
+      interval: 10s
       relabelings:
         - sourceLabels: [__meta_kubernetes_pod_ready]
           action: keep
