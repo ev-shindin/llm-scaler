@@ -110,7 +110,9 @@ Properties, each with a spec in `throughput_floor_test.go`:
   mean of under-reads would order replicas that are not needed.
 - **A hold, not an order.** The floor is capped at `scaleUp x anticipated
   supply` for the role -- the largest demand the engine's `RC = D/scaleUp -
-  anticipated` turns into nothing. Above that it would stop holding the fleet
+  anticipated` turns into nothing, with `scaleUp` read the way the engine
+  reads it (`AnalyzerThresholds`, so a per-analyzer override applies to both).
+  Above that it would stop holding the fleet
   and start growing it, and with a `mu` that under-read it would keep growing
   it every cycle. Scale-up stays with occupancy and the queue, which read well
   while a fleet is behind; the worst a bad `mu` can do is refuse one scale-down.
@@ -122,9 +124,10 @@ Properties, each with a spec in `throughput_floor_test.go`:
   principle as the arrival floor.
 
 Both floors only ever raise, and the throughput floor is applied last. A floor
-that binds logs `throughput-demand-floor` with `arrivalRate`,
-`saturatedThroughput`, `perReplicaCapacity`, `replicasImplied` and
-`heldAtFleet`; the per-replica `replica-capacity-decision` line carries
+that binds logs `throughput-demand-floor` with `demandBeforeFloor` (what
+demand stood at when it was applied -- possibly already raised by the arrival
+floor, so not always occupancy), `arrivalRate`, `saturatedThroughput`,
+`perReplicaCapacity`, `replicasImplied` and `heldAtFleet`; the per-replica `replica-capacity-decision` line carries
 `saturatedThroughput` every cycle, 0 until saturation has been observed.
 
 What it does not do: size a **backlog**. A queue of 350 requests is charged by

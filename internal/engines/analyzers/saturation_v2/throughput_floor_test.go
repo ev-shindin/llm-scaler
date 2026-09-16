@@ -7,6 +7,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 )
@@ -91,6 +92,19 @@ var _ = Describe("estimateThroughputDemand", func() {
 		rcs := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: 1, FromWarmPool: true}}
 		f := estimateThroughputDemand(runLambda, rcs, variants(domain.RoleBoth, 0, 0), 0.85)
 		Expect(f.ByRole).To(BeEmpty())
+	})
+
+	It("leaves out a replica whose variant has no per-replica capacity", func() {
+		// A throughput reading can outlive the capacity it was recorded
+		// beside -- the window persists while a variant's P reads zero for a
+		// cycle. P / mu is then 0, and a zero cost in the median would drag
+		// the role's floor toward nothing for the replicas that are priced.
+		vcs := append(variants(domain.RoleDecode, 1, 0),
+			domain.VariantCapacity{VariantName: "unpriced", Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: 0})
+		rcs := append(replicas(1, runMu), ReplicaCapacity{VariantName: "unpriced", SaturatedThroughput: runMu})
+		f := estimateThroughputDemand(runLambda, rcs, vcs, 0)
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/runMu*float64(runK1), 1e-6),
+			"the priced replica alone decides the floor")
 	})
 
 	It("says nothing without an arrival rate", func() {
@@ -238,6 +252,36 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		bare, err := fresh.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(bare.RoleDemand[domain.RoleDecode]).To(BeNumerically("<", want/5))
+	})
+
+	It("caps at the threshold the engine sizes RC with, not the policy-level one", func() {
+		// A policy may override scaleUpThreshold per analyzer. The engine
+		// sizes RC = D / thatThreshold - anticipated, so the cap has to be
+		// drawn at the same number: at a policy-level 0.95 and a saturation
+		// override of 0.60, a cap at 0.95 x supply leaves room for a floor
+		// that turns into RC > 0, and a mu that under-read orders a replica.
+		saturate()
+		in := makeAnalyzerInput(
+			[]domain.ReplicaMetrics{decode("decode-0", 200_000, 0, runLambda), prefill("prefill-0", 0)},
+			states(1, 1))
+		in.ArrivalRate = runLambda
+		policy := in.Config.(*config.ScalingPolicy)
+		policy.ScaleUpThreshold = 0.95
+		low := 0.60
+		policy.Analyzers = []config.AnalyzerScoreConfig{{Name: "saturation", Score: 1.0, ScaleUpThreshold: &low}}
+		up, _ := policy.AnalyzerThresholds(domain.SaturationAnalyzerName)
+		Expect(up).To(Equal(0.60), "the fixture must actually override the threshold")
+
+		result, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		var decodeP float64
+		for _, vc := range result.VariantCapacities {
+			if vc.VariantName == decodeVariant {
+				decodeP = vc.PerReplicaCapacity
+			}
+		}
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 0.60*decodeP, 1),
+			"capped at the analyzer's own threshold, so RC = D/0.60 - P is exactly zero")
 	})
 
 	It("does not order a replica the fleet does not have", func() {

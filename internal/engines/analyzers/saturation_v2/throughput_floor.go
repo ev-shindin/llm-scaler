@@ -3,7 +3,6 @@ package saturation_v2
 import (
 	"maps"
 	"slices"
-	"sort"
 
 	"github.com/go-logr/logr"
 
@@ -64,10 +63,11 @@ type throughputTerm struct {
 	Mu float64
 	// PerReplica is the tokens one replica of the role is worth (P).
 	PerReplica float64
-	// Replicas is lambda / Mu before the cap, and Capped reports whether the
-	// hold cap bound instead.
+	// Replicas is lambda / Mu before the cap.
 	Replicas float64
-	Capped   bool
+	// Capped reports that the hold cap bound instead of the plain lambda / Mu
+	// figure, so the floor is the fleet's own size rather than the load's.
+	Capped bool
 }
 
 // recordSaturatedThroughput folds one saturated completion-rate reading into
@@ -217,7 +217,15 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	roleDemand map[string]float64,
 	logger logr.Logger,
 ) float64 {
-	floor := estimateThroughputDemand(offeredArrivalRate(input), replicas, variants, cfg.ScaleUpThreshold)
+	// The cap is measured against the threshold the ENGINE will size RC with,
+	// which is the saturation analyzer's own -- a policy may override it per
+	// analyzer (config.AnalyzerThresholds), and the policy-level field is then
+	// not the number applyUniversalThreshold divides by. Read from the raw
+	// field, a cap computed at 0.95 would sit above an RC=0 boundary drawn at
+	// 0.60, and a floor between the two would order a replica: the exact thing
+	// the cap exists to prevent.
+	scaleUp, _ := cfg.AnalyzerThresholds(domain.SaturationAnalyzerName)
+	floor := estimateThroughputDemand(offeredArrivalRate(input), replicas, variants, scaleUp)
 	if len(floor.ByRole) == 0 {
 		return totalDemand
 	}
@@ -241,9 +249,12 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 		if tokens <= measured {
 			continue
 		}
+		// demandBeforeFloor, not occupancyDemand: by this point the arrival
+		// floor may already have raised the figure, so it is whatever demand
+		// stood at when this floor was applied, which is not always occupancy.
 		logger.Info("throughput-demand-floor",
 			"modelID", input.ModelID, "namespace", input.Namespace, "role", role,
-			"occupancyDemand", measured, "flooredTo", tokens,
+			"demandBeforeFloor", measured, "flooredTo", tokens,
 			"arrivalRate", floor.Lambda, "saturatedThroughput", term.Mu,
 			"perReplicaCapacity", term.PerReplica, "replicasImplied", term.Replicas,
 			"heldAtFleet", term.Capped)
@@ -281,7 +292,7 @@ func medianFloat(values []float64) float64 {
 	}
 	sorted := make([]float64, n)
 	copy(sorted, values)
-	sort.Float64s(sorted)
+	slices.Sort(sorted)
 	if n%2 == 0 {
 		return (sorted[n/2-1] + sorted[n/2]) / 2
 	}

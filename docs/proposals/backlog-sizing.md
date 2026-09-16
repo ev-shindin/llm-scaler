@@ -275,7 +275,7 @@ three replicas Ready and occupancy at 136k tokens (one seventh of a replica,
 the reading that took the original fleet to one):
 
 ```
-throughput-demand-floor  role=decode  occupancyDemand=135695  flooredTo=1184659
+throughput-demand-floor  role=decode  demandBeforeFloor=135695  flooredTo=1184659
                          arrivalRate=6.2  saturatedThroughput=4.87
                          replicasImplied=1.27  heldAtFleet=false
 ```
