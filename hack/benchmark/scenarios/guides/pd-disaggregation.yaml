@@ -81,23 +81,24 @@ scenario:
           # storageClassName: shared-vast
           # storageClassName: ocs-storagecluster-cephfs
 
-      # llm-d-benchmark's own default (defaults.yaml, llm-d-routing-sidecar_version
-      # anchor -> images.routingSidecar.tag) pins the routing-proxy init container
-      # to v0.9.0, which predates the llm-d-modelservice chart's rename of this
-      # sidecar's CLI flags (--vllm-port/--connector -> --model-server-port/
-      # --kv-connector, chart v0.4.16's _helpers.tpl -- confirmed by pulling and
-      # grepping that chart directly, and confirmed both charts' version numbers
-      # are unchanged from the last known-good render: the mismatch is a stale
-      # pin in llm-d-benchmark itself, not drift). That makes the routing-proxy
-      # init container crash-loop on "unknown flag: --model-server-port" the
-      # moment anything re-renders this scenario -- a fresh standup, not just a
-      # benchmark run against pods that happened to predate the mismatch.
-      # Overriding to the modelservice chart's own (floating) default tag here,
-      # rather than upstream's stale pin, until llm-d-benchmark's own anchor
-      # catches up.
+      # The routing-proxy init container and the modelservice chart have to
+      # agree on the sidecar's CLI flags, and they are pinned SEPARATELY:
+      # hack/benchmark/patch_harness.sh (fix 6) pins the chart to v0.4.15,
+      # which renders --vllm-port/--connector, and the tag here decides which
+      # sidecar receives them. v0.9.0 is the sidecar that takes those flags --
+      # llm-d-benchmark's own default anchor (defaults.yaml,
+      # llm-d-routing-sidecar_version) -- and it is pinned here rather than
+      # inherited so that a benchmark can be reproduced later.
+      #
+      # This used to say `latest`, written when the chart floated to v0.4.16
+      # (which renders --model-server-port/--kv-connector). Once the chart was
+      # pinned back to v0.4.15 the floating sidecar kept moving, and a fresh
+      # standup on 2026-09-16 crash-looped every decode pod on
+      # "unknown flag: --connector" -- the same failure the old comment
+      # described, from the other side. Move both pins together or neither.
       images:
         routingSidecar:
-          tag: latest
+          tag: v0.9.0
 
       vllmCommon:
         # rc enables UCX's RDMA transport (RoCE GPUDirect on this cluster --

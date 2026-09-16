@@ -66,6 +66,11 @@ Read the review first; the implementation design says what was built.
 
 - **[Analyzer metric interface](analyzer-metric-interface.md)**
 - **[SGLang backend](sglang-backend.md)**
+- **[Sizing a backlog](backlog-sizing.md)** — what the shape-swap P/D run
+  showed: peaks of 7 and 9 decode replicas against a need of 2, troughs of 1
+  that caused the next peak. Three fixes landed (the throughput floor among
+  them); the open question is that a queued request is charged as KV held at
+  once, when a backlog needs throughput.
 - **[What counts as a serving replica](what-counts-as-a-serving-replica.md)** —
   the count WVA derives capacity from means "Pods that reported metrics", is
   used as though it meant "Pods taking traffic", and the gap produced three

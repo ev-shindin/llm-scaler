@@ -83,24 +83,37 @@ type arrivalFloor struct {
 // See the file header for what this is and is not invariant to, and for why it
 // binds more often than "floor" suggests.
 func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
-	lambda := input.ArrivalRate
-	if lambda <= 0 {
-		// The EPP is the only source of a model-level arrival rate. Without it,
-		// fall back to what the engines completed: at steady state a queue that
-		// is neither growing nor shrinking makes completion rate equal arrival
-		// rate. That equality fails exactly when a queue is building, and
-		// completions are then capped by capacity — so this understates λ
-		// precisely when demand is highest.
-		//
-		// Tolerable because a building queue is the case OCCUPANCY reads well,
-		// so the floor is not what carries that decision. That reasoning needs
-		// the queue term to exist, though: with flow control disabled AND the
-		// EPP absent, occupancy has no queue component either and both signals
-		// understate together. Nothing here detects that combination.
-		for _, rm := range input.ReplicaMetrics {
-			lambda += rm.RequestRate
-		}
-	}
+	// Every per-request figure below is read off the DECODE side of the fleet.
+	// On a P/D deployment a prefill replica finishes each request after one
+	// token and hands it off, so its service time is the prompt's prefill cost
+	// (~0.1s against ~20s on decode) and its output length is ~1. Those are
+	// properties of the role, not of the workload, and the lower median has no
+	// defence against them: with as many prefill replicas as decode ones the
+	// median IS a prefill reading, and the floor computed from it is a few
+	// thousand tokens against a load that occupies a million. Measured on a
+	// P/D run at one replica per role: W read 0.11s and the floor stopped
+	// binding for the whole window in which the decode side was re-saturating.
+	//
+	// A non-disaggregated fleet has no prefill role, so this is the full set.
+	generating := generatingReplicas(input)
+
+	// The EPP is the only source of a model-level arrival rate. Without it,
+	// offeredArrivalRate falls back to what the engines completed: at steady
+	// state a queue that is neither growing nor shrinking makes completion
+	// rate equal arrival rate. That equality fails exactly when a queue is
+	// building, and completions are then capped by capacity — so this
+	// understates λ precisely when demand is highest.
+	//
+	// Tolerable because a building queue is the case OCCUPANCY reads well,
+	// so the floor is not what carries that decision. That reasoning needs
+	// the queue term to exist, though: with flow control disabled AND the
+	// EPP absent, occupancy has no queue component either and both signals
+	// understate together. Nothing here detects that combination.
+	//
+	// The fallback sums the generating replicas only. A P/D request completes
+	// on its prefill replica AND on its decode replica, so summing every
+	// replica's completion rate counts each request twice.
+	lambda := offeredArrivalRate(input)
 	if lambda <= 0 {
 		return arrivalFloor{Reason: "no arrival rate (EPP absent and no completions)"}
 	}
@@ -123,18 +136,18 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 	// mean for its other two callers: they are the zero-replica capacity
 	// estimate and the analyzer's own per-model workload log line, neither of
 	// which multiplies its result by an arrival rate.
-	avgIn := medianOf(input.ReplicaMetrics, func(rm domain.ReplicaMetrics) float64 { return rm.AvgInputTokens })
-	avgOut := medianOf(input.ReplicaMetrics, func(rm domain.ReplicaMetrics) float64 { return rm.AvgOutputTokens })
+	avgIn := medianOf(generating, func(rm domain.ReplicaMetrics) float64 { return rm.AvgInputTokens })
+	avgOut := medianOf(generating, func(rm domain.ReplicaMetrics) float64 { return rm.AvgOutputTokens })
 	if avgOut <= 0 {
 		return arrivalFloor{Reason: "no average output length", HasArrivalSignal: true}
 	}
 
 	// Preferred: the engine's own service time, which already covers prefill.
-	w := medianOf(input.ReplicaMetrics, func(rm domain.ReplicaMetrics) float64 { return rm.AvgServiceTime })
+	w := medianOf(generating, func(rm domain.ReplicaMetrics) float64 { return rm.AvgServiceTime })
 	source := "measured"
 	if w <= 0 {
 		// Fallback: decode-only reconstruction. Understates prefill-heavy work.
-		itl := medianOf(input.ReplicaMetrics, func(rm domain.ReplicaMetrics) float64 { return rm.AvgITL })
+		itl := medianOf(generating, func(rm domain.ReplicaMetrics) float64 { return rm.AvgITL })
 		if itl <= 0 {
 			return arrivalFloor{Reason: "no service time and no inter-token latency", HasArrivalSignal: true}
 		}
@@ -163,6 +176,26 @@ func estimateArrivalDemand(input domain.AnalyzerInput) arrivalFloor {
 		WSource:          source,
 		HasArrivalSignal: true,
 	}
+}
+
+// generatingReplicas returns the replicas whose completions describe the
+// workload -- every role but prefill (see generatesOutput). When that leaves
+// nothing, which happens only on a fleet whose decode side reports no metrics
+// this cycle, it returns the full set rather than an empty one: a prefill
+// reading is a poor estimate, but no reading at all would make the floor
+// silently decline on a fleet that is demonstrably serving.
+func generatingReplicas(input domain.AnalyzerInput) []domain.ReplicaMetrics {
+	roles := rolesFromStates(input.VariantStates)
+	out := make([]domain.ReplicaMetrics, 0, len(input.ReplicaMetrics))
+	for _, rm := range input.ReplicaMetrics {
+		if generatesOutput(rm, roles) {
+			out = append(out, rm)
+		}
+	}
+	if len(out) == 0 {
+		return input.ReplicaMetrics
+	}
+	return out
 }
 
 // medianOf takes the median per-replica value over the replicas that reported

@@ -1,6 +1,9 @@
 package saturation_v2
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 // rollingAverage maintains a fixed-size sliding window of float64 values
 // and computes their arithmetic mean. Used to smooth noisy compute-capacity
@@ -44,6 +47,17 @@ func (r *rollingAverage) Average() float64 {
 // Len returns the number of values currently stored.
 func (r *rollingAverage) Len() int {
 	return len(r.values)
+}
+
+// Max returns the largest stored value, or 0 if empty. The saturated
+// throughput window reads this rather than Average: see
+// recordSaturatedThroughput for why a completion rate under saturation can
+// only under-read.
+func (r *rollingAverage) Max() float64 {
+	if len(r.values) == 0 {
+		return 0
+	}
+	return slices.Max(r.values)
 }
 
 // Stale reports whether nothing has been added within the timeout.

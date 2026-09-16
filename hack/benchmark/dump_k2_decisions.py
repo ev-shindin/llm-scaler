@@ -3,7 +3,7 @@
 the controller logs within a given results dir's run window, and render a
 markdown report of which fallback tier fired, when, and why.
 
-Reads eight log lines:
+Reads the following log lines:
   - k2-decision                    (saturation_v2) per replica, per cycle:
                                     which of the four k2 priority tiers fired
                                     (observed / historical / derived /
@@ -24,6 +24,13 @@ Reads eight log lines:
                                     live / derived / stored-fallback estimate
   - scheduler-queue-demand         (saturation_v2) per model, per cycle: the
                                     EPP flow-control queue's token demand
+  - arrival-demand-floor           (saturation_v2) per model, per cycle when
+                                    it binds: demand raised to what the
+                                    arrival rate implies by Little's law
+  - throughput-demand-floor        (saturation_v2) per role, per cycle when
+                                    it binds: demand held at lambda / mu
+                                    replicas' worth, mu being the saturated
+                                    completion rate recorded beside k2
   - Applied saturation decision via shared cache
                                     (steadystate) the actual, post-enforcement
                                     target replica count for the variant this
@@ -82,6 +89,12 @@ SQ_MSG = "scheduler-queue-demand"
 # computed at all, and names the input that was missing.
 FLOOR_MSG = "arrival-demand-floor"
 FLOOR_NA_MSG = "arrival-demand-floor unavailable"
+# The throughput floor (saturation_v2/throughput_floor.go): the same shape as
+# FLOOR_MSG, per role, and the cycles it fires on are the ones where the fleet
+# was HELD at lambda / mu replicas after occupancy had stopped asking for them.
+# It carries replicasImplied and heldAtFleet, which together say whether the
+# hold was the load's or the cap's.
+TFLOOR_MSG = "throughput-demand-floor"
 
 MESSAGES = {
     K2_MSG,
@@ -89,6 +102,7 @@ MESSAGES = {
     SQ_MSG,
     FLOOR_MSG,
     FLOOR_NA_MSG,
+    TFLOOR_MSG,
     "replica-capacity-skipped",
     "replica-capacity-store-fallback",
     "variant-capacity-source",

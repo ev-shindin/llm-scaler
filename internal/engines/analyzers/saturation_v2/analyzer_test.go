@@ -674,6 +674,55 @@ var _ = Describe("SaturationAnalyzer", func() {
 			Expect(aggregation.SumTotalAnticipatedSupply(result.VariantCapacities)).To(BeNumerically(">", aggregation.SumTotalSupply(result.VariantCapacities)))
 		})
 
+		It("counts a Ready replica that has not been scraped yet as arriving, not as absent", func() {
+			// From the shape-swap P/D run at 07:30:23: the decode target reported
+			// 4 replicas with 2 Ready, and one metrics row -- the second Ready
+			// pod passed its probe one second before the cycle. The target's own
+			// pending count (4 - 2 = 2) excludes it and the live rows exclude it,
+			// so anticipated supply counted 3 replicas and the role was sized to
+			// 7 instead of 6.
+			input := makeAnalyzerInput(
+				[]domain.ReplicaMetrics{
+					makeReplicaMetrics("decode-0", "decode-v", 1_149_823, 1_162_240, 137, 6000, 1000),
+				},
+				[]domain.VariantReplicaState{
+					{VariantName: "decode-v", Role: domain.RoleDecode, AcceleratorName: "H200",
+						CurrentReplicas: 4, PendingReplicas: 2, GPUsPerReplica: 1},
+				},
+			)
+
+			result, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.VariantCapacities).To(HaveLen(1))
+			vc := result.VariantCapacities[0]
+			Expect(vc.ReplicaCount).To(Equal(1), "supply is what reported")
+			Expect(vc.PendingReplicas).To(Equal(3), "everything else the target owns is arriving")
+			Expect(aggregation.SumTotalAnticipatedSupply(result.VariantCapacities)).
+				To(BeNumerically("~", 4*vc.PerReplicaCapacity, 1e-6),
+					"anticipated supply must be the whole fleet the target already has")
+		})
+
+		It("reports no pending replicas while condemned replicas outnumber the target", func() {
+			// An in-flight scale-down: the target is at 1 with 3 rows still
+			// reporting. The engine's clamp caps supply at the target's count;
+			// pending must be zero here, not the target's stale not-ready figure
+			// -- which is set to a nonzero value so that the old code (pending =
+			// vs.PendingReplicas) and the new one give different answers.
+			input := makeAnalyzerInput(
+				[]domain.ReplicaMetrics{
+					makeReplicaMetrics("pod-1", "variant-a", 1000, 16000, 0, 100, 50),
+					makeReplicaMetrics("pod-2", "variant-a", 1000, 16000, 0, 100, 50),
+					makeReplicaMetrics("pod-3", "variant-a", 1000, 16000, 0, 100, 50),
+				},
+				[]domain.VariantReplicaState{
+					{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, PendingReplicas: 5, GPUsPerReplica: 1},
+				},
+			)
+			result, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.VariantCapacities[0].PendingReplicas).To(BeZero())
+		})
+
 		It("should NOT include pending replicas in scale-down calculation", func() {
 			input := makeAnalyzerInput(
 				[]domain.ReplicaMetrics{
@@ -1089,7 +1138,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0, // use count-based estimation only
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(sq, metrics, nil, activeRoles)
 
 			// Input: max(0/4=0, 10*100=1000) = 1000 (no cache hit)
 			// Output: 10 * 50 = 500
@@ -1113,7 +1162,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0,
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(sq, metrics, nil, activeRoles)
 
 			Expect(result.total).To(Equal(1500.0))
 			Expect(result.byRole["both"]).To(Equal(1500.0))
@@ -1129,7 +1178,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0,
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, nil)
+			result := estimateSchedulerQueueDemand(sq, metrics, nil, nil)
 
 			Expect(result.total).To(Equal(1500.0))
 			Expect(result.byRole).To(BeEmpty())
@@ -1142,7 +1191,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			}
 			activeRoles := map[string]bool{"prefill": true, "decode": true}
 
-			result := estimateSchedulerQueueDemand(nil, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(nil, metrics, nil, activeRoles)
 
 			Expect(result.total).To(Equal(0.0))
 			Expect(result.byRole).To(BeNil())
@@ -1164,7 +1213,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0,
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(sq, metrics, nil, activeRoles)
 
 			// Input: 10*100=1000, after cache: 1000*(1-0.5)=500
 			// Output: 10*50=500
@@ -1175,6 +1224,61 @@ var _ = Describe("SaturationAnalyzer", func() {
 			Expect(result.byRole["prefill"]).To(Equal(500.0))
 			// Decode: inputTokens + outputTokens = 500 + 500 = 1000
 			Expect(result.byRole["decode"]).To(Equal(1000.0))
+		})
+
+		It("prices a queued request's output from the decode side, not diluted by prefill", func() {
+			// From a P/D run (shape 6000 in / 1000 out, one replica per role):
+			// the prefill replica's own generation average is ~1 because it
+			// hands off after one token. Averaged unweighted with decode's
+			// 1000, the model-level output length read 500 and 213 queued
+			// requests were charged half their real output.
+			metrics := []domain.ReplicaMetrics{
+				makeReplicaMetrics("prefill-0", "prefill-v", 0, 1149312, 0, 6000, 1),
+				makeReplicaMetrics("decode-0", "decode-v", 1158912, 1162240, 0, 6000, 1000),
+			}
+			roles := map[string]string{"prefill-v": domain.RolePrefill, "decode-v": domain.RoleDecode}
+			activeRoles := map[string]bool{domain.RolePrefill: true, domain.RoleDecode: true}
+			sq := &domain.SchedulerQueueMetrics{QueueSize: 213}
+
+			result := estimateSchedulerQueueDemand(sq, metrics, roles, activeRoles)
+
+			// Input: 213 × 6000 from either side; output: 213 × 1000, decode's
+			// figure alone. The old mean gave 213 × 500 = 106,500 here.
+			Expect(result.byRole[domain.RolePrefill]).To(Equal(213.0 * 6000))
+			Expect(result.byRole[domain.RoleDecode]).To(Equal(213.0*6000 + 213.0*1000))
+			Expect(result.total).To(Equal(213.0*6000 + 213.0*1000))
+
+			// Negative control: with no roles recorded the mean is the old
+			// unweighted one, and reproduces the diluted charge from the run.
+			_, diluted, _ := computeModelWorkloadAverages(metrics, nil)
+			Expect(diluted).To(Equal(500.5))
+		})
+
+		It("averages over every replica when no role is recorded", func() {
+			// A non-disaggregated fleet has no prefill to exclude, so the
+			// role-aware mean must be the plain mean it always was.
+			metrics := []domain.ReplicaMetrics{
+				makeReplicaMetrics("pod-1", "variant-a", 5000, 16000, 0, 100, 50),
+				makeReplicaMetrics("pod-2", "variant-a", 5000, 16000, 0, 100, 150),
+			}
+			avgIn, avgOut, _ := computeModelWorkloadAverages(metrics, nil)
+			Expect(avgIn).To(Equal(100.0))
+			Expect(avgOut).To(Equal(100.0))
+		})
+
+		It("keeps the input-token and hit-rate means over both roles", func() {
+			// Only the output length is a property of the role. Prompts are the
+			// same on both sides, and the prefix cache a queued prompt can hit
+			// is the prefill side's, so those two must not lose it.
+			metrics := []domain.ReplicaMetrics{
+				{PodName: "prefill-0", VariantName: "prefill-v", AvgInputTokens: 6000, AvgOutputTokens: 1, PrefixCacheHitRate: 0.8},
+				{PodName: "decode-0", VariantName: "decode-v", AvgInputTokens: 6000, AvgOutputTokens: 1000, PrefixCacheHitRate: 0},
+			}
+			roles := map[string]string{"prefill-v": domain.RolePrefill, "decode-v": domain.RoleDecode}
+			avgIn, avgOut, hit := computeModelWorkloadAverages(metrics, roles)
+			Expect(avgIn).To(Equal(6000.0))
+			Expect(avgOut).To(Equal(1000.0))
+			Expect(hit).To(Equal(0.4))
 		})
 
 		It("should add queue demand to role capacities in end-to-end analysis", func() {
