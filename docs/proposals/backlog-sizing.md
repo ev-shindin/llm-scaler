@@ -374,10 +374,55 @@ What was done (branch `fix/phase2-oscillation`):
   3000 / 6000), so that when phase 2 does saturate its first `mu` is not
   masked by phase 1's max in a shared window.
 
-What the log implies for the re-run, before it is run: at two replicas
-occupancy keeps climbing, the batch reaches 256, `waiting` crosses 5, P1
-records `mu` ~ 2.75-3.0 in the `xxlong` bucket, and occupancy plus the queue
-order the third replica; at three, the floor is 6/2.9 x 930k = 1.92M and
-spare is 2.79M - 1.92M/0.7 = 0.05M, less than a replica: **held at 3.** The
-cost is the two minutes at two replicas with W near 80s before the queue
-forms, which is the price of scaling on saturation rather than on latency.
+- **A bucket with no reading borrows the nearest bucket's** until it has
+  its own. Found by the re-run of the two changes above without it (run
+  `guidellm-1789577844-0smu2m_1`): the new shape landed in an empty `xxlong`,
+  the floor vanished, and a three-replica fleet was sized to one from 400k
+  tokens of occupancy -- worse than the shared bucket it replaced. The
+  borrowed figure is wrong in a known direction (a shorter shape's mu holds
+  too few, which the fleet corrects by saturating once; a longer shape's
+  holds too many, which the cap bounds) and lasts until the first reading
+  of the bucket's own, which then takes over unmasked.
+
+### Measured, 2026-09-16, kermit
+
+Three runs of the same trace on the same day, same stack and HPA policy,
+same cluster; the second decode replica's start time against the load
+differed run to run (97 s, ~140 s, ~140 s), which sets how deep the first
+ramp goes and is not the code.
+
+```
+                       PR #62 image          split, no borrow       split + borrow + no
+                       (arrival floor)       (no arrival floor)     arrival floor
+                       wm9k0y_1              0smu2m_1               kb3q2v_1
+first ramp, decode     1 -> 3                1 -> 9 (3 Ready)       1 -> 6 (3 Ready)
+phase 1 steady         held 2                held 2                 held 2
+shape change           2->3->4->2->3->4      3 -> 1 (collapse),     2 -> 3 -> 4, HELD
+                       (arrival floor)       then 1 -> 5            (mu learned once)
+p95 TTFT, min 0-5      0.44 s                34 s                   8.4 s
+p95 TTFT, min 20-25    0.23 s                0.04 s                 4.8 s
+p95 TTFT, min 30-35    0.20 s                88.7 s                 0.04 s
+```
+
+The cycle-by-cycle of the last run's second phase: target 2 from 18:10
+(borrowed mu 6.5, the first ramp's deeper saturation this time); the two
+replicas' batch grows with nothing waiting; occupancy crosses the threshold
+and orders a third at 18:15:29; the batch reaches the ceiling, `waiting`
+reads 16-18, and P1 records `mu = 2.97` for `xxlong` at 18:17:44 together
+with the shape's own k2 (806k, against 1.16M for the 1000-token shape); the
+saturation moment's occupancy plus queue orders a fourth at 18:18:29 (the
+ramp, again -- the residency charge); and the target then holds until the
+load ends at 18:29. Three were Ready throughout; the fourth waited on a GPU
+the cluster did not have, so with a free cluster the settle would have been
+4 -> 3 and held (spare at four is 0.9 of a replica, at three 0.13).
+
+What the last column costs against the first: one saturation per new shape,
+4.8 s p95 for one five-minute window, to learn the shape's throughput by
+reaching it. What it buys: a fleet that does not fall below what a known
+shape needs and is not scaled down for looking idle -- the first column's
+0.23 s came from a floor that ordered replicas early on an inflated service
+time and released them again, five replicas' worth of churn per ten minutes.
+Learning a shape's throughput before its queue forms (from the batch
+approaching the engine's ceiling, or from ITL growth) would remove the
+episode and is the natural next step; it needs `num_requests_running` per
+replica, which the collector does not read today.

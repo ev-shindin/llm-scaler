@@ -72,7 +72,12 @@ Properties, each with a spec in `throughput_floor_test.go`:
   shapes sharing a bucket share a window whose max is the shorter shape's --
   which held a fleet at the shorter shape's size while the longer one was
   served. Measured on the shape-swap benchmark, where 1000 and 4000 tokens
-  shared one bucket; they no longer do.
+  shared one bucket; they no longer do. A bucket with no reading borrows the
+  nearest bucket's under the same key prefix until it has its own -- without
+  that, the first cycle of a new shape had no floor at all, and a
+  three-replica fleet was sized to one from 400k tokens of occupancy. The
+  per-replica log line names the bucket the figure came from
+  (`saturatedThroughputBucket`).
 
 A floor that binds logs `throughput-demand-floor` with `demandBeforeFloor`,
 `arrivalRate`, `saturatedThroughput`, `perReplicaCapacity`, `replicasImplied`
@@ -149,4 +154,6 @@ is a property of the load.
 | The throughput floor held two decode replicas through phase 1 | Measured, 2026-09-16 re-run (`throughput-demand-floor` at 13:12-13:25) |
 | Two replicas grew their batch 75 -> 229 with `waiting` <= 1 in phase 2 | Measured, same re-run, pod counters |
 | The retired floor ordered every phase-2 scale-up, at `W` 36-77s | Measured, same re-run, controller log |
-| Retiring it and splitting the buckets holds phase 2 at three replicas | Arithmetic on logged values; **not yet re-run** |
+| Splitting the buckets with no fallback loses the floor on a new shape (3 -> 1) | Measured, run `guidellm-1789577844-0smu2m_1` |
+| Retired floor + split buckets + borrow: phase 2 goes 2 -> 3 -> 4 and holds, `mu` = 2.97 learned at the one saturation | Measured, run `guidellm-1789581140-kb3q2v_1` |
+| The learning saturation costs one window at 4.8 s p95 TTFT | Measured, same run, engine histograms per 5-minute window |
