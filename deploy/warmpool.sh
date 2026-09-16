@@ -564,7 +564,7 @@ $(warmpool_podmonitor)"
 # The proxy image config/warmpool pins, which is what --proxy-image
 # defaults to. Emitted here rather than written out again, so the
 # default and the manifest cannot disagree about which image a pool runs.
-WARMPOOL_DEFAULT_PROXY_IMAGE="ghcr.io/ev-shindin/llm-scaler/warmpool-proxy:v9@sha256:dfbbe4b91b8ed0e21d2af049b6122d1eb570b32955d46869ab0d3a5f3e6240a7"
+WARMPOOL_DEFAULT_PROXY_IMAGE="ghcr.io/ev-shindin/llm-scaler/warmpool-proxy:v10@sha256:10d39e5162eeed8d5baa75214b1a5fc9b3b5d1024ae8e8333a131e28a0cf17d1"
 
 pool_pod_spec() {
   local memory="$1" indent="$2" role="${3:-leader}"
