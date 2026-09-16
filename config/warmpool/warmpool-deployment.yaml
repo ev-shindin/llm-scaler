@@ -383,7 +383,7 @@ spec:
           # Build your own from this tree with `make docker-build-warmpool-proxy
           # docker-push-warmpool-proxy WARMPOOL_PROXY_IMG=<ref>`
           # (Dockerfile.warmpool-proxy) and pass --proxy-image.
-          image: ghcr.io/ev-shindin/llm-scaler/warmpool-proxy:v8@sha256:66e8bb63b985c87db81716b2047f07a5deba2f1729e5397f4476d2415af72093
+          image: ghcr.io/ev-shindin/llm-scaler/warmpool-proxy:v9@sha256:dfbbe4b91b8ed0e21d2af049b6122d1eb570b32955d46869ab0d3a5f3e6240a7
           imagePullPolicy: IfNotPresent
           args:
             - --port=8000
