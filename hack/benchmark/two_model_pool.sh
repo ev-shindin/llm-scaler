@@ -1394,6 +1394,21 @@ verb_run() {
             case "$(k get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)" in
                 Failed) warn "the loader Pod failed"; break ;;
             esac
+            # A container the KERNEL killed prints nothing, and the Pod stays
+            # Running while its sibling lives. MEASURED: the Llama loader was
+            # OOMKilled at the start of its fourth rise and this loop carried on
+            # for eleven minutes, driving Qwen alone against a fleet that was
+            # no longer in anti-phase, until the sibling finished on its own.
+            # The wrapper cannot report what it never got to see, so the
+            # container state is read directly.
+            local dead
+            dead="$(k get pod "$pod" -o json 2>/dev/null | jq -r '
+                [.status.containerStatuses[]? | select(.state.terminated != null)
+                 | .name + "=" + (.state.terminated.reason // "Terminated")] | join(" ")')"
+            if [ -n "$dead" ]; then
+                warn "a loader container terminated without reporting: $dead"
+                break
+            fi
         fi
         sleep 15
     done
@@ -1527,6 +1542,17 @@ render_load_container() {
     # then reports the delay as the cluster's latency. The report refuses an arm
     # whose driver queueing is large, so starving this is a wasted run, not a
     # quiet bias.
+    #
+    # MEMORY GROWS FOR THE WHOLE RUN with the synthetic dataset. inference-perf
+    # materializes each prompt lazily in one of its worker processes (18 at 9
+    # rps) and keeps every one it has made, so the footprint is the corpus and
+    # tokenizer per worker PLUS every prompt issued so far. MEASURED: at 9 rps
+    # the Llama loader was OOMKilled at 8Gi thirty-three minutes in, at the
+    # start of its fourth rise, with ~8,500 prompts materialized; the Qwen
+    # loader at 8 rps finished. That is the worst failure this scenario has: a
+    # full arm's accelerators spent and no result. The limit below is the
+    # measured death point times four, and the request stays modest because
+    # the growth is late.
     cat <<YAML
         - name: load-$role
           image: $(load_image)
@@ -1547,10 +1573,10 @@ render_load_container() {
           resources:
             requests:
               cpu: "2"
-              memory: "4Gi"
+              memory: "8Gi"
             limits:
               cpu: "4"
-              memory: "8Gi"
+              memory: "32Gi"
           volumeMounts:
             - name: profiles
               mountPath: /profiles

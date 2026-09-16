@@ -275,6 +275,13 @@ and plausible table. The tooling enforces every one rather than trusting it:
   through the same claim the models use.
 - Everything [the warm pool guide](../warm-pool/) needs: the two images, the
   RBAC to patch Pods, the NetworkPolicy.
+- **A node with 64 GiB free for the load Pod.** Each loader container is
+  limited to 32 GiB, and it is not generous: inference-perf materializes
+  synthetic prompts lazily in its worker processes and keeps every one, so
+  memory grows for the whole run. Measured, the 9 rps loader was OOMKilled at
+  8 GiB thirty-three minutes in — at the start of its fourth rise, with the
+  arm's accelerators already spent. The driver now stops the arm the moment a
+  loader container dies, but the Job still has to fit.
 
 ## Running it
 
