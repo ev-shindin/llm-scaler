@@ -155,14 +155,37 @@ simply refetches. The fetch itself retries five times with backoff.
 must be shorter than `PHASE_SECONDS` — the profile generator refuses otherwise,
 because an uncut phase has no rise stage to read.
 
-`PREFIX_GROUPS` (default 32) is the number of distinct shared prefixes in the
-generated dataset, and it is **not** a detail. llm-d's shipped scheduling
-profile weights `prefix-cache-scorer` highest, so with a single prefix the first
-replica to cache it wins every later request regardless of its queue — measured
-on CoreWeave: one replica did 6,000,692 prompt tokens while every other Ready
-replica, including an awake warm-pool Pod in the EPP's own backend list, did
-zero. The report refuses an arm where one engine did all the work, because every
-TTFT and GPU number from such a run describes a one-replica fleet.
+### The prompts share no prefix
+
+`LOAD_DATA` (default `synthetic`) selects inference-perf's dataset, and it
+decides whether a scale-up can be measured at all. `synthetic` slices every
+prompt from a random offset into a 5 MB corpus, freshly per request, so no two
+requests start alike.
+
+The reason is llm-d's shipped scheduling profile. It weights
+`prefix-cache-scorer` highest — 3, against 2 for queue depth and 2 for KV
+utilisation — and the scorer's hashes chain from the first token. A replica
+that has cached a prompt's opening therefore wins every later request that
+shares it, **regardless of its queue**, and a replica that has cached nothing
+never receives a request, so it never caches anything, so it never starts
+winning. Measured on CoreWeave with the `shared_prefix` dataset (32 groups × 64
+prompts, cycled — the suite's own shape): per model, the busiest engine did
+**99.0 % and 98.7 %** of the prompt tokens over a whole 36-minute arm, and every
+replica the autoscaler added did 0.3–2.0 %. Both arms were one-replica fleets,
+and the aggregate hid it — pooled across the two models the busiest engine
+showed 48.9 %, which looks like spread. With `synthetic`, an **empty** second
+replica took 49.4 % of 9 rps from its first minute (p50 TTFT 58 ms).
+
+The report refuses an arm where, per model, one engine did nearly all the work,
+because every TTFT and GPU number from such a run describes a one-replica fleet.
+`LOAD_DATA=shared_prefix` with `PREFIX_GROUPS` (default 32) is kept to
+reproduce the pin, not to measure with.
+
+One consequence for calibration: with no prefix hits, every request is a full
+`INPUT_TOKENS` prefill, so a replica's capacity is lower than a shared-prefix
+run would suggest. Two Llama replicas served 9 rps at p50 58 ms under
+`synthetic`; if you change the dataset, re-measure both ends of the burst as
+described above.
 
 ### Every latency is the generator's own, per stage
 

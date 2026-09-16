@@ -121,10 +121,18 @@ INPUT_TOKENS="${INPUT_TOKENS:-1000}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-500}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 SEED="${SEED:-1729}"
-# Distinct shared prefixes in the generated dataset. NOT a detail: llm-d's
-# shipped scheduling profile weights the prefix-cache scorer highest, so with
-# one prefix the first replica to cache it wins every subsequent request and
-# the run measures a one-replica fleet no matter how much capacity is added.
+# The prompts. `synthetic` slices every prompt from a random offset into
+# inference-perf's corpus, so no two requests share a prefix -- and that is
+# what makes a scale-up measurable. llm-d's shipped scheduling profile weights
+# the prefix-cache scorer highest, and its hashes chain from the first token,
+# so a replica that cached a prompt's opening wins every later request sharing
+# it regardless of its queue, and a replica that cached nothing never receives
+# one. MEASURED with `shared_prefix` at 32 groups x 64 prompts: per model the
+# busiest engine did 99.0% and 98.7% of the work over a whole arm and every
+# replica the autoscaler added did 0.3-2.0%. With `synthetic`, an EMPTY second
+# replica took 49.4% of 9 rps from its first minute. `shared_prefix` is kept
+# to reproduce the pin, with PREFIX_GROUPS distinct prefixes.
+LOAD_DATA="${LOAD_DATA:-synthetic}"
 PREFIX_GROUPS="${PREFIX_GROUPS:-32}"
 # Seconds at the opening of each phase measured as their own stage. The harness
 # reports a latency distribution per STAGE and nothing finer, so this is what a
@@ -1293,7 +1301,8 @@ verb_run() {
             --phase-seconds "$PHASE_SECONDS" --cycles "$CYCLES" --lead-in "$LEAD_IN" \
             --low-rps "$LOW_RPS" --high-rps "$HIGH_RPS" --high-rps-b "$HIGH_RPS_B" \
             --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
-            --prefix-groups "$PREFIX_GROUPS" --request-timeout "$REQUEST_TIMEOUT" \
+            --data "$LOAD_DATA" --prefix-groups "$PREFIX_GROUPS" \
+            --request-timeout "$REQUEST_TIMEOUT" \
             --rise-window "$RISE_WINDOW" --overlap "$OVERLAP_SECONDS" \
             --seed "$SEED" --results-root /results
     }
@@ -1426,7 +1435,7 @@ verb_run() {
         --t0 "$start_at" --overlap "$OVERLAP_SECONDS" \
         --arm "$arm" --model-a "$MODEL_A" --model-b "$MODEL_B" \
         --input-tokens "$INPUT_TOKENS" --output-tokens "$OUTPUT_TOKENS" \
-        --seed "$SEED" --prefix-groups "$PREFIX_GROUPS" \
+        --seed "$SEED" --data "$LOAD_DATA" --prefix-groups "$PREFIX_GROUPS" \
         || die "could not convert the harness results for arm $arm. See $out_dir/loader.log"
     mv "$out_dir/requests.jsonl.meta.json" "$out_dir/meta.json"
     # From the meta, not from requests.jsonl: that file is empty by design now,

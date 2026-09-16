@@ -222,6 +222,9 @@ def schedule_signature(meta):
         "model_a": meta.get("model_a"),
         "model_b": meta.get("model_b"),
         "seed": meta.get("seed"),
+        # The dataset is part of the traffic: a shared_prefix arm against a
+        # synthetic one compares a one-replica fleet with a spread one.
+        "data": meta.get("data"),
     }, sort_keys=True)
 
 
@@ -613,7 +616,7 @@ def admissible(a, b, max_queue_delay, max_short=300.0, max_overlap=0.0,
         return problems
     if schedule_signature(a["meta"]) != schedule_signature(b["meta"]):
         diffs = []
-        for k in ("input_tokens", "output_tokens", "model_a", "model_b", "seed"):
+        for k in ("input_tokens", "output_tokens", "model_a", "model_b", "seed", "data"):
             if a["meta"].get(k) != b["meta"].get(k):
                 diffs.append("%s: nopool=%s pool=%s" % (k, a["meta"].get(k), b["meta"].get(k)))
         if a["meta"].get("schedule") != b["meta"].get("schedule"):

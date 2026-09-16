@@ -283,6 +283,7 @@ def convert(args):
         "input_tokens": args.input_tokens,
         "output_tokens": args.output_tokens,
         "seed": args.seed,
+        "data": args.data,
         "prefix_groups": args.prefix_groups,
         "overlap_seconds": args.overlap,
         "queue_delay_p95": queue_p95,
@@ -322,6 +323,9 @@ def main(argv):
     p.add_argument("--input-tokens", type=int, default=0)
     p.add_argument("--output-tokens", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--data", default="synthetic",
+                   help="the inference-perf dataset type the arm ran; recorded so "
+                        "the report can refuse two arms that ran different traffic")
     p.add_argument("--prefix-groups", type=int, default=0)
     args = p.parse_args(argv)
 

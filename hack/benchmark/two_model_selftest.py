@@ -639,10 +639,10 @@ if s + q != 1000:
     fail("system_prompt_len + question_len = %d, not the 1000 input tokens asked for; "
          "the two arms would be priced at a length neither ran" % (s + q))
 elif s <= q:
-    fail("the shared prefix (%d) is no longer than the unique part (%d); with little to "
-         "cache the router has nothing to spread on" % (s, q))
+    fail("the shared prefix (%d) is no longer than the unique part (%d); the shared_prefix "
+         "dataset exists to reproduce the prefix-cache pin, and a short prefix would not" % (s, q))
 else:
-    ok("input tokens split %d shared + %d unique" % (s, q))
+    ok("input tokens split %d shared + %d unique (shared_prefix only)" % (s, q))
 
 case("base_url carries the stack prefix and no route")
 rc, text = render("a")
@@ -672,10 +672,61 @@ else:
 case("the two models get different data streams")
 _, text_b = render("b")
 doc_b = yaml.safe_load(text_b)
-if doc["data"]["shared_prefix"]["seed"] == doc_b["data"]["shared_prefix"]["seed"]:
-    fail("both models draw the same questions at the same instants from one seed")
+# The synthetic generator is seeded from load.base_seed (inference-perf passes
+# config.load.base_seed to SyntheticDataGenerator), so that is the seed that
+# has to differ.
+if doc["load"]["base_seed"] == doc_b["load"]["base_seed"]:
+    fail("both models draw the same prompts at the same instants from one seed")
 else:
     ok("each model has its own data seed")
+
+case("THE PROMPTS SHARE NO PREFIX, BY DEFAULT")
+# THE DEFECT THAT INVALIDATED FIVE A/B RUNS. With the shared_prefix dataset
+# (32 groups x 64 prompts, cycled) the EPP's prefix-cache scorer pinned each
+# model to the replica that cached its prompts first: measured, 99.0% and 98.7%
+# of a model's prompt tokens on one engine over a whole arm, with every replica
+# the autoscaler added at 0.3-2.0%. Synthetic prompts are fresh random slices
+# of the corpus, and an empty second replica took 49.4% of the load at once.
+data = doc.get("data") or {}
+dist = data.get("input_distribution") or {}
+if data.get("type") != "synthetic":
+    fail("the default dataset is %r, not synthetic: prompts that share a prefix are "
+         "routed to whichever replica cached it first, so a scale-up adds capacity "
+         "that is never used" % data.get("type"))
+elif "shared_prefix" in data:
+    fail("a synthetic profile still carries a shared_prefix block")
+elif not (dist.get("min") == dist.get("max") == dist.get("mean") == 1000
+          and dist.get("std_dev") == 0):
+    fail("input lengths are not fixed at the 1000 tokens both arms are priced at: %r" % dist)
+else:
+    ok("synthetic prompts, fixed at 1000 in / %d out" %
+       (data.get("output_distribution") or {}).get("max", -1))
+
+case("total_count covers every arrival the ladder can issue")
+# inference-perf indexes its per-request length arrays by request number with
+# NO modulo, so a total_count below the arrivals issued is an IndexError
+# partway through the ladder -- after the accelerators have been spent.
+planned = sum(s["rate"] * s["duration"] for s in doc["load"]["stages"])
+tc = dist.get("total_count", 0)
+if tc < planned * 1.5:
+    fail("total_count %s against %.0f planned arrivals leaves no room for Poisson "
+         "overshoot; the run would die with an IndexError mid-ladder" % (tc, planned))
+elif (data.get("output_distribution") or {}).get("total_count") != tc:
+    fail("input and output total_count differ; whichever is smaller is the one that "
+         "breaks")
+else:
+    ok("total_count %d against %.0f planned arrivals" % (tc, planned))
+
+case("shared_prefix is still renderable, so the pin can be reproduced")
+rc_sp, text_sp = render("a", ["--data=shared_prefix"])
+doc_sp = yaml.safe_load(text_sp) if rc_sp == 0 else {}
+sp = (doc_sp.get("data") or {}).get("shared_prefix") or {}
+if rc_sp != 0:
+    fail("--data shared_prefix did not render (rc=%d)" % rc_sp)
+elif sp.get("num_groups") != 32 or "input_distribution" in doc_sp.get("data", {}):
+    fail("the shared_prefix profile is not the dataset the pin was measured on: %r" % doc_sp.get("data"))
+else:
+    ok("--data shared_prefix renders the 32-group dataset")
 
 case("THE TWO MODELS' BURSTS NEVER OVERLAP, BY DEFAULT")
 # The invariant the whole scenario rests on. Checked on what the generator
@@ -761,7 +812,7 @@ else:
     ok("a rise window that cuts nothing is refused")
 
 case("a single shared prefix is refused")
-rc, _ = render("a", ["--prefix-groups=1"])
+rc, _ = render("a", ["--data=shared_prefix", "--prefix-groups=1"])
 if rc != 2:
     fail("one prefix group was accepted. The shipped llm-d profile weights the "
          "prefix-cache scorer highest, so the first replica to cache that prefix takes "
@@ -862,6 +913,7 @@ def convert_args(a, b):
     args.overlap = 30
     args.input_tokens, args.output_tokens = 1000, 500
     args.seed, args.prefix_groups = 1729, 32
+    args.data = "synthetic"
     return args
 
 

@@ -41,6 +41,21 @@ A stage is time-boxed, so both models cross every boundary together as long as
 they start together -- which the Job's start barrier, not this file, is
 responsible for -- and stay together only to within that drain difference,
 which is what the band absorbs.
+
+THE PROMPTS SHARE NO PREFIX, BY DEFAULT. `--data synthetic` slices every prompt
+from a random offset into inference-perf's 5 MB corpus, freshly per request, so
+no two requests start alike. That is what lets a scale-up be measured at all:
+llm-d's shipped scheduling profile weights prefix-cache-scorer highest (3,
+against 2 for queue depth and 2 for KV utilisation), and its hashes chain from
+the first token -- so a replica that has cached a prompt's opening wins every
+later request that shares it, regardless of its queue, and a replica that has
+cached nothing never receives one. MEASURED on CoreWeave with the shared_prefix
+dataset at 32 groups x 64 prompts (2048 distinct prompts, cycled): per model
+the busiest engine held 99.0% and 98.7% of prompt tokens over a whole arm, and
+every replica the autoscaler added served 0.3-2.0%. With synthetic, an EMPTY
+second replica took 49.4% of 9 rps from its first minute (p50 TTFT 58ms). A
+result from the shared_prefix dataset is therefore about one replica per model
+whatever the table says; `--data shared_prefix` is kept only to reproduce it.
 """
 
 import argparse
@@ -162,15 +177,58 @@ def stages_for(stages, role):
 def split_input(input_tokens):
     """(system_prompt_len, question_len) summing to input_tokens.
 
-    Three quarters shared, one quarter unique. The shared part has to be long
-    enough that caching it is worth a router's while -- that is the whole
-    mechanism this scenario leans on to spread load across replicas -- and the
-    unique part long enough that two requests in the same group are not the
-    same request.
+    For `--data shared_prefix` only. Three quarters shared, one quarter unique.
+    An earlier docstring here said the shared part is "the mechanism this
+    scenario leans on to spread load across replicas". It is the opposite:
+    prefix caching CONCENTRATES load on whichever replica cached the prefix
+    first (see the module docstring for the measurement), which is why this
+    dataset is no longer the default.
     """
     system = (input_tokens * 3) // 4
     question = input_tokens - system
     return system, question
+
+
+def planned_requests(stages, role):
+    """How many arrivals this role's ladder issues, in expectation."""
+    return sum(rate * duration for rate, duration in stages_for(stages, role))
+
+
+def render_data(args, stages, role, seed):
+    """The `data:` block. Synthetic by default; see the module docstring."""
+    lines = []
+    if args.data == "synthetic":
+        # total_count is MANDATORY and indexed without a modulo: inference-perf
+        # draws its per-request lengths from arrays of exactly this many
+        # entries, so a run that issues more requests than this dies with an
+        # IndexError partway through its ladder. Sized at twice the planned
+        # arrivals plus a margin -- Poisson overshoot and a driver that keeps
+        # issuing while the last stage drains are both covered.
+        total = int(2 * planned_requests(stages, role)) + 1000
+        lines.append("  type: synthetic")
+        for name, n in (("input_distribution", args.input_tokens),
+                        ("output_distribution", args.output_tokens)):
+            # Fixed lengths. The scenario prices both arms at INPUT_TOKENS in
+            # and OUTPUT_TOKENS out; a distribution would make "1000 tokens"
+            # mean something different in every stage.
+            lines.append("  %s:" % name)
+            lines.append("    min: %d" % n)
+            lines.append("    max: %d" % n)
+            lines.append("    mean: %d" % n)
+            lines.append("    std_dev: 0")
+            lines.append("    total_count: %d" % total)
+        return lines
+    system_len, question_len = split_input(args.input_tokens)
+    lines.append("  type: shared_prefix")
+    lines.append("  shared_prefix:")
+    lines.append("    num_groups: %d" % args.prefix_groups)
+    lines.append("    num_prompts_per_group: %d" % args.prompts_per_group)
+    lines.append("    system_prompt_len: %d" % system_len)
+    lines.append("    question_len: %d" % question_len)
+    lines.append("    output_len: %d" % args.output_tokens)
+    lines.append("    enable_multi_turn_chat: false")
+    lines.append("    seed: %d" % seed)
+    return lines
 
 
 def yaml_quote(s):
@@ -181,7 +239,6 @@ def yaml_quote(s):
 def render_profile(args, stages, role):
     model = args.model_a if role == "a" else args.model_b
     base_url = args.endpoint_a if role == "a" else args.endpoint_b
-    system_len, question_len = split_input(args.input_tokens)
     # Distinct seeds per role so the two models do not receive the same
     # question text at the same instant; derived from the one seed so the run
     # stays reproducible from a single knob.
@@ -235,16 +292,11 @@ def render_profile(args, stages, role):
     lines.append("  ignore_eos: true")
     lines.append("tokenizer:")
     lines.append("  pretrained_model_name_or_path: %s" % yaml_quote(model))
+    # The synthetic generator is seeded from `load.base_seed` (inference-perf
+    # passes config.load.base_seed to it), so the per-role seed above already
+    # gives the two models different prompt streams.
     lines.append("data:")
-    lines.append("  type: shared_prefix")
-    lines.append("  shared_prefix:")
-    lines.append("    num_groups: %d" % args.prefix_groups)
-    lines.append("    num_prompts_per_group: %d" % args.prompts_per_group)
-    lines.append("    system_prompt_len: %d" % system_len)
-    lines.append("    question_len: %d" % question_len)
-    lines.append("    output_len: %d" % args.output_tokens)
-    lines.append("    enable_multi_turn_chat: false")
-    lines.append("    seed: %d" % seed)
+    lines.extend(render_data(args, stages, role, seed))
     lines.append("report:")
     lines.append("  request_lifecycle:")
     lines.append("    summary: true")
@@ -306,8 +358,15 @@ def build_parser():
                    help="seconds at the start of each phase measured as its own "
                         "stage; the harness reports TTFT per stage and nothing "
                         "finer, so this is what a rise window can be")
-    p.add_argument("--prefix-groups", type=int, default=32)
-    p.add_argument("--prompts-per-group", type=int, default=64)
+    p.add_argument("--data", choices=("synthetic", "shared_prefix"), default="synthetic",
+                   help="synthetic: every prompt a fresh random slice of the corpus, "
+                        "no shared prefix (the default -- see the module docstring "
+                        "for why). shared_prefix: the dataset that pinned each "
+                        "model to one replica; kept to reproduce that")
+    p.add_argument("--prefix-groups", type=int, default=32,
+                   help="shared_prefix only: distinct shared prefixes")
+    p.add_argument("--prompts-per-group", type=int, default=64,
+                   help="shared_prefix only: distinct questions per prefix")
     p.add_argument("--request-timeout", type=float, default=300)
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--workers", type=int, default=0,
@@ -340,7 +399,7 @@ def main(argv):
               "reported as steady state."
               % (args.rise_window, args.phase_seconds), file=sys.stderr)
         return 2
-    if args.prefix_groups < 2:
+    if args.data == "shared_prefix" and args.prefix_groups < 2:
         print("--prefix-groups must be at least 2: a single shared prefix makes "
               "the router's prefix-cache scorer pin every request to whichever "
               "replica cached it first, and the run measures a one-replica fleet.",
