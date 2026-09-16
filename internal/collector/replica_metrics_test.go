@@ -2145,9 +2145,10 @@ func TestCollectReplicaMetrics_TimingExcludedWhenNotReady(t *testing.T) {
 	// and was considered for the same gate, but waitingQueueDemand reads these
 	// two per-replica to price a pod's waiting queue: a starting pod's queue is
 	// work the fleet has already accepted, and zeroing its shape would erase
-	// that demand and read as "idle". Their outlier defence is in
-	// estimateArrivalDemand, the only consumer that aggregates them across
-	// replicas. Pinned so the symmetry is not "completed" later by accident.
+	// that demand and read as "idle". The throughput floor prices each
+	// replica by its own shape and takes the median across replicas, so a
+	// starting pod's is one vote there rather than a gate here. Pinned so
+	// the symmetry is not "completed" later by accident.
 	if results[0].AvgOutputTokens != 1000 {
 		t.Errorf("AvgOutputTokens is %v, want 1000 — token shape must NOT be gated on readiness",
 			results[0].AvgOutputTokens)

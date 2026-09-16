@@ -181,6 +181,33 @@ var _ = Describe("the saturated-throughput window", func() {
 		a.EvictStaleHistory(time.Hour)
 		Expect(a.saturatedThroughput).To(BeEmpty())
 	})
+
+	It("takes a history key apart around its bucket, and refuses one it cannot", func() {
+		prefix, bucket, suffix, ok := splitHistoryKey("org/model|H200|2|decode|xlong|q5")
+		Expect(ok).To(BeTrue())
+		Expect(prefix).To(Equal("org/model|H200|2|decode|"))
+		Expect(bucket).To(Equal("xlong"))
+		Expect(suffix).To(Equal("|q5"))
+		Expect(bucketOf("org/model|H200|2|decode|xlong|q5")).To(Equal("xlong"))
+
+		// A key with fewer than two separators has no bucket field to find.
+		// Both the borrow and bucketOf must say so rather than guess.
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a.recordSaturatedThroughput("m|H200|1|decode|long|q5", 5.4)
+		for _, bad := range []string{"", "no-separators", "one|separator"} {
+			_, _, _, ok := splitHistoryKey(bad)
+			Expect(ok).To(BeFalse(), bad)
+			Expect(bucketOf(bad)).To(BeEmpty(), bad)
+			mu, from := a.saturatedThroughputFor(bad)
+			Expect(mu).To(BeZero(), bad)
+			Expect(from).To(BeEmpty(), bad)
+		}
+		// A well-formed key whose bucket is not one the analyzer knows has
+		// nothing to borrow from either.
+		mu, from := a.saturatedThroughputFor("m|H200|1|decode|enormous|q5")
+		Expect(mu).To(BeZero())
+		Expect(from).To(BeEmpty())
+	})
 })
 
 var _ = Describe("estimateThroughputDemand with mixed readings", func() {

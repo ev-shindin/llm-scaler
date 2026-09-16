@@ -150,12 +150,7 @@ func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, st
 	if !ok {
 		return 0, ""
 	}
-	own := -1
-	for i, b := range outputBuckets {
-		if b == bucket {
-			own = i
-		}
-	}
+	own := slices.Index(outputBuckets, bucket)
 	if own < 0 {
 		return 0, ""
 	}
