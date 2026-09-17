@@ -362,7 +362,14 @@ about the workload from the first KEDA call.
 The controller elects a leader (`--leader-elect=true`, with tunable lease, renew and
 retry durations), so more than one replica is safe — but the extra replicas are
 **standbys**. Only the leader runs the collection and optimization loops; the others
-wait on the lease.
+wait on the lease. A standby does answer KEDA on one point: it tells KEDA which
+metric to put on the HPA (`GetMetricSpec`), because the answer KEDA gets when it
+reconciles a ScaledObject decides what the HPA carries, and an HPA created
+without one scales on CPU until the ScaledObject is edited. Everything that needs a decision it refuses
+with `Unavailable`, which KEDA reports as a trigger error and does not act on,
+and it cycles the connection every few seconds so KEDA re-dials and reaches the
+leader. The same applies to a single replica during a rollout, in the window
+between the new pod being Ready and the old pod's lease being released.
 
 ```bash
 make deploy-wva-on-k8s WVA_REPLICAS=2

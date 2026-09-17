@@ -180,10 +180,11 @@ const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
 // waitForWVALeadership blocks until a running controller-manager pod holds the
 // leader lease.
 //
-// Pod-Ready is not enough. Every engine — saturation, scale-from-zero — and the
-// KEDA external-scaler gRPC server are leader-gated runnables, so a Ready pod
-// that has not yet won the lease does nothing at all: it serves no decisions,
-// and its InferencePool datastore is still empty. The previous holder's lease
+// Pod-Ready is not enough. Every engine — saturation, scale-from-zero — is a
+// leader-gated runnable (the KEDA external-scaler server listens earlier, but
+// refuses decisions until the lease is held), so a Ready pod that has not yet
+// won the lease decides nothing: it serves no decisions, and its
+// InferencePool datastore is still empty. The previous holder's lease
 // has to expire first, which takes up to LeaseDuration (60 s here), and specs
 // that start inside that window see a WVA that is up but inert. That is what
 // made the scale-from-zero specs flaky — the engine logged "Inferencepool

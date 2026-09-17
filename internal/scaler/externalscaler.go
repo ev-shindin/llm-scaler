@@ -48,6 +48,11 @@ type Handler struct {
 	registry *registry.Registry
 	// now is the clock used for decision freshness; overridden in tests.
 	now func() time.Time
+	// elected is closed once this replica holds the leader lease; nil means it
+	// always does. Only the leader runs the engines that fill the store, so
+	// before it closes the store's silence means "not the leader", not "no
+	// decision yet" -- see leader.
+	elected <-chan struct{}
 }
 
 // NewHandler builds a Handler. A nil store falls back to decision.Default, and a
@@ -62,6 +67,39 @@ func NewHandler(c client.Reader, store *decision.Store, reg *registry.Registry) 
 		reg = registry.Default
 	}
 	return &Handler{client: c, store: store, registry: reg, now: time.Now}
+}
+
+// WithElected makes the handler refuse decision-bearing calls until elected is
+// closed (manager.Elected()). Nil leaves it answering as the leader, which is
+// what a manager without leader election is. Returns h for chaining.
+func (h *Handler) WithElected(elected <-chan struct{}) *Handler {
+	h.elected = elected
+	return h
+}
+
+// errNotLeader is what a replica that does not hold the lease answers with
+// for anything that needs a decision. Unavailable is the retriable code: KEDA
+// logs it, marks the trigger as erroring and takes no scaling action, and
+// asks again on its next poll -- by which time this replica is normally the
+// leader, since the only supported reason to be here is the window between
+// a pod becoming Ready and the outgoing pod's lease being released.
+var errNotLeader = status.Error(codes.Unavailable,
+	"this WVA replica does not hold the leader lease yet; decisions are made by the leader")
+
+// leader reports whether this replica holds the lease. An empty decision store
+// on a replica that does not is not "no decision yet" -- the leader may well
+// have one -- so the calls that read the store check this first and refuse
+// rather than answer 0.
+func (h *Handler) leader() bool {
+	if h.elected == nil {
+		return true
+	}
+	select {
+	case <-h.elected:
+		return true
+	default:
+		return false
+	}
 }
 
 // observe records that KEDA has asked about this ref. It is the discovery event:
@@ -199,6 +237,13 @@ func (h *Handler) desired(ctx context.Context, ref *pb.ScaledObjectRef) (int32, 
 // The response does not depend on the ref, but the call still registers it: KEDA
 // asks for the spec when it starts managing a ScaledObject, which makes this the
 // earliest notice WVA gets that a workload exists.
+//
+// Answered whether or not this replica is the leader. It is the one call whose
+// answer is static, and the answer KEDA gets when it reconciles a ScaledObject
+// decides what metric the HPA carries -- refusing it there leaves the HPA on
+// the Kubernetes CPU default until the next reconcile, which nothing may ever
+// trigger (see Server.NeedLeaderElection). KEDA asks again on every poll, and
+// those calls register the workload like any other.
 func (h *Handler) GetMetricSpec(_ context.Context, ref *pb.ScaledObjectRef) (*pb.GetMetricSpecResponse, error) {
 	h.observe(ref)
 	return &pb.GetMetricSpecResponse{
@@ -211,6 +256,9 @@ func (h *Handler) GetMetricSpec(_ context.Context, ref *pb.ScaledObjectRef) (*pb
 // minReplicaCount rather than acting on a guess.
 func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
 	h.observe(req.GetScaledObjectRef())
+	if !h.leader() {
+		return nil, errNotLeader
+	}
 	d, ok, err := h.desired(ctx, req.GetScaledObjectRef())
 	if err != nil {
 		return nil, err
@@ -233,6 +281,9 @@ func (h *Handler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*p
 // predicate without waiting for a poll interval.
 func (h *Handler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
 	h.observe(ref)
+	if !h.leader() {
+		return nil, errNotLeader
+	}
 	active, err := h.isActive(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -340,6 +391,21 @@ func (h *Handler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScal
 	if h.registry != nil && ref != nil {
 		release := h.registry.Hold(ref.GetNamespace(), ref.GetName(), ref.GetScalerMetadata())
 		defer release()
+	}
+
+	// Ended, not held, before the lease: the standby server that answers here
+	// is stopped on election, and a stream parked here would hold that stop
+	// open. Ended with OK rather than refused, deliberately: KEDA re-opens a
+	// stream that closed cleanly after a steady 2 s, but backs off a failed
+	// one 2, 4, 8 ... 60 s, so a refusal could leave a zero-parked workload
+	// without its activation stream for a minute after election. The
+	// registration above still happens, so the workload is known to the
+	// engines the moment they start.
+	if !h.leader() {
+		// V(3): KEDA reopens every 2 s per parked workload for the whole wait
+		// on the lease, and the default verbosity ships V(1) and V(2).
+		logger.V(3).Info("external scaler StreamIsActive ended before the leader lease is held; KEDA will reopen it")
+		return nil
 	}
 
 	// Resolve the target once, up front: it is fixed for the life of the
