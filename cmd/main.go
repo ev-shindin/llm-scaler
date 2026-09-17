@@ -151,6 +151,13 @@ func main() {
 		"How long a borrowed Pod may serve before it is returned regardless. Bounds the case "+
 			"where the ordinary replicas never arrive, which would otherwise turn insurance "+
 			"into permanent capacity for one variant.")
+	warmPoolMinHold := flag.Duration("warm-pool-min-hold", 0,
+		"Floor on how long a borrowed Pod serves: it is not handed back as excess until it "+
+			"has been lent this long, even once the ordinary replicas report Ready. A replica "+
+			"that has just passed its probe has an empty KV and prefix cache, so returning the "+
+			"bridge at that instant swaps a warm engine for a cold one at the crossover. "+
+			"Zero, the default, leaves the behaviour unchanged; the floor is bounded by "+
+			"--warm-pool-max-hold and waived whenever another variant is short.")
 	warmPoolMemoryBudget := flag.Int64("warm-pool-memory-bytes", 0,
 		"Host memory ONE pool Pod may commit to sleeping weights. A level-1 sleeper keeps its "+
 			"weights in host memory, so admitting one model too many does not fail that "+
@@ -815,7 +822,7 @@ func main() {
 	if warmPoolNS != "" {
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 			return runWarmPool(ctx, mgr, ds, warmPoolNS, warmPoolGPUUtil, warmPoolSleepMinSize,
-				warmPoolMaxHold, warmPoolPreloadTop, warmPoolMemoryBudget)
+				warmPoolMaxHold, warmPoolMinHold, warmPoolPreloadTop, warmPoolMemoryBudget)
 		})); err != nil {
 			setupLog.Error(err, "unable to add the warm pool to manager")
 			os.Exit(1)
@@ -841,7 +848,7 @@ func main() {
 				go func() {
 					defer close(done)
 					if err := runWarmPool(nsCtx, mgr, ds, ns, warmPoolGPUUtil, warmPoolSleepMinSize,
-						warmPoolMaxHold, warmPoolPreloadTop, warmPoolMemoryBudget); err != nil {
+						warmPoolMaxHold, warmPoolMinHold, warmPoolPreloadTop, warmPoolMemoryBudget); err != nil {
 						setupLog.Error(err, "warm pool stopped", "namespace", ns)
 					}
 				}()
@@ -1013,6 +1020,7 @@ func runWarmPool(
 	warmPoolGPUUtil *float64,
 	warmPoolSleepMinSize *int,
 	warmPoolMaxHold *time.Duration,
+	warmPoolMinHold *time.Duration,
 	warmPoolPreloadTop *int,
 	warmPoolMemoryBudget *int64,
 ) error {
@@ -1046,6 +1054,7 @@ func runWarmPool(
 		warmpoolpolicy.Config{
 			SleepMinSize:       *warmPoolSleepMinSize,
 			MaxHold:            *warmPoolMaxHold,
+			MinHold:            *warmPoolMinHold,
 			AdmissionWindow:    time.Hour,
 			MinMissesToAdmit:   2,
 			PreloadTop:         *warmPoolPreloadTop,
@@ -1131,6 +1140,7 @@ func runWarmPool(
 		"namespace", warmPoolNS,
 		"sleepMinSize", *warmPoolSleepMinSize,
 		"maxHold", *warmPoolMaxHold,
+		"minHold", *warmPoolMinHold,
 		"memoryBudgetBytes", *warmPoolMemoryBudget,
 		"gpuMemoryUtilization", *warmPoolGPUUtil,
 		"preloadTop", *warmPoolPreloadTop)

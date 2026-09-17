@@ -1,0 +1,38 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='680' height='340' viewBox='0 0 680 340' font-family='Helvetica, Arial, sans-serif' font-size='12'>
+<rect width='680' height='340' fill='white'/>
+<text x='80.0' y='22.0' font-size='14' text-anchor='start' fill='#222' font-weight='bold'>Accelerator-seconds over the run, per arm</text>
+<text x='80.0' y='38.0' font-size='11' text-anchor='start' fill='#555'>insurance is a cost: the pool's Pods count whether or not they were lent</text>
+<line x1='80.0' y1='290.0' x2='500.0' y2='290.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='74.0' y='294.0' font-size='11' text-anchor='end' fill='#222'>0</text>
+<line x1='80.0' y1='242.0' x2='500.0' y2='242.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='74.0' y='246.0' font-size='11' text-anchor='end' fill='#222'>4000</text>
+<line x1='80.0' y1='194.0' x2='500.0' y2='194.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='74.0' y='198.0' font-size='11' text-anchor='end' fill='#222'>8000</text>
+<line x1='80.0' y1='146.0' x2='500.0' y2='146.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='74.0' y='150.0' font-size='11' text-anchor='end' fill='#222'>12000</text>
+<line x1='80.0' y1='98.0' x2='500.0' y2='98.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='74.0' y='102.0' font-size='11' text-anchor='end' fill='#222'>16000</text>
+<line x1='80.0' y1='50.0' x2='500.0' y2='50.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='74.0' y='54.0' font-size='11' text-anchor='end' fill='#222'>20000</text>
+<text x='18.0' y='170.0' font-size='11' text-anchor='middle' fill='#222' transform='rotate(-90 18.0 170.0)'>GPU-seconds</text>
+<rect x='110.0' y='111.3' width='80.0' height='178.7' fill='#7f7f7f' fill-opacity='1.00' stroke='none'><title>nopool: model replicas 14893 GPU-s</title></rect>
+<text x='150.0' y='107.3' font-size='11' text-anchor='middle' fill='#222'>14893</text>
+<text x='150.0' y='308.0' font-size='12' text-anchor='middle' fill='#222'>nopool</text>
+<text x='150.0' y='322.0' font-size='10' text-anchor='middle' fill='#555'>peak 6 GPUs</text>
+<rect x='250.0' y='161.9' width='80.0' height='128.1' fill='#1f77b4' fill-opacity='1.00' stroke='none'><title>pool: model replicas 10679 GPU-s</title></rect>
+<rect x='250.0' y='155.7' width='80.0' height='6.2' fill='#1f77b4' fill-opacity='0.55' stroke='none'><title>pool: pool lent 513 GPU-s</title></rect>
+<rect x='250.0' y='113.6' width='80.0' height='42.1' fill='#1f77b4' fill-opacity='0.25' stroke='#1f77b4'><title>pool: pool held idle 3507 GPU-s</title></rect>
+<text x='290.0' y='109.6' font-size='11' text-anchor='middle' fill='#222'>14699</text>
+<text x='290.0' y='308.0' font-size='12' text-anchor='middle' fill='#222'>pool</text>
+<text x='290.0' y='322.0' font-size='10' text-anchor='middle' fill='#555'>peak 5 GPUs</text>
+<rect x='390.0' y='97.0' width='80.0' height='193.0' fill='#ff7f0e' fill-opacity='1.00' stroke='none'><title>floor: model replicas 16080 GPU-s</title></rect>
+<text x='430.0' y='93.0' font-size='11' text-anchor='middle' fill='#222'>16080</text>
+<text x='430.0' y='308.0' font-size='12' text-anchor='middle' fill='#222'>floor</text>
+<text x='430.0' y='322.0' font-size='10' text-anchor='middle' fill='#555'>peak 4 GPUs</text>
+<rect x='520.0' y='60.0' width='12.0' height='12.0' fill='#1f77b4' fill-opacity='1.00' stroke='none'></rect>
+<text x='536.0' y='70.0' font-size='11' text-anchor='start' fill='#222'>model replicas</text>
+<rect x='520.0' y='78.0' width='12.0' height='12.0' fill='#1f77b4' fill-opacity='0.55' stroke='none'></rect>
+<text x='536.0' y='88.0' font-size='11' text-anchor='start' fill='#222'>pool, lent</text>
+<rect x='520.0' y='96.0' width='12.0' height='12.0' fill='#1f77b4' fill-opacity='0.25' stroke='#1f77b4'></rect>
+<text x='536.0' y='106.0' font-size='11' text-anchor='start' fill='#222'>pool, held idle</text>
+</svg>

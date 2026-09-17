@@ -175,6 +175,9 @@ func poolSpecFrom(meta registry.PoolMeta, entry registry.Entry, fallback policy.
 	if meta.MaxHold != nil {
 		spec.Config.MaxHold = *meta.MaxHold
 	}
+	if meta.MinHold != nil {
+		spec.Config.MinHold = *meta.MinHold
+	}
 	if meta.Retained != nil {
 		spec.Config.Retained = *meta.Retained
 	}

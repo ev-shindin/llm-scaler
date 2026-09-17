@@ -149,6 +149,17 @@ BENCHMARK_HARNESS    ?= guidellm
 BENCHMARK_WORKLOAD   ?= prefill_heavy
 BENCHMARK_FORCE      ?= true
 BENCHMARK_MONITORING ?= true
+# Skip the chained smoketest after standup.
+#
+# For a MULTI-MODEL stack, which routes by PATH PREFIX. The smoketest's
+# model-readiness poll asks <gateway>/v1/models -- the gateway ROOT, which such a
+# stack does not route -- so it 404s and burns its whole 1800s timeout on a stack
+# where both models are already answering. Measured on CoreWeave: the root 404s
+# while /qwen3-8b/v1/models returns 200 listing the model, at the same moment.
+#
+# Single-model runs should leave this false: there the smoketest is the only
+# thing that checks the stack serves at all before a benchmark is started.
+BENCHMARK_SKIP_SMOKETEST ?= false
 BENCHMARK_UV         ?= false
 BENCHMARK_SCENARIOS_DIR ?= $(CURDIR)/test/benchmark/scenarios
 # The model WVA is benchmarked against, forwarded to the benchmark CLI as `-m`,
@@ -1481,6 +1492,7 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) standup \
 		-p $(BENCHMARK_NAMESPACE) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
+		$(if $(filter true,$(BENCHMARK_SKIP_SMOKETEST)),--skip-smoketest,) \
 		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,); \
 	rc=$$?; \
 	mv $(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml.bak \
@@ -2118,6 +2130,74 @@ benchmark-teardown: ## Tear down the benchmark environment (set BENCHMARK_NAMESP
 .PHONY: benchmark-full
 benchmark-full: benchmark-standup benchmark-run-all benchmark-teardown ## Full lifecycle: standup -> run all scenarios -> teardown
 
+# ---------------------------------------------------------------------------
+# Two models, anti-phase bursts, warm pool on and off.
+#
+# The one claim about warm pools this repo has never measured: that ONE pool
+# covers MANY models. Every warm-pool number so far is a single model bridging
+# its own scale-up, where the pool is pure overhead at steady state.
+#
+# Each verb is its own target, deliberately. The expensive failures here are the
+# ones found at minute 40 of a 45-minute run -- a second stack that replaced the
+# first one's objects, a pool never eligible to lend, a model that answers 404 --
+# so preflight, standup, verify, each arm and the report are separately runnable
+# and each says what it found. docs/guides/benchmarking/two-model-warm-pool.md
+# is the runbook.
+# ---------------------------------------------------------------------------
+TWO_MODEL := BENCHMARK_NAMESPACE=$(BENCHMARK_NAMESPACE) bash $(CURDIR)/hack/benchmark/two_model_pool.sh
+
+.PHONY: benchmark-two-model-preflight
+benchmark-two-model-preflight: ## Two-model pool run: check free accelerators, labels and cache BEFORE anything is created (BENCHMARK_NAMESPACE=<ns>)
+	@$(TWO_MODEL) preflight
+
+.PHONY: benchmark-two-model-standup
+benchmark-two-model-standup: ## Two-model pool run: stand up both model stacks (MODEL_A, MODEL_B)
+	@$(TWO_MODEL) standup
+
+.PHONY: benchmark-two-model-verify
+benchmark-two-model-verify: ## Two-model pool run: both models answer, two EPPs, pool state
+	@$(TWO_MODEL) verify
+
+.PHONY: benchmark-two-model-pool-create
+benchmark-two-model-pool-create: ## Two-model pool run: create the shared warm pool
+	@$(TWO_MODEL) pool-create
+
+.PHONY: benchmark-two-model-pool-delete
+benchmark-two-model-pool-delete: ## Two-model pool run: delete the shared warm pool
+	@$(TWO_MODEL) pool-delete
+
+.PHONY: benchmark-two-model-warm
+benchmark-two-model-warm: ## Two-model pool run: pin BOTH models resident in the pool and wait for them (a cold pool measures nothing)
+	@$(TWO_MODEL) warm
+
+.PHONY: benchmark-two-model-reset
+benchmark-two-model-reset: ## Two-model pool run: pin both models back to MIN_REPLICAS and wait, BEFORE each arm
+	@$(TWO_MODEL) reset
+
+.PHONY: benchmark-two-model-residency
+benchmark-two-model-residency: ## Two-model pool run: print what each pool Pod is actually holding
+	@$(TWO_MODEL) residency
+
+.PHONY: benchmark-two-model-run
+benchmark-two-model-run: ## Two-model pool run: drive the anti-phase load for one arm (ARM=nopool|pool|floor)
+	@if [ -z "$(ARM)" ]; then \
+		echo "ERROR: ARM is required. Usage: make benchmark-two-model-run ARM=nopool  (then ARM=pool; ARM=floor for the over-provisioned baseline)"; \
+		exit 1; \
+	fi
+	@$(TWO_MODEL) run $(ARM)
+
+.PHONY: benchmark-two-model-report
+benchmark-two-model-report: ## Two-model pool run: compare every arm that ran against nopool
+	@$(TWO_MODEL) report
+
+.PHONY: benchmark-two-model-status
+benchmark-two-model-status: ## Two-model pool run: what exists, and what holds accelerators
+	@$(TWO_MODEL) status
+
+.PHONY: benchmark-two-model-teardown
+benchmark-two-model-teardown: ## Two-model pool run: remove everything it created (shared cluster -- do not skip)
+	@$(TWO_MODEL) teardown
+
 # Stub for llm-d nightly reusable workflows (test_target=nightly-test-llm-d)
 # No-op; temporarily satisfies nightly CI make invocation
 # TODO: add nightly guide tests here
@@ -2197,6 +2277,14 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# nothing, and neither does a reader -- each one shipped with a comment
 	@# beside it claiming the opposite.
 	@bash hack/check-refusals.sh
+	@echo "Checking the two-model warm-pool scenario's guards..."
+	@# Its arms differ only in whether a pool exists, and every way of getting
+	@# that wrong produces a complete, plausible, WRONG result rather than an
+	@# error: an arm labelled `pool` that ran without one, a `nopool` arm charged
+	@# for the pool's accelerators, or a pool arm against a COLD pool -- which
+	@# pays a model load into the pool on the first burst and reports it as the
+	@# pool's cost. All of them are 26 minutes of GPU each.
+	@bash hack/check-two-model-scenario.sh
 	@echo "Checking each benchmark profile names a harness that will accept it..."
 	@# guidellm and inference-perf take mutually invalid profile schemas, and a
 	@# profile that matches neither can never run. The pre-run gate in

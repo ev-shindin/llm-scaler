@@ -29,6 +29,32 @@ type Config struct {
 	// capacity for whichever variant spiked first.
 	MaxHold time.Duration
 
+	// MinHold FLOORS a borrow: a bridge is not handed back as excess until it
+	// has been lent this long, even once the ordinary replicas report Ready.
+	//
+	// Ready is not the same as useful. A replica that has just passed its
+	// readiness probe has an empty KV cache and an empty prefix cache, and
+	// llm-d's shipped scheduling profile weights the prefix-cache scorer
+	// highest -- so a new replica both serves slower AND is chosen less, for as
+	// long as it takes to warm. Handing the bridge back at that instant swaps a
+	// warm Pod for a cold one at exactly the crossover.
+	//
+	// MEASURED on CoreWeave: bridges were returned 7s, 7s and 19s after the
+	// replica they were covering reported Ready. The one rise where no replica
+	// ever arrived -- so the pool carried the whole burst -- was the best of the
+	// four by 5679ms at p95, which is what suggested the handover is where the
+	// value goes.
+	//
+	// Zero disables it, and zero is the default: this changes when accelerators
+	// are given back, and a pool that holds longer is a pool that costs more.
+	//
+	// WAIVED the moment any OTHER variant is short. That is not a refinement,
+	// it is what stops the floor inverting the pool's purpose: with a reserve of
+	// one exactly one Pod is lendable, so a bridge lingering for model A is a
+	// bridge model B cannot borrow -- and in an anti-phase fleet, B wanting it
+	// is the entire reason the pool is shared.
+	MinHold time.Duration
+
 	// Retained turns off the hold timeout: a lent Pod goes back when the variant
 	// stops needing it, and not because it has been lent for a while.
 	//
@@ -366,16 +392,52 @@ func returnsFor(v VariantDemand, lent []pool.Membership, in Input, cfg Config) [
 		return borrowedAt(in, lent[i]).Before(borrowedAt(in, lent[j]))
 	})
 
+	// The floor is waived while anyone else is short, so it can never delay a
+	// lend to another model. Computed once: it does not depend on which bridge.
+	yield := anotherVariantIsShort(in, v.Model.Variant)
+
 	var out []Action
 	for i, m := range lent {
 		// The hold timeout reclaims a bridge whose ordinary replicas never
 		// arrived. A retained pool has none coming, so this would only churn.
-		expired := !cfg.Retained && in.Now.Sub(borrowedAt(in, m)) >= cfg.MaxHold
-		if i < excess || expired {
+		held := in.Now.Sub(borrowedAt(in, m))
+		expired := !cfg.Retained && held >= cfg.MaxHold
+		// The floor never outranks another model's need. It does not need to
+		// mention `expired`: the ceiling is enforced by the `|| expired` below,
+		// which returns the Pod whatever the floor says, so a MinHold set above
+		// MaxHold degenerates to MaxHold rather than pinning a Pod for ever.
+		tooYoung := cfg.MinHold > 0 && !yield && held < cfg.MinHold
+		if (i < excess && !tooYoung) || expired {
 			out = append(out, Action{Pod: m.Pod, Model: m.Model})
 		}
 	}
 	return out
+}
+
+// anotherVariantIsShort reports whether any variant other than `self` has fewer
+// ordinary replicas Ready than it wants.
+//
+// This is what makes MinHold safe to turn on. The floor exists to cover a cold
+// replica's warm-up, not to claim the pool; the instant another model is short,
+// its need outranks that.
+//
+// A PARKED variant is NOT short. Parked is `desired == 0 && ready == 0` with a
+// decision behind it -- an idle scale-to-zero model that wants nothing right
+// now. An earlier version counted it as short, on the reasoning that its wake
+// has no fallback; but a parked model that wakes reads `Desired > Ready` and
+// is caught here anyway, while an idle one waived the floor on every pass, so
+// in any pool shared with one parked model MinHold was inert -- exactly the
+// multi-model pool it was built for.
+func anotherVariantIsShort(in Input, self string) bool {
+	for _, o := range in.Variants {
+		if o.Model.Variant == self {
+			continue
+		}
+		if o.Desired > o.Ready {
+			return true
+		}
+	}
+	return false
 }
 
 // evictions releases warm copies beyond what a variant asked for.

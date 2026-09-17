@@ -108,6 +108,15 @@ prices it apart from them — so a bridged variant showing one more Pod than
 N accelerators, continuously, for as long as the pool exists. Size it by how
 often you spike and how long a replica takes to start — never by peak load.
 
+**Measured:** [What a warm pool buys](measured.md) — two models bursting out
+of phase with quiet stretches between, autoscaling alone against a one-Pod
+pool against a floor of two replicas, with the tables, the plots and the make
+targets to repeat it on your cluster. The short version: the pool turns
+2.5–12.6 s rises into 0.1–0.9 s, within tens of milliseconds of the floor,
+for 9 % less than the floor and about what autoscaling alone costs. The
+pool's advantage grows with the number of models sharing it, not with more
+quiet; when a model is always bursting, a floor is the cheaper insurance.
+
 ## How it is tested
 
 End-to-end, eight suites: `test/e2e/warm_pool_test.go`,

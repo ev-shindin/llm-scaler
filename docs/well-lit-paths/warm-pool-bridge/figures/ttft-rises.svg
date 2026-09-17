@@ -1,0 +1,64 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='690' height='360' viewBox='0 0 690 360' font-family='Helvetica, Arial, sans-serif' font-size='12'>
+<rect width='690' height='360' fill='white'/>
+<text x='70.0' y='22.0' font-size='14' text-anchor='start' fill='#222' font-weight='bold'>Time to first token in each rise window (first 240s after the rate goes up)</text>
+<text x='70.0' y='38.0' font-size='11' text-anchor='start' fill='#555'>bar = p95, tick = p50; one group per scale-up event, one run each</text>
+<line x1='70.0' y1='290.0' x2='670.0' y2='290.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='64.0' y='294.0' font-size='11' text-anchor='end' fill='#222'>0</text>
+<line x1='70.0' y1='242.0' x2='670.0' y2='242.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='64.0' y='246.0' font-size='11' text-anchor='end' fill='#222'>4000</text>
+<line x1='70.0' y1='194.0' x2='670.0' y2='194.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='64.0' y='198.0' font-size='11' text-anchor='end' fill='#222'>8000</text>
+<line x1='70.0' y1='146.0' x2='670.0' y2='146.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='64.0' y='150.0' font-size='11' text-anchor='end' fill='#222'>12000</text>
+<line x1='70.0' y1='98.0' x2='670.0' y2='98.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='64.0' y='102.0' font-size='11' text-anchor='end' fill='#222'>16000</text>
+<line x1='70.0' y1='50.0' x2='670.0' y2='50.0' stroke='#ddd' stroke-width='1.0'/>
+<text x='64.0' y='54.0' font-size='11' text-anchor='end' fill='#222'>20000</text>
+<text x='16.0' y='170.0' font-size='11' text-anchor='middle' fill='#222' transform='rotate(-90 16.0 170.0)'>ms</text>
+<text x='145.0' y='308.0' font-size='11' text-anchor='middle' fill='#222'>Qwen3-8B @120s</text>
+<rect x='92.0' y='202.6' width='32.7' height='87.4' fill='#7f7f7f' fill-opacity='1.00' stroke='none'><title>nopool Qwen3-8B @120s: p95 7287 ms, p50 1133 ms, 1920 served, 0 failed</title></rect>
+<line x1='92.0' y1='276.4' x2='124.7' y2='276.4' stroke='#111' stroke-width='2.0'/>
+<text x='108.3' y='199.6' font-size='10' text-anchor='middle' fill='#222'>7287</text>
+<rect x='128.7' y='287.9' width='32.7' height='2.1' fill='#1f77b4' fill-opacity='1.00' stroke='none'><title>pool Qwen3-8B @120s: p95 171 ms, p50 71 ms, 1920 served, 0 failed</title></rect>
+<line x1='128.7' y1='289.2' x2='161.3' y2='289.2' stroke='#111' stroke-width='2.0'/>
+<text x='145.0' y='284.9' font-size='10' text-anchor='middle' fill='#222'>171</text>
+<rect x='165.3' y='288.5' width='32.7' height='1.5' fill='#ff7f0e' fill-opacity='1.00' stroke='none'><title>floor Qwen3-8B @120s: p95 125 ms, p50 73 ms, 1920 served, 0 failed</title></rect>
+<line x1='165.3' y1='289.1' x2='198.0' y2='289.1' stroke='#111' stroke-width='2.0'/>
+<text x='181.7' y='285.5' font-size='10' text-anchor='middle' fill='#222'>125</text>
+<text x='295.0' y='308.0' font-size='11' text-anchor='middle' fill='#222'>Meta-Llama-3.1-8B-Instruct @1320s</text>
+<rect x='242.0' y='208.6' width='32.7' height='81.4' fill='#7f7f7f' fill-opacity='1.00' stroke='none'><title>nopool Meta-Llama-3.1-8B-Instruct @1320s: p95 6782 ms, p50 616 ms, 2160 served, 0 failed</title></rect>
+<line x1='242.0' y1='282.6' x2='274.7' y2='282.6' stroke='#111' stroke-width='2.0'/>
+<text x='258.3' y='205.6' font-size='10' text-anchor='middle' fill='#222'>6782</text>
+<rect x='278.7' y='288.8' width='32.7' height='1.2' fill='#1f77b4' fill-opacity='1.00' stroke='none'><title>pool Meta-Llama-3.1-8B-Instruct @1320s: p95 100 ms, p50 61 ms, 2160 served, 0 failed</title></rect>
+<line x1='278.7' y1='289.3' x2='311.3' y2='289.3' stroke='#111' stroke-width='2.0'/>
+<text x='295.0' y='285.8' font-size='10' text-anchor='middle' fill='#222'>100</text>
+<rect x='315.3' y='288.8' width='32.7' height='1.2' fill='#ff7f0e' fill-opacity='1.00' stroke='none'><title>floor Meta-Llama-3.1-8B-Instruct @1320s: p95 101 ms, p50 63 ms, 2160 served, 0 failed</title></rect>
+<line x1='315.3' y1='289.2' x2='348.0' y2='289.2' stroke='#111' stroke-width='2.0'/>
+<text x='331.7' y='285.8' font-size='10' text-anchor='middle' fill='#222'>101</text>
+<text x='445.0' y='308.0' font-size='11' text-anchor='middle' fill='#222'>Qwen3-8B @2520s</text>
+<rect x='392.0' y='138.9' width='32.7' height='151.1' fill='#7f7f7f' fill-opacity='1.00' stroke='none'><title>nopool Qwen3-8B @2520s: p95 12590 ms, p50 1249 ms, 1920 served, 0 failed</title></rect>
+<line x1='392.0' y1='275.0' x2='424.7' y2='275.0' stroke='#111' stroke-width='2.0'/>
+<text x='408.3' y='135.9' font-size='10' text-anchor='middle' fill='#222'>12590</text>
+<rect x='428.7' y='278.8' width='32.7' height='11.2' fill='#1f77b4' fill-opacity='1.00' stroke='none'><title>pool Qwen3-8B @2520s: p95 933 ms, p50 69 ms, 1920 served, 0 failed</title></rect>
+<line x1='428.7' y1='289.2' x2='461.3' y2='289.2' stroke='#111' stroke-width='2.0'/>
+<text x='445.0' y='275.8' font-size='10' text-anchor='middle' fill='#222'>933</text>
+<rect x='465.3' y='288.4' width='32.7' height='1.6' fill='#ff7f0e' fill-opacity='1.00' stroke='none'><title>floor Qwen3-8B @2520s: p95 131 ms, p50 77 ms, 1920 served, 0 failed</title></rect>
+<line x1='465.3' y1='289.1' x2='498.0' y2='289.1' stroke='#111' stroke-width='2.0'/>
+<text x='481.7' y='285.4' font-size='10' text-anchor='middle' fill='#222'>131</text>
+<text x='595.0' y='308.0' font-size='11' text-anchor='middle' fill='#222'>Meta-Llama-3.1-8B-Instruct @3720s</text>
+<rect x='542.0' y='259.6' width='32.7' height='30.4' fill='#7f7f7f' fill-opacity='1.00' stroke='none'><title>nopool Meta-Llama-3.1-8B-Instruct @3720s: p95 2530 ms, p50 67 ms, 2160 served, 0 failed</title></rect>
+<line x1='542.0' y1='289.2' x2='574.7' y2='289.2' stroke='#111' stroke-width='2.0'/>
+<text x='558.3' y='256.6' font-size='10' text-anchor='middle' fill='#222'>2530</text>
+<rect x='578.7' y='288.4' width='32.7' height='1.6' fill='#1f77b4' fill-opacity='1.00' stroke='none'><title>pool Meta-Llama-3.1-8B-Instruct @3720s: p95 131 ms, p50 59 ms, 2160 served, 0 failed</title></rect>
+<line x1='578.7' y1='289.3' x2='611.3' y2='289.3' stroke='#111' stroke-width='2.0'/>
+<text x='595.0' y='285.4' font-size='10' text-anchor='middle' fill='#222'>131</text>
+<rect x='615.3' y='288.8' width='32.7' height='1.2' fill='#ff7f0e' fill-opacity='1.00' stroke='none'><title>floor Meta-Llama-3.1-8B-Instruct @3720s: p95 104 ms, p50 63 ms, 2160 served, 0 failed</title></rect>
+<line x1='615.3' y1='289.2' x2='648.0' y2='289.2' stroke='#111' stroke-width='2.0'/>
+<text x='631.7' y='285.8' font-size='10' text-anchor='middle' fill='#222'>104</text>
+<rect x='70.0' y='338.0' width='12.0' height='12.0' fill='#7f7f7f' fill-opacity='1.00' stroke='none'></rect>
+<text x='86.0' y='348.0' font-size='11' text-anchor='start' fill='#222'>nopool</text>
+<rect x='150.0' y='338.0' width='12.0' height='12.0' fill='#1f77b4' fill-opacity='1.00' stroke='none'></rect>
+<text x='166.0' y='348.0' font-size='11' text-anchor='start' fill='#222'>pool</text>
+<rect x='230.0' y='338.0' width='12.0' height='12.0' fill='#ff7f0e' fill-opacity='1.00' stroke='none'></rect>
+<text x='246.0' y='348.0' font-size='11' text-anchor='start' fill='#222'>floor</text>
+</svg>
