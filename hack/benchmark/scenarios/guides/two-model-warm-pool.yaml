@@ -199,6 +199,20 @@ shared:
     profile: auto
     resource: auto
 
+  # --------------------------------------------------------------------------
+  # SCRAPE - 10s, for the vllm-<model> PodMonitors the harness renders for
+  # both stacks (template 18_podmonitor reads THIS key; this scenario leaves
+  # decode.monitoring.podmonitor to the chart's default). The scale-up signal
+  # is a queue at the engine and moves only when Prometheus holds a sample
+  # that shows it, so 30s is 0-30s of jitter on every scaling decision.
+  # Measured on the anti-phase run: decision lags 25/56/56/87s at 30s,
+  # 15/60/60/76s at 10s -- the jitter goes; the queue's own formation time
+  # does not. The pool PodMonitor is 10s too (deploy/warmpool.sh), so pool and
+  # models are read alike. Every number on the measured page was taken at 10s.
+  # --------------------------------------------------------------------------
+  monitoring:
+    scrapeInterval: "10s"
+
   # -------------------------------------------------------------------------
   # Affinity / Node Selection
   # By default, affinity is disabled and pods schedule on any available node.
