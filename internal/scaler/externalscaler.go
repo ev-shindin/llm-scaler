@@ -402,7 +402,9 @@ func (h *Handler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScal
 	// registration above still happens, so the workload is known to the
 	// engines the moment they start.
 	if !h.leader() {
-		logger.V(1).Info("external scaler StreamIsActive ended before the leader lease is held; KEDA will reopen it")
+		// V(3): KEDA reopens every 2 s per parked workload for the whole wait
+		// on the lease, and the default verbosity ships V(1) and V(2).
+		logger.V(3).Info("external scaler StreamIsActive ended before the leader lease is held; KEDA will reopen it")
 		return nil
 	}
 

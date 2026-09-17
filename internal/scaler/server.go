@@ -50,8 +50,9 @@ type Server struct {
 
 	// listening is set once a listener is bound and cleared when Start returns.
 	// Where the platform allows it the hand-off binds the full server before
-	// stopping the standby, so there is no moment in between at which it would
-	// be false; elsewhere the gap is sub-millisecond and left as is.
+	// stopping the standby, so the port is never unbound in between (see
+	// listen for the microsecond caveat); elsewhere the gap is sub-millisecond
+	// and left as is.
 	listening atomic.Bool
 }
 
@@ -161,7 +162,8 @@ func (s *Server) Start(ctx context.Context) error {
 	// allows it (overlapBind), so the port is never unbound in between: a
 	// GetMetricSpec refused in that gap would leave an HPA on the CPU default
 	// with nothing left to flip it back, since the full server refuses
-	// nothing. Where it does not, the standby has to go first.
+	// nothing. Where it does not, the standby has to go first. (Overlapping
+	// shrinks the gap to microseconds rather than removing it -- see listen.)
 	var srv *served
 	if overlapBind {
 		srv, err = s.bind(ctx, full)

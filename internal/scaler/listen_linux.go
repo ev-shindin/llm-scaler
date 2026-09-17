@@ -20,6 +20,13 @@ const overlapBind = true
 // over both sockets until the standby's is closed. Both listeners must set
 // the option, which is why every bind goes through here.
 //
+// Not quite gapless: a connection the kernel has completed and queued on the
+// standby's socket, but that Go has not yet accepted when that socket closes,
+// is reset (unless net.ipv4.tcp_migrate_req is on, which it is not by
+// default). That is the microseconds between the full server binding and
+// the standby's listener closing, against the seconds the port used to be
+// unbound; it is not zero.
+//
 // The price is that a second process in the same network namespace and UID
 // can bind the port too, where it used to fail with EADDRINUSE. In a Pod the
 // namespace holds one process; locally, two controllers on one machine
