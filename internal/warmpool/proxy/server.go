@@ -119,6 +119,20 @@ type Server struct {
 	// readiness reflect the engine rather than the pointer at it -- see
 	// ReadyHandler -- and is cleared by the next response that works.
 	degraded atomic.Bool
+	// draining is the hand-back state: readiness fails so the kubelet marks
+	// the Pod NotReady and the EPP drops it, while requests that still arrive
+	// are FORWARDED, not refused. Set by the control endpoint's drain, cleared
+	// by the next point or clear.
+	//
+	// Without it the hand-back cleared the upstream first, and every request
+	// the EPP dispatched in the second or two before it noticed -- the probe
+	// period plus the endpoint update -- was answered 503 "no model is awake
+	// in this Pod". Measured on a two-model run: one to two such failures at
+	// every hand-back, and none anywhere else.
+	draining atomic.Bool
+	// refused counts requests answered 503 for want of an upstream. Logged with
+	// each refusal, so a run that produced them can be read back.
+	refused atomic.Int64
 	// health is a separate client so a readiness check cannot be starved by
 	// the streaming connections the proxy transport is holding.
 	health *http.Client
@@ -201,17 +215,57 @@ var ErrUpstreamNotAnEngine = errors.New("upstream must be an engine port")
 // and would mark the Pod Ready while doing it. The only legitimate value is an
 // engine in this same Pod, which shares its network namespace.
 //
-// An empty addr means no model is awake.
+// An empty addr means no model is awake. Either way the Pod is no longer
+// draining: a clear finishes a hand-back, a point starts a new lend.
 func (s *Server) SetUpstream(addr string) error {
 	if addr == "" {
 		s.upstream.Store(nil)
+		s.draining.Store(false)
 		return nil
 	}
 	if err := validUpstream(addr, s.cfg.MinUpstreamPort, s.cfg.UpstreamPortCount); err != nil {
 		return err
 	}
 	s.upstream.Store(&addr)
+	s.draining.Store(false)
 	return nil
+}
+
+// Drain starts a hand-back: readiness fails from now on, so the kubelet marks
+// the Pod NotReady and the EPP stops dispatching to it, while the upstream is
+// kept and every request that still arrives is served. Clearing the upstream
+// afterwards -- once the EPP has had time to notice -- is then safe.
+//
+// Draining with no upstream, or a Pod ALREADY draining, reports false: in
+// both there is nothing new to hand back and readiness is failing already.
+// The second matters on a retry: a hand-back that drained and then failed
+// (clear, unlabel, a cancelled wait) comes back through here, and the caller
+// uses "nothing to drain" to skip a wait the EPP has long since satisfied.
+//
+// The flag is set and then the upstream re-read, so a clear landing between
+// the check and the store resolves to "nothing to drain" rather than leaving
+// draining=true on an empty proxy. A concurrent POINT is not covered -- the
+// reconciler serialises a Pod's activate and deactivate, so it cannot happen
+// through the controller; from the control port by hand, a point during a
+// drain ends the drain (SetUpstream clears the flag), which is the right
+// outcome either way.
+func (s *Server) Drain() bool {
+	if s.Upstream() == "" {
+		return false
+	}
+	if !s.draining.CompareAndSwap(false, true) {
+		return false // already draining: nothing new to hand back
+	}
+	if s.Upstream() == "" {
+		s.draining.Store(false)
+		return false
+	}
+	return true
+}
+
+// Draining reports whether a hand-back is in progress.
+func (s *Server) Draining() bool {
+	return s.draining.Load()
 }
 
 // validUpstream reports whether addr is an engine in this Pod. Separated from
@@ -365,6 +419,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	// run `warmpool-proxy --check` inside the container instead, over loopback,
 	// where no policy applies. See Check.
 	if s.Upstream() == "" {
+		// Logged, and counted: a request reaching a Pod with nothing awake
+		// means the EPP still lists it, and that is a sequencing defect
+		// somewhere -- not a condition to answer quietly. The hand-back used
+		// to produce exactly this (see draining); the log is what lets the next
+		// occurrence be traced to its transition.
+		n := s.refused.Add(1)
+		klog.FromContext(r.Context()).V(1).Info("warm-pool proxy refused a request: no model is awake",
+			"path", r.URL.Path, "from", r.RemoteAddr, "refusedTotal", n, "draining", s.Draining())
 		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
 		return
 	}
@@ -381,6 +443,10 @@ func (s *Server) HealthHandler(w http.ResponseWriter, _ *http.Request) {
 
 // UpstreamPath is where the control endpoint lives.
 const UpstreamPath = "/upstream"
+
+// DrainPath starts a hand-back: POST fails readiness while the upstream keeps
+// serving. See Drain.
+const DrainPath = "/upstream/drain"
 
 // ReadyPath is the Pod's readiness probe.
 const ReadyPath = "/readyz"
@@ -403,6 +469,12 @@ const HealthPath = "/healthz"
 func (s *Server) ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	if s.Upstream() == "" {
 		http.Error(w, "no model is awake in this Pod", http.StatusServiceUnavailable)
+		return
+	}
+	// A hand-back in progress: NotReady so the EPP drops the Pod, while the
+	// serving port keeps answering the requests still in flight to it.
+	if s.Draining() {
+		http.Error(w, "draining: this Pod is being handed back", http.StatusServiceUnavailable)
 		return
 	}
 	// An upstream that is set is not the same as an engine that answers. A vLLM
@@ -493,6 +565,9 @@ func (s *Server) engineGet(ctx context.Context, upstream, path string, out any) 
 
 type upstreamBody struct {
 	Address string `json:"address"`
+	// Draining is reported, not set, here: a hand-back in progress. Set
+	// through DrainPath.
+	Draining bool `json:"draining,omitempty"`
 }
 
 // UpstreamHandler serves the control endpoint: GET reports the current target,
@@ -505,7 +580,7 @@ type upstreamBody struct {
 func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, upstreamBody{Address: s.Upstream()})
+		writeOK(w, upstreamBody{Address: s.Upstream(), Draining: s.Draining()})
 	case http.MethodPut:
 		var body upstreamBody
 		// Bounded: an unbounded decode on a control endpoint is an OOM waiting
@@ -519,7 +594,7 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 			// first would reject it -- there is no host:port in "" -- which
 			// silently removed a documented way to take a Pod out of service.
 			_ = s.SetUpstream("")
-			writeJSON(w, http.StatusOK, upstreamBody{Address: ""})
+			writeOK(w, upstreamBody{Address: ""})
 			return
 		}
 		if err := validUpstream(body.Address, s.cfg.MinUpstreamPort, s.cfg.UpstreamPortCount); err != nil {
@@ -553,7 +628,7 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 		// readiness uses to clear the flag. Without this, every probe after an
 		// earlier failure spends a live request re-establishing it.
 		s.degraded.Store(false)
-		writeJSON(w, http.StatusOK, upstreamBody{Address: s.Upstream()})
+		writeOK(w, upstreamBody{Address: s.Upstream()})
 	case http.MethodDelete:
 		_ = s.SetUpstream("")
 		w.WriteHeader(http.StatusNoContent)
@@ -562,8 +637,26 @@ func (s *Server) UpstreamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+// DrainHandler serves DrainPath: POST starts a hand-back (see Drain) and
+// reports the state; anything else is refused. 204 when there was nothing to
+// drain, so a caller can tell "draining now" from "was already out of
+// service" without a second request.
+func (s *Server) DrainHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.Drain() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeOK(w, upstreamBody{Address: s.Upstream(), Draining: true})
+}
+
+// writeOK answers 200 with a JSON body. Every success on the control endpoint
+// is a 200; the failures go through http.Error.
+func writeOK(w http.ResponseWriter, body any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(body)
 }

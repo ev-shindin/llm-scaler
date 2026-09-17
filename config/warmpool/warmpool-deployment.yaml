@@ -383,7 +383,7 @@ spec:
           # Build your own from this tree with `make docker-build-warmpool-proxy
           # docker-push-warmpool-proxy WARMPOOL_PROXY_IMG=<ref>`
           # (Dockerfile.warmpool-proxy) and pass --proxy-image.
-          image: ghcr.io/ev-shindin/llm-scaler/warmpool-proxy:v8@sha256:66e8bb63b985c87db81716b2047f07a5deba2f1729e5397f4476d2415af72093
+          image: ghcr.io/ev-shindin/llm-scaler/warmpool-proxy:v11@sha256:9e3ea1e1785a35bbea0abb87d98c6602f6ea68f3bef2a64ccaac84f16d4f5062
           imagePullPolicy: IfNotPresent
           args:
             - --port=8000
@@ -422,8 +422,11 @@ spec:
             # its model sleeps.
             #
             # periodSeconds and failureThreshold are load-bearing, not defaults.
-            # Deactivate clears the proxy, waits DrainWait, then sleeps the
-            # engine -- so the kubelet must notice within that wait. With the
+            # Deactivate drains the proxy (readiness fails, forwarding goes on),
+            # waits DrainWait for the kubelet and the EPP to notice, clears it,
+            # then sleeps the engine -- so the kubelet must notice within that
+            # wait, or the EPP keeps dispatching to a Pod about to lose its
+            # upstream. With the
             # defaults (period 5, failureThreshold 3) it takes 5-20 s to mark
             # the Pod NotReady while the engine sleeps at ~2 s, leaving the Pod
             # in its InferencePool with nothing awake behind it: every dispatch

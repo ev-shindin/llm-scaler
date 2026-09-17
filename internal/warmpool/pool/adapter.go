@@ -230,9 +230,17 @@ func (a *Adapter) membershipsIn(ctx context.Context, p *corev1.Pod) ([]Membershi
 	// Unknown is its own answer. The Pod drops out of this observation, exactly
 	// as it does when the supervisor will not answer, and the next pass looks
 	// again.
-	upstream, err := a.newProxy(p.Status.PodIP).Upstream(ctx)
+	upstream, draining, err := a.newProxy(p.Status.PodIP).State(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read the proxy's upstream in %s: %w", p.Name, err)
+	}
+	// A draining proxy is a hand-back that did not finish: it points at an
+	// engine, but the Pod is NotReady and takes no traffic. Reading it as
+	// serving would count the Pod as covering its variant for ever. Read with
+	// no upstream instead, the awake engine is Waking -- an orphan the next
+	// pass returns, which completes the hand-back.
+	if draining {
+		upstream = ""
 	}
 
 	podRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
@@ -658,17 +666,51 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 		return err
 	}
 
-	// Clear the proxy FIRST: it is the gate. /readyz then fails, the kubelet
-	// marks the Pod NotReady, and the EPP drains within the measured ~630 ms.
-	if err := a.newProxy(p.Status.PodIP).Clear(ctx); err != nil {
-		return fmt.Errorf("take %s out of service: %w", pod, err)
+	// DRAIN first, clear after. Draining fails /readyz -- the kubelet marks
+	// the Pod NotReady and the EPP stops dispatching within the measured
+	// ~630 ms -- while the proxy keeps forwarding what the EPP still sends
+	// during that window. The upstream is cleared only once that window has
+	// passed, so no request ever meets a proxy with nothing behind it.
+	//
+	// It used to clear first, on the reasoning that the proxy is the gate.
+	// It is, but a gate that slams answers 503 to whatever was already in the
+	// doorway: measured on a two-model run, one to two requests at EVERY
+	// hand-back failed with the proxy's own "no model is awake in this Pod",
+	// and none failed anywhere else.
+	//
+	// A proxy image without the drain endpoint gets the old order, and says
+	// so: the pool still works, with the window it always had.
+	px := a.newProxy(p.Status.PodIP)
+	// Whether there is traffic to drain. A retry after a clear that already
+	// landed, or a Pod whose proxy has nothing behind it, is NotReady already:
+	// waiting then protects nothing and spends the budget the retry path has.
+	leaving := true
+	drained, err := px.Drain(ctx)
+	switch {
+	case errors.Is(err, ErrDrainUnsupported):
+		log.FromContext(ctx).V(logging.DEFAULT).Info(
+			"pool proxy predates the drain step; clearing first, which can 503 in-flight requests",
+			"pod", pod.String())
+		if err := px.Clear(ctx); err != nil {
+			return fmt.Errorf("take %s out of service: %w", pod, err)
+		}
+	case err != nil:
+		return fmt.Errorf("drain %s: %w", pod, err)
+	default:
+		leaving = drained
 	}
-	if wait := a.drainFor(ctx); wait > 0 {
+	if wait := a.drainFor(ctx); leaving && wait > 0 {
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	// Cleared whatever the drain reported -- "nothing to drain" included --
+	// so that unlabel and sleep never follow a proxy that still has an
+	// upstream. Idempotent on a proxy already cleared.
+	if err := px.Clear(ctx); err != nil {
+		return fmt.Errorf("take %s out of service: %w", pod, err)
 	}
 	if err := a.removeLabels(ctx, p, model.PoolLabels); err != nil {
 		return fmt.Errorf("leave the InferencePool for %s: %w", model.Variant, err)
@@ -682,13 +724,13 @@ func (a *Adapter) Deactivate(ctx context.Context, pod types.NamespacedName, mode
 // drainFor is how long to let in-flight work finish, bounded by the time the
 // context actually has left.
 //
-// The drain must never be allowed to consume the whole budget, because the two
-// calls AFTER it are the ones that matter. Deactivate clears the proxy first, so
-// a timeout inside the drain leaves the Pod NotReady, still carrying its
+// The drain must never be allowed to consume the whole budget, because the
+// calls AFTER it are the ones that matter. Deactivate drains the proxy first,
+// so a timeout inside the wait leaves the Pod NotReady, still carrying its
 // InferencePool labels, and with its engine still awake holding the GPU. The
-// next pass reads that as Waking, which still counts as lent, and schedules the
-// same Deactivate -- which fails at the same point again. The Pod never returns
-// to the reserve.
+// next pass reads a draining proxy as Waking -- an orphan, which it returns by
+// scheduling the same Deactivate -- and that fails at the same point again.
+// The Pod never returns to the reserve.
 //
 // That is a livelock reachable purely by configuration: DrainWait lives on this
 // Adapter and the deadline comes from the reconciler's ActTimeout, two knobs in

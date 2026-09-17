@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-logr/stdr"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/warmpool/proxy"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +30,9 @@ import (
 )
 
 const testNamespace = "pool-ns"
+
+// lentUpstream is where a lent Pod's proxy points: the pool's first engine port.
+const lentUpstream = "127.0.0.1:9001"
 
 // deadAddr is an address proven to have nothing behind it: bound and closed, so
 // the kernel confirmed it was free rather than the test guessing a port.
@@ -127,8 +131,12 @@ type harness struct {
 	// Failure knobs. Each names a step that can fail in production and whose
 	// failure must stop the sequence rather than let it run on: the orderings
 	// this adapter exists to enforce are only enforced if a failed step aborts.
-	deleteFails  bool
-	clearFails   bool
+	deleteFails bool
+	clearFails  bool
+	// drainUnsupported makes the fake proxy an older image: no /upstream/drain.
+	drainUnsupported bool
+	// draining is the fake proxy's hand-back state, reported on GET.
+	draining     bool
 	sleepFails   bool
 	garbageList  bool
 	garbageState bool
@@ -297,6 +305,24 @@ func (h *harness) serveEngine(w http.ResponseWriter, r *http.Request) {
 func (h *harness) serveProxy(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if r.URL.Path == proxy.DrainPath {
+		if h.drainUnsupported {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.upstream == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.journal.add("drain")
+		h.draining = true
+		_, _ = w.Write([]byte(`{"address":"` + h.upstream + `","draining":true}`))
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		var body struct {
@@ -305,6 +331,7 @@ func (h *harness) serveProxy(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		h.journal.add("point " + body.Address)
 		h.upstream = body.Address
+		h.draining = false
 		_, _ = w.Write([]byte(`{"address":"` + body.Address + `"}`))
 	case http.MethodDelete:
 		h.journal.add("clear")
@@ -313,9 +340,10 @@ func (h *harness) serveProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.upstream = ""
+		h.draining = false
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		_, _ = w.Write([]byte(`{"address":"` + h.upstream + `"}`))
+		_, _ = w.Write([]byte(`{"address":"` + h.upstream + `","draining":` + strconv.FormatBool(h.draining) + `}`))
 	}
 }
 
@@ -366,7 +394,7 @@ func TestActivateLabelsBeforeWaking(t *testing.T) {
 		t.Fatalf("endpoint = %+v, want the instance's own port", ep)
 	}
 	h.journal.inOrder(t, "label", "wake", "point")
-	if got := h.upstream; got != "127.0.0.1:9001" {
+	if got := h.upstream; got != lentUpstream {
 		t.Errorf("proxy must be pointed at the Pod-local address, got %q", got)
 	}
 }
@@ -420,15 +448,20 @@ func TestActivateNeverPointsAtAnEngineThatDidNotWake(t *testing.T) {
 	h.journal.never(t, "point")
 }
 
-func TestDeactivateClearsTheProxyBeforeSleeping(t *testing.T) {
-	// The ordering that is a 503 if reversed: clearing the proxy is what makes
-	// the Pod NotReady and drains the EPP (~630 ms measured).
+func TestDeactivateDrainsThenClearsBeforeSleeping(t *testing.T) {
+	// The ordering, and every step of it is a 503 if moved. Drain first, so
+	// the Pod goes NotReady and the EPP drops it while the proxy still
+	// forwards; clear only after that window; unlabel; sleep. Clearing before
+	// the drain wait was the old order, and it answered every request the EPP
+	// dispatched in that window with "no model is awake in this Pod" --
+	// measured: one to two per hand-back, none anywhere else.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 
 	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err != nil {
 		t.Fatalf("Deactivate: %v", err)
 	}
-	h.journal.inOrder(t, "clear", "unlabel", "sleep")
+	h.journal.inOrder(t, "drain", "clear", "unlabel", "sleep")
 
 	var got corev1.Pod
 	if err := h.k8s.Get(context.Background(), podA(), &got); err != nil {
@@ -493,13 +526,38 @@ func TestListWarmDiscoversStateRatherThanRemembering(t *testing.T) {
 	// Awake and pointed at means serving; awake and not pointed at means the
 	// wake is still in flight.
 	h.asleep = false
-	h.upstream = "127.0.0.1:9001"
+	h.upstream = lentUpstream
 	if got, _ = h.adapter.ListWarm(context.Background()); got[0].State != Serving {
 		t.Errorf("state = %q, want serving", got[0].State)
 	}
 	h.upstream = ""
 	if got, _ = h.adapter.ListWarm(context.Background()); got[0].State != Waking {
 		t.Errorf("state = %q, want waking", got[0].State)
+	}
+}
+
+func TestAHandBackThatDrainedButDidNotFinishReadsAsWakingNotServing(t *testing.T) {
+	// The regression the drain step could have introduced. Before it, the
+	// first action of a hand-back was the clear, so any later failure left the
+	// proxy empty, the engine read as Waking, and the next pass returned it as
+	// an orphan. With the drain first, the same failure leaves the proxy
+	// pointed AND draining: read as Serving, the Pod would count as covering
+	// its variant and never be returned, while taking no traffic.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream
+	h.asleep = false
+	h.clearFails = true
+
+	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err == nil {
+		t.Fatal("a clear that fails must be reported")
+	}
+	h.journal.inOrder(t, "drain", "clear")
+	got, err := h.adapter.ListWarm(context.Background())
+	if err != nil {
+		t.Fatalf("ListWarm: %v", err)
+	}
+	if len(got) != 1 || got[0].State != Waking {
+		t.Fatalf("a drained, unfinished hand-back must read as Waking so the next pass returns it; got %+v", got)
 	}
 }
 
@@ -706,11 +764,27 @@ func TestAFailedEvictionIsReportedRatherThanAssumed(t *testing.T) {
 	}
 }
 
+func TestDeactivateFallsBackToClearingFirstOnAnOlderProxy(t *testing.T) {
+	// A proxy image without /upstream/drain answers 404. The hand-back must
+	// still complete -- with the old order and its old window -- rather than
+	// leave a Pod lent forever because the controller was upgraded first.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
+	h.drainUnsupported = true
+
+	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err != nil {
+		t.Fatalf("Deactivate against an older proxy: %v", err)
+	}
+	h.journal.never(t, "drain")
+	h.journal.inOrder(t, "clear", "unlabel", "sleep")
+}
+
 func TestDeactivateDoesNotSleepAModelStillTakingTraffic(t *testing.T) {
 	// The whole reason the proxy is cleared first. If clearing fails the Pod is
 	// still Ready and still in its InferencePool, so sleeping anyway is the
 	// Ready-but-asleep window -- every request routed there 503s.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.clearFails = true
 
 	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err == nil {
@@ -733,6 +807,7 @@ func TestDeactivateDoesNotSleepAModelStillInItsInferencePool(t *testing.T) {
 	// EPP's endpoint set. Sleeping while it is still listed is a 503 for as long
 	// as the EPP takes to notice.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.k8s = refusePatches(t, h.k8s)
 	h.adapter.client = h.k8s
 
@@ -764,6 +839,7 @@ func TestDeactivateGivesUpTheDrainWithTheContext(t *testing.T) {
 	// with the context rather than hold the loop open, and it must not go on to
 	// sleep an engine whose Pod it can no longer observe.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.adapter.DrainWait = time.Minute
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -817,17 +893,19 @@ func mustList(t *testing.T, c client.Client) []runtime.Object {
 }
 
 func TestTheDrainYieldsToTheDeadlineRatherThanStrandingThePod(t *testing.T) {
-	// Deactivate clears the proxy FIRST, so a timeout inside the drain leaves
+	// Deactivate drains the proxy FIRST, so a timeout inside the wait leaves
 	// the Pod NotReady, still carrying its InferencePool labels, and with its
-	// engine awake holding the GPU. The next pass reads that as Waking, which
-	// still counts as lent, and schedules the same Deactivate -- which fails at
-	// the same point again. The Pod never returns to the reserve.
+	// engine awake holding the GPU. The next pass reads a draining proxy as
+	// Waking -- an orphan, which it returns by scheduling the same Deactivate
+	// -- and that fails at the same point again. The Pod never returns to the
+	// reserve.
 	//
 	// That livelock is reachable purely by configuration, because DrainWait
 	// lives on the Adapter and the deadline comes from the reconciler's
 	// ActTimeout: two knobs in two packages with nothing tying them together.
 	// The drain yields instead.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", map[string]string{"llm-d.ai/model": "qwen"}))
+	h.upstream = lentUpstream // lent: the proxy points at the model being handed back
 	h.adapter.DrainWait = time.Hour
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -856,6 +934,7 @@ func TestTheDrainIsUnshortenedWhenThereIsTimeForIt(t *testing.T) {
 	// kills the requests still in flight, so a deadline with room must leave the
 	// full DrainWait alone.
 	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.upstream = lentUpstream // lent: there is traffic to drain
 	h.adapter.DrainWait = 40 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -868,6 +947,25 @@ func TestTheDrainIsUnshortenedWhenThereIsTimeForIt(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Errorf("drained for %s, want the full DrainWait when the budget allows it", elapsed)
 	}
+}
+
+func TestNothingToDrainMeansNoWait(t *testing.T) {
+	// A retry after a clear that already landed, or a Pod whose proxy has
+	// nothing behind it, is NotReady already. Waiting then protects nothing
+	// and spends the budget the retry path exists for.
+	h := newHarness(t, poolPod("pod-a", "10.0.0.1", nil))
+	h.upstream = "" // nothing lent: the proxy answers 204 to the drain
+	h.adapter.DrainWait = 400 * time.Millisecond
+
+	start := time.Now()
+	if err := h.adapter.Deactivate(context.Background(), podA(), qwen()); err != nil {
+		t.Fatalf("Deactivate: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 400*time.Millisecond {
+		t.Errorf("waited %s with nothing to drain", elapsed)
+	}
+	h.journal.never(t, "drain")
+	h.journal.inOrder(t, "clear", "unlabel", "sleep")
 }
 
 func TestTheDrainIsSkippedWhenTheDeadlineHasAllButPassed(t *testing.T) {
