@@ -252,6 +252,18 @@ func (e *Engine) recordAnalyzerMetrics(namespace, modelID string, results []allo
 	e.evictStaleAnalyzerSeries(namespace, modelID, current)
 }
 
+// zeroObservedReplicas sets wva_analyzer_observed_replicas to 0 for every
+// (analyzer, variant) this model published last cycle. Called on the cycle
+// that skips analysis because the model had no replica rows at all: the
+// series is kept -- a blip must not make it flap, and its siblings are kept
+// too -- but its value has to be what was observed, which is nothing.
+func (e *Engine) zeroObservedReplicas(namespace, modelID string) {
+	modelKey := utils.GetNamespacedKey(namespace, modelID)
+	for prev := range e.lastAnalyzerSeries[modelKey].target {
+		e.metricsEmitter.RecordAnalyzerObservedReplicas(prev.analyzer, namespace, modelID, prev.variant, 0)
+	}
+}
+
 // evictStaleAnalyzerSeries deletes the analyzer series this model published on
 // the previous cycle but not on this one, then records the current set.
 func (e *Engine) evictStaleAnalyzerSeries(namespace, modelID string, current analyzerSeries) {
