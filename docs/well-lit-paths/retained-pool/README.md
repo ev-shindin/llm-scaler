@@ -109,7 +109,8 @@ demand moves.
   `internal/engines/analyzers/saturation_v2/warmpool_bridge_test.go` — covering
   the pressure comparison, the tie-break, interval preemption, and the switch
   storm that an earlier version of this rule produced.
-- Benchmark: `hack/benchmark/scenarios/guides/variants/v2-retained-switch.yaml`.
+- Benchmark: `hack/benchmark/scenarios/guides/variants/v2-retained-switch.yaml`;
+  the harness's own start-path settings are in [Replica start time in the harness](../../guides/benchmarking/README.md#replica-start-time-in-the-harness).
 - **Not covered end to end.** `test/e2e/` contains no retained-pool spec; the
   warm-pool suites there exercise the bridge case.
 

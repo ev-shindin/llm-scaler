@@ -187,6 +187,26 @@ benchmark's behaviour in place are in
 the P/D cases in `arrival_demand_test.go` and `analyzer_test.go`), each with a
 negative control against the code it replaced.
 
+## Replica start time
+
+Every ramp in the benchmark above is sized by one number: how long the second
+replica of a role takes to become Ready while the first serves the load alone.
+The queue that builds in that time is charged to the fleet as demand, so two
+runs of the same trace against the same controller can differ by several
+replicas at the first ramp on nothing but the pod start. Two pages cover it:
+
+- what any workload WVA scales should get right on its way to Ready -- no
+  installs at container start, a short probe period, engine caches that
+  outlive the pod, the image already on the node -- is the prerequisite
+  checklist in [Preparing a workload](../../reference/workload-preparation.md#the-rest-of-the-start-path);
+- what the benchmark harness adds to that path, and how this scenario removes
+  it, is in [Replica start time in the harness](../../guides/benchmarking/README.md#replica-start-time-in-the-harness).
+
+What is left is the cold process and, on a large model, its weight load; the
+autoscaler-side answer -- sizing a backlog by throughput rather than residency,
+so the ramp stops tracking the start time at all -- is the open item in
+[Sizing a backlog](../../proposals/backlog-sizing.md).
+
 ## Tuning it
 
 Per-role thresholds follow the ordinary policy surface:

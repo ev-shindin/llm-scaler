@@ -60,7 +60,7 @@ decision in the wrong direction.
 
 - Benchmark scenario:
   `hack/benchmark/scenarios/guides/two-variant-wva.yaml`, with the variant
-  definitions under `scenarios/guides/variants/`.
+  definitions under `scenarios/guides/variants/`; the harness's own start-path settings are in [Replica start time in the harness](../../guides/benchmarking/README.md#replica-start-time-in-the-harness).
 - **No end-to-end suite covers two variants of one model.** The evidence for
   this path is the benchmark scenario and its written-up run, not a CI spec —
   which is the leg to add if you depend on it.
