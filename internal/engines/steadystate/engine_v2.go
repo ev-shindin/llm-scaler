@@ -956,13 +956,12 @@ func buildCapacities(ctx context.Context, nr *allocation.NamedAnalyzerResult, me
 // so the symmetric fix — a departing counterpart to PendingReplicas — would mean
 // listing pods, which is the cluster-wide watch this design removed. Clamping to
 // a count the scale target already publishes is what makes this cheap.
+//
+// ObservedReplicas is deliberately NOT derived here from the pre-clamp
+// ReplicaCount: when a variant had no rows this cycle the analyzer fills
+// ReplicaCount from scale-target status, which would make "saw the whole
+// fleet" and "saw nothing" read the same. The analyzer sets it from its rows.
 func clampReplicaCountToScaleTarget(vc *domain.VariantCapacity, m domain.VariantMetadata) {
-	// Record what the analyzer actually saw before the cap hides it. The cap
-	// only ever lowers ReplicaCount, so once it has run there is no way to tell
-	// "the analyzer saw two replicas" from "it saw three and one is not owned"
-	// -- which is the whole question when a conceded or unadopted replica is
-	// serving. Published as wva_analyzer_observed_replicas.
-	vc.ObservedReplicas = vc.ReplicaCount
 	if m.CurrentReplicas > 0 {
 		vc.ReplicaCount = min(vc.ReplicaCount, m.CurrentReplicas)
 	}
@@ -1074,10 +1073,11 @@ func logAnalyzerResult(ctx context.Context, modelID, namespace string, nr alloca
 		// rather than being absent.
 		Role   string `json:"role"`
 		Reason string `json:"reason,omitempty"`
-		// Observed is the pre-clamp replica count. It differs from the fleet the
-		// scale target owns exactly when something else is serving, so a cycle
-		// that saw only part of the fleet is visible in this line rather than
-		// inferred from demand afterwards.
+		// Observed is how many replicas reported rows this cycle, before the
+		// scale-target clamp. It differs from the target's ready count exactly
+		// when something unowned is serving or a Pod's metrics were missing, so
+		// a cycle that saw only part of the fleet is visible in this line rather
+		// than inferred from demand afterwards.
 		Observed int `json:"observed"`
 	}
 	variants := make([]variantEntry, 0, len(nr.Result.VariantCapacities))

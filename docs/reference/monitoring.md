@@ -236,11 +236,13 @@ with `wva_saturation_utilization` and `wva_analyzer_demand` / `wva_analyzer_targ
 showing what drove it. A desired that never becomes current is an actuation
 problem (KEDA, the HPA, or the workload), not a decision problem. A desired
 that looks too low is worth checking against `wva_analyzer_observed_replicas`:
-it is the replica count the analyzer attributed to the variant in its last
-cycle, before the scale-target clamp, so below `wva_current_replicas` means a
-Pod was missing from the cycle (a scrape gap, and the low number is correct for
-what was seen), and above it means something the scale target does not own is
-serving the model.
+how many of the variant's replicas reported metrics in the analyzer's last
+cycle, not capped at the scale target. Compare it with the target's **ready**
+replicas, not with `wva_current_replicas`, which also counts pods still
+starting and legitimately absent during every scale-up. Below ready means a
+Pod's metrics were missing from the cycle (a scrape gap, and the low desired is
+correct for what was seen); above it means something the scale target does not
+own is serving the model.
 
 ```bash
 # read them straight off the controller

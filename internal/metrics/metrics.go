@@ -257,7 +257,7 @@ func InitMetrics(registry prometheus.Registerer) error {
 	analyzerObservedReplicas = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVAAnalyzerObservedReplicas,
-			Help: "Replicas an analyzer attributed to a variant in its last cycle, before the scale-target clamp. Compare with wva_current_replicas: equal means the analyzer saw the whole fleet, lower means a pod was missing from the cycle, higher means replicas are serving that the scale target does not own.",
+			Help: "Replicas of a variant that reported metrics in the analyzer's last cycle and were attributed to it, not capped at the scale target. Compare with the target's READY replicas (not wva_current_replicas, which counts pods still starting): lower means a pod's metrics were missing from the cycle, higher means replicas are serving that the scale target does not own; 0 means nothing reported, or the analyzer does not read per-replica metrics.",
 		},
 		analyzerTargetLabels,
 	)

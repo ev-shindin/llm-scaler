@@ -421,18 +421,14 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 		// cycle computes demand over a subset of the fleet, and recommending fewer
 		// replicas is then CORRECT, not the regression this spec is about.
 		//
-		// BE PRECISE ABOUT WHAT THIS WAITS FOR. It is a symptom of the premise,
-		// not the premise: no metric reports "the unowned Pod is attributed to
-		// this variant" (see the note above about why the demand-ratio guard was
-		// removed). The two coincide in the failure this fixes, and they can
-		// diverge -- demand can be high for another reason, the arrival floor
-		// being the obvious one, in which case this clears while the unowned Pod
-		// is still uncounted and the Consistently below can fail when that reason
-		// goes away. That residual is narrower than the failure it replaces, and
-		// it is not zero. A signal that measures attribution directly would
-		// retire this gate.
+		// This is the second gate, after the attribution gate above has seen the
+		// whole fleet in one cycle. It waits for the recommendation to catch up
+		// with that -- the attribution gate proves the premise, this one proves
+		// the analyzer acted on it. It cannot be satisfied by the no-metrics path
+		// any more, because the attribution gate does not clear until a real
+		// analysis has attributed three Pods.
 		//
-		// Measured, on the run that made this change: three cycles with no
+		// Measured, on the run that first made this a gate: three cycles with no
 		// saturation metrics at all, then a cycle carrying the unowned Pod and one
 		// of the two owned ones. Demand 4 instead of 6, supply 12, so spare came
 		// to 12 - 4/0.7 = 6.29 -- just over one replica's 6 -- and WVA correctly
@@ -462,11 +458,11 @@ var _ = Describe("Scale-down with supply beyond the scale target", Label("full")
 					"assertion below cannot tell a low recommendation from a missing one")
 
 			g.Expect(v).To(BeNumerically(">=", float64(targetReplicas)),
-				"WVA still recommends %v < %d. Either the fleet is not fully scraped yet "+
-					"(demand=%s; it settles at one unit per reporting Pod, so a low value here "+
-					"means a Pod is missing from the cycle), or the unowned replica's capacity "+
-					"is being counted as spare, which is the regression this spec guards and "+
-					"which never clears this gate", v, targetReplicas, demandNow())
+				"WVA still recommends %v < %d with demand=%s and attributed=%s. If attributed "+
+					"has dropped below %d a Pod fell out of the analyzer's view again (a scrape "+
+					"gap); if it is still %d the unowned replica's capacity is being counted as "+
+					"spare, which is the regression this spec guards and which never clears "+
+					"this gate", v, targetReplicas, demandNow(), observedNow(), targetReplicas+1, targetReplicas+1)
 		}, time.Duration(cfg.EventuallyExtendedSec)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
 			Should(Succeed())
 

@@ -160,14 +160,18 @@ type VariantCapacity struct {
 	ReplicaCount    int
 	PendingReplicas int
 
-	// ObservedReplicas is how many replicas the analyzer actually attributed to
-	// this variant, recorded BEFORE ReplicaCount is capped at the scale target.
+	// ObservedReplicas is how many of this variant's own replicas REPORTED
+	// METRICS this cycle and were attributed to it -- the live row count, never
+	// scale-target status, and 0 when nothing reported or the analyzer does not
+	// read per-replica rows. Unlike ReplicaCount it is not capped at the scale
+	// target's count.
 	//
-	// The two differ exactly when replicas are serving that the scale target
-	// does not own -- a conceded replica, a bridge, a pod the ReplicaSet has not
-	// adopted -- and that difference is otherwise unrecoverable downstream,
-	// because the cap only ever lowers ReplicaCount. Diagnostics only: nothing
-	// sizes capacity from this, and it is published as
+	// It differs from the target's ready count in both directions, and both are
+	// the point: above it, replicas are serving that the target does not own (a
+	// conceded replica, a pod the ReplicaSet has not adopted); below it, a Pod's
+	// metrics were missing from the cycle. Neither is recoverable downstream,
+	// because ReplicaCount is either capped or filled in from status. Diagnostics
+	// only: nothing sizes capacity from this, and it is published as
 	// wva_analyzer_observed_replicas so "the analyzer saw the whole fleet" is
 	// answerable without inferring it from demand, which is not proportional to
 	// replicas.

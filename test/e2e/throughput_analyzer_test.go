@@ -139,6 +139,10 @@ func restartWVAController(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf("patch wva-controller-manager: %w", err)
 	}
+	// One budget for the rollout and the lease wait together. The lease wait
+	// alone has been measured at 64 s (an old pod that died without releasing,
+	// so the lease had to expire), so PodReadyTimeout needs to be comfortably
+	// above that; the default 300 s is.
 	deadline := time.Now().Add(time.Duration(cfg.PodReadyTimeout) * time.Second)
 	poll := time.Duration(cfg.PollIntervalSec) * time.Second
 	rolledOut := false
@@ -146,6 +150,14 @@ func restartWVAController(ctx context.Context) error {
 		dep, err := k8sClient.AppsV1().Deployments(cfg.WVANamespace).Get(ctx, "wva-controller-manager", metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("get wva-controller-manager: %w", err)
+		}
+		// Status lags the patch: until the controller has observed the new
+		// generation, the counts describe the previous rollout and read as
+		// complete. Without this the loop exits at once and a rollout that never
+		// starts is reported by the lease wait below as an election problem.
+		if dep.Status.ObservedGeneration < dep.Generation {
+			time.Sleep(poll)
+			continue
 		}
 		if dep.Status.UpdatedReplicas >= 1 &&
 			dep.Status.ReadyReplicas == dep.Status.UpdatedReplicas &&
