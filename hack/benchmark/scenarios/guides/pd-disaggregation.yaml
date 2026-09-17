@@ -513,7 +513,9 @@ scenario:
         # differs. The default fires every 30 s, so an engine is marked Ready
         # up to 30 s after it is -- 29 s on a measured decode pod -- and on the
         # autoscaler's first ramp that is 29 s more queue charged to the fleet.
-        # 0/5/360 keeps the 30-minute budget and finds the engine within 5 s.
+        # 1/5/360 keeps the 30-minute budget and finds the engine within 5 s
+        # (1, not 0: the API drops a zero and the harness's validator then
+        # reads None where it expects the scenario's value).
         # (patch_harness.sh fix 10 sets the same default for scenarios that do
         # not spell this out.)
         # -----------------------------------------------------------------------
@@ -521,7 +523,7 @@ scenario:
           startup:
             path: /health
             failureThreshold: 360
-            initialDelaySeconds: 0
+            initialDelaySeconds: 1
             periodSeconds: 5
             timeoutSeconds: 5
           liveness:
@@ -727,7 +729,9 @@ scenario:
         # differs. The default fires every 30 s, so an engine is marked Ready
         # up to 30 s after it is -- 29 s on a measured decode pod -- and on the
         # autoscaler's first ramp that is 29 s more queue charged to the fleet.
-        # 0/5/360 keeps the 30-minute budget and finds the engine within 5 s.
+        # 1/5/360 keeps the 30-minute budget and finds the engine within 5 s
+        # (1, not 0: the API drops a zero and the harness's validator then
+        # reads None where it expects the scenario's value).
         # (patch_harness.sh fix 10 sets the same default for scenarios that do
         # not spell this out.)
         # -----------------------------------------------------------------------
@@ -735,7 +739,7 @@ scenario:
           startup:
             path: /health
             failureThreshold: 360
-            initialDelaySeconds: 0
+            initialDelaySeconds: 1
             periodSeconds: 5
             timeoutSeconds: 5
           liveness:

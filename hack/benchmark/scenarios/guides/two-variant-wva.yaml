@@ -296,11 +296,12 @@ shared:
     probes:
       startup:
         path: /v1/models
-        # 0/5/360, not 15/30/60: a 30 s period reports an engine Ready up to
+        # 1/5/360, not 15/30/60 (1 not 0: the API drops a zero and the
+        # harness's validator then reads None where it expects the value): a 30 s period reports an engine Ready up to
         # 30 s after it is, and the autoscaler's first ramp charges every one
         # of those seconds as queue. Same 30-minute budget.
         failureThreshold: 360
-        initialDelaySeconds: 0
+        initialDelaySeconds: 1
         periodSeconds: 5
         timeoutSeconds: 5
       liveness:

@@ -694,8 +694,11 @@ PYEOF
 # complete" at 21:29:10 and was marked Ready at 21:29:39. On the autoscaler's
 # first ramp those 29 s are 29 s more queue charged to the fleet.
 #
-# 0 / 5 / 360 keeps the same 30-minute budget (was 30 + 60 x 30 = 1830 s, now
-# 360 x 5 = 1800 s) and finds the engine within 5 s of its first 200. The
+# 1 / 5 / 360 keeps the same 30-minute budget (was 30 + 60 x 30 = 1830 s, now
+# 1 + 360 x 5 = 1801 s) and finds the engine within 5 s of its first 200 -- 1
+# rather than 0 because the API server drops a zero from the rendered probe
+# and the harness's own config validator then reads None where it expects
+# the scenario's value, failing the standup's smoketest. The
 # first probes fail on connection refused while the API server binds; that is
 # what failureThreshold is for. Scenarios that spell out their own probes
 # (two-variant-wva, workload-autoscaling) carry the same numbers.
@@ -719,14 +722,21 @@ OLD = '''  probe_startup: &probe_startup
 '''
 NEW = '''  probe_startup: &probe_startup
     path: /health
-    # wva-patch: 0/5/360 finds a started engine within 5 s; same 30-min budget.
+    # wva-patch: 1/5/360 finds a started engine within 5 s; same 30-min budget.
     failureThreshold: 360
-    initialDelaySeconds: 0
+    initialDelaySeconds: 1
     periodSeconds: 5
     timeoutSeconds: 5
 '''
 if NEW in src:
     print("  fix 10 (startup probe period): already applied")
+    sys.exit(0)
+# An earlier form of this fix used initialDelaySeconds 0; move it on.
+EARLIER = NEW.replace("1/5/360", "0/5/360").replace("initialDelaySeconds: 1", "initialDelaySeconds: 0")
+if src.count(EARLIER) == 1:
+    src = src.replace(EARLIER, NEW, 1)
+    io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+    print("  fix 10 (startup probe period): initialDelaySeconds 0 -> 1")
     sys.exit(0)
 if src.count(OLD) != 1:
     sys.exit("anchor missing or ambiguous (upstream shape changed): probe_startup: &probe_startup")

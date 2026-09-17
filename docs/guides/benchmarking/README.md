@@ -286,8 +286,10 @@ patched in the clone; it is the scenario's `initContainers[preprocess].command`.
 
 **The startup probe.** The harness default is `initialDelaySeconds 30 /
 periodSeconds 30 / failureThreshold 60`. `patch_harness.sh` fix 10 changes the
-default to `0 / 5 / 360` (the same 30-minute budget), and the scenarios that
-spell out their own `probes:` block carry the same numbers.
+default to `1 / 5 / 360` (the same 30-minute budget; 1 rather than 0 because
+the API server drops a zero and the harness's config validator then fails the
+standup on `None`), and the scenarios that spell out their own `probes:` block
+carry the same numbers.
 
 **Engine caches.** The chart mounts the model PVC read-only at `/model-cache`,
 and a second mount of the same claim inherits that (the CSI driver publishes a
