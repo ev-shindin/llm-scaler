@@ -1,10 +1,11 @@
 # Preparing a workload to be scaled
 
 Three things decide whether a scale-up actually helps: whether a new replica can
-get its weights quickly, whether an old one can leave without dropping requests,
-and whether the Deployment says enough about itself for WVA to act on. None are
-WVA settings -- they are properties of the model server, and `make
-workload-patch` writes them.
+get to Ready quickly -- its weights, and everything else on the way -- whether
+an old one can leave without dropping requests, and whether the Deployment says
+enough about itself for WVA to act on. None are WVA settings -- they are
+properties of the model server. `make workload-patch` writes the first two;
+the rest of the start path is a checklist, below.
 
 > Part of the [WVA deployment guide](../../deploy/). For what to watch once it is
 > running, see [Watching what WVA decides](monitoring.md).
@@ -59,6 +60,34 @@ to see which of a namespace's models could share one.
 (An earlier revision of this section gave ~430 MB/s as the PVC's bandwidth. That
 was an end-to-end weight-load rate, not storage throughput; the conclusion above
 is unchanged, but the reason it gave was wrong.)
+
+## The rest of the start path
+
+Why start time is an autoscaling concern and not only an operations one: the
+running replicas serve alone until the new one is Ready, the queue they build
+in that time is charged to the fleet as demand, and the ramp is sized by it. A
+replica that takes twice as long to start does not cost one more replica; it
+costs however many the doubled queue implies, and they arrive after the queue
+is gone. So before tuning the scaler, take the seconds out of the start. These
+are properties of the pod template -- a Deployment's or a LeaderWorkerSet's --
+and hold with or without a benchmark harness in front of the workload:
+
+| on the way to Ready | what to check |
+|---|---|
+| **Nothing installed at container start.** | The container's command runs the engine and nothing else: no `apt`, `pip`, `curl` or clone before it. Anything the engine needs is in the image. A start that depends on a package mirror is as slow as the mirror that day, which is the one term that makes start time *vary* between otherwise identical replicas. |
+| **`startupProbe` period.** | `periodSeconds` of a few seconds; a probe that fires every 30 s reports a started engine up to 30 s late, every time. Keep the time budget by raising `failureThreshold` (period 5 with threshold 360 is the same 30 minutes as period 30 with threshold 60). The first probes fail on connection refused while the server binds; that is what the threshold is for. |
+| **Engine caches that outlive the pod.** | vLLM writes its torch.compile artefacts, the FlashInfer autotune table and Triton's JIT cache under `/tmp` unless told otherwise, so every replica recompiles from nothing. Point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` at a read-write path shared across replicas -- a subPath of an RWX claim -- and the second replica finds the first one's. If the model claim is mounted read-only, use another claim rather than mounting it a second time: a CSI driver publishes a claim once per pod, and the second mount inherits read-only. And make the engine tolerate a cache path that turns out not to be writable -- a storage hiccup must cost one compile, not the replica; vLLM fails hard on a read-only cache directory unless the variable is unset first. The cache is keyed by a hash of the engine config, so a changed model, flag or version misses rather than hits stale. |
+| **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts. Pre-pull on every node the workload can schedule to, or keep that set of nodes small and warm. |
+| **The weights** | are the section above. |
+
+What is left after those is the cold process itself -- imports, the API
+server, the KV-transfer connector, the profile run -- and the weight load on a
+large model. Below that floor the only lever is not starting cold: the
+[warm pool](../guides/warm-pool/), or a minimum replica count of two.
+
+The benchmark harness this repository uses puts its own steps on the engine's
+start path; what they are and how the benchmark scenarios handle them is in
+[Benchmark WVA](../guides/benchmarking/README.md#replica-start-time-in-the-harness).
 
 ## Draining before scale-down
 

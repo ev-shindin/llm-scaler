@@ -261,6 +261,64 @@ release: released images reject `--external-scaler-bind-address`, which these
 manifests pass, so a run against one measures a CrashLoopBackOff. Set `IMG` to
 your own build whenever you have changed controller code.
 
+## Replica start time in the harness
+
+Every ramp a benchmark records is sized by how long a new replica takes to
+become Ready ([why](../../reference/workload-preparation.md#the-rest-of-the-start-path)).
+llm-d-benchmark adds steps of its own to that path, and a benchmark that keeps
+them measures the harness, not the autoscaler. The scenarios under
+`hack/benchmark/scenarios/guides/` handle three of them; a scenario of your own
+should copy the same three blocks.
+
+**Package installs at engine start.** The `preprocess` init container
+(`set_llmdbench_environment.py`, from the harness image) writes
+`/shared-config/llmdbench_env.sh`, which every engine container sources before
+`vllm serve`, and it opens with two `apt-get update && apt install` runs:
+`iproute2`, for the `ip route`/`ip rule` lines the script emits on a multi-NIC
+RDMA node, and `infiniband-diags`, which nothing on the serving path calls. On
+a single-NIC node the script has no `ip` commands and both installs are dead
+weight -- and mirror speed is why the same standup starts replicas in
+different times on different days. The scenarios wrap the init container's
+command so it post-processes the script it just wrote: the `infiniband-diags`
+block always goes, the `iproute2` block goes unless an `ip route`/`ip rule`
+line is present. The generator itself runs from the image, so this cannot be
+patched in the clone; it is the scenario's `initContainers[preprocess].command`.
+
+**The startup probe.** The harness default is `initialDelaySeconds 30 /
+periodSeconds 30 / failureThreshold 60`. `patch_harness.sh` fix 10 changes the
+default to `0 / 5 / 360` (the same 30-minute budget), and the scenarios that
+spell out their own `probes:` block carry the same numbers.
+
+**Engine caches.** The chart mounts the model PVC read-only at `/model-cache`,
+and a second mount of the same claim inherits that (the CSI driver publishes a
+claim once per pod), so the scenarios mount the harness's own `workload-pvc`
+-- RWX, read-write, created at standup for the results -- at `/engine-cache`
+(an `additionalVolumes` entry of type `persistentVolumeClaim` with a
+`subPath`), and point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and
+`TRITON_CACHE_DIR` at it through `extraEnvVars`. The preprocess command also
+appends a guard to the generated script: each of those directories is tested
+for writability where the engine runs, and one that is not writable is unset
+so the engine falls back to its default and pays a compile rather than
+failing -- vLLM dies on `os.makedirs` otherwise, and a CSI publish that is
+retried after a failure has come back read-only on one node of a cluster
+while read-write everywhere else. (Two things to know if you edit that
+command: Kubernetes rewrites `$$` to `$` and expands `$(NAME)` in a
+container's `command`/`args`, so neither may appear in it; and the generator
+leaves its script without a trailing newline.)
+
+After a standup, check what was rendered rather than trusting the scenario:
+
+```bash
+D=$(kubectl get pods -n $BENCHMARK_NAMESPACE -l llm-d.ai/role=decode -o jsonpath='{.items[0].metadata.name}')
+# probe timing and cache paths on the engine container
+kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{range .spec.containers[?(@.name=="vllm")]}startup {.startupProbe.periodSeconds}s x{.startupProbe.failureThreshold}{"\n"}{range .env[*]}{.name}={.value}{"\n"}{end}{end}' | grep -E 'startup|CACHE|FLASHINFER|TRITON'
+# 0 on a single-NIC node; 1 (iproute2) where the script carries routing lines
+kubectl exec -n $BENCHMARK_NAMESPACE $D -c vllm -- grep -c apt-get /shared-config/llmdbench_env.sh
+# the second replica should report a compile-cache hit, not a compile; a
+# "not writable" line here means the guard fell back to the engine default
+kubectl logs -n $BENCHMARK_NAMESPACE $D -c vllm | grep -E 'torch.compile took|Using cache directory|not writable'
+```
+
 ## Snapshotting a run
 
 A run's charts live in Prometheus, which ages them out. Capture them while they

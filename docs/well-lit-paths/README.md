@@ -23,6 +23,14 @@ Everything here assumes WVA is installed and a workload is registered. If it is
 not, start at [Install WVA in a namespace](../guides/install-in-namespace/) —
 the paths pick up after it.
 
+Everything here also assumes a replica starts as fast as it can. Every ramp on
+every path is sized by the queue the running replicas build while the new one
+starts, so seconds lost on the way to Ready come back as over-ordered replicas.
+The checklist is in
+[Preparing a workload](../reference/workload-preparation.md#the-rest-of-the-start-path);
+read it before the path you take. Paths that are benchmarked also point at what
+the harness adds to that path.
+
 ## How these differ from the guides
 
 A **guide** ([guides/](../guides/)) is the steps: run these commands, in this

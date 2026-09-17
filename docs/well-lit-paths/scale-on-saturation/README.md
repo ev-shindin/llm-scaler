@@ -68,7 +68,7 @@ the Prometheus queries it makes each cycle — one set per namespace, not per po
   `saturation_analyzer_path_test.go`, `saturation_config_test.go`,
   `external_scaler_keda_test.go`, `smoke_keda_test.go`.
 - Benchmark scenario: `hack/benchmark/scenarios/guides/workload-autoscaling.yaml`,
-  driven by [Benchmark WVA](../../guides/benchmarking/).
+  driven by [Benchmark WVA](../../guides/benchmarking/); the harness's own start-path settings are in [Replica start time in the harness](../../guides/benchmarking/README.md#replica-start-time-in-the-harness).
 - The recorded numbers in
   [benchmark-results.md](../../developer-guide/benchmark-results.md) were
   measured on WVA v0.6.0's earlier saturation engine. They are a historical
