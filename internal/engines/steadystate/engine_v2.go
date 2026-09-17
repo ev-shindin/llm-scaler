@@ -242,6 +242,7 @@ func (e *Engine) recordAnalyzerMetrics(namespace, modelID string, results []allo
 		}
 		for _, vc := range nr.Result.VariantCapacities {
 			e.metricsEmitter.RecordAnalyzerTarget(nr.Name, namespace, modelID, vc.VariantName, vc.PerReplicaCapacity)
+			e.metricsEmitter.RecordAnalyzerObservedReplicas(nr.Name, namespace, modelID, vc.VariantName, vc.ObservedReplicas)
 			current.target[analyzerTargetSeries{analyzer: nr.Name, variant: vc.VariantName}] = struct{}{}
 		}
 	}
@@ -249,6 +250,18 @@ func (e *Engine) recordAnalyzerMetrics(namespace, modelID string, results []allo
 	// Evict after emitting, never before, so a series that survives the cycle is
 	// never briefly absent from a concurrent scrape.
 	e.evictStaleAnalyzerSeries(namespace, modelID, current)
+}
+
+// zeroObservedReplicas sets wva_analyzer_observed_replicas to 0 for every
+// (analyzer, variant) this model published last cycle. Called on the cycle
+// that skips analysis because the model had no replica rows at all: the
+// series is kept -- a blip must not make it flap, and its siblings are kept
+// too -- but its value has to be what was observed, which is nothing.
+func (e *Engine) zeroObservedReplicas(namespace, modelID string) {
+	modelKey := utils.GetNamespacedKey(namespace, modelID)
+	for prev := range e.lastAnalyzerSeries[modelKey].target {
+		e.metricsEmitter.RecordAnalyzerObservedReplicas(prev.analyzer, namespace, modelID, prev.variant, 0)
+	}
 }
 
 // evictStaleAnalyzerSeries deletes the analyzer series this model published on
@@ -266,6 +279,7 @@ func (e *Engine) evictStaleAnalyzerSeries(namespace, modelID string, current ana
 	for prev := range e.lastAnalyzerSeries[modelKey].target {
 		if _, still := current.target[prev]; !still {
 			e.metricsEmitter.DeleteAnalyzerTarget(prev.analyzer, namespace, modelID, prev.variant)
+			e.metricsEmitter.DeleteAnalyzerObservedReplicas(prev.analyzer, namespace, modelID, prev.variant)
 		}
 	}
 	e.lastAnalyzerSeries[modelKey] = current
@@ -954,6 +968,11 @@ func buildCapacities(ctx context.Context, nr *allocation.NamedAnalyzerResult, me
 // so the symmetric fix — a departing counterpart to PendingReplicas — would mean
 // listing pods, which is the cluster-wide watch this design removed. Clamping to
 // a count the scale target already publishes is what makes this cheap.
+//
+// ObservedReplicas is deliberately NOT derived here from the pre-clamp
+// ReplicaCount: when a variant had no rows this cycle the analyzer fills
+// ReplicaCount from scale-target status, which would make "saw the whole
+// fleet" and "saw nothing" read the same. The analyzer sets it from its rows.
 func clampReplicaCountToScaleTarget(vc *domain.VariantCapacity, m domain.VariantMetadata) {
 	if m.CurrentReplicas > 0 {
 		vc.ReplicaCount = min(vc.ReplicaCount, m.CurrentReplicas)
@@ -1066,6 +1085,12 @@ func logAnalyzerResult(ctx context.Context, modelID, namespace string, nr alloca
 		// rather than being absent.
 		Role   string `json:"role"`
 		Reason string `json:"reason,omitempty"`
+		// Observed is how many replicas reported rows this cycle, before the
+		// scale-target clamp. It differs from the target's ready count exactly
+		// when something unowned is serving or a Pod's metrics were missing, so
+		// a cycle that saw only part of the fleet is visible in this line rather
+		// than inferred from demand afterwards.
+		Observed int `json:"observed"`
 	}
 	variants := make([]variantEntry, 0, len(nr.Result.VariantCapacities))
 	for _, vc := range nr.Result.VariantCapacities {
@@ -1074,10 +1099,11 @@ func logAnalyzerResult(ctx context.Context, modelID, namespace string, nr alloca
 			role = domain.RoleBoth
 		}
 		variants = append(variants, variantEntry{
-			Name:   vc.VariantName,
-			PRC:    vc.PerReplicaCapacity,
-			Role:   role,
-			Reason: vc.Reason,
+			Name:     vc.VariantName,
+			PRC:      vc.PerReplicaCapacity,
+			Role:     role,
+			Reason:   vc.Reason,
+			Observed: vc.ObservedReplicas,
 		})
 	}
 

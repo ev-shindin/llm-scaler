@@ -399,6 +399,7 @@ func (a *ThroughputAnalyzer) Analyze(
 			VariantName:        variantName,
 			Role:               state.role,
 			ReplicaCount:       nKV,
+			ObservedReplicas:   nKV,
 			PendingReplicas:    pending,
 			PerReplicaCapacity: perReplicaSupply,
 			TotalDemand:        demand,

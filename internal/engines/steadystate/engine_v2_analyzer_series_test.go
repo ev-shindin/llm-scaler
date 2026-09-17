@@ -290,3 +290,54 @@ func TestRecordAnalyzerMetrics_RepublishesAfterEvictAll(t *testing.T) {
 	assert.ElementsMatch(t, []string{"v1"},
 		seriesLabels(t, registry, constants.WVAAnalyzerTarget, constants.LabelVariantName))
 }
+
+// gaugeValues returns, for the named metric family, each series' value keyed
+// by the given label.
+func gaugeValues(t *testing.T, registry *prometheus.Registry, metricName, labelName string) map[string]float64 {
+	t.Helper()
+	mfs, err := registry.Gather()
+	require.NoError(t, err)
+	out := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() != metricName {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == labelName {
+					out[l.GetValue()] = m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return out
+}
+
+// The observed-replicas series is the one analyzer series whose VALUE has to
+// change on a cycle that skips analysis: nothing was observed, and a stale
+// count would read as a fully scraped fleet in exactly the case the series
+// exists to expose. The series itself is kept, like its siblings.
+func TestZeroObservedReplicas_ZeroesWhatTheModelPublished(t *testing.T) {
+	e, registry := analyzerSeriesEngine(t)
+
+	nr := namedResult("saturation", nil, 5, "v1", "v2")
+	nr.Result.VariantCapacities[0].ObservedReplicas = 3
+	nr.Result.VariantCapacities[1].ObservedReplicas = 2
+	e.recordAnalyzerMetrics("ns", "m", []allocation.NamedAnalyzerResult{nr})
+	require.Equal(t, map[string]float64{"v1": 3, "v2": 2},
+		gaugeValues(t, registry, constants.WVAAnalyzerObservedReplicas, constants.LabelVariantName))
+
+	e.zeroObservedReplicas("ns", "m")
+
+	assert.Equal(t, map[string]float64{"v1": 0, "v2": 0},
+		gaugeValues(t, registry, constants.WVAAnalyzerObservedReplicas, constants.LabelVariantName),
+		"a skipped cycle must read as nothing observed, with the series kept")
+	assert.ElementsMatch(t, []string{"v1", "v2"},
+		seriesLabels(t, registry, constants.WVAAnalyzerTarget, constants.LabelVariantName),
+		"the sibling series are untouched")
+}
+
+func TestZeroObservedReplicas_UnknownModelIsNoOp(t *testing.T) {
+	e, _ := analyzerSeriesEngine(t)
+	e.zeroObservedReplicas("ns", "never-published")
+}

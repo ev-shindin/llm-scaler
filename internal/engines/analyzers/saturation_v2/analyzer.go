@@ -738,6 +738,11 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 		// as SumTotalAnticipatedSupply adds the two.
 		replicaCount := readyCount
 		pendingCount := vs.PendingReplicas
+		// What this cycle's rows attributed to the variant, own replicas only,
+		// and 0 when none reported. Never readyCount: that is scale-target
+		// status, and the point of this number is to be the thing status is
+		// not -- see domain.VariantCapacity.ObservedReplicas.
+		observedReplicas := 0
 
 		var capacityLabel string
 		if len(replicas) > 0 {
@@ -807,6 +812,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 			// Prefer the live count over readyCount: it is what actually reported
 			// capacity this cycle, where readyCount is (lagging) scale-target status.
 			replicaCount = ownReplicas
+			observedReplicas = ownReplicas
 			// And keep the ARRIVING count in step with it. Pending is everything
 			// the scale target owns that did not report this cycle -- not just
 			// the pods the target itself calls not-ready. A replica that turned
@@ -868,6 +874,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 			VariantName:      vs.VariantName,
 			Role:             vs.Role,
 			ReplicaCount:     replicaCount,
+			ObservedReplicas: observedReplicas,
 			PendingReplicas:  pendingCount,
 			WarmPoolReplicas: warmPoolReplicas,
 			// Both readings are MEASURED, so both are the analyzer's to emit, and

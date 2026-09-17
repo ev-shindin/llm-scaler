@@ -127,14 +127,22 @@ wait || true
 // Returns an error so callers can Skip() rather than Fail() when the restart is
 // impractical (no RBAC, restricted environment). Uses a bounded wait.
 func restartWVAController(ctx context.Context) error {
-	patch := []byte(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"` +
-		time.Now().UTC().Format(time.RFC3339) + `"}}}}}`)
+	// The stamp is what identifies the post-restart pod below: it lands on the
+	// pod's own annotations through the template, so the pod that carries it is
+	// the one this restart created and no other.
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	patch := []byte(`{"spec":{"template":{"metadata":{"annotations":{"` + restartedAtAnnotation + `":"` +
+		stamp + `"}}}}}`)
 	if _, err := k8sClient.AppsV1().Deployments(cfg.WVANamespace).Patch(
 		ctx, "wva-controller-manager",
 		types.StrategicMergePatchType, patch, metav1.PatchOptions{},
 	); err != nil {
 		return fmt.Errorf("patch wva-controller-manager: %w", err)
 	}
+	// One budget for the rollout and the lease wait together. The lease wait
+	// alone has been measured at 64 s (an old pod that died without releasing,
+	// so the lease had to expire), so PodReadyTimeout needs to be comfortably
+	// above that; the default 300 s is.
 	deadline := time.Now().Add(time.Duration(cfg.PodReadyTimeout) * time.Second)
 	poll := time.Duration(cfg.PollIntervalSec) * time.Second
 	rolledOut := false
@@ -142,6 +150,14 @@ func restartWVAController(ctx context.Context) error {
 		dep, err := k8sClient.AppsV1().Deployments(cfg.WVANamespace).Get(ctx, "wva-controller-manager", metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("get wva-controller-manager: %w", err)
+		}
+		// Status lags the patch: until the controller has observed the new
+		// generation, the counts describe the previous rollout and read as
+		// complete. Without this the loop exits at once and a rollout that never
+		// starts is reported by the lease wait below as an election problem.
+		if dep.Status.ObservedGeneration < dep.Generation {
+			time.Sleep(poll)
+			continue
 		}
 		if dep.Status.UpdatedReplicas >= 1 &&
 			dep.Status.ReadyReplicas == dep.Status.UpdatedReplicas &&
@@ -154,8 +170,12 @@ func restartWVAController(ctx context.Context) error {
 	if !rolledOut {
 		return fmt.Errorf("wva-controller-manager rollout did not complete within %ds", cfg.PodReadyTimeout)
 	}
-	return waitForWVALeadership(ctx, deadline, poll)
+	return waitForWVALeadership(ctx, stamp, deadline, poll)
 }
+
+// restartedAtAnnotation is the pod-template annotation kubectl rollout restart
+// bumps; restartWVAController writes it by hand with the same key.
+const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
 
 // waitForWVALeadership blocks until a running controller-manager pod holds the
 // leader lease.
@@ -169,7 +189,26 @@ func restartWVAController(ctx context.Context) error {
 // made the scale-from-zero specs flaky — the engine logged "Inferencepool
 // datastore is empty" and the workload was woken (or not) by something else
 // entirely.
-func waitForWVALeadership(ctx context.Context, deadline time.Time, poll time.Duration) error {
+//
+// The holder has to be THE POD THIS RESTART CREATED, not merely a pod that
+// exists. A rolling update surges the new pod in before the old one is deleted,
+// and the old one keeps the lease until its shutdown finishes -- through the
+// moment the rollout reports complete, since a Terminating pod is dropped from
+// the Deployment's counts but is still there to Get. Accepting it returned this
+// wait while the new pod was Ready, in the Service, and not yet listening on
+// the scaler port. A ScaledObject created in that gap gets an HPA with an
+// empty metrics list -- Kubernetes defaults it to Resource/cpu, and KEDA only
+// re-derives the HPA's metrics on a ScaledObject change, so nothing ever
+// replaces it: measured as a 600 s spec timeout with WVA publishing desired=2
+// every cycle and the HPA parked on FailedGetResourceMetric.
+//
+// Measured on kind, sampling the lease once a second across a restart: the
+// rollout reported complete at 3 s with the Terminating pod still the holder,
+// which is where the old check returned; the new pod acquired the lease at
+// 18 s in one run and at 64 s in another, where the old pod died without
+// releasing and the lease had to expire. The stamp written at restart is the
+// only thing that names the new pod without a clock.
+func waitForWVALeadership(ctx context.Context, stamp string, deadline time.Time, poll time.Duration) error {
 	// The LEADER_ELECTION_ID default (internal/config/loader.go), which the e2e
 	// deployment does not override. A deployment that does override it has no
 	// lease under this name, and the NotFound branch below degrades to not
@@ -192,7 +231,8 @@ func waitForWVALeadership(ctx context.Context, deadline time.Time, poll time.Dur
 			// terminated one still nominally holding the lease.
 			podName, _, found := strings.Cut(lastHolder, "_")
 			if found {
-				if _, err := k8sClient.CoreV1().Pods(cfg.WVANamespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
+				pod, err := k8sClient.CoreV1().Pods(cfg.WVANamespace).Get(ctx, podName, metav1.GetOptions{})
+				if err == nil && pod.DeletionTimestamp == nil && pod.Annotations[restartedAtAnnotation] == stamp {
 					return nil
 				}
 			}
@@ -483,6 +523,18 @@ var _ = Describe("Multi-analyzer engine scale-up (saturation-driven, throughput 
 		// desired count is no longer surfaced in VA status; the annotated scaler consumes
 		// wva_desired_replicas and drives the target Deployment above its MinReplicas floor,
 		// so we assert the observable Deployment replica count instead.
+		By("Confirming KEDA has wired its external metric onto the HPA")
+		// Before the assertion below, not as part of it: a Deployment that never
+		// grows reads the same whether WVA recommended nothing or KEDA never wired
+		// the metric that carries the recommendation. This spec restarts WVA and
+		// registers the ScaledObject seconds later, which is exactly the shape
+		// that once left the HPA on the CPU default for the whole timeout (see
+		// waitForWVALeadership). Measured at 20-35 s on kind; 120 s is generous.
+		Eventually(func(g Gomega) {
+			expectKEDAExternalMetricWired(g, cfg.LLMDNamespace, modelDecodeDeployment)
+		}, 120*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
+			Should(Succeed())
+
 		By("Asserting KEDA actuates scale-up above MinReplicas")
 		// Faked kv-cache-usage=0.9 > scaleUpThreshold=0.85 deterministically drives a
 		// V2 saturation scale-up; KEDA consumes wva_desired_replicas and drives the
