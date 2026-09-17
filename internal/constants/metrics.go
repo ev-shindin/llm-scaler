@@ -251,6 +251,19 @@ const (
 	// WVAAnalyzerTarget is a gauge exposing each analyzer's per-replica target P
 	// (per variant). Labels: analyzer_name, namespace, model_name, variant_name.
 	WVAAnalyzerTarget = "wva_analyzer_target"
+	// WVAAnalyzerObservedReplicas is a gauge exposing how many replicas an
+	// analyzer actually attributed to a variant in its last cycle, BEFORE the
+	// scale-target clamp. Labels: analyzer_name, namespace, model_name,
+	// variant_name.
+	//
+	// It answers "did the analyzer see the whole fleet this cycle", which no
+	// other series can: demand is the greater of occupancy and the arrival
+	// floor and so is not proportional to replicas, and the ReplicaCount behind
+	// supply is capped at the scale target, which is exactly the number a
+	// conceded or otherwise unowned replica exceeds. Reading this beside
+	// wva_current_replicas separates "a pod is missing from the cycle" from
+	// "the fleet really is that size".
+	WVAAnalyzerObservedReplicas = "wva_analyzer_observed_replicas"
 	// WVAConfigInfo is an info-style gauge that exposes WVA configuration as labels.
 	// Labels: analyzer_name, limiter_enabled, scale_to_zero_enabled
 	WVAConfigInfo = "wva_config_info"

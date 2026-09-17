@@ -85,8 +85,9 @@ var (
 
 	// Per-analyzer (demand, target) signals — the common D/P contract exposed so
 	// KEDA/HPA and dashboards can consume every analyzer's reasoning.
-	analyzerDemand *prometheus.GaugeVec
-	analyzerTarget *prometheus.GaugeVec
+	analyzerDemand           *prometheus.GaugeVec
+	analyzerTarget           *prometheus.GaugeVec
+	analyzerObservedReplicas *prometheus.GaugeVec
 
 	// controllerInstance stores the optional controller instance identifier.
 	// When set, it's added as a label to all emitted metrics.
@@ -252,6 +253,13 @@ func InitMetrics(registry prometheus.Registerer) error {
 			Help: "Per-analyzer demand D (the total measured signal) for a model instance, in the analyzer's own unit. Role is empty for non-disaggregated models. Paired with wva_analyzer_target as the D/P contract every analyzer exposes.",
 		},
 		analyzerDemandLabels,
+	)
+	analyzerObservedReplicas = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVAAnalyzerObservedReplicas,
+			Help: "Replicas an analyzer attributed to a variant in its last cycle, before the scale-target clamp. Compare with wva_current_replicas: equal means the analyzer saw the whole fleet, lower means a pod was missing from the cycle, higher means replicas are serving that the scale target does not own.",
+		},
+		analyzerTargetLabels,
 	)
 	analyzerTarget = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -673,6 +681,9 @@ func InitMetrics(registry prometheus.Registerer) error {
 	}
 	if err := registry.Register(analyzerDemand); err != nil {
 		return fmt.Errorf("failed to register analyzerDemand metric: %w", err)
+	}
+	if err := registry.Register(analyzerObservedReplicas); err != nil {
+		return fmt.Errorf("failed to register analyzerObservedReplicas metric: %w", err)
 	}
 	if err := registry.Register(analyzerTarget); err != nil {
 		return fmt.Errorf("failed to register analyzerTarget metric: %w", err)
@@ -1411,6 +1422,26 @@ func (m *MetricsEmitter) DeleteAnalyzerDemand(analyzer, namespace, modelID, role
 	analyzerDemand.Delete(analyzerDemandLabelsFor(analyzer, namespace, modelID, role))
 }
 
+// RecordAnalyzerObservedReplicas publishes how many replicas the analyzer
+// attributed to a variant this cycle, before the scale-target clamp. Nil-guarded
+// like RecordAnalyzerTarget.
+func (m *MetricsEmitter) RecordAnalyzerObservedReplicas(analyzer, namespace, modelID, variantName string, observed int) {
+	if analyzerObservedReplicas == nil {
+		return
+	}
+	analyzerObservedReplicas.With(analyzerTargetLabelsFor(analyzer, namespace, modelID, variantName)).Set(float64(observed))
+}
+
+// DeleteAnalyzerObservedReplicas removes one wva_analyzer_observed_replicas
+// series. Shares analyzerTarget's label shape and its eviction bookkeeping, so
+// the two are always added and removed together.
+func (m *MetricsEmitter) DeleteAnalyzerObservedReplicas(analyzer, namespace, modelID, variantName string) {
+	if analyzerObservedReplicas == nil {
+		return
+	}
+	analyzerObservedReplicas.Delete(analyzerTargetLabelsFor(analyzer, namespace, modelID, variantName))
+}
+
 // DeleteAnalyzerTarget removes one wva_analyzer_target series.
 func (m *MetricsEmitter) DeleteAnalyzerTarget(analyzer, namespace, modelID, variantName string) {
 	if analyzerTarget == nil {
@@ -1433,6 +1464,9 @@ func (m *MetricsEmitter) DeleteAnalyzerSeriesForModel(namespace, modelID string)
 	}
 	if analyzerTarget != nil {
 		analyzerTarget.DeletePartialMatch(match)
+	}
+	if analyzerObservedReplicas != nil {
+		analyzerObservedReplicas.DeletePartialMatch(match)
 	}
 }
 

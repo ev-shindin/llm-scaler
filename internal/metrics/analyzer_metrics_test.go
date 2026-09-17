@@ -311,3 +311,65 @@ func TestDeleteAnalyzerSeriesForModel_WithControllerInstance(t *testing.T) {
 		t.Error("the surviving model's series was wrongly removed")
 	}
 }
+
+// TestRecordAnalyzerObservedReplicas covers the case the series exists for: an
+// analyzer that attributed MORE replicas than the scale target owns. The gauge
+// has to carry the pre-clamp number, because that difference is what tells a
+// half-scraped cycle apart from a fleet with something extra serving in it.
+func TestRecordAnalyzerObservedReplicas(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	if err := InitMetrics(registry); err != nil {
+		t.Fatalf("InitMetrics failed: %v", err)
+	}
+	emitter := NewMetricsEmitter()
+
+	emitter.RecordAnalyzerObservedReplicas("saturation", "ns", "m", "v1", 3)
+
+	if got := countSeries(t, registry, constants.WVAAnalyzerObservedReplicas); got != 1 {
+		t.Fatalf("%d observed-replica series, want 1", got)
+	}
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != constants.WVAAnalyzerObservedReplicas {
+			continue
+		}
+		// gaugeValue is the shared helper in metrics_test.go.
+		v, ok := gaugeValue(mf, map[string]string{constants.LabelVariantName: "v1"})
+		if !ok {
+			t.Fatal("no observed-replica series for variant v1")
+		}
+		if v != 3 {
+			t.Errorf("observed replicas = %v, want 3", v)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("metric %s not found", constants.WVAAnalyzerObservedReplicas)
+	}
+}
+
+func TestDeleteAnalyzerObservedReplicasRemovesOnlyThatSeries(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	if err := InitMetrics(registry); err != nil {
+		t.Fatalf("InitMetrics failed: %v", err)
+	}
+	emitter := NewMetricsEmitter()
+
+	emitter.RecordAnalyzerObservedReplicas("saturation", "ns", "m", "v1", 3)
+	emitter.RecordAnalyzerObservedReplicas("saturation", "ns", "m", "v2", 2)
+	emitter.DeleteAnalyzerObservedReplicas("saturation", "ns", "m", "v1")
+
+	if got := countSeries(t, registry, constants.WVAAnalyzerObservedReplicas); got != 1 {
+		t.Errorf("after delete: %d series, want 1", got)
+	}
+	if hasSeries(t, registry, constants.WVAAnalyzerObservedReplicas, constants.LabelVariantName, "v1") {
+		t.Error("v1 series still present after delete")
+	}
+	if !hasSeries(t, registry, constants.WVAAnalyzerObservedReplicas, constants.LabelVariantName, "v2") {
+		t.Error("v2 series was wrongly removed")
+	}
+}

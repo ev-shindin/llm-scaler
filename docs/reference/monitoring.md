@@ -234,7 +234,13 @@ like "WVA is fine" everywhere else:
 **Is the decision itself sane?** — `wva_desired_replicas` vs `wva_current_replicas`,
 with `wva_saturation_utilization` and `wva_analyzer_demand` / `wva_analyzer_target`
 showing what drove it. A desired that never becomes current is an actuation
-problem (KEDA, the HPA, or the workload), not a decision problem.
+problem (KEDA, the HPA, or the workload), not a decision problem. A desired
+that looks too low is worth checking against `wva_analyzer_observed_replicas`:
+it is the replica count the analyzer attributed to the variant in its last
+cycle, before the scale-target clamp, so below `wva_current_replicas` means a
+Pod was missing from the cycle (a scrape gap, and the low number is correct for
+what was seen), and above it means something the scale target does not own is
+serving the model.
 
 ```bash
 # read them straight off the controller

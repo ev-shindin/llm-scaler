@@ -160,6 +160,19 @@ type VariantCapacity struct {
 	ReplicaCount    int
 	PendingReplicas int
 
+	// ObservedReplicas is how many replicas the analyzer actually attributed to
+	// this variant, recorded BEFORE ReplicaCount is capped at the scale target.
+	//
+	// The two differ exactly when replicas are serving that the scale target
+	// does not own -- a conceded replica, a bridge, a pod the ReplicaSet has not
+	// adopted -- and that difference is otherwise unrecoverable downstream,
+	// because the cap only ever lowers ReplicaCount. Diagnostics only: nothing
+	// sizes capacity from this, and it is published as
+	// wva_analyzer_observed_replicas so "the analyzer saw the whole fleet" is
+	// answerable without inferring it from demand, which is not proportional to
+	// replicas.
+	ObservedReplicas int
+
 	// PerReplicaCapacity is the representative capacity per replica, in the same
 	// scale-target units as ReplicaCount — so demand / PerReplicaCapacity yields
 	// a replica target directly.
