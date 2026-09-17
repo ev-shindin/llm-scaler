@@ -84,8 +84,10 @@ SQ_MSG = "scheduler-queue-demand"
 # to, (lambda + backlog / drain) / mu replicas -- rather than by occupancy: the
 # first thing to check when a target looks higher than the fleet appears to
 # warrant, or when a queue did NOT order the replicas it used to. It carries
-# replicasImplied, backlogRequests and drainSeconds, and residentDemand next to
-# demandBeforeFloor (the difference is the residency charge the queues had).
+# replicasImplied, backlogRequests and drainSeconds, residentDemand next to
+# demandBeforeFloor (the difference is the residency charge the queues had),
+# and heldAtFleet/heldWhy: a floor built on a borrowed or single reading may
+# hold the fleet but not grow it, and says which.
 #
 # Logs from before the throughput floor carry an "arrival-demand-floor" line
 # instead (a Little's-law floor on the reported service time, retired for

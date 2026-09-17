@@ -7,6 +7,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 )
 
@@ -30,10 +31,13 @@ var _ = Describe("estimateThroughputDemand", func() {
 			VariantName: "v", Role: role, ReplicaCount: ready, PerReplicaCapacity: float64(runK1),
 		}}
 	}
+	// Readings from the variant's own bucket with enough samples to order;
+	// the specs on holding build their own.
 	replicas := func(n int) []ReplicaCapacity {
 		out := make([]ReplicaCapacity, 0, n)
 		for i := 0; i < n; i++ {
-			out = append(out, ReplicaCapacity{VariantName: "v", SaturatedThroughput: runMu})
+			out = append(out, ReplicaCapacity{VariantName: "v", SaturatedThroughput: runMu,
+				SaturatedThroughputSamples: MinThroughputSamplesToOrder})
 		}
 		return out
 	}
@@ -42,7 +46,7 @@ var _ = Describe("estimateThroughputDemand", func() {
 		// 6 / 5.4 = 1.11 replicas' worth of demand. Through the engine's
 		// RC = D / 0.85 - supply that is 1.31 replicas, so a two-replica fleet
 		// holds and a one-replica fleet is (correctly) short.
-		f := estimateThroughputDemand(runLambda, replicas(6), variants(domain.RoleDecode, 6), nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(runLambda, replicas(6), variants(domain.RoleDecode, 6), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole).To(HaveKey(domain.RoleDecode))
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/runMu*float64(runK1), 1e-6))
 		Expect(f.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", 1.111, 1e-3))
@@ -53,8 +57,8 @@ var _ = Describe("estimateThroughputDemand", func() {
 		// The property the arrival floor was supposed to have and did not:
 		// mu is a per-replica constant, so the floor is the same at one
 		// replica as at six.
-		one := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds)
-		six := estimateThroughputDemand(runLambda, replicas(6), variants(domain.RoleDecode, 6), nil, BacklogDrainSeconds)
+		one := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
+		six := estimateThroughputDemand(runLambda, replicas(6), variants(domain.RoleDecode, 6), nil, BacklogDrainSeconds, 0.85)
 		Expect(six.ByRole[domain.RoleDecode]).To(BeNumerically("~", one.ByRole[domain.RoleDecode], 1e-6))
 	})
 
@@ -64,16 +68,57 @@ var _ = Describe("estimateThroughputDemand", func() {
 		// is measured. The first version capped this at the fleet's size and
 		// the order came 50 s later, from occupancy, after the replica had
 		// tipped into preemption (file header).
-		f := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/runMu*float64(runK1), 1e-6))
 		Expect(f.ByRole[domain.RoleDecode]/0.85).To(BeNumerically(">", float64(runK1)),
 			"RC = D / scaleUp - one replica's supply is positive: the second replica is ordered")
 
 		By("and not one more as replicas arrive: the figure is the load's, not the fleet's")
-		g := estimateThroughputDemand(runLambda, replicas(2), variants(domain.RoleDecode, 2), nil, BacklogDrainSeconds)
+		g := estimateThroughputDemand(runLambda, replicas(2), variants(domain.RoleDecode, 2), nil, BacklogDrainSeconds, 0.85)
 		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", f.ByRole[domain.RoleDecode], 1e-6))
 		Expect(g.ByRole[domain.RoleDecode]/0.85).To(BeNumerically("<", 2*float64(runK1)),
 			"at two replicas RC is negative: nothing more is ordered")
+	})
+
+	It("holds but does not order on a borrowed reading", func() {
+		// A mu borrowed from a neighbouring bucket is wrong in a known
+		// direction; from a longer shape it is too low and would over-order.
+		// The shape-swap benchmark's phase 2 starts exactly so: the 4000-token
+		// shape reads the 1000-token shape's mu until it has its own. Borrowed
+		// readings hold the fleet at its size and no more.
+		borrowed := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 2.67, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true}
+		f := estimateThroughputDemand(runLambda, []ReplicaCapacity{borrowed}, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
+		Expect(f.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", runLambda/2.67, 1e-6), "the uncapped figure is reported")
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*float64(runK1), 1e-6), "capped at scaleUp x one replica")
+		Expect(f.Terms[domain.RoleDecode].Held).To(BeTrue())
+		Expect(f.Terms[domain.RoleDecode].HeldWhy).To(Equal("borrowed"))
+
+		By("ordering once one replica has a reading of its own")
+		own := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 2.67, SaturatedThroughputSamples: MinThroughputSamplesToOrder}
+		g := estimateThroughputDemand(runLambda, []ReplicaCapacity{borrowed, own}, variants(domain.RoleDecode, 2), nil, BacklogDrainSeconds, 0.85)
+		Expect(g.Terms[domain.RoleDecode].Held).To(BeFalse())
+		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/2.67*float64(runK1), 1e-6))
+	})
+
+	It("holds but does not order on a single reading", func() {
+		// The first reading at a saturation under-reads (3.67 against a true
+		// 7.13 on the run); an order on it over-provisions, and the
+		// over-provisioned fleet never saturates again to correct it.
+		one := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu / 2, SaturatedThroughputSamples: 1}}
+		f := estimateThroughputDemand(runLambda, one, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
+		Expect(f.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", 2.22, 0.01))
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*float64(runK1), 1e-6))
+		Expect(f.Terms[domain.RoleDecode].HeldWhy).To(Equal("single-sample"))
+
+		By("ordering from the second reading on")
+		two := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu / 2, SaturatedThroughputSamples: 2}}
+		g := estimateThroughputDemand(runLambda, two, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
+		Expect(g.Terms[domain.RoleDecode].Held).To(BeFalse())
+		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", 2.22*float64(runK1), 0.01*float64(runK1)))
+
+		By("with no scale-up threshold there is nothing to cap against, and the figure stands")
+		z := estimateThroughputDemand(runLambda, one, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0)
+		Expect(z.Terms[domain.RoleDecode].Held).To(BeFalse())
 	})
 
 	It("prices a backlog as arrivals to clear within the drain target", func() {
@@ -82,22 +127,22 @@ var _ = Describe("estimateThroughputDemand", func() {
 		// As throughput: 350 / 60 s = 5.8 extra req/s, (6 + 5.8) / 5.4 = 2.19
 		// replicas in all, the load included.
 		backlog := map[string]float64{domain.RoleDecode: 350}
-		f := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), backlog, 60)
+		f := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), backlog, 60, 0.85)
 		Expect(f.Terms[domain.RoleDecode].Backlog).To(Equal(350.0))
 		Expect(f.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", (runLambda+350.0/60)/runMu, 1e-6))
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", (runLambda+350.0/60)/runMu*float64(runK1), 1e-6))
 
 		By("a longer drain target asks for less")
-		g := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), backlog, 120)
+		g := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), backlog, 120, 0.85)
 		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("<", f.ByRole[domain.RoleDecode]))
 
 		By("another role's backlog is not this role's")
 		h := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1),
-			map[string]float64{domain.RolePrefill: 350}, 60)
+			map[string]float64{domain.RolePrefill: 350}, 60, 0.85)
 		Expect(h.Terms[domain.RoleDecode].Backlog).To(BeZero())
 
 		By("a non-positive drain target disables the backlog term rather than dividing by it")
-		z := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), backlog, 0)
+		z := estimateThroughputDemand(runLambda, replicas(1), variants(domain.RoleDecode, 1), backlog, 0, 0.85)
 		Expect(z.Terms[domain.RoleDecode].Backlog).To(BeZero())
 		Expect(z.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/runMu*float64(runK1), 1e-6))
 	})
@@ -106,7 +151,7 @@ var _ = Describe("estimateThroughputDemand", func() {
 		rcs := append(replicas(2), ReplicaCapacity{VariantName: "p", SaturatedThroughput: 0})
 		vcs := append(variants(domain.RoleDecode, 2),
 			domain.VariantCapacity{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 1, PerReplicaCapacity: 919_449})
-		f := estimateThroughputDemand(runLambda, rcs, vcs, nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(runLambda, rcs, vcs, nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole).To(HaveKey(domain.RoleDecode))
 		Expect(f.ByRole).NotTo(HaveKey(domain.RolePrefill))
 	})
@@ -116,7 +161,7 @@ var _ = Describe("estimateThroughputDemand", func() {
 		// --gpu-memory-utilization, and it is going home); its rate is not
 		// this variant's.
 		rcs := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: 1, FromWarmPool: true}}
-		f := estimateThroughputDemand(runLambda, rcs, variants(domain.RoleBoth, 0), nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(runLambda, rcs, variants(domain.RoleBoth, 0), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole).To(BeEmpty())
 	})
 
@@ -128,13 +173,13 @@ var _ = Describe("estimateThroughputDemand", func() {
 		vcs := append(variants(domain.RoleDecode, 1),
 			domain.VariantCapacity{VariantName: "unpriced", Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: 0})
 		rcs := append(replicas(1), ReplicaCapacity{VariantName: "unpriced", SaturatedThroughput: runMu})
-		f := estimateThroughputDemand(runLambda, rcs, vcs, nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(runLambda, rcs, vcs, nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/runMu*float64(runK1), 1e-6),
 			"the priced replica alone decides the floor")
 	})
 
 	It("says nothing without an arrival rate", func() {
-		f := estimateThroughputDemand(0, replicas(2), variants(domain.RoleBoth, 2), nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(0, replicas(2), variants(domain.RoleBoth, 2), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole).To(BeEmpty())
 	})
 })
@@ -254,14 +299,14 @@ var _ = Describe("estimateThroughputDemand with mixed readings", func() {
 			{VariantName: "slow", SaturatedThroughput: 2.0},
 			{VariantName: "slow", SaturatedThroughput: 2.0},
 		}
-		f := estimateThroughputDemand(6, replicas, variants, nil, BacklogDrainSeconds)
+		f := estimateThroughputDemand(6, replicas, variants, nil, BacklogDrainSeconds, 0.85)
 		fastCost := 930_000 / 5.4
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 6*fastCost, 1e-6),
 			"five readings, three of them the fast card's: the median is the fast card's cost")
 		Expect(f.Terms[domain.RoleDecode].Mu).To(Equal(5.4))
 
 		By("averaging the central pair on an even count")
-		f = estimateThroughputDemand(6, replicas[1:], variants, nil, BacklogDrainSeconds)
+		f = estimateThroughputDemand(6, replicas[1:], variants, nil, BacklogDrainSeconds, 0.85)
 		slowCost := 600_000 / 2.0
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 6*(fastCost+slowCost)/2, 1e-6))
 	})
@@ -298,15 +343,22 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		}
 	}
 
-	saturate := func() {
-		// 07:29:08 on the run: queue 10 over threshold 5, 1.15M resident,
-		// completing 5.4/s.
+	// Two saturated cycles: 07:29:08 on the run, queue 10 over threshold 5,
+	// 1.15M resident, completing 5.4/s -- and the cycle after it, which is
+	// what makes the window one the floor may order on
+	// (MinThroughputSamplesToOrder).
+	saturateOnce := func() {
 		in := makeAnalyzerInput(
 			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 10, runMu), prefill("prefill-0", 66_183)},
 			states(1, 1))
 		in.ArrivalRate = runLambda
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
+	}
+	saturate := func() {
+		for i := 0; i < MinThroughputSamplesToOrder; i++ {
+			saturateOnce()
+		}
 	}
 
 	It("holds the decode role at lambda / mu once the fleet has caught up", func() {
@@ -350,7 +402,26 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	})
 
 	It("orders the second replica from lambda / mu on a fleet of one", func() {
-		saturate()
+		// After ONE saturated cycle the window holds a single reading and the
+		// floor holds the fleet where it is (RC = 0 exactly); after the second
+		// it orders.
+		saturateOnce()
+		in0 := makeAnalyzerInput(
+			[]domain.ReplicaMetrics{decode("decode-0", 200_000, 0, runLambda), prefill("prefill-0", 0)},
+			states(1, 1))
+		in0.ArrivalRate = runLambda
+		held, err := analyzer.Analyze(ctx, in0)
+		Expect(err).NotTo(HaveOccurred())
+		var heldP float64
+		for _, vc := range held.VariantCapacities {
+			if vc.VariantName == decodeVariant {
+				heldP = vc.PerReplicaCapacity
+			}
+		}
+		Expect(held.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 0.85*heldP, 1),
+			"one reading: capped at scaleUp x the one replica, so nothing is ordered")
+
+		saturateOnce()
 		// One decode replica at a fifth of its KV, no queue, mu on record:
 		// occupancy says nothing; the load says 1.11 replicas. RC through the
 		// engine's headroom is D / 0.85 - P > 0, so the second replica is
@@ -474,6 +545,61 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			"the 200 queued prompts are 3.3 extra req/s against a prefill mu of 30")
 	})
 
+	It("leaves a bridge's queue out of the backlog and out of the residency it takes back", func() {
+		saturate()
+		// A warm-pool bridge lent to the variant carries a queue of its own;
+		// aggregation counts its demand toward the variant, but it is not
+		// this variant's backlog to size for and its residency charge is not
+		// one the floor put there.
+		own := decode("decode-0", 300_000, 0, runMu)
+		bridge := decode("bridge-0", 300_000, 600, runMu)
+		bridge.FromWarmPool = true
+		in := makeAnalyzerInput([]domain.ReplicaMetrics{own, bridge, prefill("prefill-0", 0)}, states(1, 1))
+		in.ArrivalRate = runLambda
+		result, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		// The bridge's 600 queued requests are charged once, by aggregation,
+		// as 600 x 7000 = 4.2M of residency on top of 0.6M resident. The floor
+		// neither takes that charge out (it is not one it put there) nor
+		// re-prices it as a backlog: either mistake would land at
+		// (6 + 600/60) / 5.4 = 2.96 replicas' worth (2.75M) instead.
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 600_000+600*7000, 1),
+			"the bridge's queue stays as the residency aggregation charged, and enters no backlog")
+	})
+
+	It("keeps prefill's own engine queue as residency while dropping its scheduler-queue share", func() {
+		saturate()
+		// Only the share of the scheduler queue goes: requests waiting in a
+		// prefill engine's own queue are work prefill has accepted, and stay
+		// charged until prefill has a mu to price them by.
+		p := prefill("prefill-0", 66_183)
+		p.QueueLength = 4 // under the threshold: no saturation, no mu for prefill
+		in := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 300_000, 0, runMu), p}, states(1, 1))
+		in.ArrivalRate = runLambda
+		in.SchedulerQueue = &domain.SchedulerQueueMetrics{QueueSize: 200, QueueBytes: 200 * 6000 * 4}
+		result, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 66_183+4*6000, 1),
+			"resident KV plus the own queue at prefill's input-only footprint; the 200 x 6000 scheduler share is gone")
+	})
+
+	It("floors the resident KV at zero when the residency it takes back exceeds what was measured", func() {
+		// Reachable only if a residency charge outlives the demand it was
+		// folded into; the arithmetic must not hand the engine a negative
+		// demand. Exercised at the function level with an inconsistent pair.
+		rcs := []ReplicaCapacity{{VariantName: decodeVariant, SaturatedThroughput: runMu,
+			SaturatedThroughputSamples: MinThroughputSamplesToOrder, QueueLength: 10, LocalQueueDemand: 500_000}}
+		vcs := []domain.VariantCapacity{{VariantName: decodeVariant, Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: float64(runK1)}}
+		roleDemand := map[string]float64{domain.RoleDecode: 100_000}
+		in := makeAnalyzerInput(nil, states(1, 1))
+		in.ArrivalRate = runLambda
+		total := analyzer.applyThroughputFloor(in, in.Config.(*config.ScalingPolicy), rcs, vcs, 100_000, roleDemand, nil, 0, GinkgoLogr)
+		want := (runLambda + 10.0/BacklogDrainSeconds) / runMu * float64(runK1)
+		Expect(roleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
+		Expect(total).To(BeNumerically("~", want, 1))
+		Expect(total).To(BeNumerically(">", 0))
+	})
+
 	It("does not record a bridge's throughput under the variant it is lent to", func() {
 		// A warm-pool bridge is recorded with the borrowing variant's name, so
 		// it lands on the same history key as the variant's own replicas. Its
@@ -573,6 +699,9 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 
+		_, err = analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred(), "the second saturated cycle, so the window may order")
+
 		st[0].CurrentReplicas = 4
 		in = makeAnalyzerInput([]domain.ReplicaMetrics{
 			both("a", 20_000, 0, 1.5), both("b", 20_000, 0, 1.5), both("c", 20_000, 0, 1.5), both("d", 20_000, 0, 1.5)}, st)
@@ -581,5 +710,19 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.RoleDemand).To(BeNil())
 		Expect(result.TotalDemand).To(BeNumerically("~", runLambda/runMu*result.VariantCapacities[0].PerReplicaCapacity, 1))
+
+		By("pricing a queue as a backlog on the total, with the residency charge taken out")
+		// One replica full with 60 waiting and 40 at the scheduler: residency
+		// would charge 100 x 7000 = 700k on top of 1.16M resident; the model
+		// prices (6 + 100/60) / 5.4 = 1.42 replicas' worth.
+		st[0].CurrentReplicas = 1
+		in = makeAnalyzerInput([]domain.ReplicaMetrics{both("a", 1_158_912, 60, runMu)}, st)
+		in.ArrivalRate = runLambda
+		in.SchedulerQueue = &domain.SchedulerQueueMetrics{QueueSize: 40, QueueBytes: 40 * 6000 * 4}
+		result, err = analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		P := result.VariantCapacities[0].PerReplicaCapacity
+		Expect(result.TotalDemand).To(BeNumerically("~", (runLambda+100.0/BacklogDrainSeconds)/runMu*P, 1))
+		Expect(result.TotalDemand / P).To(BeNumerically("~", 1.42, 0.01))
 	})
 })

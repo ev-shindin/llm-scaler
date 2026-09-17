@@ -69,6 +69,17 @@ const (
 	// keeps the order within one start. See throughput_floor.go.
 	BacklogDrainSeconds = 60.0
 
+	// MinThroughputSamplesToOrder is how many saturated readings a role's own
+	// output-length bucket must hold before the throughput floor may ORDER a
+	// replica from it; with fewer it holds the fleet and no more. The first
+	// reading at a saturation under-reads (a 1m rate on a replica that has
+	// been full for 20 s counts a third of a minute's completions), and an
+	// order on an under-read over-provisions in a way that removes the
+	// saturation which would have corrected it. Measured on the shape-swap
+	// trace: 3.67, then 5.23, then 7.13 req/s on three consecutive saturated
+	// cycles of one replica. Two readings is the second cycle.
+	MinThroughputSamplesToOrder = 2
+
 	// VeryLongOutputThreshold is the upper bound (exclusive) for the "xxlong"
 	// output-length bucket; anything at or above it is "huge".
 	VeryLongOutputThreshold = 6000

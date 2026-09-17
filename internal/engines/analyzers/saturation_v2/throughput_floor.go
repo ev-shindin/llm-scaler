@@ -7,7 +7,10 @@ import (
 
 	"github.com/go-logr/logr"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
 // Occupancy -- resident KV plus the waiting queues -- is a state of the
@@ -58,6 +61,15 @@ import (
 // saturation and never drifts down); what a late order cost was five to
 // seven replicas at the first ramp of every run.
 //
+// Two readings are not trusted with an order, only with a hold, and for
+// those the old cap at scaleUp x anticipated supply stays: a mu BORROWED from
+// a neighbouring bucket (nearestSaturatedThroughput), which is wrong in a
+// known direction and, from a longer shape, over-orders; and a window with a
+// SINGLE reading, which is the first cycle's under-read -- an order on it
+// over-provisions, and the over-provisioned fleet never saturates again to
+// record the second reading that would have corrected it
+// (MinThroughputSamplesToOrder).
+//
 // The same model prices a BACKLOG. Occupancy charged every queued request at
 // its full KV footprint, as if all of them had to be resident at once, and
 // the engine sized the fleet to hold them: 350 queued requests became five to
@@ -101,6 +113,11 @@ type throughputTerm struct {
 	Backlog float64
 	// Replicas is (lambda + Backlog / DrainSeconds) / Mu.
 	Replicas float64
+	// Held reports that the floor was capped at the fleet's own size because
+	// its mu is not one the floor may order on -- HeldWhy says which:
+	// "borrowed" (a neighbouring bucket's reading) or "single-sample".
+	Held    bool
+	HeldWhy string
 }
 
 // recordSaturatedThroughput folds one saturated completion-rate reading into
@@ -141,12 +158,30 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 // (see nearestSaturatedThroughput); the returned bucket names which, so the
 // log can say the figure is borrowed. Returns 0 and "" when no bucket has one.
 func (a *SaturationAnalyzer) saturatedThroughputFor(key string) (float64, string) {
+	r := a.saturatedThroughputReading(key)
+	return r.rate, r.bucket
+}
+
+// throughputReading is what the floor knows about a key's saturated
+// throughput: the figure, the bucket it came from, how many readings that
+// bucket's window holds, and whether the bucket is a neighbour's.
+type throughputReading struct {
+	rate     float64
+	bucket   string
+	samples  int
+	borrowed bool
+}
+
+// saturatedThroughputReading is saturatedThroughputFor with the window's
+// size and provenance, which decide whether the floor may order on it.
+func (a *SaturationAnalyzer) saturatedThroughputReading(key string) throughputReading {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if ra, ok := a.saturatedThroughput[key]; ok {
-		return ra.Max(), bucketOf(key)
+		return throughputReading{rate: ra.Max(), bucket: bucketOf(key), samples: ra.Len()}
 	}
-	return a.nearestSaturatedThroughput(key)
+	rate, bucket, samples := a.nearestSaturatedThroughput(key)
+	return throughputReading{rate: rate, bucket: bucket, samples: samples, borrowed: rate > 0}
 }
 
 // nearestSaturatedThroughput finds the reading in the output-length bucket
@@ -173,14 +208,14 @@ func (a *SaturationAnalyzer) saturatedThroughputFor(key string) (float64, string
 // Ties between an equally distant shorter and longer bucket go to the shorter
 // one -- the under-hold, which occupancy corrects, rather than the over-hold,
 // which only the cap does.
-func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, string) {
+func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, string, int) {
 	prefix, bucket, suffix, ok := splitHistoryKey(key)
 	if !ok {
-		return 0, ""
+		return 0, "", 0
 	}
 	own := slices.Index(outputBuckets, bucket)
 	if own < 0 {
-		return 0, ""
+		return 0, "", 0
 	}
 	for dist := 1; dist < len(outputBuckets); dist++ {
 		for _, i := range []int{own - dist, own + dist} {
@@ -188,11 +223,11 @@ func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, st
 				continue
 			}
 			if ra, found := a.saturatedThroughput[prefix+outputBuckets[i]+suffix]; found {
-				return ra.Max(), outputBuckets[i]
+				return ra.Max(), outputBuckets[i], ra.Len()
 			}
 		}
 	}
-	return 0, ""
+	return 0, "", 0
 }
 
 // splitHistoryKey takes a key of the form built by historyKey --
@@ -232,15 +267,20 @@ func bucketOf(key string) string {
 // practice, whose queue is rarely the one that saturates, and a role that has
 // never been seen saturated has no business being sized by this file.
 //
-// There is no cap at the fleet's size (see the file header for what the cap
-// cost). The bound is the formula itself: it asks for the replicas the load
-// and the backlog need, and not one more as replicas are added.
+// The floor is not capped at the fleet's size (see the file header for what
+// the cap cost) -- with one exception. A role whose readings are all borrowed
+// from a neighbouring bucket, or whose own window holds fewer than
+// MinThroughputSamplesToOrder readings, may hold the fleet but not grow it:
+// its floor is capped at scaleUp x the role's anticipated supply, the largest
+// demand the engine's RC = D / scaleUp - anticipated turns into nothing. The
+// term says so (Held, HeldWhy). scaleUp <= 0 disables the cap.
 func estimateThroughputDemand(
 	lambda float64,
 	replicas []ReplicaCapacity,
 	variants []domain.VariantCapacity,
 	backlog map[string]float64,
 	drainSeconds float64,
+	scaleUp float64,
 ) throughputFloor {
 	out := throughputFloor{Lambda: lambda, DrainSeconds: drainSeconds}
 	if lambda <= 0 || len(replicas) == 0 || len(variants) == 0 {
@@ -253,11 +293,18 @@ func estimateThroughputDemand(
 		perReplica[vc.VariantName] = vc.PerReplicaCapacity
 		roleOf[vc.VariantName] = canonicalRole(vc.Role)
 	}
+	// The per-role anticipated supply the hold cap is measured against, from
+	// the one place that defines it: the engine reads the same figure through
+	// the same helper, so the cap and the RC it exists to zero cannot drift.
+	anticipated := aggregation.AggregateByRole(variants)
 
 	// tokens per unit of arrival rate, per role: P / mu for each replica that
-	// can price it.
+	// can price it -- and whether any of them may order (own window, enough
+	// readings).
 	costs := make(map[string][]float64)
 	mus := make(map[string][]float64)
+	mayOrder := make(map[string]bool)
+	borrowedOnly := make(map[string]bool)
 	for _, rc := range replicas {
 		if rc.FromWarmPool || rc.SaturatedThroughput <= 0 {
 			continue
@@ -269,6 +316,15 @@ func estimateThroughputDemand(
 		role := roleOf[rc.VariantName]
 		costs[role] = append(costs[role], p/rc.SaturatedThroughput)
 		mus[role] = append(mus[role], rc.SaturatedThroughput)
+		if _, seen := borrowedOnly[role]; !seen {
+			borrowedOnly[role] = true
+		}
+		if !rc.SaturatedThroughputBorrowed {
+			borrowedOnly[role] = false
+			if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder {
+				mayOrder[role] = true
+			}
+		}
 	}
 	if len(costs) == 0 {
 		return out
@@ -282,14 +338,23 @@ func estimateThroughputDemand(
 		rate := lambda
 		var b float64
 		if drainSeconds > 0 {
-			b = backlog[role]
-			if b < 0 {
-				b = 0
-			}
+			b = max(backlog[role], 0)
 			rate += b / drainSeconds
 		}
-		out.ByRole[role] = rate * cost
-		out.Terms[role] = throughputTerm{Mu: mu, PerReplica: cost * mu, Backlog: b, Replicas: rate / mu}
+		floor := rate * cost
+		term := throughputTerm{Mu: mu, PerReplica: cost * mu, Backlog: b, Replicas: rate / mu}
+		if !mayOrder[role] && scaleUp > 0 {
+			if hold := scaleUp * anticipated[role].TotalAnticipatedSupply; floor > hold {
+				floor = hold
+				term.Held = true
+				term.HeldWhy = "single-sample"
+				if borrowedOnly[role] {
+					term.HeldWhy = "borrowed"
+				}
+			}
+		}
+		out.ByRole[role] = floor
+		out.Terms[role] = term
 	}
 	return out
 }
@@ -310,7 +375,11 @@ func estimateThroughputDemand(
 // scheduler queue per role, and eppQueued the requests in it. For a role with
 // a mu, both that charge and the engines' own queue charge (LocalQueueDemand)
 // come back out and the queued requests go into the floor as a backlog. For
-// prefill without a mu, the scheduler-queue charge is dropped (file header).
+// prefill without a mu, the scheduler-queue charge is dropped (file header),
+// and that is logged at the per-replica verbosity when it changes the figure:
+// it is the normal state of a P/D fleet, so an INFO line every cycle would be
+// noise, but a reader comparing scheduler-queue-demand's byRole with
+// RoleDemand needs to find the gap somewhere.
 //
 // Logged at INFO when it binds, with the terms: a floor that changes a
 // decision is worth a line, and which of lambda, mu, P and the backlog moved
@@ -319,6 +388,7 @@ func estimateThroughputDemand(
 // saturated, not a gap.
 func (a *SaturationAnalyzer) applyThroughputFloor(
 	input domain.AnalyzerInput,
+	cfg *config.ScalingPolicy,
 	replicas []ReplicaCapacity,
 	variants []domain.VariantCapacity,
 	totalDemand float64,
@@ -350,7 +420,12 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 		residency[role] += tokens
 	}
 
-	floor := estimateThroughputDemand(offeredArrivalRate(input), replicas, variants, backlog, BacklogDrainSeconds)
+	// The hold cap is measured against the threshold the ENGINE sizes RC
+	// with, which is the saturation analyzer's own (config.AnalyzerThresholds):
+	// a cap drawn at the policy-level figure while the engine divides by a
+	// per-analyzer override would leave a gap that orders a replica.
+	scaleUp, _ := cfg.AnalyzerThresholds(domain.SaturationAnalyzerName)
+	floor := estimateThroughputDemand(offeredArrivalRate(input), replicas, variants, backlog, BacklogDrainSeconds, scaleUp)
 
 	// Prefill with no mu: the scheduler queue's prompts are not resident work
 	// for prefill (file header). Only the disaggregated case has a prefill
@@ -361,8 +436,12 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	if roleDemand != nil {
 		if _, priced := floor.ByRole[domain.RolePrefill]; !priced {
 			if share, ok := eppByRole[domain.RolePrefill]; ok && share > 0 {
-				if _, ok := roleDemand[domain.RolePrefill]; ok {
-					roleDemand[domain.RolePrefill] -= share
+				if before, ok := roleDemand[domain.RolePrefill]; ok {
+					roleDemand[domain.RolePrefill] = before - share
+					logger.V(logging.DEFAULT).Info("scheduler-queue-prefill-share-dropped",
+						"modelID", input.ModelID, "namespace", input.Namespace,
+						"eppQueueSize", eppQueued, "droppedTokens", share,
+						"prefillDemandBefore", before, "prefillDemandAfter", before-share)
 				}
 			}
 		}
@@ -390,14 +469,8 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 		// What occupancy measured with the queues' residency charge removed:
 		// the resident KV alone. The queued requests are in the floor as a
 		// backlog now, and must not be counted twice.
-		resident := measured - residency[role]
-		if resident < 0 {
-			resident = 0
-		}
-		want := resident
-		if tokens > want {
-			want = tokens
-		}
+		resident := max(measured-residency[role], 0)
+		want := max(resident, tokens)
 		if want == measured {
 			continue
 		}
@@ -406,7 +479,7 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 			"demandBeforeFloor", measured, "residentDemand", resident, "flooredTo", want,
 			"arrivalRate", floor.Lambda, "backlogRequests", term.Backlog, "drainSeconds", floor.DrainSeconds,
 			"saturatedThroughput", term.Mu, "perReplicaCapacity", term.PerReplica,
-			"replicasImplied", term.Replicas)
+			"replicasImplied", term.Replicas, "heldAtFleet", term.Held, "heldWhy", term.HeldWhy)
 		if roleDemand != nil {
 			roleDemand[role] = want
 		}

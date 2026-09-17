@@ -226,7 +226,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	if input.SchedulerQueue != nil {
 		eppQueued = float64(input.SchedulerQueue.QueueSize)
 	}
-	totalDemand = a.applyThroughputFloor(input, replicaCapacities, variantCapacities,
+	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
 		totalDemand, roleDemand, queueDemand.byRole, eppQueued, logger)
 
 	result := &domain.AnalyzerResult{
@@ -315,7 +315,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	if k2Priority == k2SrcObserved && rm.Ready && !rm.FromWarmPool {
 		a.recordSaturatedThroughput(historyKey, rm.RequestRate)
 	}
-	saturatedThroughput, throughputBucket := a.saturatedThroughputFor(historyKey)
+	reading := a.saturatedThroughputReading(historyKey)
+	saturatedThroughput, throughputBucket := reading.rate, reading.bucket
 
 	effectiveCapacity := k1
 	bound := "k1-memory"
@@ -356,20 +357,22 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	})
 
 	return &ReplicaCapacity{
-		PodName:               rm.PodName,
-		VariantName:           rm.VariantName,
-		AcceleratorName:       accelerator,
-		TokensInUse:           rm.TokensInUse,
-		QueueLength:           rm.QueueLength,
-		LocalQueueDemand:      localQueueDemand,
-		TotalKvCapacityTokens: rm.TotalKvCapacityTokens,
-		MemoryBoundCapacity:   k1,
-		ComputeBoundCapacity:  k2,
-		K2Priority:            k2Priority,
-		EffectiveCapacity:     effectiveCapacity,
-		ReplicaDemand:         replicaDemand,
-		FromWarmPool:          rm.FromWarmPool,
-		SaturatedThroughput:   saturatedThroughput,
+		PodName:                     rm.PodName,
+		VariantName:                 rm.VariantName,
+		AcceleratorName:             accelerator,
+		TokensInUse:                 rm.TokensInUse,
+		QueueLength:                 rm.QueueLength,
+		LocalQueueDemand:            localQueueDemand,
+		TotalKvCapacityTokens:       rm.TotalKvCapacityTokens,
+		MemoryBoundCapacity:         k1,
+		ComputeBoundCapacity:        k2,
+		K2Priority:                  k2Priority,
+		EffectiveCapacity:           effectiveCapacity,
+		ReplicaDemand:               replicaDemand,
+		FromWarmPool:                rm.FromWarmPool,
+		SaturatedThroughput:         saturatedThroughput,
+		SaturatedThroughputSamples:  reading.samples,
+		SaturatedThroughputBorrowed: reading.borrowed,
 	}
 }
 

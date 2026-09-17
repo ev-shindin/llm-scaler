@@ -77,6 +77,14 @@ type ReplicaCapacity struct {
 	// recorded beside k2; 0 when no saturation has been observed for the
 	// bucket. Read by the throughput floor (throughput_floor.go).
 	SaturatedThroughput float64
+	// SaturatedThroughputSamples is how many readings the window that
+	// produced SaturatedThroughput holds, and SaturatedThroughputBorrowed
+	// whether that window is a neighbouring bucket's rather than the
+	// replica's own (see nearestSaturatedThroughput). The floor orders a
+	// replica only on an own window of MinThroughputSamplesToOrder readings;
+	// anything less holds.
+	SaturatedThroughputSamples  int
+	SaturatedThroughputBorrowed bool
 }
 
 // outputBuckets lists the output-length buckets in ascending order of length.

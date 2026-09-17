@@ -76,6 +76,15 @@ Properties, each with a spec in `throughput_floor_test.go`:
   bound is the formula, which does not move as replicas are added. What a
   `mu` that under-read costs is bounded by the under-read, and the window's
   max corrects it upward at the next saturation.
+- **Two readings may hold but not order**, and for those the cap at
+  `scaleUp x anticipated supply` stays (`heldAtFleet`, `heldWhy` on the log
+  line). A `mu` *borrowed* from a neighbouring bucket is wrong in a known
+  direction and, from a longer shape, would over-order. A window with a
+  *single* reading is the first cycle's under-read (3.67 against a true 7.13
+  on the run), and an order on it over-provisions in a way that removes the
+  saturation which would have recorded the second, corrected reading
+  (`MinThroughputSamplesToOrder`, 2). Neither changed the measured runs:
+  every order on them came from a window with several readings of its own.
 - **A backlog is throughput, not residency.** 350 queued requests at 6 req/s
   arriving are 58 s of arrivals; two replicas at 5.4 req/s each clear them in
   about two minutes and three in one. Charged as resident KV they were five
@@ -178,4 +187,5 @@ is a property of the load.
 | The learning saturation costs one window at 4.8 s p95 TTFT | Measured, same run, engine histograms per 5-minute window |
 | The second replica's order came from occupancy at +69-78 s on three runs; the lone replica tipped at +91 / +91 / +144 s | Measured, runs `wm9k0y_1`, `ydqs8h_1`, `t1pclo_1`, the first replica's own counters |
 | A 350-request backlog charged as residency ordered five extra replicas that arrived after it was gone | Measured, run `biran-20260915-102548-571` |
-| `(lambda + B/T) / mu` orders the second replica in the first cycle and sizes the first-ramp backlog at 2-3 replicas | Arithmetic on the runs' logged values; **run pending** |
+| `(lambda + B/T) / mu` orders the second replica at +62 s and sizes the first-ramp backlog at 3 replicas | Measured, run `guidellm-1789645863-l32fnc_1` (warm controller) and `guidellm-1789642083-9yngog_1` (cold) |
+| The first reading at a saturation under-reads and the window's max corrects it | Measured, same cold run: 3.67, 5.23, 7.13 req/s on three consecutive saturated cycles |
