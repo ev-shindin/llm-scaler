@@ -738,21 +738,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register the KEDA external scaler gRPC server. Leader-gated (a plain
-	// manager.Runnable) so it is co-located with the optimize loop that feeds the
-	// in-memory decision store it serves.
+	// Register the KEDA external scaler gRPC server. NOT leader-gated: it
+	// listens from process start so KEDA's GetMetricSpec is answered in the
+	// window between this pod becoming Ready and its winning the lease, which
+	// is where a ScaledObject would otherwise be wired to the CPU default for
+	// good (see scaler.Server.NeedLeaderElection). Elected tells the handler
+	// when the decision store behind it is being fed; until then the calls
+	// that read it are refused rather than answered with "no decision".
 	//
 	// It writes registry.Default as well as reading the decision store: every call
 	// registers the workload it names, which is how WVA discovers what it manages
-	// (docs/plans/engine/keda-driven-discovery.md). Leader-gating it therefore also
-	// gates discovery — correct, since only the leader runs the engines that
-	// consume the registry.
-	if err := mgr.Add(&scaler.Server{
+	// (docs/plans/engine/keda-driven-discovery.md). Registering before the lease
+	// is held is harmless and useful -- the engines that consume the registry
+	// start on election and find the workloads already there.
+	externalScaler := &scaler.Server{
 		Addr:     *externalScalerBindAddress,
 		Client:   mgr.GetAPIReader(),
 		Registry: registry.Default,
-	}); err != nil {
+		Elected:  mgr.Elected(),
+	}
+	if err := mgr.Add(externalScaler); err != nil {
 		setupLog.Error(err, "unable to add KEDA external scaler to manager")
+		os.Exit(1)
+	}
+	// Ready means "in the Service KEDA dials", so it must not precede the
+	// listener: a Ready pod that refuses connections is the window above.
+	if err := mgr.AddReadyzCheck("external-scaler", externalScaler.Ready); err != nil {
+		setupLog.Error(err, "unable to register the KEDA external scaler readiness check")
 		os.Exit(1)
 	}
 
