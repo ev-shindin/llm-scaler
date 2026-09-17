@@ -684,3 +684,54 @@ src = src.replace(ANCHOR, BLOCK, 1)
 io.open(path, "w", encoding="utf-8", newline="\n").write(src)
 print("  fix 8 (harness RBAC for workloads): applied")
 PYEOF
+
+# ---------------------------------------------------------------------------
+# Fix 10 -- defaults.yaml: find a started engine within seconds, not 30.
+#
+# The default startupProbe is initialDelaySeconds 30 / periodSeconds 30 /
+# failureThreshold 60. A probe that fires every 30 s reports an engine Ready
+# up to 30 s after it is: the decode pod above logged "Application startup
+# complete" at 21:29:10 and was marked Ready at 21:29:39. On the autoscaler's
+# first ramp those 29 s are 29 s more queue charged to the fleet.
+#
+# 0 / 5 / 360 keeps the same 30-minute budget (was 30 + 60 x 30 = 1830 s, now
+# 360 x 5 = 1800 s) and finds the engine within 5 s of its first 200. The
+# first probes fail on connection refused while the API server binds; that is
+# what failureThreshold is for. Scenarios that spell out their own probes
+# (two-variant-wva, workload-autoscaling) carry the same numbers.
+# ---------------------------------------------------------------------------
+DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
+if [ ! -f "$DEFAULTS" ]; then
+    note "fix 10 (startup probe period): no defaults.yaml, skipped"
+else
+    "$PY" - "$DEFAULTS" <<'PYEOF' || fail "fix 10 (startup probe period) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+OLD = '''  probe_startup: &probe_startup
+    path: /health
+    failureThreshold: 60
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+'''
+NEW = '''  probe_startup: &probe_startup
+    path: /health
+    # wva-patch: 0/5/360 finds a started engine within 5 s; same 30-min budget.
+    failureThreshold: 360
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 5
+'''
+if NEW in src:
+    print("  fix 10 (startup probe period): already applied")
+    sys.exit(0)
+if src.count(OLD) != 1:
+    sys.exit("anchor missing or ambiguous (upstream shape changed): probe_startup: &probe_startup")
+src = src.replace(OLD, NEW, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 10 (startup probe period): applied")
+PYEOF
+fi

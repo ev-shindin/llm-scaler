@@ -388,7 +388,43 @@ scenario:
           - name: preprocess
             imageKey: benchmark
             imagePullPolicy: Always
-            command: ["set_llmdbench_environment.py", "-e", "/shared-config/llmdbench_env.sh", "-i"]
+            # The generator (from the benchmark image, so not patchable in the clone)
+            # starts the script it writes with two apt-get installs: iproute2 for the
+            # `ip route/rule` lines it emits on a multi-NIC RDMA node, infiniband-diags
+            # for nothing the serving container ever runs. On a single-NIC node the
+            # script has no ip commands and both installs are dead weight: 71 s of a
+            # 186 s order-to-Ready measured on a decode pod that already had the image,
+            # and the only part that varied run to run (mirror speed). The autoscaler
+            # sizes its first ramp by the queue one replica builds while the second
+            # starts, so those 71 s were six over-ordered replicas. The install of
+            # iproute2 stays whenever the script needs it.
+            command:
+              - /bin/sh
+              - -c
+              - |
+                set_llmdbench_environment.py -e /shared-config/llmdbench_env.sh -i || exit $?
+                f=/shared-config/llmdbench_env.sh
+                sed -i '/^which ibstat$/,/^fi$/d' "$f"
+                if ! grep -qE '^ip (route|rule) ' "$f"; then
+                  sed -i '/^which ip$/,/^fi$/d' "$f"
+                fi
+                grep -c apt-get "$f" | sed 's/^/preprocess: apt-get lines left in llmdbench_env.sh: /'
+                # The engine sources this script before it starts, so the guard below runs
+                # where the cache mount is. A cache dir that is not writable (a CSI
+                # publish that came back read-only after a retry, seen once on kermit)
+                # must cost a compile, not the replica: vLLM fails hard on os.makedirs.
+                echo >> "$f"  # the generator leaves no trailing newline
+                cat >> "$f" <<'EOF'
+                for v in VLLM_CACHE_ROOT FLASHINFER_WORKSPACE_DIR TRITON_CACHE_DIR; do
+                  # neither a doubled dollar nor a dollar-paren in here: Kubernetes rewrites both in a container command
+                  eval "d=\${$v}"
+                  [ -n "$d" ] || continue
+                  if ! mkdir -p "$d" 2>/dev/null || ! touch "$d/.writable" 2>/dev/null; then
+                    echo "engine cache $v=$d is not writable; using the engine default instead"
+                    unset $v
+                  fi
+                done
+                EOF
             volumeMounts:
               - name: shared-config
                 mountPath: /shared-config
@@ -422,6 +458,22 @@ scenario:
             value: debug
           - name: UCX_MAX_RMA_RAILS
             value: "1"
+          # vLLM writes its torch.compile artefacts, the FlashInfer autotune
+          # table and Triton's JIT cache under /tmp inside the container, so
+          # every replica recompiles from nothing: 14 s of torch.compile on a
+          # 0.6B model, measured, more on a large one. /engine-cache is a subPath
+          # of the harness's workload PVC (RWX, read-write; the model claim is
+          # mounted read-only and a CSI driver publishes a claim once per pod, so
+          # a second mount of it inherits read-only) -- see additionalVolumes --
+          # so a replica after the first finds the caches warm. vLLM keys them by
+          # a hash of the engine config: a change of model, flags or version
+          # is a miss, never a stale hit.
+          - name: VLLM_CACHE_ROOT
+            value: /engine-cache/vllm
+          - name: FLASHINFER_WORKSPACE_DIR
+            value: /engine-cache/flashinfer
+          - name: TRITON_CACHE_DIR
+            value: /engine-cache/triton
 
         # -----------------------------------------------------------------------
         # Extra Container Configuration
@@ -455,14 +507,50 @@ scenario:
           imagePullPolicy: Always
 
         # -----------------------------------------------------------------------
+        # Probes
+        #
+        # Same paths as the harness defaults; only the startup probe's timing
+        # differs. The default fires every 30 s, so an engine is marked Ready
+        # up to 30 s after it is -- 29 s on a measured decode pod -- and on the
+        # autoscaler's first ramp that is 29 s more queue charged to the fleet.
+        # 0/5/360 keeps the 30-minute budget and finds the engine within 5 s.
+        # (patch_harness.sh fix 10 sets the same default for scenarios that do
+        # not spell this out.)
+        # -----------------------------------------------------------------------
+        probes:
+          startup:
+            path: /health
+            failureThreshold: 360
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 5
+          liveness:
+            failureThreshold: 3
+            periodSeconds: 5
+          readiness:
+            path: /health
+            failureThreshold: 3
+            periodSeconds: 5
+
+        # -----------------------------------------------------------------------
         # Additional Volume Mounts
         # -----------------------------------------------------------------------
-        additionalVolumeMounts: []
+        additionalVolumeMounts:
+          # Read-write home for the engine caches (VLLM_CACHE_ROOT and friends
+          # above): the harness's workload PVC, which its results pod already
+          # mounts read-write. The model claim is mounted read-only.
+          - name: engine-cache
+            mountPath: /engine-cache
+            subPath: engine-cache
 
         # -----------------------------------------------------------------------
         # Additional Volumes
         # -----------------------------------------------------------------------
-        additionalVolumes: []
+        additionalVolumes:
+          - name: engine-cache
+            type: persistentVolumeClaim
+            persistentVolumeClaim:
+              claimName: workload-pvc
 
       # -------------------------------------------------------------------------
       # Decode Configuration
@@ -506,7 +594,43 @@ scenario:
           - name: preprocess
             imageKey: benchmark
             imagePullPolicy: Always
-            command: ["set_llmdbench_environment.py", "-e", "/shared-config/llmdbench_env.sh", "-i"]
+            # The generator (from the benchmark image, so not patchable in the clone)
+            # starts the script it writes with two apt-get installs: iproute2 for the
+            # `ip route/rule` lines it emits on a multi-NIC RDMA node, infiniband-diags
+            # for nothing the serving container ever runs. On a single-NIC node the
+            # script has no ip commands and both installs are dead weight: 71 s of a
+            # 186 s order-to-Ready measured on a decode pod that already had the image,
+            # and the only part that varied run to run (mirror speed). The autoscaler
+            # sizes its first ramp by the queue one replica builds while the second
+            # starts, so those 71 s were six over-ordered replicas. The install of
+            # iproute2 stays whenever the script needs it.
+            command:
+              - /bin/sh
+              - -c
+              - |
+                set_llmdbench_environment.py -e /shared-config/llmdbench_env.sh -i || exit $?
+                f=/shared-config/llmdbench_env.sh
+                sed -i '/^which ibstat$/,/^fi$/d' "$f"
+                if ! grep -qE '^ip (route|rule) ' "$f"; then
+                  sed -i '/^which ip$/,/^fi$/d' "$f"
+                fi
+                grep -c apt-get "$f" | sed 's/^/preprocess: apt-get lines left in llmdbench_env.sh: /'
+                # The engine sources this script before it starts, so the guard below runs
+                # where the cache mount is. A cache dir that is not writable (a CSI
+                # publish that came back read-only after a retry, seen once on kermit)
+                # must cost a compile, not the replica: vLLM fails hard on os.makedirs.
+                echo >> "$f"  # the generator leaves no trailing newline
+                cat >> "$f" <<'EOF'
+                for v in VLLM_CACHE_ROOT FLASHINFER_WORKSPACE_DIR TRITON_CACHE_DIR; do
+                  # neither a doubled dollar nor a dollar-paren in here: Kubernetes rewrites both in a container command
+                  eval "d=\${$v}"
+                  [ -n "$d" ] || continue
+                  if ! mkdir -p "$d" 2>/dev/null || ! touch "$d/.writable" 2>/dev/null; then
+                    echo "engine cache $v=$d is not writable; using the engine default instead"
+                    unset $v
+                  fi
+                done
+                EOF
             volumeMounts:
               - name: shared-config
                 mountPath: /shared-config
@@ -551,6 +675,22 @@ scenario:
             value: debug
           - name: UCX_MAX_RMA_RAILS
             value: "1"
+          # vLLM writes its torch.compile artefacts, the FlashInfer autotune
+          # table and Triton's JIT cache under /tmp inside the container, so
+          # every replica recompiles from nothing: 14 s of torch.compile on a
+          # 0.6B model, measured, more on a large one. /engine-cache is a subPath
+          # of the harness's workload PVC (RWX, read-write; the model claim is
+          # mounted read-only and a CSI driver publishes a claim once per pod, so
+          # a second mount of it inherits read-only) -- see additionalVolumes --
+          # so a replica after the first finds the caches warm. vLLM keys them by
+          # a hash of the engine config: a change of model, flags or version
+          # is a miss, never a stale hit.
+          - name: VLLM_CACHE_ROOT
+            value: /engine-cache/vllm
+          - name: FLASHINFER_WORKSPACE_DIR
+            value: /engine-cache/flashinfer
+          - name: TRITON_CACHE_DIR
+            value: /engine-cache/triton
 
         # -----------------------------------------------------------------------
         # Extra Container Configuration
@@ -581,14 +721,50 @@ scenario:
           imagePullPolicy: Always
 
         # -----------------------------------------------------------------------
+        # Probes
+        #
+        # Same paths as the harness defaults; only the startup probe's timing
+        # differs. The default fires every 30 s, so an engine is marked Ready
+        # up to 30 s after it is -- 29 s on a measured decode pod -- and on the
+        # autoscaler's first ramp that is 29 s more queue charged to the fleet.
+        # 0/5/360 keeps the 30-minute budget and finds the engine within 5 s.
+        # (patch_harness.sh fix 10 sets the same default for scenarios that do
+        # not spell this out.)
+        # -----------------------------------------------------------------------
+        probes:
+          startup:
+            path: /health
+            failureThreshold: 360
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 5
+          liveness:
+            failureThreshold: 3
+            periodSeconds: 5
+          readiness:
+            path: /health
+            failureThreshold: 3
+            periodSeconds: 5
+
+        # -----------------------------------------------------------------------
         # Additional Volume Mounts
         # -----------------------------------------------------------------------
-        additionalVolumeMounts: []
+        additionalVolumeMounts:
+          # Read-write home for the engine caches (VLLM_CACHE_ROOT and friends
+          # above): the harness's workload PVC, which its results pod already
+          # mounts read-write. The model claim is mounted read-only.
+          - name: engine-cache
+            mountPath: /engine-cache
+            subPath: engine-cache
 
         # -----------------------------------------------------------------------
         # Additional Volumes
         # -----------------------------------------------------------------------
-        additionalVolumes: []
+        additionalVolumes:
+          - name: engine-cache
+            type: persistentVolumeClaim
+            persistentVolumeClaim:
+              claimName: workload-pvc
 
     harness:
       name: vllm-benchmark
