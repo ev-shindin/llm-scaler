@@ -239,9 +239,11 @@ func (h *Handler) desired(ctx context.Context, ref *pb.ScaledObjectRef) (int32, 
 // earliest notice WVA gets that a workload exists.
 //
 // Answered whether or not this replica is the leader. It is the one call whose
-// answer is static, and it is the one KEDA makes exactly once, at ScaledObject
-// creation, to decide what metric the HPA carries -- refusing it there leaves
-// the HPA on the Kubernetes CPU default for good (see Server.NeedLeaderElection).
+// answer is static, and the answer KEDA gets when it reconciles a ScaledObject
+// decides what metric the HPA carries -- refusing it there leaves the HPA on
+// the Kubernetes CPU default until the next reconcile, which nothing may ever
+// trigger (see Server.NeedLeaderElection). KEDA asks again on every poll, and
+// those calls register the workload like any other.
 func (h *Handler) GetMetricSpec(_ context.Context, ref *pb.ScaledObjectRef) (*pb.GetMetricSpecResponse, error) {
 	h.observe(ref)
 	return &pb.GetMetricSpecResponse{

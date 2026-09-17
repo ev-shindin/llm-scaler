@@ -90,9 +90,27 @@ var _ = Describe("Server before and after the leader lease", func() {
 
 		Expect(srv.Ready(nil)).To(Succeed(), "still Ready across the hand-off")
 
-		By("shutdown: cancelling the context stops the full server")
+		By("shutdown: a stream KEDA never hangs up on does not hold the stop open")
+		// A push trigger keeps StreamIsActive open indefinitely; a plain
+		// GracefulStop would wait for it through the manager's whole shutdown
+		// budget, and the leader lease is released only after that. The stop
+		// is bounded, so this returns in stopGrace rather than never.
+		// Not derived from ctx: cancelling the server must not be what ends
+		// the stream, or the stop is never actually waiting on it.
+		streamCtx, stopStream := context.WithCancel(context.Background())
+		defer stopStream()
+		stream, err := cli.StreamIsActive(streamCtx, ref("chat-decode", nil))
+		Expect(err).NotTo(HaveOccurred())
+		first, err := stream.Recv()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(first.Result).To(BeTrue())
+
+		stopped := time.Now()
 		cancel()
-		Eventually(done, 5*time.Second).Should(Receive(BeNil()))
+		Eventually(done, 10*time.Second).Should(Receive(BeNil()))
+		Expect(time.Since(stopped)).To(BeNumerically("<", 8*time.Second), "the stop waited on the open stream")
 		Expect(srv.Ready(nil)).To(HaveOccurred(), "stopped, so not Ready")
+		_, err = stream.Recv()
+		Expect(err).To(HaveOccurred(), "the stream was closed by the forced stop")
 	})
 })

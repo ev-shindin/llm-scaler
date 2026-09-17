@@ -363,9 +363,9 @@ The controller elects a leader (`--leader-elect=true`, with tunable lease, renew
 retry durations), so more than one replica is safe — but the extra replicas are
 **standbys**. Only the leader runs the collection and optimization loops; the others
 wait on the lease. A standby does answer KEDA on one point: it tells KEDA which
-metric to put on the HPA (`GetMetricSpec`), because KEDA asks that exactly once,
-when a ScaledObject is created, and an HPA created without an answer scales on
-CPU until the ScaledObject is edited. Everything that needs a decision it refuses
+metric to put on the HPA (`GetMetricSpec`), because the answer KEDA gets when it
+reconciles a ScaledObject decides what the HPA carries, and an HPA created
+without one scales on CPU until the ScaledObject is edited. Everything that needs a decision it refuses
 with `Unavailable`, which KEDA reports as a trigger error and does not act on,
 and it cycles the connection every few seconds so KEDA re-dials and reaches the
 leader. The same applies to a single replica during a rollout, in the window

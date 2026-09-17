@@ -3,7 +3,6 @@ package scaler
 import (
 	"context"
 	"errors"
-	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -22,13 +21,15 @@ import (
 // external scaler over gRPC.
 //
 // It listens from process start on every replica, leader or not -- see
-// NeedLeaderElection -- in two phases. Until this replica holds the lease it
-// answers GetMetricSpec, refuses everything that needs a decision, and cycles
-// each client connection every few seconds so a client that landed on a
-// standby re-dials and can reach the leader. Once elected it serves in full,
-// on a fresh listener, for as long as it runs. Multi-replica HA remains what
-// docs/reference/configuration.md says it is: standbys wait on the lease; the
-// only thing they now do for KEDA is tell it which metric to carry.
+// NeedLeaderElection -- in two phases. Until this replica holds the lease a
+// standby server answers GetMetricSpec, refuses everything that needs a
+// decision, and cycles each client connection every few seconds so a client
+// that landed on a standby re-dials and can reach the leader. On election the
+// full server binds the same port alongside it (SO_REUSEPORT, see listen), the
+// standby is stopped, and the full server serves for as long as it runs.
+// Multi-replica HA remains what docs/reference/configuration.md says it is:
+// standbys wait on the lease; the only thing they now do for KEDA is tell it
+// which metric to carry.
 type Server struct {
 	// Addr is the gRPC bind address, e.g. ":9090".
 	Addr string
@@ -45,9 +46,9 @@ type Server struct {
 	// without leader election reports too.
 	Elected <-chan struct{}
 
-	// listening is set once a listener is bound and cleared when the server
-	// stops for good -- not across the standby-to-leader hand-off, which
-	// re-binds within the same call.
+	// listening is set once a listener is bound and cleared when Start returns.
+	// The hand-off binds the full server before stopping the standby, so there
+	// is no moment in between at which it would be false.
 	listening atomic.Bool
 }
 
@@ -103,58 +104,113 @@ var _ manager.LeaderElectionRunnable = (*Server)(nil)
 // In-flight calls get the grace period to finish; none takes that long.
 const standbyConnectionAge = 5 * time.Second
 
+// stopGrace bounds a graceful stop. Unary calls finish in milliseconds, but a
+// StreamIsActive is held open by KEDA for as long as KEDA likes, and a
+// GracefulStop waits for it -- through the manager's whole shutdown budget,
+// with the leader lease released only after that, which is precisely the
+// window the standby phase exists to cover. After this long the stop is
+// forced; KEDA re-opens a dropped stream on its own.
+const stopGrace = 2 * time.Second
+
+// neverElected gates the standby server's handler: whichever way the lease
+// goes, a call that reached the standby is answered as a standby. Gating it
+// on the real lease instead let a stream that arrived after election but
+// before the standby drained pass the check, subscribe, and hold the
+// standby's stop open.
+var neverElected = make(chan struct{})
+
 // Start listens and serves until ctx is cancelled, then stops gracefully.
 // It implements manager.Runnable.
 func (s *Server) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("external-scaler")
-	handler := NewHandler(s.Client, nil, s.Registry).WithElected(s.Elected)
 	// On every exit, including a cancellation that lands during the hand-off.
 	defer s.listening.Store(false)
 
-	if !handler.leader() {
-		logger.Info("KEDA external scaler listening before the leader lease is held; decisions refused until then", "addr", s.Addr)
-		standby := []grpc.ServerOption{grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionAge:      standbyConnectionAge,
-			MaxConnectionAgeGrace: standbyConnectionAge,
-		})}
-		if err := s.serve(ctx, handler, s.Elected, standby...); err != nil {
+	full := NewHandler(s.Client, nil, s.Registry).WithElected(s.Elected)
+	if full.leader() {
+		logger.Info("KEDA external scaler listening", "addr", s.Addr)
+		srv, err := s.bind(ctx, full)
+		if err != nil {
 			return err
 		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		logger.Info("leader lease held; KEDA external scaler serving decisions", "addr", s.Addr)
-	} else {
-		logger.Info("KEDA external scaler listening", "addr", s.Addr)
+		return s.run(ctx, srv)
 	}
-	err := s.serve(ctx, handler, nil)
-	logger.Info("KEDA external scaler stopped")
-	return err
-}
 
-// serve runs one gRPC server on Addr until ctx is cancelled or until closes,
-// whichever first, and stops it gracefully. A nil until never closes.
-func (s *Server) serve(ctx context.Context, handler pb.ExternalScalerServer, until <-chan struct{}, opts ...grpc.ServerOption) error {
-	lis, err := net.Listen("tcp", s.Addr)
+	logger.Info("KEDA external scaler listening before the leader lease is held; decisions refused until then", "addr", s.Addr)
+	standby, err := s.bind(ctx, NewHandler(s.Client, nil, s.Registry).WithElected(neverElected),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      standbyConnectionAge,
+			MaxConnectionAgeGrace: standbyConnectionAge,
+		}))
 	if err != nil {
 		return err
 	}
-	s.listening.Store(true)
-	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterExternalScalerServer(grpcServer, handler)
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- grpcServer.Serve(lis) }()
 	select {
 	case <-ctx.Done():
-		grpcServer.GracefulStop()
+		standby.stop()
 		return nil
-	case <-until:
-		// GracefulStop closes the listener and waits for in-flight calls, and
-		// every call a standby accepts is short -- the handler refuses the
-		// long-lived stream before the lease is held for exactly this reason.
-		grpcServer.GracefulStop()
-		return nil
-	case err := <-serveErr:
+	case err := <-standby.err:
 		return err
+	case <-s.Elected:
+	}
+
+	// Bind the full server BEFORE stopping the standby, so the port is never
+	// unbound in between: a GetMetricSpec refused in that gap would leave an
+	// HPA on the CPU default with nothing left to flip it back, since the full
+	// server refuses nothing.
+	srv, err := s.bind(ctx, full)
+	if err != nil {
+		standby.stop()
+		return err
+	}
+	standby.stop()
+	logger.Info("leader lease held; KEDA external scaler serving decisions", "addr", s.Addr)
+	return s.run(ctx, srv)
+}
+
+// served is one gRPC server and the channel its Serve goroutine reports on.
+type served struct {
+	srv *grpc.Server
+	err chan error
+}
+
+// bind listens on Addr and starts serving handler; the caller owns the stop.
+func (s *Server) bind(ctx context.Context, handler pb.ExternalScalerServer, opts ...grpc.ServerOption) (*served, error) {
+	lis, err := listen(ctx, s.Addr)
+	if err != nil {
+		return nil, err
+	}
+	s.listening.Store(true)
+	r := &served{srv: grpc.NewServer(opts...), err: make(chan error, 1)}
+	pb.RegisterExternalScalerServer(r.srv, handler)
+	go func() { r.err <- r.srv.Serve(lis) }()
+	return r, nil
+}
+
+// run waits for ctx or for Serve to fail, and stops the server on the former.
+func (s *Server) run(ctx context.Context, r *served) error {
+	logger := log.FromContext(ctx).WithName("external-scaler")
+	select {
+	case <-ctx.Done():
+		r.stop()
+		logger.Info("KEDA external scaler stopped")
+		return nil
+	case err := <-r.err:
+		return err
+	}
+}
+
+// stop drains the server for at most stopGrace, then forces it.
+func (r *served) stop() {
+	done := make(chan struct{})
+	go func() {
+		r.srv.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(stopGrace):
+		r.srv.Stop()
+		<-done
 	}
 }
