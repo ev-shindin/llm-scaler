@@ -205,9 +205,12 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// move when replicas are added -- so it holds the fleet at the size the
 	// LOAD implies once occupancy stops implying anything.
 	//
-	// Strictly a floor, and a hold rather than an order: it never lowers
-	// demand, and it is capped so it cannot ask for a replica the fleet does
-	// not have. Scale-up stays with occupancy and the queues.
+	// Strictly a floor: it never lowers demand. It does order -- lambda / mu
+	// against a fleet that is short is the earliest signal there is, some 50 s
+	// ahead of occupancy on the measured runs -- and it prices a backlog as
+	// work to drain within BacklogDrainSeconds rather than as KV that must be
+	// resident at once, which is what turned a 350-request queue into five to
+	// seven extra replicas.
 	//
 	// There used to be a second floor here, from Little's law on the service
 	// time the engines report. It was retired: service time is ITL x output
@@ -219,8 +222,12 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// them BEFORE any replica reached saturation, so the throughput this floor
 	// depends on was never observed. The evidence, and what this floor does
 	// that one could not, are in docs/developer-guide/saturation-demand-floor.md.
-	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
-		totalDemand, roleDemand, logger)
+	var eppQueued float64
+	if input.SchedulerQueue != nil {
+		eppQueued = float64(input.SchedulerQueue.QueueSize)
+	}
+	totalDemand = a.applyThroughputFloor(input, replicaCapacities, variantCapacities,
+		totalDemand, roleDemand, queueDemand.byRole, eppQueued, logger)
 
 	result := &domain.AnalyzerResult{
 		AnalyzerName:      a.Name(),
@@ -353,6 +360,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		VariantName:           rm.VariantName,
 		AcceleratorName:       accelerator,
 		TokensInUse:           rm.TokensInUse,
+		QueueLength:           rm.QueueLength,
+		LocalQueueDemand:      localQueueDemand,
 		TotalKvCapacityTokens: rm.TotalKvCapacityTokens,
 		MemoryBoundCapacity:   k1,
 		ComputeBoundCapacity:  k2,
@@ -442,6 +451,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 		VariantName:           rm.VariantName,
 		AcceleratorName:       accelerator,
 		TokensInUse:           replicaDemand,
+		QueueLength:           rm.QueueLength,
+		LocalQueueDemand:      localQueueDemand,
 		TotalKvCapacityTokens: effectiveCapacity, // synthetic: store-derived
 		MemoryBoundCapacity:   effectiveCapacity,
 		ComputeBoundCapacity:  effectiveCapacity,

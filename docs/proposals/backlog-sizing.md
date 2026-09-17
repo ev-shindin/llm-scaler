@@ -157,7 +157,16 @@ the run ended with an order for 6.
    What this does not change: the peaks. The floor only raises, and at the
    peaks the queue charge is already far above it.
 
-## Open: a backlog is charged as residency
+## A backlog is charged as residency -- built on `fix/backlog-by-throughput`
+
+What follows is the analysis that led to it and the direction it proposed;
+the implementation is in `throughput_floor.go` and described in [the
+throughput floor](../developer-guide/saturation-demand-floor.md). Two things
+changed against the direction below, both from measurement: the local engine
+queue is priced by throughput too, not only the scheduler's (on the first
+ramp it was 180 of the 380 queued requests, and the same argument applies);
+and the floor now orders as well as holds, because the second replica's
+order was the late one -- see the developer guide.
 
 The peaks come from one convention. `waitingQueueDemand` and
 `estimateSchedulerQueueDemand` price every queued request at its full KV

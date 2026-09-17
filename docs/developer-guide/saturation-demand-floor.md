@@ -34,14 +34,23 @@ keep up, which in the analyzer's (demand, per-replica capacity) contract is a
 demand of
 
 ```
-floor_role = (lambda / mu_role) x P_role      tokens
-demand     = max(occupancy, floor)            never lowers, only raises
+floor_role = ((lambda + B_role / T) / mu_role) x P_role    tokens
+demand     = max(resident KV, floor)                        never lowers, only raises
 ```
 
 applied per role on a P/D fleet (every request passes through both roles, so
 each must keep up with all of it) and on the total otherwise. `lambda` is the
 scheduler's arrival rate, or the generating replicas' completion rate when the
-scheduler reports none.
+scheduler reports none. `B` is the role's backlog -- the requests waiting in
+its engines' queues plus the scheduler's -- and `T` the drain target
+(`BacklogDrainSeconds`, 60): the fleet asked for clears the backlog in about
+`T` while keeping up with `lambda`. For a role with a `mu`, the queues enter
+the model this way and their residency charge (every queued request at its
+full KV footprint, as if all had to be resident at once) comes out; a role
+with no `mu` keeps the residency charge, except prefill's share of the
+scheduler queue, which is dropped -- a prefill replica holds a prompt for its
+prefill time plus the hand-off, and the only thing that makes it hold longer
+is decode being saturated, which more prefill replicas do not fix.
 
 Properties, each with a spec in `throughput_floor_test.go`:
 
@@ -54,14 +63,24 @@ Properties, each with a spec in `throughput_floor_test.go`:
   than the engine runs. One run's readings for one replica were 5.4, 3.3 and
   3.5 req/s while it was demonstrably completing 5.4. The floor divides by
   `mu`, so a mean of under-reads would order replicas that are not needed.
-- **A hold, not an order.** The floor is capped at `scaleUp x anticipated
-  supply` for the role, with `scaleUp` read the way the engine reads it
-  (`AnalyzerThresholds`, so a per-analyzer override applies to both) -- the
-  largest demand the engine's `RC = D/scaleUp - anticipated` turns into
-  nothing. Above that it would stop holding the fleet and start growing it,
-  and with a `mu` that under-read it would keep growing it every cycle.
-  Scale-up stays with occupancy and the queues, which read well while a fleet
-  is behind; the worst a bad `mu` can do is refuse one scale-down.
+- **An order as well as a hold, and the order comes first.** The first
+  version was capped at the fleet's own size, so that scale-up stayed with
+  occupancy and the queues. Measured on three runs of the shape-swap trace,
+  that put the second replica's order at +69-78 s after load start, from
+  occupancy crossing k1 -- and the lone replica, at 94% of its saturated rate
+  from the first cycle, tipped into preemption at +91 s on two of them and
+  +144 s on the third. With a 60-100 s start the replica landed after the
+  tip, and the queue that built in between was sized as five to seven extra
+  replicas. `lambda / mu = 0.94` through the engine's scale-up headroom orders
+  that replica in the first cycle `lambda` is measured. There is no cap; the
+  bound is the formula, which does not move as replicas are added. What a
+  `mu` that under-read costs is bounded by the under-read, and the window's
+  max corrects it upward at the next saturation.
+- **A backlog is throughput, not residency.** 350 queued requests at 6 req/s
+  arriving are 58 s of arrivals; two replicas at 5.4 req/s each clear them in
+  about two minutes and three in one. Charged as resident KV they were five
+  replicas, each arriving after the queue was gone. `B / T` prices them as
+  what they are.
 - **Ready pods and own replicas only.** The collector leaves a not-Ready pod's
   completion rate in place (only its timing is dropped), and a bridge's rate is
   the pool's, not the variant's.
@@ -157,3 +176,6 @@ is a property of the load.
 | Splitting the buckets with no fallback loses the floor on a new shape (3 -> 1) | Measured, run `guidellm-1789577844-0smu2m_1` |
 | Retired floor + split buckets + borrow: phase 2 goes 2 -> 3 -> 4 and holds, `mu` = 2.97 learned at the one saturation | Measured, run `guidellm-1789581140-kb3q2v_1` |
 | The learning saturation costs one window at 4.8 s p95 TTFT | Measured, same run, engine histograms per 5-minute window |
+| The second replica's order came from occupancy at +69-78 s on three runs; the lone replica tipped at +91 / +91 / +144 s | Measured, runs `wm9k0y_1`, `ydqs8h_1`, `t1pclo_1`, the first replica's own counters |
+| A 350-request backlog charged as residency ordered five extra replicas that arrived after it was gone | Measured, run `biran-20260915-102548-571` |
+| `(lambda + B/T) / mu` orders the second replica in the first cycle and sizes the first-ramp backlog at 2-3 replicas | Arithmetic on the runs' logged values; **run pending** |

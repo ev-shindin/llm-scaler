@@ -59,6 +59,16 @@ const (
 	// output-length bucket.
 	ExtraLongOutputThreshold = 3000
 
+	// BacklogDrainSeconds is how long a queued request may wait for capacity
+	// that is not yet running: the throughput model prices a backlog of B
+	// requests as B / BacklogDrainSeconds extra arrivals per second, so the
+	// fleet it asks for clears the backlog in about this long while keeping up
+	// with the load. It should not be shorter than a replica's start time --
+	// capacity ordered to drain a backlog faster than it can start drains
+	// nothing -- and a replica on the benchmark clusters takes 60-100 s. Sixty
+	// keeps the order within one start. See throughput_floor.go.
+	BacklogDrainSeconds = 60.0
+
 	// VeryLongOutputThreshold is the upper bound (exclusive) for the "xxlong"
 	// output-length bucket; anything at or above it is "huge".
 	VeryLongOutputThreshold = 6000

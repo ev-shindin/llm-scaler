@@ -50,8 +50,8 @@ var logContract = map[string][]string{
 	// demand it replaced, and which of lambda, mu and P produced it.
 	"throughput-demand-floor": {
 		"modelID", "namespace", "role",
-		"demandBeforeFloor", "flooredTo", // what changed
-		"arrivalRate", "saturatedThroughput", "perReplicaCapacity", "replicasImplied", "heldAtFleet", // and from which terms
+		"demandBeforeFloor", "residentDemand", "flooredTo", // what changed
+		"arrivalRate", "backlogRequests", "drainSeconds", "saturatedThroughput", "perReplicaCapacity", "replicasImplied", // and from which terms
 	},
 	"replica-capacity-skipped":        {"modelID", "namespace", "variant", "reason"},
 	"replica-capacity-store-fallback": {"modelID", "namespace", "variant", "reason"},
@@ -422,6 +422,10 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 
 	fields := requireLogged(t, logs, "throughput-demand-floor")
 	assert.Equal(t, domain.RoleBoth, fields["role"])
-	assert.Equal(t, false, fields["heldAtFleet"],
-		"the load implies 2.8 replicas of a four-replica fleet, so the floor is the load's, not the cap's")
+	// The saturated cycle binds too (its queue of ten is a backlog), so the
+	// idle cycle's line is the last one.
+	entries := logs.FilterMessage("throughput-demand-floor").All()
+	last := entries[len(entries)-1].ContextMap()
+	assert.Equal(t, 0.0, last["backlogRequests"], "nothing queued: the floor is the load's alone")
+	assert.Equal(t, BacklogDrainSeconds, last["drainSeconds"])
 }
