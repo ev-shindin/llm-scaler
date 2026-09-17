@@ -40,6 +40,21 @@ Two details worth knowing:
   nothing behind its proxy, so scraping it would produce a permanently-DOWN
   target for every idle Pod — a pool of ten mostly-idle Pods would read as broken
   monitoring.
+- **Scrape the engines every 10 s, the pool's and the models' alike.** The
+  scale-up signal — and so the lend — is a queue at the engine, and it can
+  move only when Prometheus holds a sample that shows it, so the scrape
+  interval is jitter on every decision. Measured on a two-model run, from
+  each rate step to the scale-up decision: 25 / 56 / 56 / 87 s at 30 s,
+  15 / 60 / 60 / 76 s at 10 s. The jitter goes; the ~60 s the queue itself
+  takes to form does not — that is a property of the signal, not the scrape.
+  In those four rises the controller added under 7 s after the sample; its
+  bound is the 15 s optimization interval plus the ScaledObject's 5 s poll.
+  The pool's PodMonitor and the shipped model-server PodMonitor
+  (`config/modelserver-metrics/`) use 10 s; set the same on model servers you
+  deploy from your own values (`monitoring.podmonitor.interval` in a
+  modelservice values file, as the `two-variant-wva` and
+  `workload-autoscaling` benchmark scenarios do — the P/D scenario takes the
+  harness's own PodMonitor and its interval).
 
 > **Check your Prometheus actually selects it.** The operator only reads
 > PodMonitors matching its `podMonitorSelector`. A stack installed with a
