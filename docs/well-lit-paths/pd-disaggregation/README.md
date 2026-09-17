@@ -2,11 +2,10 @@
 
 > **Experimental.** The scenario stands up and runs, WVA's role handling is
 > covered end to end, and the shape has a published benchmark (below). What is
-> still short: a backlog is sized as if it had to be resident at once, so the
-> first ramp and every new shape's first saturation over-order for a few
-> minutes (named under *Measured*), and there is no P/D-specific steady-state
-> e2e spec. Take it as a working recipe with one open item, not a settled
-> default.
+> still short: a shape the controller has never seen saturated is sized from
+> occupancy until it has (named under *Measured*), and there is no
+> P/D-specific steady-state e2e spec. Take it as a working recipe with one
+> open item, not a settled default.
 
 Prefill and decode have different shapes — prefill is compute-bound, decode is
 memory-bandwidth-bound — so llm-d can run them as separate deployments connected
@@ -131,25 +130,28 @@ causes it, so check `kubectl create deployment` works in your namespace first.
 
 The scenario, trace, policy and HPA behaviour above, on CoreWeave 8 x H200
 nodes (k1 = 929,894 tokens per decode replica), against the controller image
-built from this tree, on 2026-09-16 (run `guidellm-1789581140-kb3q2v_1`).
-The graphs and tables are the ones `post_run_analyze.sh` writes.
+built from this tree, on 2026-09-17 (run `guidellm-1789645863-l32fnc_1`).
+The controller had served one pass of the same trace before this one, so the
+saturated throughput of both shapes was on record; the pass before it, on a
+controller that had seen nothing, is the second column where it differs. The
+graphs and tables are the ones `post_run_analyze.sh` writes.
 
-| | |
-|---|---|
-| decode replicas ordered | 1 → 6 (first ramp) → 3 → 2 → 3 → 4, **held to the end** |
-| decode replicas Ready | at most 3: the cluster had no free GPUs for the rest |
-| prefill replicas | 1 → 3 (first ramp) → 1 |
-| ready replicas, both roles, mean / max | 3.78 / 6 |
-| TTFT p50 / p95 | 102 ms / 17.2 s |
-| ITL p50 / p95 | 6.3 / 23.5 ms |
-| request latency p50 / p95 | 19.7 / 91.2 s |
-| requests / errors | 13,288 / 0 |
+| | this run | the cold pass before it |
+|---|---|---|
+| decode replicas ordered | 1 → 3 (first ramp) → 2 → 3 → 4, held | 1 → 3 → 2 → 3 → 4, held |
+| second decode replica ordered | +62 s after load start | +81 s |
+| prefill replicas | 1 throughout | 1 throughout |
+| replicas, both roles, mean / max | 2.59 / 4 | 2.73 / 4 |
+| TTFT p50 / p95 / p99 | 100 ms / **213 ms** / 11.7 s | 99 ms / 7.0 s / 24.7 s |
+| ITL p50 / p95 | 5.4 / 21.7 ms | 4.1 / 23.0 ms |
+| request latency p50 / p95 | 14.6 / 79.2 s | 14.2 / 84.5 s |
+| GPU-minutes | 100.0 | 105.3 |
+| requests / errors | 13,288 / 0 | 13,288 / 0 |
 
 Where the tail is, by five-minute window (p95 TTFT from the engines' own
-histograms): **8.4 s in minutes 0-5**, then 0.05-0.07 s for the rest of the
-first phase; **4.8 s in minutes 20-25**, then 0.04-0.17 s for the rest of the
-second. The two windows are the two saturations below; outside them the p95 is
-under a tenth of a second.
+histograms): **1.8 s in minutes 0-5**, then 0.08 s for the rest of the first
+phase; **0.22 s in minutes 20-25**, then 0.04-0.05 s for the rest of the
+second. On the cold pass the same two windows read 7.0 s and 3.3 s.
 
 ![pipeline: replicas, demand vs capacity, KV, running, waiting, EPP queue](shape-swap-rps6-pipeline.png)
 
@@ -158,43 +160,40 @@ under a tenth of a second.
 How to read it.
 
 **The first ramp** (minutes 0-5). One decode replica serves 6 req/s until the
-second one is Ready, which took 140 s here; in that time its queue reached
-150 and the flow-control queue 180, and the analyzer -- which charges every
-queued request as KV that must be resident at once -- ordered six decode and
-three prefill replicas to drain it. Three decode replicas ever became Ready
-(the cluster was full), the queue was gone before any of them arrived, and
-the target came back down over the next ten minutes. How deep this ramp goes
-is set by the second replica's start time against the load; a run of the
-same trace an hour earlier, where it landed in 97 s, peaked at three with a
-0.4 s p95. Sizing a backlog by throughput rather than residency is the open
-item in [Sizing a backlog](../../proposals/backlog-sizing.md).
+second is Ready. The analyzer knows what one replica of this shape completes
+when saturated, and the arrival rate over that is 0.85-0.91 of a replica from
+the first cycle the rate is measured, so it orders the second replica at
++62 s -- from the load, not from the queue, and before the first replica
+tips into preemption. The second lands at +160 s; a queue of ~110 forms in
+the last minute of the wait and is priced as work to drain within 60 s
+(`backlogRequests` on the `throughput-demand-floor` line), which is one more
+replica, not five: the target peaks at 3, the queue is gone in a minute, and
+the third replica is released at +6 min. Prefill is never ordered: prompts
+waiting at the scheduler are no longer charged to it as resident KV.
 
 **The first phase, steady** (minutes 5-18). Occupancy is a fraction of one
 replica (5-15% KV) -- the reading that, taken alone, would size the fleet to
 one. The dashed target holds at two because the analyzer floors each role's
 demand at what the load requires in throughput: the arrival rate over the
-completion rate one replica sustained when it was last seen saturated
-(`throughput-demand-floor` in the controller log carries the terms). Prefill
-holds at one because nothing is charged to it.
+completion rate one replica sustained when it was last seen saturated.
 
-**The shape change** (minute 18 on). The 4000-token shape has never been
-seen saturated, so the floor borrows the 1000-token shape's throughput and
-holds two, which is one short for this shape. The two replicas fall behind by
-growing their batch rather than a queue -- 75 to 229 against an engine
-ceiling of 256, ITL 6 to 20 ms -- until the batch reaches the ceiling, a queue
-forms (the blip at 18:16), and the replicas' own completion rate for this
-shape, 2.97 req/s, is recorded. From there the floor is 6 / 2.97 = two
-replicas' worth, occupancy plus the queue order a third and then a fourth
-(the ramp again, smaller), and the fleet **holds** for the remaining eleven
-minutes. That one saturation is the 4.8 s window above: the price of learning
-a new shape's throughput by reaching it, paid once per shape per bucket.
+**The shape change** (minute 18 on). The 4000-token shape's throughput is on
+record (2.67 req/s), so as the replicas' output length crosses into its
+bucket the floor becomes 6 / 2.67 = 2.25 replicas' worth and orders the
+third at +4 min into the phase -- no queue forms at all (the waiting panel is
+flat through the whole second phase), the batch peaks at 63% KV and relaxes.
+The fourth, at minute 31, is one noisy arrival-rate sample (6.7 req/s for a
+cycle against a steady 5.4-6.0) tipping 2.5 replicas' worth over the
+three-replica boundary; the analyzer asked for three again 90 s later and the
+HPA's 180 s window kept the fourth to the end. One spare replica for six
+minutes is the cost of that jitter today.
 
-What still moves: the ramp on every saturation, first or new-shape, is the
-backlog charged as residency; and a shape is learned only by saturating on
-it once. Both are named in the proposal doc. What no longer moves: the fleet
-does not fall below what the load needs once a shape is known, and a fleet
-that has just caught up is not scaled down for looking idle. The mechanism
-is in [the throughput floor](../../developer-guide/saturation-demand-floor.md).
+What still moves: a controller that has never seen a shape saturated has no
+throughput for it and sizes that first ramp from occupancy and the backlog,
+which is the cold pass in the table -- a peak of three still, but the order
+comes 20 s later and the queue is deeper. The mechanism is in
+[the throughput floor](../../developer-guide/saturation-demand-floor.md); the
+analysis that led to it in [Sizing a backlog](../../proposals/backlog-sizing.md).
 
 ## How it is tested
 
