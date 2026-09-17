@@ -3,6 +3,7 @@ package saturation_v2
 import (
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/go-logr/logr"
 
@@ -11,23 +12,27 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 )
 
-// The arrival-rate floor in arrival_demand.go sizes the fleet by Little's law
-// from the service time the engines currently report. That service time is not
-// a property of the load: it is ITL x output length, and ITL grows with the
-// batch a replica is running. Measured on one decode pod across a run at a
-// constant 6 req/s and a constant 6000/1000 shape (biran-20260915-102548-571):
+// Occupancy -- resident KV plus the waiting queues -- is a state of the
+// fleet, not a property of the load, and it falls as replicas are added. Any
+// floor built from a per-request cost measured on the current fleet has the
+// same defect: the service time the engines report is ITL x output length,
+// and ITL grows with the batch a replica is running. Measured on one decode
+// pod across a run at a constant 6 req/s and a constant 6000/1000 shape
+// (biran-20260915-102548-571):
 //
 //	replicas sharing the load   batch   ITL      W (service time)
 //	6                           ~1      2.0 ms   2.0 s
 //	1                           136-178 18-50 ms 16-52 s
 //
 // A 25x range in W at the same load, so lambda x W x tokens with the W of the
-// moment is current occupancy restated: at six replicas it read 88k tokens
-// (one tenth of a replica) and authorised the scale-down to one, where the
-// same load then saturated that one replica within a minute and the cycle
-// repeated. That floor is bounded below by the uncontended W, which is real,
-// but the uncontended W is what a fleet that is far too large measures, so
-// the bound holds nothing up.
+// moment is current occupancy restated. A floor built that way (the
+// arrival-rate floor this file replaced) read 88k tokens at six replicas and
+// authorised the scale-down to one; and on the way UP it did the opposite
+// harm, pricing the load at the inflated W of a fleet that was behind,
+// ordering replicas before any had reached saturation, and releasing them
+// once they had brought W back down. Measured as a 2-4 replica oscillation
+// with a ten-minute period on the second phase of the shape-swap benchmark
+// (docs/proposals/backlog-sizing.md).
 //
 // What a replica can do does not move with the fleet: its completion rate
 // when saturated. With the queue over the threshold the engine is completing
@@ -103,15 +108,89 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 }
 
 // saturatedThroughputFor returns the saturated completion rate on record for
-// key, or 0 when saturation has never been observed for the bucket.
-func (a *SaturationAnalyzer) saturatedThroughputFor(key string) float64 {
+// key, and the bucket it came from. When the key's own bucket has no reading
+// it borrows the nearest output-length bucket's under the same key prefix
+// (see nearestSaturatedThroughput); the returned bucket names which, so the
+// log can say the figure is borrowed. Returns 0 and "" when no bucket has one.
+func (a *SaturationAnalyzer) saturatedThroughputFor(key string) (float64, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	ra, ok := a.saturatedThroughput[key]
-	if !ok {
-		return 0
+	if ra, ok := a.saturatedThroughput[key]; ok {
+		return ra.Max(), bucketOf(key)
 	}
-	return ra.Max()
+	return a.nearestSaturatedThroughput(key)
+}
+
+// nearestSaturatedThroughput finds the reading in the output-length bucket
+// closest to key's, on the same model, accelerator, GPU count, role and queue
+// threshold. Caller holds a.mu.
+//
+// A shape the fleet has not yet been seen saturated under has no throughput
+// of its own, and without this the floor would simply vanish on the first
+// cycle of a new shape -- which is the moment a floor is for. Measured on the
+// shape-swap benchmark: the switch from 1000 to 4000 output tokens landed in
+// an empty bucket, occupancy read 400k at three replicas, and the target went
+// from 3 towards 1 in one cycle, where the shared bucket it replaced would
+// at least have held two.
+//
+// The neighbour's figure is wrong in a known direction. Throughput falls with
+// output length, so a shorter shape's mu is too high and holds too few
+// replicas (the fleet then saturates and learns its own, exactly once); a
+// longer shape's mu is too low and holds too many, which the cap bounds at
+// the fleet's own size. Either is better than no floor. The borrowed figure
+// is used only until the bucket has a reading of its own: a fresh window
+// takes over the first cycle it exists, so it is never masked by the
+// neighbour's max.
+//
+// Ties between an equally distant shorter and longer bucket go to the shorter
+// one -- the under-hold, which occupancy corrects, rather than the over-hold,
+// which only the cap does.
+func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, string) {
+	prefix, bucket, suffix, ok := splitHistoryKey(key)
+	if !ok {
+		return 0, ""
+	}
+	own := slices.Index(outputBuckets, bucket)
+	if own < 0 {
+		return 0, ""
+	}
+	for dist := 1; dist < len(outputBuckets); dist++ {
+		for _, i := range []int{own - dist, own + dist} {
+			if i < 0 || i >= len(outputBuckets) {
+				continue
+			}
+			if ra, found := a.saturatedThroughput[prefix+outputBuckets[i]+suffix]; found {
+				return ra.Max(), outputBuckets[i]
+			}
+		}
+	}
+	return 0, ""
+}
+
+// splitHistoryKey takes a key of the form built by historyKey --
+// model|accelerator|gpus|role|bucket|qN -- apart around its bucket. The
+// model ID may itself contain "|"-free "/" and other characters but never
+// "|", so counting from the right is safe: the bucket is the second-to-last
+// field.
+func splitHistoryKey(key string) (prefix, bucket, suffix string, ok bool) {
+	last := strings.LastIndexByte(key, '|')
+	if last < 0 {
+		return "", "", "", false
+	}
+	prev := strings.LastIndexByte(key[:last], '|')
+	if prev < 0 {
+		return "", "", "", false
+	}
+	return key[:prev+1], key[prev+1 : last], key[last:], true
+}
+
+// bucketOf returns the output-length bucket a history key was built with.
+func bucketOf(key string) string {
+	_, bucket, _, ok := splitHistoryKey(key)
+	if !ok {
+		return ""
+	}
+	return bucket
 }
 
 // estimateThroughputDemand computes the per-role floor from lambda and the
@@ -198,8 +277,7 @@ func estimateThroughputDemand(
 // On a disaggregated fleet each role is floored on its own: the scheduler's
 // arrival rate is every request, and every request passes through both
 // roles, so each must keep up with all of it. The model-level total is raised
-// by the same amount so RoleDemand and TotalDemand keep moving together --
-// which is what raiseRoleDemandTo preserves from the other direction. On a
+// by the same amount so RoleDemand and TotalDemand keep moving together. On a
 // non-disaggregated fleet there is no RoleDemand and the single "both" floor
 // lands on the total directly.
 //
@@ -249,9 +327,6 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 		if tokens <= measured {
 			continue
 		}
-		// demandBeforeFloor, not occupancyDemand: by this point the arrival
-		// floor may already have raised the figure, so it is whatever demand
-		// stood at when this floor was applied, which is not always occupancy.
 		logger.Info("throughput-demand-floor",
 			"modelID", input.ModelID, "namespace", input.Namespace, "role", role,
 			"demandBeforeFloor", measured, "flooredTo", tokens,
@@ -266,10 +341,21 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	return totalDemand
 }
 
-// offeredArrivalRate is the model-level arrival rate the two floors share:
-// the scheduler's, or the completion rate of the replicas that generate
-// output when the scheduler reports none. See estimateArrivalDemand for what
-// the fallback is and is not good for.
+// offeredArrivalRate is the model-level arrival rate: the scheduler's, or the
+// completion rate of the replicas that generate output when the scheduler
+// reports none.
+//
+// The EPP is the only source of a model-level arrival rate. Without it, fall
+// back to what the engines completed: at steady state a queue that is neither
+// growing nor shrinking makes completion rate equal arrival rate. That
+// equality fails exactly when a queue is building, and completions are then
+// capped by capacity -- so this understates lambda precisely when demand is
+// highest. Tolerable because a building queue is the case OCCUPANCY reads
+// well, so the floor is not what carries that decision.
+//
+// The fallback sums the generating replicas only. A P/D request completes on
+// its prefill replica AND on its decode replica, so summing every replica's
+// completion rate counts each request twice.
 func offeredArrivalRate(input domain.AnalyzerInput) float64 {
 	if input.ArrivalRate > 0 {
 		return input.ArrivalRate
@@ -284,7 +370,7 @@ func offeredArrivalRate(input domain.AnalyzerInput) float64 {
 // medianFloat is the median of values, averaging the central pair on an even
 // count: every value here is a learned per-replica figure, none is suspect,
 // and the midpoint is the better estimate -- the same convention as median()
-// for capacities, not medianOf's outlier-defending lower median.
+// for capacities.
 func medianFloat(values []float64) float64 {
 	n := len(values)
 	if n == 0 {
@@ -297,4 +383,27 @@ func medianFloat(values []float64) float64 {
 		return (sorted[n/2-1] + sorted[n/2]) / 2
 	}
 	return sorted[n/2]
+}
+
+// generatingReplicas returns the replicas whose completions describe the
+// workload -- every role but prefill (see generatesOutput). On a P/D fleet a
+// prefill replica finishes each request after one token and hands it off, so
+// its completion rate, output length and service time are properties of the
+// role, not of the workload. When that leaves nothing, which happens only on a
+// fleet whose decode side reports no metrics this cycle, it returns the full
+// set rather than an empty one: a prefill reading is a poor estimate, but no
+// reading at all would make the floor silently decline on a fleet that is
+// demonstrably serving.
+func generatingReplicas(input domain.AnalyzerInput) []domain.ReplicaMetrics {
+	roles := rolesFromStates(input.VariantStates)
+	out := make([]domain.ReplicaMetrics, 0, len(input.ReplicaMetrics))
+	for _, rm := range input.ReplicaMetrics {
+		if generatesOutput(rm, roles) {
+			out = append(out, rm)
+		}
+	}
+	if len(out) == 0 {
+		return input.ReplicaMetrics
+	}
+	return out
 }

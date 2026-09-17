@@ -72,22 +72,36 @@ type ReplicaCapacity struct {
 	SaturatedThroughput float64
 }
 
+// outputBuckets lists the output-length buckets in ascending order of length.
+// The order is what the throughput floor walks when a bucket has no reading
+// of its own (see nearestSaturatedThroughput).
+var outputBuckets = []string{"short", "medium", "long", "xlong", "xxlong", "huge"}
+
 // classifyOutputLength returns a workload bucket name based on average
 // output token length. The buckets are used to key compute-capacity (k2)
 // history, since k2 depends heavily on generation length.
 //
-// Buckets:
+// Buckets (the thresholds and why they sit where they do are in constants.go):
 //
 //	"short"  — avgOutput in [0, 100)
 //	"medium" — avgOutput in [100, 500)
-//	"long"   — avgOutput >= 500
+//	"long"   — avgOutput in [500, 1500)
+//	"xlong"  — avgOutput in [1500, 3000)
+//	"xxlong" — avgOutput in [3000, 6000)
+//	"huge"   — avgOutput >= 6000
 func classifyOutputLength(avgOutputTokens float64) string {
 	switch {
 	case avgOutputTokens < ShortOutputThreshold:
 		return "short"
 	case avgOutputTokens < MediumOutputThreshold:
 		return "medium"
-	default:
+	case avgOutputTokens < LongOutputThreshold:
 		return "long"
+	case avgOutputTokens < ExtraLongOutputThreshold:
+		return "xlong"
+	case avgOutputTokens < VeryLongOutputThreshold:
+		return "xxlong"
+	default:
+		return "huge"
 	}
 }

@@ -47,17 +47,16 @@ var logContract = map[string][]string{
 	},
 	// The floor changes a scaling decision when it binds, so the same contract
 	// applies: a reader has to be able to tell the floored demand from the
-	// occupancy it replaced, and which service-time source produced it.
-	"arrival-demand-floor": {
-		"modelID", "namespace",
-		"occupancyDemand", "flooredTo", // what changed
-		"arrivalRate", "serviceTimeSec", "serviceTimeFrom", "tokensPerRequest", // and from which terms
+	// demand it replaced, and which of lambda, mu and P produced it.
+	"throughput-demand-floor": {
+		"modelID", "namespace", "role",
+		"demandBeforeFloor", "flooredTo", // what changed
+		"arrivalRate", "saturatedThroughput", "perReplicaCapacity", "replicasImplied", "heldAtFleet", // and from which terms
 	},
-	"arrival-demand-floor unavailable": {"modelID", "namespace", "reason"},
-	"replica-capacity-skipped":         {"modelID", "namespace", "variant", "reason"},
-	"replica-capacity-store-fallback":  {"modelID", "namespace", "variant", "reason"},
-	"variant-capacity-source":          {"modelID", "namespace", "variant", "reason"},
-	"zero-replica-capacity-estimate":   {"modelID", "namespace", "variant", "source"},
+	"replica-capacity-skipped":        {"modelID", "namespace", "variant", "reason"},
+	"replica-capacity-store-fallback": {"modelID", "namespace", "variant", "reason"},
+	"variant-capacity-source":         {"modelID", "namespace", "variant", "reason"},
+	"zero-replica-capacity-estimate":  {"modelID", "namespace", "variant", "source"},
 }
 
 // k2PriorityLabels is the closed vocabulary the report's Priority column
@@ -391,106 +390,38 @@ func TestLogContract_PerReplicaLinesAreVerbosityGated(t *testing.T) {
 	})
 }
 
-// TestLogContract_ArrivalFloorBinds pins the line emitted when the floor
-// actually changes a decision. It carries both the number it replaced and the
-// terms it was built from, because "the target went up" is not diagnosable
-// without knowing whether lambda moved or the service time did.
-func TestLogContract_ArrivalFloorBinds(t *testing.T) {
+// TestLogContract_ThroughputFloorBinds pins the line the floor emits when it
+// changes a decision, and the terms it was built from: "the target held" is
+// not diagnosable without knowing whether lambda moved or mu did.
+func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	ctx, logs := observedCtx(t)
 	analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	states := []domain.VariantReplicaState{
+		{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
+	}
 
-	rm := makeReplicaMetrics("pod-1", "variant-a", 10_000, 600_000, 0, 4000, 1000)
-	rm.AvgServiceTime = 24.6
-	input := makeAnalyzerInput(
-		[]domain.ReplicaMetrics{rm},
-		[]domain.VariantReplicaState{
-			{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
-		},
-	)
+	// A saturated cycle first, so a throughput is on record for the bucket.
+	sat := makeReplicaMetrics("pod-1", "variant-a", 500_000, 600_000, 10, 4000, 1000)
+	sat.RequestRate = 5
+	sat.Ready = true
+	input := makeAnalyzerInput([]domain.ReplicaMetrics{sat}, states)
 	input.ArrivalRate = 14
-
 	_, err := analyzer.Analyze(ctx, input)
 	require.NoError(t, err)
 
-	fields := requireLogged(t, logs, "arrival-demand-floor")
-	assert.Equal(t, "measured", fields["serviceTimeFrom"],
-		"the engine published a service time, so the reconstruction must not have been used")
-}
+	// Then an idle-looking one: occupancy a fraction of a replica, the load
+	// unchanged. The floor binds and says so.
+	idle := makeReplicaMetrics("pod-1", "variant-a", 10_000, 600_000, 0, 4000, 1000)
+	idle.RequestRate = 5
+	idle.Ready = true
+	states[0].CurrentReplicas = 4
+	input = makeAnalyzerInput([]domain.ReplicaMetrics{idle, idle, idle, idle}, states)
+	input.ArrivalRate = 14
+	_, err = analyzer.Analyze(ctx, input)
+	require.NoError(t, err)
 
-// TestLogContract_ArrivalFloorUnavailableIsGatedOnOccupancy pins the gate, not
-// just the line.
-//
-// The gate is the whole reason this can log at DEFAULT verbosity. Gating on
-// having replicas would look equivalent and is not: an idle pod still reports
-// metrics (the engine publishes 0 rather than nothing), so a model parked at
-// minReplicaCount 1 would emit this every optimize cycle forever -- four lines a
-// minute, per model, for a diagnostic that never changes.
-func TestLogContract_ArrivalFloorUnavailableIsGatedOnOccupancy(t *testing.T) {
-	t.Run("reports a serving fleet it cannot floor", func(t *testing.T) {
-		ctx, logs := observedCtx(t)
-		analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-
-		// Occupancy present, but no arrival rate and no completions anywhere.
-		input := makeAnalyzerInput(
-			[]domain.ReplicaMetrics{makeReplicaMetrics("pod-1", "variant-a", 10_000, 600_000, 0, 4000, 1000)},
-			[]domain.VariantReplicaState{
-				{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
-			},
-		)
-
-		_, err := analyzer.Analyze(ctx, input)
-		require.NoError(t, err)
-		fields := requireLogged(t, logs, "arrival-demand-floor unavailable")
-		assert.Contains(t, fields["reason"], "arrival rate")
-	})
-
-	t.Run("still reports when load is arriving but occupancy reads zero", func(t *testing.T) {
-		// The hole an occupancy-only gate would leave. A sample landing between
-		// completions, or a replica still warming, reads zero occupancy while
-		// requests are demonstrably arriving -- and with no timings published
-		// yet, the floor cannot be computed either. Neither branch would fire and
-		// nothing would be said, in precisely the case this diagnostic exists
-		// for. HasArrivalSignal is what keeps it audible.
-		ctx, logs := observedCtx(t)
-		analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-
-		rm := makeReplicaMetrics("pod-1", "variant-a", 0, 600_000, 0, 4000, 1000)
-		rm.AvgServiceTime = 0
-		rm.AvgITL = 0
-		input := makeAnalyzerInput(
-			[]domain.ReplicaMetrics{rm},
-			[]domain.VariantReplicaState{
-				{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
-			},
-		)
-		input.ArrivalRate = 14 // load IS arriving
-
-		_, err := analyzer.Analyze(ctx, input)
-		require.NoError(t, err)
-		fields := requireLogged(t, logs, "arrival-demand-floor unavailable")
-		assert.Contains(t, fields["reason"], "inter-token latency",
-			"it should name the timing it could not get, not the arrival rate it had")
-	})
-
-	t.Run("stays silent for an idle fleet that reports zeros", func(t *testing.T) {
-		ctx, logs := observedCtx(t)
-		analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-
-		// A replica exists and reports metrics, but holds nothing: the engine
-		// publishes 0 rather than nothing. This is the case that would otherwise
-		// repeat forever.
-		input := makeAnalyzerInput(
-			[]domain.ReplicaMetrics{makeReplicaMetrics("pod-1", "variant-a", 0, 600_000, 0, 4000, 1000)},
-			[]domain.VariantReplicaState{
-				{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
-			},
-		)
-
-		_, err := analyzer.Analyze(ctx, input)
-		require.NoError(t, err)
-		for _, e := range logs.All() {
-			assert.NotEqual(t, "arrival-demand-floor unavailable", e.Message,
-				"an idle-but-provisioned model must not emit this every cycle")
-		}
-	})
+	fields := requireLogged(t, logs, "throughput-demand-floor")
+	assert.Equal(t, domain.RoleBoth, fields["role"])
+	assert.Equal(t, false, fields["heldAtFleet"],
+		"the load implies 2.8 replicas of a four-replica fleet, so the floor is the load's, not the cap's")
 }

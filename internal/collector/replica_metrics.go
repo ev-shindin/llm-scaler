@@ -1151,7 +1151,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// rather than a real one. Observed directly on a live run: a decode
 		// pod failing its readiness probe reported a batch of "completions"
 		// averaging ~145 hours of service time each, which was then averaged
-		// unweighted across the fleet by estimateArrivalDemand and inflated
+		// unweighted across the fleet by the arrival-rate demand floor and inflated
 		// the demand floor ~590x for several minutes. Excluding it here is a
 		// second, independent layer under that call site's own median-based
 		// aggregation -- if a value like this shouldn't be trusted, the
@@ -1165,7 +1165,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// already accepted, so zeroing its shape would erase real demand and
 		// read as "idle" -- the failure this whole change exists to avoid,
 		// pointing the other way. Their outlier defence lives in
-		// estimateArrivalDemand, the only consumer that aggregates them across
+		// the throughput floor, the only consumer that aggregates them across
 		// replicas.
 		avgITL := data.avgITL
 		avgServiceTime := data.avgServiceTime
