@@ -58,6 +58,13 @@ type ReplicaCapacity struct {
 	// prefill replicas, and queueLength * (avgInputTokens + avgOutputTokens) for
 	// decode/"both". See waitingQueueDemand.
 	ReplicaDemand int64
+	// QueueLength is the number of requests waiting in this replica's engine
+	// queue, and LocalQueueDemand the residency charge waitingQueueDemand put
+	// on them, which ReplicaDemand includes. Carried separately so the
+	// throughput model (throughput_floor.go) can take the residency charge
+	// back out and price the same requests as work to be done instead.
+	QueueLength      int
+	LocalQueueDemand int64
 
 	// FromWarmPool marks a BRIDGE: a warm pool Pod lent to this variant rather
 	// than one of its own replicas. Carried through from the collector so
@@ -70,6 +77,14 @@ type ReplicaCapacity struct {
 	// recorded beside k2; 0 when no saturation has been observed for the
 	// bucket. Read by the throughput floor (throughput_floor.go).
 	SaturatedThroughput float64
+	// SaturatedThroughputSamples is how many readings the window that
+	// produced SaturatedThroughput holds, and SaturatedThroughputBorrowed
+	// whether that window is a neighbouring bucket's rather than the
+	// replica's own (see nearestSaturatedThroughput). The floor orders a
+	// replica only on an own window of MinThroughputSamplesToOrder readings;
+	// anything less holds.
+	SaturatedThroughputSamples  int
+	SaturatedThroughputBorrowed bool
 }
 
 // outputBuckets lists the output-length buckets in ascending order of length.

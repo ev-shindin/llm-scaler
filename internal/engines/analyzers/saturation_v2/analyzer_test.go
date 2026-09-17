@@ -1325,9 +1325,14 @@ var _ = Describe("SaturationAnalyzer", func() {
 			Expect(result.RoleDemand).NotTo(BeNil())
 
 			// Scheduler queue: input=max(0, 10*100)=1000, output=10*50=500
-			// Prefill role demand: replica(3000) + queue(1000) = 4000
 			// Decode role demand: replica(2000) + queue(1500) = 3500
-			Expect(result.RoleDemand["prefill"]).To(Equal(4000.0))
+			// Prefill role demand: replica(3000) only. Its 1000-token share of
+			// the scheduler queue is attributed (see the log line) and then
+			// dropped by the throughput model while prefill has no saturated
+			// throughput: a prefill replica holds a prompt for its prefill
+			// time plus the hand-off, and a queue at the scheduler is decode's
+			// to drain (throughput_floor.go).
+			Expect(result.RoleDemand["prefill"]).To(Equal(3000.0))
 			Expect(result.RoleDemand["decode"]).To(Equal(3500.0))
 
 			// Model-level total still uses inputTokens+outputTokens (1500)

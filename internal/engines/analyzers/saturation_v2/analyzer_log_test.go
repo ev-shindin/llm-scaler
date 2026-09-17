@@ -50,13 +50,18 @@ var logContract = map[string][]string{
 	// demand it replaced, and which of lambda, mu and P produced it.
 	"throughput-demand-floor": {
 		"modelID", "namespace", "role",
-		"demandBeforeFloor", "flooredTo", // what changed
-		"arrivalRate", "saturatedThroughput", "perReplicaCapacity", "replicasImplied", "heldAtFleet", // and from which terms
+		"demandBeforeFloor", "residentDemand", "flooredTo", // what changed
+		"arrivalRate", "backlogRequests", "drainSeconds", "saturatedThroughput", "perReplicaCapacity", "replicasImplied", // and from which terms
+		"heldAtFleet", "heldWhy", // and whether the floor was allowed to order on them
 	},
-	"replica-capacity-skipped":        {"modelID", "namespace", "variant", "reason"},
-	"replica-capacity-store-fallback": {"modelID", "namespace", "variant", "reason"},
-	"variant-capacity-source":         {"modelID", "namespace", "variant", "reason"},
-	"zero-replica-capacity-estimate":  {"modelID", "namespace", "variant", "source"},
+	// Prefill's share of the scheduler queue is dropped while prefill has no
+	// mu (throughput_floor.go); the line is what explains the gap between
+	// scheduler-queue-demand's byRole and RoleDemand.
+	"scheduler-queue-prefill-share-dropped": {"modelID", "namespace", "eppQueueSize", "droppedTokens", "prefillDemandBefore", "prefillDemandAfter"},
+	"replica-capacity-skipped":              {"modelID", "namespace", "variant", "reason"},
+	"replica-capacity-store-fallback":       {"modelID", "namespace", "variant", "reason"},
+	"variant-capacity-source":               {"modelID", "namespace", "variant", "reason"},
+	"zero-replica-capacity-estimate":        {"modelID", "namespace", "variant", "source"},
 }
 
 // k2PriorityLabels is the closed vocabulary the report's Priority column
@@ -400,14 +405,17 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 		{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
 	}
 
-	// A saturated cycle first, so a throughput is on record for the bucket.
+	// Two saturated cycles first, so a throughput the floor may order on is
+	// on record for the bucket (MinThroughputSamplesToOrder).
 	sat := makeReplicaMetrics("pod-1", "variant-a", 500_000, 600_000, 10, 4000, 1000)
 	sat.RequestRate = 5
 	sat.Ready = true
 	input := makeAnalyzerInput([]domain.ReplicaMetrics{sat}, states)
 	input.ArrivalRate = 14
-	_, err := analyzer.Analyze(ctx, input)
-	require.NoError(t, err)
+	for i := 0; i < MinThroughputSamplesToOrder; i++ {
+		_, err := analyzer.Analyze(ctx, input)
+		require.NoError(t, err)
+	}
 
 	// Then an idle-looking one: occupancy a fraction of a replica, the load
 	// unchanged. The floor binds and says so.
@@ -417,11 +425,16 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	states[0].CurrentReplicas = 4
 	input = makeAnalyzerInput([]domain.ReplicaMetrics{idle, idle, idle, idle}, states)
 	input.ArrivalRate = 14
-	_, err = analyzer.Analyze(ctx, input)
+	_, err := analyzer.Analyze(ctx, input)
 	require.NoError(t, err)
 
 	fields := requireLogged(t, logs, "throughput-demand-floor")
 	assert.Equal(t, domain.RoleBoth, fields["role"])
-	assert.Equal(t, false, fields["heldAtFleet"],
-		"the load implies 2.8 replicas of a four-replica fleet, so the floor is the load's, not the cap's")
+	// The saturated cycles bind too (their queue of ten is a backlog), so the
+	// idle cycle's line is the last one.
+	entries := logs.FilterMessage("throughput-demand-floor").All()
+	last := entries[len(entries)-1].ContextMap()
+	assert.Equal(t, 0.0, last["backlogRequests"], "nothing queued: the floor is the load's alone")
+	assert.Equal(t, BacklogDrainSeconds, last["drainSeconds"])
+	assert.Equal(t, false, last["heldAtFleet"], "two readings of its own: the floor is the load's, not the cap's")
 }

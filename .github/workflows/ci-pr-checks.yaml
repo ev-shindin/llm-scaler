@@ -125,9 +125,13 @@ jobs:
       # yq is not preinstalled on ubuntu-latest; the readiness checks are FATAL
       # without it rather than skipping, because a skip is how a green run comes
       # to mean nothing.
+      #
+      # The download retries: GitHub's release CDN answered a 500 once and the
+      # PR went red before a single check had run. --retry-all-errors covers
+      # HTTP 5xx, which plain --retry does not; the six attempts span ~2 min.
       - name: Install yq
         run: |
-          sudo curl -fsSL -o /usr/local/bin/yq \
+          sudo curl -fsSL --retry 6 --retry-delay 10 --retry-all-errors -o /usr/local/bin/yq \
             https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
           yq --version

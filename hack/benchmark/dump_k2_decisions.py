@@ -79,11 +79,15 @@ K2_MSG = "k2-decision"
 RC_MSG = "replica-capacity-decision"
 SQ_MSG = "scheduler-queue-demand"
 # The throughput floor (saturation_v2/throughput_floor.go). TFLOOR_MSG fires
-# only when the floor actually raises demand, so its presence in a dump marks
-# the cycles where the fleet was HELD at lambda / mu replicas after occupancy
-# had stopped asking for them -- the first thing to check when a target looks
-# higher than the fleet appears to warrant. It carries replicasImplied and
-# heldAtFleet, which together say whether the hold was the load's or the cap's.
+# only when the floor actually changes demand, so its presence in a dump marks
+# the cycles where the fleet was sized by throughput -- held at, or ordered up
+# to, (lambda + backlog / drain) / mu replicas -- rather than by occupancy: the
+# first thing to check when a target looks higher than the fleet appears to
+# warrant, or when a queue did NOT order the replicas it used to. It carries
+# replicasImplied, backlogRequests and drainSeconds, residentDemand next to
+# demandBeforeFloor (the difference is the residency charge the queues had),
+# and heldAtFleet/heldWhy: a floor built on a borrowed or single reading may
+# hold the fleet but not grow it, and says which.
 #
 # Logs from before the throughput floor carry an "arrival-demand-floor" line
 # instead (a Little's-law floor on the reported service time, retired for
