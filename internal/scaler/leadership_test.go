@@ -92,11 +92,13 @@ var _ = Describe("Answering before the leader lease is held", func() {
 		Expect(a.Result).To(BeTrue())
 	})
 
-	It("refuses StreamIsActive with Unavailable, having registered the caller", func() {
+	It("ends StreamIsActive cleanly, without a push, having registered the caller", func() {
+		// Cleanly (nil), not refused: KEDA reopens a cleanly closed stream
+		// after a steady 2 s, but backs a failed one off towards a minute.
 		h := newHandler(scaledObjectFor("chat-decode", "chat-decode-deploy"))
 		stream := newFakeStream(ctx)
 		err := h.StreamIsActive(ref("chat-decode", map[string]string{registry.ModelIDKey: "default/default"}), stream)
-		Expect(status.Code(err)).To(Equal(codes.Unavailable), "got %v", err)
+		Expect(err).NotTo(HaveOccurred())
 		stream.expectNoPush()
 	})
 

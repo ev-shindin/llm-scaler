@@ -755,7 +755,12 @@ func main() {
 		Addr:     *externalScalerBindAddress,
 		Client:   mgr.GetAPIReader(),
 		Registry: registry.Default,
-		Elected:  mgr.Elected(),
+	}
+	// Without leader election this replica is the leader from the start; the
+	// manager's Elected channel says so too, but only after it has started
+	// the server, which would put it through a standby phase for nothing.
+	if cfg.EnableLeaderElection() {
+		externalScaler.Elected = mgr.Elected()
 	}
 	if err := mgr.Add(externalScaler); err != nil {
 		setupLog.Error(err, "unable to add KEDA external scaler to manager")

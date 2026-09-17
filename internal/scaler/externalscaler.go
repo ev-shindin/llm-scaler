@@ -393,15 +393,17 @@ func (h *Handler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScal
 		defer release()
 	}
 
-	// Refused, not held, before the lease: the standby server that answers
-	// here is stopped gracefully on election, and a graceful stop waits for
-	// every call in flight -- a stream parked here would hold the full server
-	// back until KEDA hung up. KEDA re-opens a refused stream on a backoff
-	// starting at 2 s. The registration above still happens, so the workload
-	// is known to the engines the moment they start.
+	// Ended, not held, before the lease: the standby server that answers here
+	// is stopped on election, and a stream parked here would hold that stop
+	// open. Ended with OK rather than refused, deliberately: KEDA re-opens a
+	// stream that closed cleanly after a steady 2 s, but backs off a failed
+	// one 2, 4, 8 ... 60 s, so a refusal could leave a zero-parked workload
+	// without its activation stream for a minute after election. The
+	// registration above still happens, so the workload is known to the
+	// engines the moment they start.
 	if !h.leader() {
-		logger.V(1).Info("external scaler StreamIsActive refused before the leader lease is held")
-		return errNotLeader
+		logger.V(1).Info("external scaler StreamIsActive ended before the leader lease is held; KEDA will reopen it")
+		return nil
 	}
 
 	// Resolve the target once, up front: it is fixed for the life of the

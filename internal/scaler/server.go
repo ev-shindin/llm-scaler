@@ -42,13 +42,16 @@ type Server struct {
 	// discovery. Nil uses registry.Default, which is what the engines read.
 	Registry *registry.Registry
 	// Elected is closed once this replica holds the leader lease
-	// (manager.Elected()). Nil means always elected, which is what a manager
-	// without leader election reports too.
+	// (manager.Elected()). Nil means always elected. Pass nil when leader
+	// election is off: the manager's channel does close in that case too, but
+	// only after it has started this runnable, so the standby phase would run
+	// for the moments in between and hand off for nothing.
 	Elected <-chan struct{}
 
 	// listening is set once a listener is bound and cleared when Start returns.
-	// The hand-off binds the full server before stopping the standby, so there
-	// is no moment in between at which it would be false.
+	// Where the platform allows it the hand-off binds the full server before
+	// stopping the standby, so there is no moment in between at which it would
+	// be false; elsewhere the gap is sub-millisecond and left as is.
 	listening atomic.Bool
 }
 
@@ -154,16 +157,25 @@ func (s *Server) Start(ctx context.Context) error {
 	case <-s.Elected:
 	}
 
-	// Bind the full server BEFORE stopping the standby, so the port is never
-	// unbound in between: a GetMetricSpec refused in that gap would leave an
-	// HPA on the CPU default with nothing left to flip it back, since the full
-	// server refuses nothing.
-	srv, err := s.bind(ctx, full)
-	if err != nil {
+	// Bind the full server BEFORE stopping the standby where the platform
+	// allows it (overlapBind), so the port is never unbound in between: a
+	// GetMetricSpec refused in that gap would leave an HPA on the CPU default
+	// with nothing left to flip it back, since the full server refuses
+	// nothing. Where it does not, the standby has to go first.
+	var srv *served
+	if overlapBind {
+		srv, err = s.bind(ctx, full)
+		if err != nil {
+			standby.stop()
+			return err
+		}
 		standby.stop()
-		return err
+	} else {
+		standby.stop()
+		if srv, err = s.bind(ctx, full); err != nil {
+			return err
+		}
 	}
-	standby.stop()
 	logger.Info("leader lease held; KEDA external scaler serving decisions", "addr", s.Addr)
 	return s.run(ctx, srv)
 }
