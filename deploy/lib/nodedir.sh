@@ -31,7 +31,10 @@ nodedir_ok() {
         *) echo "needs at least two components (/mnt/local/models, not ${dir}): the whole of a top-level directory is not a weights directory"; return 1 ;;
     esac
     local prefix
-    for prefix in /etc /usr /bin /sbin /lib /lib32 /lib64 /boot /dev /proc /sys /run /var/run /var/lib /var/log /root /home /opt/cni /snap /tmp /var/tmp; do
+    # the second row is where RHCOS keeps /home, /root, /usr/local, /opt and
+    # the ostree deployments (its /home, /root, /opt, /mnt are symlinks into /var)
+    for prefix in /etc /usr /bin /sbin /lib /lib32 /lib64 /boot /dev /proc /sys /run /var/run /var/lib /var/log /root /home /opt/cni /snap /tmp /var/tmp \
+                  /var/home /var/roothome /var/usrlocal /var/opt/cni /sysroot /ostree; do
         case "$dir" in
             "$prefix"|"$prefix"/*) echo "'${dir}' is under ${prefix}, which the node itself lives in; a hostPath there is mounted read-write by every pod in the namespace"; return 1 ;;
         esac

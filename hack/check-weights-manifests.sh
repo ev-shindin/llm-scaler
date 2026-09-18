@@ -53,8 +53,11 @@ def check(cond, msg):
     if not cond:
         bad.append(msg)
 
-check([d["kind"] for d in docs] == ["PersistentVolume", "PersistentVolumeClaim", "DaemonSet"], "kinds: %s" % [d["kind"] for d in docs])
-pv, pvc, ds = docs
+check([d["kind"] for d in docs] == ["ServiceAccount", "PersistentVolume", "PersistentVolumeClaim", "DaemonSet"], "kinds: %s" % [d["kind"] for d in docs])
+sa, pv, pvc, ds = docs
+check(sa["metadata"]["name"] == "weights-downloader" and sa["metadata"]["namespace"] == "check-ns" and sa.get("automountServiceAccountToken") is False,
+      "a ServiceAccount of its own, with no token: %s" % sa)
+check(ds["spec"]["template"]["spec"].get("serviceAccountName") == "weights-downloader", "the downloader runs as its own ServiceAccount, so an SCC granted for it is granted to it alone")
 label = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 check(bool(label.match(pvc["metadata"]["name"])) and bool(label.match(ds["metadata"]["name"])), "claim/DaemonSet names are DNS-1123 labels")
 check(pvc["metadata"]["name"] == ds["metadata"]["name"], "claim and DaemonSet share a name")
@@ -66,8 +69,9 @@ check(pv["spec"]["persistentVolumeReclaimPolicy"] == "Retain", "Retain: the file
 check(pv["spec"]["hostPath"] == {"path": "/mnt/local/models", "type": "DirectoryOrCreate"}, "hostPath: %s" % pv["spec"]["hostPath"])
 check(pv["spec"]["accessModes"] == ["ReadWriteMany"] == pvc["spec"]["accessModes"], "RWX on both: every node mounts the same claim")
 for d in docs:
-    check(d["metadata"]["annotations"]["wva.llmd.ai/weights-model"] == "Qwen/Qwen3-32B", "annotation names the model")
     check(d["metadata"]["labels"].get("app.kubernetes.io/managed-by") == "wva-weights", "managed-by on %s" % d["kind"])
+for d in (pv, pvc, ds):
+    check(d["metadata"].get("annotations", {}).get("wva.llmd.ai/weights-model") == "Qwen/Qwen3-32B", "annotation names the model on %s" % d["kind"])
 check(ds["metadata"]["annotations"]["wva.llmd.ai/weights-node-selector"] == "example.com/accelerator=h200", "the DaemonSet records the selector")
 tpl = ds["spec"]["template"]; ps = tpl["spec"]
 check(tpl["metadata"]["labels"].get("app.kubernetes.io/managed-by") == "wva-weights", "pods carry managed-by")
@@ -102,24 +106,24 @@ check(res.get("limits", {}).get("memory"), "a memory limit")
 csc = c.get("securityContext", {})
 check(csc.get("allowPrivilegeEscalation") is False and "ALL" in csc.get("capabilities", {}).get("drop", []), "drops all capabilities")
 
-check(len(default) == 3, "defaults render three documents")
-if len(default) == 3:
-    dps = default[2]["spec"]["template"]["spec"]
+check(len(default) == 4, "defaults render four documents")
+if len(default) == 4:
+    dps = default[3]["spec"]["template"]["spec"]
     check("nodeSelector" not in dps, "no --node-selector: no nodeSelector")
     terms = dps.get("affinity", {}).get("nodeAffinity", {}).get("requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
     keys = [t["matchExpressions"][0]["key"] for t in terms if len(t.get("matchExpressions", [])) == 2]
     check(keys == product_keys, "the default affinity is the product-key list: %s" % keys)
-    check(default[1]["spec"]["resources"]["requests"]["storage"] == "1Ti", "default capacity 1Ti")
+    check(default[2]["spec"]["resources"]["requests"]["storage"] == "1Ti", "default capacity 1Ti")
     check("HF_TOKEN" not in {e["name"] for e in dps["containers"][0]["env"]}, "no --hf-token-secret: no HF_TOKEN env")
     check(dps["tolerations"] == [{"key": "nvidia.com/gpu", "operator": "Exists"}], "default toleration")
-if len(secret) == 3:
-    senv = {e["name"]: e for e in secret[2]["spec"]["template"]["spec"]["containers"][0]["env"]}
+if len(secret) == 4:
+    senv = {e["name"]: e for e in secret[3]["spec"]["template"]["spec"]["containers"][0]["env"]}
     check(senv["HF_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": "myonlysecret", "key": "HF_TOKEN"}, "a Secret named without /KEY uses the key HF_TOKEN: %s" % senv["HF_TOKEN"])
     check(senv["TARGET_DIR"]["value"] == "/weights/models/gpt2", "a model id with no org lands under models/<id>: %s" % senv["TARGET_DIR"]["value"])
-if len(other) == 3:
-    check(other[0]["metadata"]["name"] != default[0]["metadata"]["name"], "the same model in another namespace gets its own (cluster-scoped) volume")
-    check(other[1]["metadata"]["name"] == default[1]["metadata"]["name"], "and the same claim name (namespace-scoped)")
-    check(other[0]["spec"]["claimRef"]["namespace"] == "other-ns", "bound into its own namespace")
+if len(other) == 4:
+    check(other[1]["metadata"]["name"] != default[1]["metadata"]["name"], "the same model in another namespace gets its own (cluster-scoped) volume")
+    check(other[2]["metadata"]["name"] == default[2]["metadata"]["name"], "and the same claim name (namespace-scoped)")
+    check(other[1]["spec"]["claimRef"]["namespace"] == "other-ns", "bound into its own namespace")
 
 if bad:
     for b in bad:
@@ -134,14 +138,14 @@ for badmodel in 'a/b/c' '/x' 'x/' 'a b' 'a"b' '' '..' 'a/..' '../x' 'Qwen/..' '.
 done
 [ "$refused" -eq 0 ] && ok "a model id that is not [org/]name of Hugging Face characters, or carries .. / -- / a segment edge of . or -, is refused"
 refused=0
-for badpath in relative / 'a b' '/p"' '' /mnt /etc /etc/models /var/lib/kubelet /var/lib/containerd/x /tmp/models /home/me/models /proc/1 /mnt/local/models/ /mnt/local/../x; do
+for badpath in relative / 'a b' '/p"' '' /mnt /etc /etc/models /var/lib/kubelet /var/lib/containerd/x /tmp/models /home/me/models /proc/1 /mnt/local/models/ /mnt/local/../x /var/home/core/w /var/roothome/w /var/usrlocal/w /var/opt/cni/w /sysroot/ostree/x /ostree/x; do
     if bash deploy/weights.sh apply -n check-ns --model m --path "$badpath" --image "$IMG" --dry-run >/dev/null 2>&1; then fail "a --path of '$badpath' must be refused"; refused=1; fi
 done
 [ "$refused" -eq 0 ] && ok "a path that is not absolute, has one component, ends in /, holds .., or sits under a system prefix (/etc, /var/lib, /tmp, /home, ...) is refused"
-for goodpath in /mnt/local/models /data/models /opt/models /srv/weights; do
+for goodpath in /mnt/local/models /data/models /opt/models /srv/weights /var/mnt/weights /var/srv/weights /var/data/weights; do
     bash deploy/weights.sh apply -n check-ns --model m --path "$goodpath" --image "$IMG" --dry-run >/dev/null 2>&1 || fail "a --path of '$goodpath' must be accepted"
 done
-ok "a data directory of two or more components outside the system prefixes is accepted"
+ok "a data directory of two or more components outside the system prefixes is accepted, RHCOS's /var/mnt and /var/srv included"
 # the refusal loops prove nothing if the good form is refused too
 bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --image "$IMG" --dry-run >/dev/null 2>&1 && ok "the form the refusal tests vary is itself accepted" || fail "the refusal tests' base invocation is refused, so they prove nothing"
 if bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --image "$IMG" --hf-token-secret 'a b' --dry-run >/dev/null 2>&1; then fail "a Secret reference with a space must be refused"; else ok "a Secret reference that is not NAME[/KEY] is refused"; fi
@@ -211,6 +215,9 @@ case "\$1 \$2" in
         *) echo "stub kubectl: unexpected pvc read:\$ARGV" >&2; exit 2 ;;
       esac ;;
   "get events")  want -n check-ns; printf '%s' "\${STUB_EVENT:-}" ;;
+  "logs -n")     want -n check-ns; printf '%s\n' "\${STUB_LOG:-}" ;;
+  "api-resources --api-group=security.openshift.io") [ -n "\${STUB_OPENSHIFT:-}" ] && echo "securitycontextconstraints scc security.openshift.io/v1 false SecurityContextConstraints"; : ;;
+  "delete serviceaccount") want -n check-ns; echo deleted ;;
   "apply -f")    cat >/dev/null; echo applied ;;
   "delete daemonset"|"delete pvc") want -n check-ns; echo deleted ;;
   "get pv")      want -l "$LBL"; want -o json; refuse -n; cat "$T/pvs.json" ;;
@@ -244,6 +251,9 @@ expect_line node-evicted absent
 grep -q 'node-evicted .*Evicted' "$T/status.out" && ok "status: an evicted downloader shows its reason" || fail "status: Evicted reason missing"
 grep -q '^  node-cpu ' "$T/status.out" && fail "status: a node with an empty product label was counted" || ok "status: the default placement leaves the empty-label node out"
 grep -q 'node-failing .*CrashLoopBackOff' "$T/status.out" && ok "status: a failing downloader shows its reason" || fail "status: reason missing"
+grep -q 'Permission denied' "$T/status.out" && fail "status: a permission diagnosis with no permission error in the log" || ok "status: no permission diagnosis when the log shows none"
+STUB_LOG='PermissionError: [Errno 13] Permission denied: /weights/models/Qwen' PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/eacces.out" 2>&1 || true
+grep -q 'cannot write .*Permission denied in its log' "$T/eacces.out" && grep -q 'chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR' "$T/eacces.out" && ok "status: a downloader dying on Permission denied is named, with the node-directory steps (OpenShift: project UID, no relabel)" || fail "status EACCES diagnosis: $(grep -c 'Permission' "$T/eacces.out") line(s)"
 grep -q '1/6 nodes hold it; 5 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
 grep -q '1 node(s) carry an AMD, Intel or Gaudi accelerator label' "$T/status.out" && ok "status: a non-NVIDIA node under the default placement is named" || fail "status: vendor warning missing"
 grep -q "claim ${NAME}: Bound" "$T/status.out" && ok "status: reports the claim Bound" || fail "status: claim line: $(head -1 "$T/status.out")"
@@ -270,6 +280,10 @@ else
     fail "apply must not fail for a missing jq after the manifests were applied: $out"
 fi
 if PATH="$T/bin:$T/nojq" bash deploy/weights.sh status -n check-ns >/dev/null 2>&1; then fail "status without jq must fail"; else ok "status: without jq refuses with a reason"; fi
+STUB_OPENSHIFT=1 PATH="$STUB_PATH" bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /var/mnt/weights --image "$IMG" > "$T/ocp.out" 2>&1 || true
+grep -q 'OpenShift: the downloader runs as the project UID' "$T/ocp.out" && grep -q 'chcon -t container_file_t /var/mnt/weights' "$T/ocp.out" && ok "apply: on a cluster with SecurityContextConstraints the OpenShift node-directory steps are printed once, with the path" || fail "apply on OpenShift: $(grep -c OpenShift "$T/ocp.out") notice(s)"
+PATH="$STUB_PATH" bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /mnt/local/models --image "$IMG" > "$T/k8s.out" 2>&1 || true
+grep -q 'OpenShift:' "$T/k8s.out" && fail "apply: the OpenShift notice printed on a cluster without SCCs" || ok "apply: no OpenShift notice on a cluster without SecurityContextConstraints"
 if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/pending.out" 2>&1; then fail "status must fail while the claim is not Bound"; else grep -q 'Pending' "$T/pending.out" && ok "status: an unbound claim is reported and fails" || fail "status: unbound claim: $(head -1 "$T/pending.out")"; fi
 if STUB_DAEMONSETS="" PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/none.out" 2>&1; then fail "status with nothing to check must fail"; else grep -q 'no weights DaemonSets' "$T/none.out" && ok "status: no DaemonSets and no --model is refused with a reason" || fail "status: $(tail -1 "$T/none.out")"; fi
 : > "$T/calls"
@@ -290,6 +304,7 @@ grep -q "^delete daemonset -n check-ns ${NAME} --ignore-not-found" "$T/calls" &&
 grep -q '^get pvc' "$T/calls" && fail "delete: a claim was read for its volume name (a tenant writes that field)" || ok "delete: no claim is read for a volume name"
 grep -q "^delete pv .*othernamespace" "$T/calls" && fail "delete --model: another namespace's volume for the same model was deleted" || ok "delete --model: another namespace's volume for the same model is left alone"
 grep -q "^delete pv .*second-model" "$T/calls" && fail "delete --model: another model's volume was deleted" || ok "delete --model: another model's volume in this namespace is left alone"
+grep -q "^delete serviceaccount" "$T/calls" && fail "delete --model: the ServiceAccount other models' downloaders share was deleted" || ok "delete --model: the shared ServiceAccount stays"
 : > "$T/calls"
 PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --all >/dev/null 2>&1
 grep -q "^delete daemonset -n check-ns -l ${LBL} --ignore-not-found" "$T/calls" && grep -q "^delete pvc -n check-ns -l ${LBL} --ignore-not-found" "$T/calls" && ok "delete --all: by both labels" || fail "delete --all issued: $(grep delete "$T/calls" | tr '\n' ';')"
@@ -299,6 +314,7 @@ case "$line" in
     *) fail "delete --all pv delete: $line" ;;
 esac
 grep -q "^get pv -l ${LBL} -o json" "$T/calls" && ok "delete: the volumes are listed by our labels, cluster-scoped" || fail "delete: pv listing: $(grep '^get pv' "$T/calls")"
+grep -q "^delete serviceaccount -n check-ns weights-downloader --ignore-not-found" "$T/calls" && ok "delete --all: the downloader ServiceAccount goes too" || fail "delete --all: ServiceAccount kept: $(grep serviceaccount "$T/calls")"
 : > "$T/calls"
 printf '{"items":[]}' > "$T/pvs-none.json"; cp "$T/pvs.json" "$T/pvs-all.json"; cp "$T/pvs-none.json" "$T/pvs.json"
 PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --all >/dev/null 2>&1
@@ -463,13 +479,23 @@ out="$("$PY" "$T/fix11.py" "$T/03.j2" 2>&1 || true)"
 case "$out" in *"applied"*) ok "fix 11: applies to the upstream anchors" ;; *) fail "fix 11 on the fixture: $out" ;; esac
 grep -q 'readinessProbe' "$T/03.j2" && grep -q '"test", "-f", "{{ storage.hostPath.path }}/{{ model.path }}/.download-complete"' "$T/03.j2" && ok "fix 11: the readiness probe tests the marker under the hostPath" || fail "fix 11: probe missing or wrong"
 grep -q 'storage.hostPath.affinity is defined' "$T/03.j2" && ok "fix 11: an optional affinity renders" || fail "fix 11: affinity block missing"
-grep -q 'chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null || echo' "$T/03.j2" && ok "fix 11: the SELinux relabel is best-effort (it ended the script on a node without SELinux, before the marker)" || fail "fix 11: chcon still fatal"
 out="$("$PY" "$T/fix11.py" "$T/03.j2" 2>&1 || true)"
 case "$out" in *"already applied"*) ok "fix 11: idempotent" ;; *) fail "fix 11 second run: $out" ;; esac
 # the earlier form: probe + affinity applied, chcon untouched -- completed, not refused
-sed 's|chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null .*|chcon -R -t container_file_t "{{ storage.hostPath.path }}"|' "$T/03.j2" > "$T/03-earlier.j2"
+grep -q 'chcon -R -t container_file_t -l s0 "{{ storage.hostPath.path }}" 2>/tmp/chcon.err' "$T/03.j2" && grep -q 'grep -q "unlabeled file' "$T/03.j2" && grep -q 'cat /tmp/chcon.err; exit 1' "$T/03.j2" && ok "fix 11: chcon at level s0, skipped only on the no-SELinux text, fatal otherwise (a wrong SCC must not mark an unreadable directory)" || fail "fix 11: chcon form"
+"$PY" - "$T/03.j2" <<'PYEOF' || fail "fix 11: could not rebuild the earlier forms"
+import sys, re
+src = open(sys.argv[1]).read()
+a = src.index("              # wva-patch: skipped only where there is no SELinux")
+b = src.index("\n              fi\n", src.index("cat /tmp/chcon.err; exit 1")) + len("\n              fi\n")
+open(sys.argv[1].replace("03.j2", "03-earlier.j2"), "w").write(src[:a] + '              chcon -R -t container_file_t "{{ storage.hostPath.path }}"\n' + src[b:])
+open(sys.argv[1].replace("03.j2", "03-prev.j2"), "w").write(src[:a] + '              chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null || echo "Relabelling skipped: no SELinux on this node (wva-patch)."\n' + src[b:])
+PYEOF
 out="$("$PY" "$T/fix11.py" "$T/03-earlier.j2" 2>&1 || true)"
-case "$out" in *"chcon made best-effort"*) ok "fix 11: the earlier form (fatal chcon) is completed in place" ;; *) fail "fix 11 on the earlier form: $out" ;; esac
+case "$out" in *"chcon made best-effort"*) ok "fix 11: the earliest form (fatal chcon) is completed in place" ;; *) fail "fix 11 on the earliest form: $out" ;; esac
+out="$("$PY" "$T/fix11.py" "$T/03-prev.j2" 2>&1 || true)"
+case "$out" in *"gated on the no-SELinux text"*) ok "fix 11: the previous form (chcon swallowed on any error) is completed in place" ;; *) fail "fix 11 on the previous form: $out" ;; esac
+cmp -s "$T/03-earlier.j2" "$T/03.j2" && cmp -s "$T/03-prev.j2" "$T/03.j2" && ok "fix 11: both migrations end at the current form" || fail "fix 11: migrated templates differ from a fresh apply"
 sed 's/images.benchmark.repository/images.other.repository/' "$T/03-orig.j2" > "$T/03-drift.j2"
 if "$PY" "$T/fix11.py" "$T/03-drift.j2" >/dev/null 2>&1; then fail "fix 11 must fail on a missing anchor, not skip"; else ok "fix 11: a missing anchor is a hard error"; fi
 

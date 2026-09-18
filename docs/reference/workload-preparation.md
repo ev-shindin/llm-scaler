@@ -131,18 +131,25 @@ Three things to know before relying on it:
   by default -- the controller's own read of nodes is granted by the
   cluster-admin setup, not to the person running `make`. Without it the
   DaemonSets still apply; the status is what fails, with a Forbidden.
-- The holder runs the engine image as that image runs -- as root, since
-  engine images are built that way and `runAsNonRoot` would fail the
-  container -- with no privilege, every capability dropped, a read-only
-  root filesystem and the runtime's default seccomp profile. Engine images
-  bake in `NVIDIA_VISIBLE_DEVICES=all`, which the NVIDIA runtime honours
-  even from a container that requested no GPU; the holder sets it to
-  `void`, so no device is injected. That is admitted under Pod Security
-  `baseline` and under OpenShift's `restricted-v2` SCC, and rejected
-  under Pod Security `restricted` (which requires `runAsNonRoot`). When
-  no holder appears on any node, `prepull-status` prints the DaemonSet's
-  latest `FailedCreate` event, which is where a pod-security, quota or
-  LimitRange rejection is reported.
+- The holder runs the engine image as that image runs -- as root on
+  Kubernetes, since engine images are built that way and `runAsNonRoot`
+  would fail the container; as a UID from the project's range on
+  OpenShift, where `restricted-v2` assigns one, which `sleep` does not
+  mind -- with no privilege, every capability dropped, a read-only root
+  filesystem and the runtime's default seccomp profile. (No `runAsUser`
+  either way: a fixed one is what a MustRunAsRange SCC rejects.) Engine
+  images bake in `NVIDIA_VISIBLE_DEVICES=all`, which the NVIDIA runtime
+  honours even from a container that requested no GPU -- on OpenShift's
+  GPU operator too, whose toolkit ships that acceptance on; the holder
+  sets it to `void`, so no device is injected. That is admitted under Pod
+  Security `baseline` and under OpenShift's `restricted-v2` SCC (by
+  analysis; not yet run there), and rejected where Pod Security
+  `restricted` is *enforced* (it requires `runAsNonRoot`) -- OpenShift's
+  label syncer only warns at that level, so there `kubectl apply` prints
+  a `runAsNonRoot != true` warning and the apply goes through. When no
+  holder appears on any node, `prepull-status` prints the DaemonSet's
+  latest `FailedCreate` event, which is where a pod-security, quota, SCC
+  or LimitRange rejection is reported.
 - Held with `IfNotPresent` under a *tag*, a node keeps whatever that tag
   pointed at when it pulled; with `Always` the registry's current digest
   would win at every start. For a pinned release tag that is the point.
@@ -168,6 +175,7 @@ removes the read term when it is the one that dominates.
 # the engine image is any image carrying huggingface_hub; the claim is printed
 make weights WEIGHTS_MODEL=Qwen/Qwen3-32B WEIGHTS_PATH=/mnt/local/models \
      WEIGHTS_IMAGE=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=<ns>
+# on RHCOS (OpenShift) the directory is under /var: WEIGHTS_PATH=/var/mnt/weights
 make weights-status NAMESPACE=<ns>          # per accelerator node: present / downloading, and why not
 make weights-delete NAMESPACE=<ns>          # drop the claim, volume and downloader; the files stay
 ```
@@ -198,22 +206,61 @@ What it costs, and what it needs:
   (`/mnt/local/weights/<namespace>`), on a disk that is not the node's own
   (`/mnt/local/...` on CoreWeave), never a network mount, and never a
   system path: the script refuses `/etc`, `/var/lib`, `/tmp`, `/home` and
-  their kind, a top-level directory on its own, and `..`.
+  their kind (and where RHCOS keeps them: `/var/home`, `/var/roothome`,
+  `/var/usrlocal`, `/sysroot`, `/ostree`), a top-level directory on its
+  own, and `..`.
 - Leave to create PersistentVolumes, which are cluster-scoped; a namespace
-  tenant does not have it. Ask the cluster admin to run `make weights` or
-  to create the volume; the rest is namespaced.
+  tenant does not have it (on OpenShift the `storage-admin` role carries
+  it). Ask the cluster admin to run `make weights` or to create the
+  volume. The claim's `WEIGHTS_CAPACITY` (1Ti unless set) is a request a
+  `requests.storage` quota charges -- a project with a storage quota
+  refuses the claim; set the capacity near the model's size there. And a
+  cluster that reaches Hugging Face through a proxy does not inject its
+  proxy into arbitrary pods: the downloader would need `HTTPS_PROXY`.
 - Pod Security `baseline` admits the downloader (it mounts the claim, not a
-  hostPath); `restricted` does not (the image runs as root). **Not yet run
-  on OpenShift or any SELinux-enforcing node**, where two more things
-  hold: the downloader needs the `anyuid` SCC (the node directory is
-  root-owned, and `restricted-v2` would run it as a UID that cannot write
-  there), and the directory has to carry `container_file_t` before any
-  container can write to it -- the kubelet does not relabel a hostPath, so
-  the admin labels it once on each node (`chcon -Rt container_file_t
-  <dir>`). On OpenShift the pods of one namespace share an SELinux level,
-  so the engines read what the downloader wrote and another namespace's
-  pods do not; on other distributions with SELinux enforcing, check the
-  runtime's category assignment before relying on that.
+  hostPath); `restricted` does not. On Kubernetes it runs as root, which
+  is what writing the root-owned directory the kubelet creates takes. It
+  runs as its own ServiceAccount, `weights-downloader`, so anything an
+  admin grants for it is granted to it alone.
+
+**On OpenShift** -- by analysis; not yet run there, and `make weights`
+says so when the cluster has SecurityContextConstraints:
+
+- `restricted-v2` admits the downloader and runs it as the project's range
+  UID with GID 0, which cannot write a root-owned directory; and the
+  kubelet does not relabel a hostPath, so even root as `container_t` could
+  not write a directory labelled `var_t`/`mnt_t`. Both surface as
+  `CrashLoopBackOff` with `Permission denied` in the log, which
+  `weights-status` names. Neither exists to fix until the first pod has
+  run, so prepare the directory on each node **before** `make weights`:
+  ```bash
+  oc debug node/<node> -- chroot /host sh -c \
+    'mkdir -p /var/mnt/weights && chgrp 0 /var/mnt/weights && chmod 2775 /var/mnt/weights && chcon -t container_file_t /var/mnt/weights'
+  ```
+  or, for an extra disk, a MachineConfig mount unit at that path with
+  `Options=context=system_u:object_r:container_file_t:s0`, which labels
+  the whole disk for containers and survives everything (and puts every
+  file at level `s0`, so the per-project isolation below no longer
+  applies -- the directory split is then the only separation). No SCC
+  grant is needed on this path. The alternative is root: `oc adm policy
+  add-scc-to-user <scc> -z weights-downloader -n <ns>`, where the SCC has
+  to allow the `runtime/default` seccomp profile the pod sets -- stock
+  `anyuid` does not, and admission then falls through to `restricted-v2`
+  as if nothing had been granted (`oc get pod <p> -o
+  jsonpath='{.metadata.annotations.openshift\.io/scc}'` says which SCC
+  took the pod).
+- The directory is under `/var` on RHCOS (`/var/mnt/<x>`, `/var/srv/<x>`):
+  the root is read-only, `/mnt`, `/home`, `/opt`, `/srv` are symlinks into
+  `/var`, and `/var/mnt` on its own is the root disk -- the one the
+  kubelet's image store and eviction thresholds live on. Mount the NVMe
+  there first (a MachineConfig mount unit); the script cannot tell a
+  mountpoint from a directory. A new top-level directory fails outright
+  (`read-only file system`).
+- Files the downloader writes carry the project's SELinux level, so the
+  engines in the same project read them and another project's pods
+  cannot even see the marker: on OpenShift one directory per project is
+  not advice but the only thing that works, unless the disk is mounted
+  with `context=` as above.
 - A node that joins later has no copy until the DaemonSet reaches it, and a
   replica scheduled there meanwhile reads from a directory that is being
   written. `weights-status` says which nodes are there yet. A cordoned node

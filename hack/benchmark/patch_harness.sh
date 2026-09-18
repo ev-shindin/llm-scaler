@@ -766,7 +766,11 @@ fi
 # partial context to unlabeled file"), and under the script's `set -e` that
 # ends it before the marker is written: measured on kermit (Ubuntu), all 16
 # downloaders crash-looped, each restart downloading the model again and
-# never marking it. The relabel is best-effort now.
+# never marking it. The relabel is skipped on exactly that text now, and
+# fails as before on any other error (a wrong SCC on OpenShift must not
+# leave a marked directory the engines cannot read); it also sets the level
+# to s0, since the spc_t downloader writes at whatever level the runtime
+# gave it and the engines read at the namespace's.
 # ---------------------------------------------------------------------------
 DS_TPL="$REPO_DIR/config/templates/jinja/03_download_daemonset.yaml.j2"
 if [ ! -f "$DS_TPL" ]; then
@@ -807,17 +811,30 @@ AFF_NEW = '''{% if storage.hostPath.tolerations is defined and storage.hostPath.
 '''
 CHCON_OLD = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}"
 '''
-CHCON_NEW = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null || echo "Relabelling skipped: no SELinux on this node (wva-patch)."
+CHCON_NEW = '''              # wva-patch: skipped only where there is no SELinux (the text
+              # chcon prints for an unlabelled filesystem); any other failure
+              # is real and the marker must not be written. Level s0: readable
+              # at every namespace level, since spc_t wrote at a random one.
+              if ! chcon -R -t container_file_t -l s0 "{{ storage.hostPath.path }}" 2>/tmp/chcon.err; then
+                if grep -q "unlabeled file\\|Operation not supported" /tmp/chcon.err; then
+                  echo "Relabelling skipped: no SELinux on this node (wva-patch)."
+                else
+                  cat /tmp/chcon.err; exit 1
+                fi
+              fi
 '''
 if PROBE_NEW in src and AFF_NEW in src and CHCON_NEW in src:
     print("  fix 11 (download DaemonSet readiness + affinity): already applied")
     sys.exit(0)
-# an earlier form of this fix lacked the chcon part; complete it
-if PROBE_NEW in src and AFF_NEW in src and src.count(CHCON_OLD) == 1:
-    src = src.replace(CHCON_OLD, CHCON_NEW, 1)
-    io.open(path, "w", encoding="utf-8", newline="\n").write(src)
-    print("  fix 11 (download DaemonSet readiness + affinity): chcon made best-effort")
-    sys.exit(0)
+# earlier forms of this fix: the chcon still fatal, or swallowed on any error
+CHCON_PREV = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null || echo "Relabelling skipped: no SELinux on this node (wva-patch)."
+'''
+for earlier, what in ((CHCON_OLD, "chcon made best-effort"), (CHCON_PREV, "chcon skip gated on the no-SELinux text, level s0")):
+    if PROBE_NEW in src and AFF_NEW in src and src.count(earlier) == 1:
+        src = src.replace(earlier, CHCON_NEW, 1)
+        io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+        print("  fix 11 (download DaemonSet readiness + affinity): " + what)
+        sys.exit(0)
 for old in (PROBE_OLD, AFF_OLD, CHCON_OLD):
     if src.count(old) != 1:
         sys.exit("anchor missing or ambiguous (upstream shape changed): " + old.splitlines()[0].strip())

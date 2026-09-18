@@ -19,8 +19,9 @@
 #
 # Options:
 #   --model HFID                Hugging Face id, e.g. Qwen/Qwen3-32B
-#   --path DIR                  directory on the node, e.g. /mnt/local/models;
-#                               the model lands under DIR/models/HFID
+#   --path DIR                  directory on the node, e.g. /mnt/local/models
+#                               (/var/mnt/models on RHCOS, where /mnt is the
+#                               root disk); the model lands under DIR/models/HFID
 #   --image IMG                 image to download with: any image carrying
 #                               huggingface_hub -- the engine image itself
 #                               is the natural choice, and it is then held
@@ -46,15 +47,27 @@
 # cluster-scoped: apply needs leave to create PersistentVolumes, which a
 # namespace tenant does not have -- ask the cluster admin to run apply, or
 # to create the volume. Nothing here uses a hostPath volume in a Pod (the
-# downloader mounts the claim), so Pod Security "baseline" admits it;
-# "restricted" does not (the image runs as root). The node directory is
-# cluster-shared, root-writable state: every namespace pointed at the same
-# DIR shares it and trusts its marker, and nothing charges what is written
-# there to a quota -- one DIR per trust domain, on a disk that is not the
-# node's own. On SELinux-enforcing nodes (OpenShift) the directory has to
-# carry container_file_t before this can write to it (the kubelet does not
-# relabel a hostPath), and the downloader needs the anyuid SCC for the UID;
-# not yet run there.
+# downloader mounts the claim), so Pod Security "baseline" admits it and
+# "restricted" does not (no runAsNonRoot: on Kubernetes the image runs as
+# root, which is what writing a root-owned node directory takes). The node
+# directory is cluster-shared, root-writable state: every namespace pointed
+# at the same DIR shares it and trusts its marker, and nothing charges what
+# is written there to a quota (the claim's --capacity IS charged to a
+# storage quota) -- one DIR per trust domain, on a disk that is not the
+# node's own. The downloader runs as its own ServiceAccount,
+# weights-downloader, so anything granted for it is granted to it alone.
+#
+# On OpenShift -- NOT YET RUN THERE -- restricted-v2 admits the downloader
+# and runs it as the project's range UID with GID 0, which cannot write a
+# root-owned directory, and the kubelet does not relabel a hostPath, so
+# container_t cannot write it either way. Before apply, on each node (oc
+# debug node/<n> -- chroot /host): mkdir -p DIR && chgrp 0 DIR && chmod
+# 2775 DIR && chcon -t container_file_t DIR; or mount the disk at DIR with
+# a MachineConfig mount unit carrying context=system_u:object_r:
+# container_file_t:s0. No SCC grant is then needed. `status` says when a
+# downloader died on a permission error. Granting anyuid to
+# weights-downloader is the other way, and it needs an SCC that also
+# allows the runtime/default seccomp profile (stock anyuid does not).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,6 +100,7 @@ ALL=false
 LABEL_COMPONENT="app.kubernetes.io/component=node-local-weights,app.kubernetes.io/managed-by=wva-weights"
 STORAGE_CLASS="node-local-weights"
 MARKER=".download-complete"
+SA_NAME="weights-downloader"
 
 usage() {
     sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
@@ -150,6 +164,20 @@ render() {
     local secret_key="${HF_SECRET#*/}"
     [ "$secret_key" != "$HF_SECRET" ] || secret_key="HF_TOKEN"
     cat <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${SA_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: node-local-weights
+    app.kubernetes.io/component: node-local-weights
+    app.kubernetes.io/managed-by: wva-weights
+# The downloader's own identity: what an admin grants for it (an SCC on
+# OpenShift) is granted to it alone, not to every pod that names no
+# ServiceAccount. It makes no API call, so no token.
+automountServiceAccountToken: false
+---
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -230,6 +258,7 @@ spec:
       annotations:
         wva.llmd.ai/weights-model: "${MODEL}"
     spec:
+      serviceAccountName: ${SA_NAME}
       automountServiceAccountToken: false
       securityContext:
         seccompProfile:
@@ -323,6 +352,13 @@ cmd_apply() {
     fi
     render | kubectl apply -f - >/dev/null
     log_info "downloading ${MODEL} under ${NODE_PATH} on $(accelerator_selector_text "$NODE_SELECTOR"); claim $(name_for "$MODEL") -- mount pvc://$(name_for "$MODEL")/models/${MODEL}"
+    # On OpenShift the downloader runs as the project's range UID and the
+    # directory is not relabelled for containers: both are the admin's to
+    # prepare on each node before this apply, and neither shows until the
+    # first pod dies on it. Said once, here, when the cluster is one.
+    if kubectl api-resources --api-group=security.openshift.io 2>/dev/null | grep -q securitycontextconstraints; then
+        log_warning "OpenShift: the downloader runs as the project UID (GID 0) under restricted-v2 and the kubelet does not relabel a hostPath; on each node, before this takes: mkdir -p ${NODE_PATH} && chgrp 0 ${NODE_PATH} && chmod 2775 ${NODE_PATH} && chcon -t container_file_t ${NODE_PATH} (oc debug node/<n> -- chroot /host ...), or a MachineConfig mount at ${NODE_PATH} with context=system_u:object_r:container_file_t:s0. weights.sh --help has the rest; not yet run on OpenShift"
+    fi
     # The report after an apply is not a verdict: the download just started.
     # Its exits (no node matches, a node list the caller may not read) are
     # warnings in report mode, and jq is checked here because log_error
@@ -421,7 +457,8 @@ cmd_status() {
         echo "${model}  (claim ${name}: ${bound:-missing}; nodes: $(accelerator_selector_text "$selector"))"
         [ "$bound" = Bound ] || rc=1
         printf '  %-28s %-12s %s\n' NODE WEIGHTS DOWNLOADER
-        while IFS=$'\t' read -r node phase reason; do
+        local eacces=0
+        while IFS=$'\t' read -r node phase reason podname message; do
             local has=absent
             [ "$phase" = "no pod" ] || holders=$((holders + 1))
             if [ "$phase" = Ready ]; then
@@ -434,6 +471,18 @@ cmd_status() {
                 rc=1
             fi
             printf '  %-28s %-12s %s %s\n' "$node" "$has" "$phase" "$reason"
+            # A downloader that keeps dying says why in its log, not in its
+            # state: a permission error is the node directory (root-owned,
+            # or not labelled for containers), which is the platform's, not
+            # the namespace's.
+            case "$reason" in
+                CrashLoopBackOff|Error)
+                    if kubectl logs -n "$NAMESPACE" "$podname" --tail=20 2>/dev/null | grep -q 'Permission denied\|PermissionError\|Errno 13'; then
+                        echo "    the downloader cannot write ${NODE_PATH:-the node directory}: Permission denied in its log"
+                        eacces=$((eacces + 1))
+                    fi ;;
+                CreateContainerConfigError) [ -z "$message" ] || echo "    ${message}" ;;
+            esac
         done < <(printf '%s' "$nodes_json" | jq -r --arg ds "$name" --slurpfile pods "$pods_file" \
             '.items[] as $node
              | ($pods[0].items | map(select(.spec.nodeName == $node.metadata.name and .metadata.labels["wva.llmd.ai/weights"] == $ds)) | first) as $pod
@@ -443,8 +492,13 @@ cmd_status() {
                   elif $pod.status.phase == "Running" and ((($pod.status.containerStatuses // [])[0].state // {}) | has("running")) then "Downloading"
                   else $pod.status.phase + " (not ready)" end),
                  (if $pod == null then ""
-                  else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // ""))) end)
+                  else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // ""))) end),
+                 ($pod.metadata.name // ""),
+                 (if $pod == null then "" else (((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.message // "")) | gsub("[\\t\\n]"; " ")) end)
                ] | @tsv')
+        if [ "$eacces" -gt 0 ]; then
+            echo "  ${eacces} node(s): the node directory is not writable by the downloader. On Kubernetes the downloader is root and the kubelet creates the directory root-owned, so this is a mount that is read-only or not there; on OpenShift it runs as the project UID (GID 0) under restricted-v2 and the directory is not relabelled -- on each node: mkdir -p DIR && chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR, or a MachineConfig mount with context=...:container_file_t:s0 (weights.sh --help)"
+        fi
         echo "  ${ready}/${node_count} nodes hold it; $((node_count - ready)) do not"
         [ -n "$selector" ] || printf '%s' "$nodes_json" | accelerator_vendor_warning
         if [ "$holders" -eq 0 ]; then
@@ -500,6 +554,9 @@ cmd_delete() {
     run_delete delete daemonset -n "$NAMESPACE" "${selector[@]}" --ignore-not-found
     run_delete delete pvc -n "$NAMESPACE" "${selector[@]}" --ignore-not-found
     [ "${#volumes[@]}" -eq 0 ] || run_delete delete pv "${volumes[@]}" --ignore-not-found
+    # the ServiceAccount is shared by every model's downloader; it goes with --all
+    [ "$ALL" = true ] && run_delete delete serviceaccount -n "$NAMESPACE" "$SA_NAME" --ignore-not-found
+    return 0
 }
 
 CMD="${1:-}"

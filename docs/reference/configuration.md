@@ -266,7 +266,7 @@ own disk. Full description in
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WEIGHTS_MODEL` | Hugging Face model id | *(required for `weights`)* |
-| `WEIGHTS_PATH` | Absolute directory on the node; the model lands under `<path>/models/<id>` | *(required for `weights`)* |
+| `WEIGHTS_PATH` | Absolute directory on the node (under `/var` on RHCOS, e.g. `/var/mnt/weights`; system paths refused); the model lands under `<path>/models/<id>` | *(required for `weights`)* |
 | `WEIGHTS_IMAGE` | Image to download with -- any image carrying `huggingface_hub`, i.e. the engine image | *(required for `weights`)* |
 | `WEIGHTS_HF_TOKEN_SECRET` | `<secret>[/<key>]` holding a Hugging Face token, for gated models (key defaults to `HF_TOKEN`) | *(none)* |
 | `WEIGHTS_CAPACITY` | The volume's declared capacity; a declaration, hostPath has no quota | `1Ti` |

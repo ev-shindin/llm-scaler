@@ -330,11 +330,19 @@ existing claim, and a run that looks like it measured a local read while
 reading the shared volume is the wrong measurement -- so use a fresh
 namespace or delete the claim; and the harness's downloader is not
 `make weights`'s: it mounts the hostPath directly with `seLinuxOptions.type:
-spc_t` (Pod Security `privileged`; on OpenShift the `privileged` SCC -- the
-`hostmount-anyuid` binding the harness makes for itself does not admit
-`spc_t`), it runs with the harness ServiceAccount's token automounted, it
+spc_t` (Pod Security `privileged`; on OpenShift only the `privileged` SCC
+admits a pod-supplied SELinux type -- the `hostmount-anyuid` binding the
+harness makes for itself admits nothing it needs, and the harness grants
+`privileged` to its own `inference-perf-runner` ServiceAccount in its
+admin-prerequisites step, which is why the standup is cluster-admin-only on
+OpenShift), it runs with the harness ServiceAccount's token automounted, it
 `pip install`s an unpinned `huggingface_hub` from PyPI at every start, and
-`hf auth login` writes the token into the container's `/tmp`. `make weights`
+`hf auth login` writes the token into the container's `/tmp`. Fix 11 also
+makes its `chcon` relabel fail on anything but the no-SELinux case and
+label at level `s0`, since the `spc_t` downloader writes at whatever level
+the runtime gave it and the engines read at the project's. On RHCOS the
+directory is under `/var` (`BENCHMARK_MODEL_HOSTPATH=/var/mnt/wva-bench`,
+with a disk mounted there). None of this has been run on OpenShift yet. `make weights`
 (the general form,
 [Weights on the node's disk](../../reference/workload-preparation.md#weights-on-the-nodes-disk))
 mounts the claim, carries no token, runs the engine image's own library,
