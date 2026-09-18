@@ -32,11 +32,6 @@ type variantRecord struct {
 	// Utilization is the analyzer's per-variant demand/capacity ratio, carried
 	// through to the decision for the wva_saturation_utilization gauge.
 	Utilization float64
-
-	// TotalDemand is the analyzer's demand for this variant, in
-	// PerReplicaCapacity's units, carried through to the decision so the sticky
-	// scale-down can price a replica count other than the running one.
-	TotalDemand float64
 }
 
 // buildVariantRecords joins the request's discovery metadata with the capacity
@@ -69,7 +64,6 @@ func buildVariantRecords(req ModelScalingRequest, satResult *domain.AnalyzerResu
 			VariantMetadata:    m,
 			PerReplicaCapacity: vc.PerReplicaCapacity,
 			Utilization:        vc.Utilization,
-			TotalDemand:        vc.TotalDemand,
 		})
 	}
 	return out

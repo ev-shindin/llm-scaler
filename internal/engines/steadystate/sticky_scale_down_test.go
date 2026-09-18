@@ -153,7 +153,21 @@ func TestHoldPublishedScaleDown_RecordsItsStep(t *testing.T) {
 	assert.Equal(t, 1, step.TargetReplicas)
 	assert.Equal(t, domain.ActionScaleDown, d.Action)
 	assert.Contains(t, step.Reason, "held the published 1 against a fresh target of 2")
-	assert.Equal(t, step.Reason, d.Reason(), "the event and the condition carry the hold's reason, not the optimizer's")
+	assert.Equal(t, stickyReason, d.Reason(), "the event and the condition carry the hold's reason, not the optimizer's")
+	assert.NotContains(t, d.Reason(), "0.", "the event message carries no per-cycle number, so the API server can aggregate it")
+}
+
+func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Second)
+	// The no-decision path resolved the running count (2); 1 was published.
+	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, now))
+	// Nothing published, or published is not lower: the resolved value stands.
+	assert.Equal(t, 2, carryPublished(2, 0, fresh, false, now))
+	assert.Equal(t, 2, carryPublished(2, 2, fresh, true, now))
+	assert.Equal(t, 2, carryPublished(2, 3, fresh, true, now))
+	// A stale publish is a previous incarnation's: the resolved value stands.
+	assert.Equal(t, 2, carryPublished(2, 1, now.Add(-stickyMaxAge-time.Minute), true, now))
 }
 
 func TestHoldPublishedScaleDown_RespectsARaisedFloor(t *testing.T) {

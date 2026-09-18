@@ -1685,6 +1685,12 @@ func (e *Engine) applySaturationDecisions(
 			} else if curr, ok := currentAllocations[vaName]; ok {
 				targetReplicas = curr.NumReplicas
 			}
+			if sticky {
+				// A cycle with no metrics cannot justify raising what the last
+				// cycle with metrics lowered; see carryPublished.
+				p, at, ok := published(va.Namespace, va.GetScaleTargetName())
+				targetReplicas = carryPublished(targetReplicas, p, at, ok, time.Now())
+			}
 			// Keep existing accelerator or use current (skip sentinel values)
 			if acc := updateVa.Status.DesiredOptimizedAlloc.Accelerator; constants.IsAcceleratorResolved(acc) {
 				acceleratorName = acc

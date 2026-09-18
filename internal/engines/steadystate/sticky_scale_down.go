@@ -10,6 +10,14 @@ import (
 // stickyStepName is the pipeline step holdPublishedScaleDown records.
 const stickyStepName = "sticky-scale-down"
 
+// stickyReason is the decision reason a held scale-down carries. It reaches
+// the ScaledDown event and the OptimizationReady condition, and it is
+// constant on purpose: the API server aggregates only identical event
+// messages, and a hold that lasts KEDA's window at a 15 s cycle would
+// otherwise leave ~20 distinct events per descent. The numbers go in the
+// pipeline step and the log line.
+const stickyReason = "held the published scale-down: the fresh target crept back up while utilization at the published count stays under the scale-up threshold"
+
 // stickyMaxAge is how old a published value may be and still be held. The
 // decision store never evicts, so a Deployment deleted and re-created under
 // the same name would otherwise inherit a value published for a fleet that
@@ -70,7 +78,8 @@ const stickyMaxAge = 5 * time.Minute
 // variant's status when there is one and the current count when there is
 // not -- a restart mid-descent therefore re-arms KEDA's window once. That is
 // the pre-existing behaviour on that path, and one window per restart is
-// what it costs.
+// what it costs. A no-decision CYCLE (a scrape gap, a skipped model) does
+// not have that effect: carryPublished republishes the held value there.
 //
 // Reports whether it changed the decision. Inert without a published value,
 // with one older than stickyMaxAge or below the variant's own floor, without
@@ -101,13 +110,30 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 	}
 	crept := d.TargetReplicas
 	d.TargetReplicas = published
-	reason := fmt.Sprintf(
-		"held the published %d against a fresh target of %d: utilization at %d would be %.2f, under the scale-up threshold %.2f",
-		published, crept, published, utilAtPublished, d.ScaleUpThreshold)
 	// Through SetDecisionReason, the one writer of Action, so the event and the
 	// condition that carry Reason() say what happened rather than repeating the
 	// optimizer's text under a different action.
-	d.SetDecisionReason(domain.ActionScaleDown, d.ReasonCategory(), reason)
-	d.AddDecisionStep(stickyStepName, reason, true)
+	d.SetDecisionReason(domain.ActionScaleDown, d.ReasonCategory(), stickyReason)
+	d.AddDecisionStep(stickyStepName, fmt.Sprintf(
+		"held the published %d against a fresh target of %d: utilization at %d would be %.2f, under the scale-up threshold %.2f",
+		published, crept, published, utilAtPublished, d.ScaleUpThreshold), true)
 	return d, true
+}
+
+// carryPublished is the no-decision counterpart of the hold: a cycle with
+// nothing to say for a variant republishes what it would otherwise have
+// resolved -- the previous desired from status, or the running count when
+// the variant has no status, which every variant synthesized from a
+// ScaledObject lacks -- and the running count is exactly the value that
+// re-arms KEDA's window mid-descent. When a fresh published value is lower,
+// it is republished instead: a cycle with no metrics cannot justify raising
+// what the last cycle with metrics lowered. Returns the value to publish.
+func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, now time.Time) int {
+	if !havePublished || published <= 0 || now.Sub(publishedAt) > stickyMaxAge {
+		return resolved
+	}
+	if published < resolved {
+		return published
+	}
+	return resolved
 }
