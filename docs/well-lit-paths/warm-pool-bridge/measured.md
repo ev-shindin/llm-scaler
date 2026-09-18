@@ -7,8 +7,8 @@ the same traffic: autoscaling alone (`nopool`), autoscaling with a shared
 one-Pod warm pool (`pool`), and no pool but a floor of two replicas per model
 (`floor`). Bursts are separated by long quiet stretches, so a held floor is
 paid for mostly idle — the shape a pool exists for. One run of each arm, on
-CoreWeave H200s, 2026-09-18, with the controller's sticky scale-down on (below).
-The scenario and every guard that keeps the arms comparable are in the
+CoreWeave H200s, 2026-09-18. The scenario and every guard that keeps the arms
+comparable are in the
 [benchmarking guide](../../guides/benchmarking/two-model-warm-pool.md); the
 numbers below are that report's, unedited.
 
@@ -23,7 +23,6 @@ numbers below are that report's, unedited.
 | ceiling | every model 1–4 replicas in every arm; the cluster could place 8 |
 | scrape | vLLM metrics every 10 s, models and pool alike ([why](../../guides/warm-pool/operating.md)); the scenario sets it, nothing is patched by hand |
 | hand-back | the pool proxy drains before it is cleared (`warmpool-proxy:v11`), so a returning Pod cannot answer `503` in the second before the EPP drops it |
-| scale-down | `WVA_STICKY_SCALE_DOWN=true`: a published scale-down is held against demand noise until the scale-up threshold says otherwise, so the fleet actually descends between bursts ([why](#why-the-sticky-scale-down)) |
 
 | arm | what it is | the insurance it pays |
 | --- | --- | --- |
@@ -112,37 +111,13 @@ pool, is where the Qwen rise at 120 s (p95 831 ms against the floor's 127)
 comes from. The lever there is the demand signal
 ([operating guide](../../guides/warm-pool/operating.md)).
 
-## Why the sticky scale-down
-
-The scale-down rule is stateless: every 15 s the target is recomputed from
-scratch as the smallest replica count whose utilization stays under the
-scale-down boundary. A model idling at 3 rps on two replicas sits right at
-that boundary with one replica, and its demand moves ±15 % from one cycle
-to the next — so the target flips 1, 2, 1, 2, … and KEDA's HPA, which takes
-the **maximum** of the published values over its 300 s window, keeps the
-second replica for as long as the chatter lasts. Measured here before the
-fix, in two runs: Qwen held two replicas through the whole 900 s quiet band
-(about 1 GPU × 3 000 s in the arm meant to show what autoscaling alone
-costs), and whether it happened to be at one or two replicas when the next
-burst came decided between a 12.6 s and a 125 ms rise on the same schedule.
-
-With `WVA_STICKY_SCALE_DOWN=true` the controller keeps publishing a
-scale-down it has already published until demand at that count would reach
-the scale-*up* threshold — the same two thresholds, applied to the value
-KEDA acts on. In this run the hold fired 33 times, every burst started from
-one replica per model, and the floor arm's cost is 4 GPUs × 4020 s to the
-second. The numbers above are the ones to compare a pool against; without
-the switch, autoscaling alone is dearer by whatever the chatter happens to
-hold, and the comparison is luck.
-
 ## Measure it on your cluster
 
 Everything above comes from one make-target family and runs against any
 llm-d install with two models and a shared model cache. The scenario carries
 the 10 s scrape, the ceiling and the pool shape come from the variables, and
 the controller is whatever `IMG` names (the default is this repository's
-`main`). The sticky scale-down is a switch on the controller, set after the
-standup and before anything is measured:
+`main`):
 
 ```bash
 export BENCHMARK_NAMESPACE=<your namespace>
@@ -150,8 +125,6 @@ export MAX_REPLICAS=4 POOL_REPLICAS=1 POOL_RESERVE=0
 export PHASE_SECONDS=300 OVERLAP_SECONDS=900 CYCLES=2
 make benchmark-two-model-preflight      # placeable accelerators, one accelerator kind
 make benchmark-two-model-standup        # both stacks, one gateway
-kubectl -n $BENCHMARK_NAMESPACE set env deploy/wva-controller-manager WVA_STICKY_SCALE_DOWN=true
-kubectl -n $BENCHMARK_NAMESPACE rollout status deploy/wva-controller-manager
 make benchmark-two-model-verify
 make benchmark-two-model-reset && make benchmark-two-model-run ARM=nopool
 make benchmark-two-model-reset && make benchmark-two-model-run ARM=floor
