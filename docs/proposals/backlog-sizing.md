@@ -585,9 +585,51 @@ The decode test, and why it is what it is:
   decode the repeated rows are the same under-read repeated, and the
   window's max is unaffected.
 
-Not yet re-run on a cluster with the gate, the hold and the memory in
-place; the replay above is arithmetic on the logged rows (the gate would
-have been on for 13 of the cold pass's 210 cycles and 9 of the warm pass's,
-one contiguous episode each). The re-run should capture prefill's
-`num_requests_running`, its KV at the queue peak and the EPP flow-control
-queue, which is what separates held blocks from bursts.
+Replayed on the logged rows, the gate would have been on for 13 of the
+cold pass's 210 cycles and 9 of the warm pass's, one contiguous episode
+each.
+
+### Re-run with the gate, the hold and the memory, 2026-09-18
+
+Same trace, cluster, stack and HPA policy; image built from this branch at
+`860d174f`; controller restarted before the cold pass. Runs
+`guidellm-1789760128-zphd9d_1` (cold) and `guidellm-1789763936-mr6h9x_1`
+(warm, same controller).
+
+```
+                          run 8 cold      run 9 cold      run 8 warm      run 9 warm
+prefill replicas          2 from +331 s   1 throughout    2 from +51 s    1 throughout
+all-pod GPU-min           167.8           137.9           168.0           132.9
+decode GPU-min            95.7            99.1            93.1            94.2
+2nd decode ordered/Ready  +85 / +168      +70 / +221      +66 / +153      +48 / +133
+first-ramp peak           3               4               3               3
+TTFT p95 / p99            7.9 s / 25.2 s  25.3 s / 49.8 s 243 ms / 17.3 s 194 ms / 3.3 s
+p95, minutes 0-5          5.0 s           21.5 s          5.8 s           0.59 s
+p95, minutes 20-25        4.1 s           4.4 s           0.22 s          0.22 s
+P1-obs-downstream lines   --              0               --              0
+prefill-demand-held       --              11 (+130..+340) --              9
+```
+
+Prefill never left one replica on either pass: 30-35 GPU-minutes per pass
+against run 8, and the warm pass's p95 the lowest of the series. The gate
+was never needed -- prefill showed no saturated row on either pass -- and
+the hold engaged on the cycles decode was full and queued (11 on the cold
+pass, at +130..+340 s; 9 on the warm), clamping a prefill demand of
+6k-36k to the band floor: no order, no release.
+
+The cold pass's first ramp is the pod-start variance on record
+([the workload preparation reference](../reference/workload-preparation.md), "The rest of the start path"), not the analyzer: the second
+decode replica was ordered at +70 s, as on every run (+62..+85), and took
+129 s to become Ready (created 19:36:58, containers started 14 s later,
+Ready 19:39:07) against 81-83 s on runs 7 and 8 -- same image on the node,
+same volume. The lone replica tipped at its usual ~+90 s, the backlog ran
+two minutes instead of one, and the throughput floor priced it as a fourth
+replica at +265 s and released it at +355 s. Nothing here touches decode's
+demand or a pod's start; the phase switch at +1200 s, where the same
+paths run without a start, is 4.4 s against 4.1 and 3.5 s. A second cold
+pass on the same image is below.
+
+The re-run did not get the signals that separate held blocks from bursts
+(prefill's `num_requests_running`, its KV at the queue peak, the EPP
+flow-control queue); prefill never saturated, so there was no peak to
+read. Still open.
