@@ -106,6 +106,7 @@ as a variant's `reason`, because no capacity comes from it:
 | value | meaning |
 | --- | --- |
 | `P1-obs-invalid` | an observation was discarded for exceeding the KV cache's **physical** ceiling, i.e. a scrape artifact. Note the bound is the ceiling, not k1: k1 is the ceiling times `kvCacheThreshold` (0.80 by default), so occupancy between the two is legitimate and is kept. The analyzer falls through to the next priority |
+| `P1-obs-downstream` | a **prefill** replica's saturated queue was left unrecorded because the **decode** role was saturated in the same cycle. A prefill request completes only when decode admits it and pulls its KV, so with decode over its threshold the prefill engine holds finished prompts it cannot hand off and its queue fills behind them: that is decode's saturation seen from upstream, not a reading of prefill. Neither k2 nor the saturated throughput (`throughput-demand-floor`) is recorded from it; the analyzer falls through to the next priority. A prefill fleet that is itself the bottleneck starves decode, so decode is not saturated then and the reading records as usual |
 | `no-data` | no ready replicas, no stored record, no compatible variant — capacity is 0 this cycle (normal for newly deployed variants) |
 | `error` | K2 priority not in known set — indicates an unlabelled code path; should not occur in normal operation |
 

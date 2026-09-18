@@ -150,6 +150,15 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		accelByVariant[vs.VariantName] = vs.AcceleratorName
 	}
 
+	// Whether the decode role is saturated this cycle decides what a
+	// saturated PREFILL replica is evidence of (computeK2): a prefill request
+	// completes only when decode admits it, so while decode is over its queue
+	// threshold, prefill's queue and its held KV are decode's backlog seen
+	// from upstream, and neither its occupancy nor its completion rate is a
+	// reading of prefill. Decided once, over every decode row, before any
+	// replica is priced -- the order the rows arrive in must not matter.
+	decodeSaturated := roleSaturated(input.ReplicaMetrics, rolesByVariant, domain.RoleDecode, satConfig.QueueLengthThreshold)
+
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]ReplicaCapacity, 0, len(input.ReplicaMetrics))
 	for _, rm := range input.ReplicaMetrics {
@@ -159,8 +168,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		default:
 		}
 		gpuCount := gpusByVariant[rm.VariantName]
+		role := rolesByVariant[rm.VariantName]
+		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			rolesByVariant[rm.VariantName], accelByVariant[rm.VariantName], logger)
+			role, accelByVariant[rm.VariantName], downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -245,7 +256,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 // computeReplicaCapacity computes the capacity breakdown for a single replica.
 // The role argument is the replica's P/D role, which determines how requests
 // waiting in the local engine queue are charged (see waitingQueueDemand).
-// An empty role is treated as domain.RoleBoth.
+// An empty role is treated as domain.RoleBoth. downstreamSaturated says the
+// role this replica hands its requests to is saturated this cycle, which
+// makes the replica's own saturation not a reading of it (computeK2); it is
+// only ever true for prefill.
 // Returns nil if the replica has no V2 capacity data (TotalKvCapacityTokens == 0).
 func (a *SaturationAnalyzer) computeReplicaCapacity(
 	rm domain.ReplicaMetrics,
@@ -254,6 +268,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	gpuCount int,
 	role string,
 	accelerator string,
+	downstreamSaturated bool,
 	logger logr.Logger,
 ) *ReplicaCapacity {
 	if rm.TotalKvCapacityTokens <= 0 {
@@ -290,6 +305,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		k1,
 		rm.TotalKvCapacityTokens,
 		role,
+		downstreamSaturated,
 		logger,
 	)
 	// The same saturated moment that yields a k2 observation yields the
@@ -516,6 +532,7 @@ func (a *SaturationAnalyzer) computeK2(
 	k1 int64,
 	kvCeiling int64,
 	role string,
+	downstreamSaturated bool,
 	logger logr.Logger,
 ) (int64, k2Source) {
 	// Priority 1: Observed (queue saturated)
@@ -565,7 +582,36 @@ func (a *SaturationAnalyzer) computeK2(
 	// genuine observation diluted to 1/N against samples describing behaviour
 	// from before the gap -- an exposure this smoothing creates and the raw
 	// return did not have.
-	if queueLen >= int(queueThreshold) && tokensInUse > 0 {
+	//
+	// A saturated PREFILL replica is a reading of prefill only while decode
+	// is not saturated. A prefill request completes when decode admits it and
+	// pulls its KV, so with decode over its queue threshold the prefill
+	// engine holds finished prompts it cannot hand off, its queue fills
+	// behind them, and its completion rate is decode's admission rate. That
+	// is decode's saturation seen from upstream. Recorded as prefill's, it
+	// persists: measured on the shape-swap P/D benchmark (2026-09-18, cold
+	// pass), a single prefill replica showed queue 30 and 357 800 resident
+	// tokens for four cycles at +220..+265 s -- the cycles both decode
+	// replicas were over the threshold at ~1.0M resident -- and was priced
+	// at k2 = 357 800 (k1 was 919 859) and mu = 5.57 req/s. Its own
+	// occupancy then read 100 % of that k2 and ordered a second prefill
+	// replica; the mu, below the 6 req/s offered, held both for the rest
+	// of the run (lambda / mu = 1.08 replicas) while their resident KV read
+	// zero -- 35 GPU-minutes, and no later cycle could correct either
+	// figure, because a prefill fleet of two never saturates again. The
+	// reading is left unrecorded: k2 falls through to history or k1, and
+	// the throughput floor records no mu (computeReplicaCapacity keys that
+	// on k2SrcObserved). A prefill fleet that is itself the bottleneck is
+	// the case decode is NOT saturated in -- decode is starved of prefills
+	// -- so its saturation still records.
+	if queueLen >= int(queueThreshold) && tokensInUse > 0 && downstreamSaturated {
+		logger.V(logging.DEFAULT).Info("k2-decision",
+			"modelID", modelID, "namespace", namespace, "variant", variantName,
+			"priority", k2ReasonObsDownstream, "historyKey", historyKey,
+			"queueLength", queueLen, "queueThreshold", queueThreshold,
+			"reason", "queue saturated while the decode role is; a prefill completes only when decode admits it, so this is decode's saturation seen from prefill; not recorded",
+			"tokensInUse", tokensInUse, "k1", k1)
+	} else if queueLen >= int(queueThreshold) && tokensInUse > 0 {
 		k2Observed := tokensInUse
 		if kvCeiling > 0 && k2Observed > kvCeiling {
 			logger.V(logging.DEFAULT).Info("k2-decision",
@@ -1134,6 +1180,23 @@ func canonicalRole(role string) string {
 		return domain.RoleBoth
 	}
 	return role
+}
+
+// roleSaturated reports whether any replica of the given role has its local
+// queue at or over the threshold this cycle -- the same test computeK2 admits
+// a P1-obs reading on, applied across a role. Every row counts, bridges
+// included: a warm-pool Pod lent to decode that is over the threshold is
+// decode saturated as much as one of its own replicas is.
+func roleSaturated(metrics []domain.ReplicaMetrics, rolesByVariant map[string]string, role string, queueThreshold float64) bool {
+	for _, rm := range metrics {
+		if canonicalRole(rolesByVariant[rm.VariantName]) != role {
+			continue
+		}
+		if rm.QueueLength >= int(queueThreshold) && rm.TokensInUse > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // waitingQueueDemand estimates the KV-token demand of the requests waiting in a

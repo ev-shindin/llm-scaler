@@ -435,3 +435,87 @@ Learning a shape's throughput before its queue forms (from the batch
 approaching the engine's ceiling, or from ITL growth) would remove the
 episode and is the natural next step; it needs `num_requests_running` per
 replica, which the collector does not read today.
+
+## The prefill side of the same convention, 2026-09-18
+
+With the queues priced as throughput (`fix/backlog-by-throughput`) the first
+ramp is 1 -> 2 -> 3 on every cold run since, and the second phase 2 -> 3 -> 4
+held. What the cold pass of 2026-09-18 (run `guidellm-1789743465-ckjz7y_1`,
+same trace, same Kubernetes cluster and HPA policy, controller restarted
+before the pass) added was a **prefill** replica that the earlier runs never
+ordered, and kept for the rest of the run:
+
+```
++85 s    decode 1 -> 2 (lambda / mu)                 ready +168
++190 s   decode 2 -> 3                               ready +281
++220 s   prefill 1 -> 2                              ready +331, held to the end
++280 s   decode 3 -> 2, applied +470
+...      prefill stays 2 through +2231
+```
+
+Decode GPU-minutes came out lower than the run before (95.7 against 105.8,
+one fewer flap at the second peak) and the all-pod figure higher (167.8
+against 144.6): the second prefill replica cost 35 GPU-minutes and prefilled
+nothing a single one could not -- both prefill pods read 0 running, 0
+waiting and ~0 % KV on every harness scrape after +330 s.
+
+Where it came from, cycle by cycle from the controller log:
+
+```
+15:01:03  decode sjldp P1-obs  inUse 1 039 474  queue 35    prefill P4-k1  inUse 385 067  queue 0
+          decode fvntl P1-obs  inUse   970 475  queue 46
+15:01:33  decode sjldp P1-obs  inUse 1 039 474  queue 81    prefill P1-obs inUse 357 800  queue 30  mu 4.77
+15:01:48  ...                                                prefill P1-obs inUse 357 800  queue 30
+15:02:03  ...                                                prefill P1-obs inUse 357 800  queue 30  mu 5.57
+15:02:18  decode sjldp P1-obs  inUse   589 249  queue 81    prefill P1-obs inUse 357 800  queue 30
+15:02:33  decode sjldp P2-hist inUse   208 407  queue 3     prefill P2-hist inUse  54 150  queue 0
+```
+
+The prefill replica saturated -- by the analyzer's definition, queue over
+the threshold with tokens resident -- exactly and only while both decode
+replicas were saturated at their k1. A prefill request completes when decode
+admits it and pulls its KV; with decode full, the prefill engine held 385k
+tokens of finished prompts it could not hand off (its KV read 20 % on the
+harness scrape at +129 s, the only non-zero reading of the run), its queue
+filled behind them, and its completion rate was decode's admission rate.
+Recorded as prefill's: k2 = 357 800 against a k1 of 919 859, so the one
+replica's own occupancy read 100 % and `roleRC` for prefill went to 63 141
+at 15:01:33 -- the order; and `mu` = 5.57 req/s, below the 6 req/s offered,
+so `lambda / mu` read 1.07-1.15 replicas for the rest of the run
+(`replicasImplied` on 137 `throughput-demand-floor` lines for prefill) while
+`residentDemand` on the same lines read 0-54k. Two prefill replicas never
+saturate again, so no later reading could displace either figure: the
+window keeps a max, and the history evicts after 24 h.
+
+This is the convention the throughput floor removed for the queues,
+surfacing one layer down: a backlog that belongs to decode, charged to
+prefill -- not as residency this time, but as prefill's *capacity* and
+*throughput*, which persist. The fix is on the admission side, where the
+k2 capacity model already puts it (`docs/plans/analyzers/k2-capacity-model.md`:
+sample admission must be strict, because persistence makes a bad sample
+permanent): a prefill P1 reading taken in a
+cycle where any decode replica is over the queue threshold is left
+unrecorded (`P1-obs-downstream`), for both k2 and `mu`. Decode's own reading
+in the same cycle records as before. A prefill fleet that is itself the
+bottleneck starves decode, so decode is not saturated then and prefill's
+reading records. On the run's rows, the gated cycle prices prefill at k1
+with a demand of 357 800 + 30 x 6000 = 537 800 -- 58 % of one replica, no
+order (`downstream_saturation_test.go` replays it).
+
+Still charged as residency, and left so:
+
+- Prefill's own queue and its held KV *during* a decode saturation. Both are
+  decode's backlog too, but they are transient (gone the cycle decode
+  admits), bounded by prefill's k1, and an order needs `inUse + queue x
+  input` to reach 0.85 x k1 -- about 40 more queued 6000-token prompts than
+  the run showed. Dropping them would make prefill's demand read zero in
+  exactly the cycles decode is short, and on a larger fleet that is a
+  prefill scale-down mid-burst.
+- The four "readings" above are one Prometheus sample seen four times (the
+  rows repeat to the token), which is what let a single saturated moment
+  clear `MinThroughputSamplesToOrder`. The gate makes it moot for prefill;
+  for decode the repeated rows are the same under-read repeated, and the
+  window's max is unaffected.
+
+Not yet re-run on a cluster with the gate in place; the replay above is
+arithmetic on the logged rows.

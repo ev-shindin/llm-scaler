@@ -526,10 +526,13 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			"prefill keeps only its own resident KV")
 
 		By("pricing it as a backlog once prefill has a saturated throughput of its own")
+		// Learned on a cycle decode is NOT saturated in: a prefill saturation
+		// under a saturated decode is decode's, and is not recorded
+		// (computeK2).
 		satP := prefill("prefill-0", 900_000)
 		satP.QueueLength = 10
 		satP.RequestRate = 30
-		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 180, runMu), satP}, states(1, 1))
+		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 300_000, 0, runMu), satP}, states(1, 1))
 		in2.ArrivalRate = runLambda
 		_, err = analyzer.Analyze(ctx, in2)
 		Expect(err).NotTo(HaveOccurred())
