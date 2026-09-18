@@ -94,9 +94,17 @@ make prepull-status NAMESPACE=<ns>          # per accelerator node: present / ab
 make prepull-delete NAMESPACE=<ns>          # stop holding every image (or IMAGES=<image> for one)
 ```
 
-`PREPULL_NODE_SELECTOR=<key=value>` picks the nodes (default
-`nvidia.com/gpu.present=true`, the GPU operator's label; set it to whatever
-the model servers select on). The holder runs the image itself, asleep, with a
+By default the holder lands on every node carrying any known GPU product
+label -- GPU Feature Discovery's, CoreWeave's, GKE's, EKS's, Karpenter's,
+the AMD operator's; the list in `deploy/lib/accelerator_nodes.sh`, the same
+one the controller resolves nodes through -- which is where the model
+servers go when they select on nothing. `PREPULL_NODE_SELECTOR=<key=value>`
+narrows that to what the model servers select on, when they do.
+`PREPULL_TOLERATIONS=<key>[,<key>]` adds taints beyond `nvidia.com/gpu`,
+which is always tolerated: a holder `Pending` on every node with no reason
+is a taint it does not tolerate. `prepull-status` lists the nodes each
+DaemonSet was applied for (the selector is recorded on it), so it needs no
+selector of its own. The holder runs the image itself, asleep, with a
 memory limit and no accelerator: a container that exited would not protect
 its image from the kubelet's garbage collection, a running one does. The
 image has to carry `/bin/sh` for that; one that does not is still pulled
@@ -112,7 +120,7 @@ scheduled to it would pull from scratch, and nothing in the namespace can
 fix that -- it is the node's disk. (Seen on the first run of this on a
 17-node cluster: 16 held the image within two minutes, one was that node.)
 
-Two things to know before relying on it:
+Three things to know before relying on it:
 
 - `prepull-status` (and the report `prepull` prints after applying) lists
   nodes, which is cluster-scoped. A namespace tenant has no `list nodes`
@@ -121,8 +129,11 @@ Two things to know before relying on it:
   DaemonSets still apply; the status is what fails, with a Forbidden.
 - The holder runs the engine image as that image runs -- as root, since
   engine images are built that way and `runAsNonRoot` would fail the
-  container -- with no privilege, every capability dropped and the
-  runtime's default seccomp profile. That is admitted under Pod Security
+  container -- with no privilege, every capability dropped, a read-only
+  root filesystem and the runtime's default seccomp profile. Engine images
+  bake in `NVIDIA_VISIBLE_DEVICES=all`, which the NVIDIA runtime honours
+  even from a container that requested no GPU; the holder sets it to
+  `void`, so no device is injected. That is admitted under Pod Security
   `baseline` and under OpenShift's `restricted-v2` SCC, and rejected
   under Pod Security `restricted` (which requires `runAsNonRoot`). When
   no holder appears on any node, `prepull-status` prints the DaemonSet's

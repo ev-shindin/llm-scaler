@@ -193,7 +193,8 @@ Optional, except `BENCHMARK_NAMESPACE`.
 | `BENCHMARK_WVA_DEPLOY` | `true` | `false` |
 | `BENCHMARK_PREPULL` | `true` | `false` |
 | `BENCHMARK_PREPULL_IMAGES` | the engine image the harness pins | `ghcr.io/you/engine:tag` |
-| `PREPULL_NODE_SELECTOR` | `nvidia.com/gpu.present=true` | `example.com/accelerator=h200` |
+| `PREPULL_NODE_SELECTOR` | *(empty: every node with a known GPU product label)* | `example.com/accelerator=h200` |
+| `PREPULL_TOLERATIONS` | *(empty: `nvidia.com/gpu` only)* | `dedicated,example.com/pool` |
 
 **The harness image must match `BENCHMARK_REPO_REF`.** The harness pod always
 runs the checkout's scripts — they are copied in from a ConfigMap built from the
@@ -279,14 +280,15 @@ harness's, and comes first:
 
 **The image is on every accelerator node before the harness deploys it.** A
 replica scheduled to a node without the engine image pulls 10-20 GB before
-its container starts, which on the shape-swap runs was the difference between
-a 63 s and a 175 s second replica. `make benchmark-standup` holds the image
+its container starts -- a minute or more on top of the start path above, and
+the one term of it that differs from node to node. `make benchmark-standup` holds the image
 the harness pins (`docker.io/vllm/vllm-openai:v0.26.0` in v0.7.8's
 `defaults.yaml`, read from the clone) on every accelerator node before it
 deploys anything -- `BENCHMARK_PREPULL=false` skips it,
-`BENCHMARK_PREPULL_IMAGES=<image>[,<image>]` overrides it, and
-`PREPULL_NODE_SELECTOR` picks the nodes. The holders keep pulling while the
-standup goes on, so before the run:
+`BENCHMARK_PREPULL_IMAGES=<image>[,<image>]` overrides it,
+`PREPULL_NODE_SELECTOR` narrows the nodes (the default is every node with a
+known GPU product label) and `PREPULL_TOLERATIONS` adds taints. The holders
+keep pulling while the standup goes on, so before the run:
 
 ```bash
 make prepull-status NAMESPACE=$BENCHMARK_NAMESPACE      # every accelerator node: present

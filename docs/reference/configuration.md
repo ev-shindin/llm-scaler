@@ -204,6 +204,21 @@ safe to apply. Full description in
 | `WVA_MODEL_VOLUME_NAME` | The volume name in the emitted patch | `model-storage` |
 | `WVA_MODEL_CACHE_PATH` | Where that volume is mounted, and the parent of the emitted `HF_HOME` | `/model-cache` |
 
+### Holding the engine image (`make prepull`)
+
+One DaemonSet per image keeps the engine image present on every accelerator
+node, so a scale-up never starts with a pull. Full description in
+[Holding the image on the nodes](workload-preparation.md#holding-the-image-on-the-nodes).
+`NAMESPACE` must be given on the command line for these targets.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `IMAGES` | Comma-separated image references, exactly as the model server's pod spec names them | *(required for `prepull`)* |
+| `PREPULL_NODE_SELECTOR` | `key=value` narrowing the nodes to what the model servers select on. Empty: every node carrying a known GPU product label (`deploy/lib/accelerator_nodes.sh`) | *(empty)* |
+| `PREPULL_TOLERATIONS` | Comma-separated taint keys the holder tolerates beyond `nvidia.com/gpu` | *(empty)* |
+| `BENCHMARK_PREPULL` | `false` makes `benchmark-standup` skip the pre-pull | `true` |
+| `BENCHMARK_PREPULL_IMAGES` | What `benchmark-standup` holds instead of the image the harness pins | *(the harness's pin)* |
+
 Scope follows the same rules as the ScaledObject plan above: `NAMESPACE=<ns>`
 pins the scan to one namespace, and without it a cluster-scoped install walks
 every namespace holding model servers.

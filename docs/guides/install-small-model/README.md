@@ -46,9 +46,11 @@ kubectl get nodes -o custom-columns=NODE:.metadata.name,GPU:.status.allocatable.
 
 <!-- guide:deploy.standup start -->
 ```bash
-# Deploys the model server, its EPP and the InferencePool -- and NOTHING else.
-# BENCHMARK_WVA_DEPLOY=false is what keeps the autoscaler out of it: this guide
-# gets you a model to scale, and installing WVA is the next guide's job.
+# Deploys the model server, its EPP and the InferencePool, and holds the
+# engine image on the accelerator nodes (the prepull-* pods; BENCHMARK_PREPULL=false
+# skips that) -- nothing else. BENCHMARK_WVA_DEPLOY=false is what keeps the
+# autoscaler out of it: this guide gets you a model to scale, and installing
+# WVA is the next guide's job.
 make benchmark-standup BENCHMARK_NAMESPACE=${NAMESPACE} MODEL_ID=${MODEL_ID}         BENCHMARK_WVA_DEPLOY=false
 ```
 <!-- guide:deploy.standup end -->
@@ -168,7 +170,10 @@ kubectl get pods -n ${NAMESPACE}
 ```
 <!-- guide:verify.serving end -->
 
-Both the decode pod and the EPP should be `Running`. A decode pod in
+Both the decode pod and the EPP should be `Running`, and so should one
+`prepull-*` pod per accelerator node -- the standup's image holder
+([Holding the image on the nodes](../../reference/workload-preparation.md#holding-the-image-on-the-nodes)).
+A decode pod in
 `CrashLoopBackOff` is almost always the memory budget above — check its log for
 `torch.OutOfMemoryError` before looking anywhere else.
 

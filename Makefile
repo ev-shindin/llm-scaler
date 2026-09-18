@@ -586,24 +586,37 @@ model-cache: ## Create the weights PVC. NAMESPACE=<ns> WVA_MODEL_PVC_SIZE=<size>
 ## requested, a few megabytes); `prepull-status` says per node whether the
 ## kubelet has it. IMAGES is comma-separated and must name the image exactly as
 ## the model server's pod spec does. deploy/prepull.sh --help has the rest.
-PREPULL_NODE_SELECTOR ?= nvidia.com/gpu.present=true
+##
+## PREPULL_NODE_SELECTOR is empty by default: the holder then lands on every
+## node carrying any known GPU product label (deploy/lib/accelerator_nodes.sh),
+## which is what the model servers schedule to when they select on nothing.
+## Set it to KEY=VALUE when they select on something. PREPULL_TOLERATIONS is a
+## comma list of taint keys beyond nvidia.com/gpu.
+##
+## NAMESPACE has a Makefile default (the install's), so these targets require
+## it on the command line -- a status of, or holders in, a namespace nobody
+## named is the wrong answer. Same idiom as model-cache and workload-patch.
+PREPULL_NODE_SELECTOR ?=
+PREPULL_TOLERATIONS ?=
+PREPULL_ARGS = $(if $(PREPULL_NODE_SELECTOR),--node-selector "$(PREPULL_NODE_SELECTOR)",) $(foreach t,$(subst $(comma), ,$(PREPULL_TOLERATIONS)),--toleration $(t))
+prepull_namespace_given = $(filter command line environment,$(origin NAMESPACE))
 comma := ,
 # benchmark-standup holds the harness's engine image on the accelerator nodes
 # before deploying it. false skips; IMAGES overrides what the clone pins.
 BENCHMARK_PREPULL ?= true
 BENCHMARK_PREPULL_IMAGES ?=
 .PHONY: prepull prepull-status prepull-delete
-prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> picks the nodes.
+prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> narrows the nodes, PREPULL_TOLERATIONS=<key>[,<key>] adds taints.
 	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
-	@test -n "$(NAMESPACE)" || { echo "prepull: set NAMESPACE=<ns>" >&2; exit 1; }
-	@bash deploy/prepull.sh apply -n "$(NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
+	@test -n "$(prepull_namespace_given)" || { echo "prepull: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/prepull.sh apply -n "$(NAMESPACE)" $(PREPULL_ARGS) $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
 
 prepull-status: ## Per accelerator node: is each held image present, and what its holder is doing. NAMESPACE=<ns> [IMAGES=<img>]
-	@test -n "$(NAMESPACE)" || { echo "prepull-status: set NAMESPACE=<ns>" >&2; exit 1; }
-	@bash deploy/prepull.sh status -n "$(NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
+	@test -n "$(prepull_namespace_given)" || { echo "prepull-status: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/prepull.sh status -n "$(NAMESPACE)" $(if $(PREPULL_NODE_SELECTOR),--node-selector "$(PREPULL_NODE_SELECTOR)",) $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
 
 prepull-delete: ## Stop holding IMAGES=<img>[,<img>] (or every held image with IMAGES unset) in NAMESPACE=<ns>.
-	@test -n "$(NAMESPACE)" || { echo "prepull-delete: set NAMESPACE=<ns>" >&2; exit 1; }
+	@test -n "$(prepull_namespace_given)" || { echo "prepull-delete: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
 	@bash deploy/prepull.sh delete -n "$(NAMESPACE)" $(if $(IMAGES),$(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i)),--all)
 
 .PHONY: workload-patch
@@ -1430,7 +1443,7 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 		else \
 			echo "Holding the engine image on the accelerator nodes: $$imgs (BENCHMARK_PREPULL=false skips; make prepull-status NAMESPACE=$(BENCHMARK_NAMESPACE) checks)"; \
 			kubectl create namespace "$(BENCHMARK_NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
-				&& bash deploy/prepull.sh apply -n "$(BENCHMARK_NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" \
+				&& bash deploy/prepull.sh apply -n "$(BENCHMARK_NAMESPACE)" $(PREPULL_ARGS) \
 				$$(printf '%s' "$$imgs" | tr ',' '\n' | sed 's/^/--image /' | tr '\n' ' ') \
 				|| echo "WARNING: pre-pull did not apply; the standup continues without it"; \
 		fi; \
@@ -2280,6 +2293,7 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash -n deploy/install.sh
 	@bash -n deploy/install-epp.sh
 	@bash -n deploy/prepull.sh
+	@bash -n deploy/lib/accelerator_nodes.sh
 	@bash -n hack/benchmark/engine_image.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done
 	@for script in deploy/*/install.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
