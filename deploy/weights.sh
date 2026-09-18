@@ -361,25 +361,50 @@ cmd_status() {
         holders=0
         selector="$NODE_SELECTOR"
         if [ "$NODE_SELECTOR_GIVEN" = false ]; then
+            # Off the live DaemonSet's pod template: a nodeSelector is the
+            # KEY=VALUE it was applied with, none is the affinity default.
+            # An object a namespace tenant can edit, so held to the same rule
+            # as the flag before it reaches kubectl.
             selector="$(kubectl get daemonset -n "$NAMESPACE" "$name" \
-                -o jsonpath='{.metadata.annotations.wva\.llmd\.ai/weights-node-selector}' 2>/dev/null || true)"
-        fi
-        local nodes_json
-        if ! nodes_json="$(accelerator_nodes_json "$selector")"; then
-            if [ "$mode" = report ]; then
-                log_warning "cannot list nodes (a namespace tenant may not); the download is running, but this report needs cluster-scoped node read -- ask for cluster-reader or check with the cluster admin"
-                rm -f "$pods_file"
-                return 1
+                -o jsonpath='{.spec.template.spec.nodeSelector}' 2>/dev/null \
+                | jq -r 'to_entries | map(.key + "=" + .value) | first // ""' 2>/dev/null || true)"
+            local why
+            if ! why="$(accelerator_selector_ok "$selector")"; then
+                if [ "$mode" = report ]; then
+                    log_warning "DaemonSet ${name} carries a nodeSelector this script did not write (${why}); pass --node-selector to report on it"
+                    rc=1
+                    continue
+                fi
+                log_error "DaemonSet ${name} carries a nodeSelector this script did not write (${why}); pass --node-selector to report on it"
             fi
-            log_error "cannot list nodes: status needs cluster-scoped node read (cluster-reader), which a namespace tenant does not have"
         fi
+        local nodes_json err_file
+        err_file="$(mktemp)"
+        # Caught on the line (report mode runs under `|| true`); the reason
+        # is kubectl's, and only a Forbidden is the permission story.
+        if ! nodes_json="$(accelerator_nodes_json "$selector" 2>"$err_file")"; then
+            local why
+            if grep -q Forbidden "$err_file"; then
+                why="a namespace tenant may not list nodes; this needs cluster-scoped node read (cluster-reader) -- ask for it or check with the cluster admin"
+            else
+                why="$(tr '\n' ' ' < "$err_file")"
+            fi
+            rm -f "$err_file"
+            if [ "$mode" = report ]; then
+                log_warning "cannot list nodes for ${model}: ${why}"
+                rc=1
+                continue
+            fi
+            log_error "cannot list nodes: ${why}"
+        fi
+        rm -f "$err_file"
         local node_count
         node_count="$(printf '%s' "$nodes_json" | jq '.items | length')"
         if [ "$node_count" -eq 0 ]; then
             if [ "$mode" = report ]; then
-                log_warning "no node matches $(accelerator_selector_text "$selector"); the downloader will run nowhere (--node-selector picks the nodes)"
-                rm -f "$pods_file"
-                return 1
+                log_warning "no node matches $(accelerator_selector_text "$selector"); ${model} will be downloaded nowhere (--node-selector picks the nodes)"
+                rc=1
+                continue
             fi
             log_error "no node matches $(accelerator_selector_text "$selector") (--node-selector picks the nodes)"
         fi
@@ -413,6 +438,7 @@ cmd_status() {
                   else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // ""))) end)
                ] | @tsv')
         echo "  ${ready}/${node_count} nodes hold it; $((node_count - ready)) do not"
+        [ -n "$selector" ] || printf '%s' "$nodes_json" | accelerator_vendor_warning
         if [ "$holders" -eq 0 ]; then
             local why
             why="$(kubectl get events -n "$NAMESPACE" \

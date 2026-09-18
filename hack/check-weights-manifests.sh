@@ -148,7 +148,8 @@ cat > "$T/nodes.json" <<EOF
  {"metadata":{"name":"node-loading", "labels":{"gpu.nvidia.com/model":"H200"}}},
  {"metadata":{"name":"node-failing", "labels":{"nvidia.com/gpu.product":"H200"}}},
  {"metadata":{"name":"node-nopod",   "labels":{"nvidia.com/gpu.product":"H200"}}},
- {"metadata":{"name":"node-cpu",     "labels":{"gpu.nvidia.com/model":""}}}
+ {"metadata":{"name":"node-cpu",     "labels":{"gpu.nvidia.com/model":""}}},
+ {"metadata":{"name":"node-amd",     "labels":{"amd.com/gpu.product-name":"MI300X"}}}
 ]}
 EOF
 cat > "$T/pods.json" <<EOF
@@ -167,11 +168,18 @@ ARGV=" \$* "
 want() { case "\$ARGV" in *" \$1 \$2 "*) ;; *) echo "stub kubectl: \$1 \$2 missing from:\$ARGV" >&2; exit 2 ;; esac; }
 refuse() { case "\$ARGV" in *" \$1 "*) echo "stub kubectl: unexpected \$1 in:\$ARGV" >&2; exit 2 ;; esac; }
 case "\$1 \$2" in
-  "get nodes")   if [ -n "\${STUB_SELECTOR:-}" ]; then want -l "\$STUB_SELECTOR"; else refuse -l; fi; cat "$T/nodes.json" ;;
+  "get nodes")   if [ -n "\${STUB_SELECTOR:-}" ]; then want -l "\$STUB_SELECTOR"; else refuse -l; fi
+                 [ -n "\${STUB_NODES_ERROR:-}" ] && { echo "\$STUB_NODES_ERROR" >&2; exit 1; }
+                 cat "$T/nodes.json" ;;
   "get pods")    want -n check-ns; want -l "$LBL"; cat "$T/pods.json" ;;
   "get daemonset")
       want -n check-ns
-      case "\$ARGV" in *" -l "*) want -l "$LBL"; printf '%s\n' "\${STUB_DAEMONSETS-Qwen/Qwen3-32B}" ;; *) printf '%s' "\${STUB_DS_SELECTOR:-}" ;; esac ;;
+      case "\$ARGV" in
+        *" -l "*) want -l "$LBL"; printf '%s\n' "\${STUB_DAEMONSETS-Qwen/Qwen3-32B}" ;;
+        *) want -o "jsonpath={.spec.template.spec.nodeSelector}"
+           case "\$ARGV" in *" ${NAME} "*) ;; *) echo "stub kubectl: get daemonset for a name that is not the DaemonSet:\$ARGV" >&2; exit 2 ;; esac
+           if [ -n "\${STUB_DS_SELECTOR:-}" ]; then jq -cn --arg k "\${STUB_DS_SELECTOR%%=*}" --arg v "\${STUB_DS_SELECTOR#*=}" '{(\$k): \$v}'; else printf '{}'; fi ;;
+      esac ;;
   "get pvc")
       want -n check-ns
       case "\$ARGV" in
@@ -202,7 +210,8 @@ grep -qF 'node-failing                 absent       Running (not ready) CrashLoo
 expect_line node-nopod   absent
 grep -q '^  node-cpu ' "$T/status.out" && fail "status: a node with an empty product label was counted" || ok "status: the default placement leaves the empty-label node out"
 grep -q 'node-failing .*CrashLoopBackOff' "$T/status.out" && ok "status: a failing downloader shows its reason" || fail "status: reason missing"
-grep -q '1/4 nodes hold it; 3 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
+grep -q '1/5 nodes hold it; 4 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
+grep -q '1 node(s) carry an AMD, Intel or Gaudi accelerator label' "$T/status.out" && ok "status: a non-NVIDIA node under the default placement is named" || fail "status: vendor warning missing"
 grep -q "claim ${NAME}: Bound" "$T/status.out" && ok "status: reports the claim Bound" || fail "status: claim line: $(head -1 "$T/status.out")"
 [ "$rc" -ne 0 ] && ok "status: exits non-zero while a node lacks the weights" || fail "status: exit 0 with nodes lacking the weights"
 grep -q 'stub kubectl:' "$T/status.out" && fail "status: a kubectl call lacked its scope: $(grep 'stub kubectl:' "$T/status.out" | head -1)" || ok "status: every kubectl call carried -n / -l"
@@ -211,7 +220,11 @@ if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash deploy/weights.sh status -n che
 if STUB_DAEMONSETS="" PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/none.out" 2>&1; then fail "status with nothing to check must fail"; else grep -q 'no weights DaemonSets' "$T/none.out" && ok "status: no DaemonSets and no --model is refused with a reason" || fail "status: $(tail -1 "$T/none.out")"; fi
 : > "$T/calls"
 STUB_DS_SELECTOR=example.com/accelerator=h200 STUB_SELECTOR=example.com/accelerator=h200 PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns >/dev/null 2>&1 || true
-grep -q 'get nodes -l example.com/accelerator=h200' "$T/calls" && ok "status: lists the nodes the DaemonSet was applied for" || fail "status: recorded selector not used: $(grep 'get nodes' "$T/calls")"
+grep -q 'get nodes -l example.com/accelerator=h200' "$T/calls" && ok "status: lists the nodes the DaemonSet was applied for (its live nodeSelector)" || fail "status: live selector not used: $(grep 'get nodes' "$T/calls")"
+if STUB_DS_SELECTOR='a=b"c' PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/edited.out" 2>&1; then fail "status must refuse a DaemonSet nodeSelector that is not label characters"; else
+    grep -q 'this script did not write' "$T/edited.out" && ok "status: a DaemonSet nodeSelector this script did not write is refused before kubectl" || fail "status on an edited DaemonSet: $(tail -1 "$T/edited.out")"; fi
+if STUB_NODES_ERROR='error: unable to parse requirement' PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/nf.out" 2>&1; then fail "status must fail when nodes cannot be listed"; else
+    grep -q 'unable to parse requirement' "$T/nf.out" && ! grep -q cluster-reader "$T/nf.out" && ok "status: a node-list failure that is not a Forbidden reports kubectl's reason" || fail "status non-Forbidden: $(tail -1 "$T/nf.out")"; fi
 
 # delete: DaemonSet and claim in the namespace, the volume by the name read off the claim
 : > "$T/calls"
