@@ -314,21 +314,38 @@ container with no probe is Ready the moment it starts, and makes its SELinux
 relabel best-effort: on a node without SELinux `chcon` fails, and under the
 downloader's `set -e` that ended the script before the marker -- every
 downloader crash-looped, re-downloading on each restart. The download Job is
-skipped. Three things to know: the harness waits for EVERY node the
+skipped. The benchmark uses the harness's downloader, not `make weights`,
+because the harness owns `model-pvc`'s name and the engine's `pvc://` uri,
+keeps an existing claim, and only its own mode skips the download Job and
+holds the engine deploy until every node is Ready; `make weights` beside it
+would leave the harness's Job writing a single node's copy. Three things to know: the harness waits for EVERY node the
 DaemonSet counts, and a DaemonSet counts a cordoned node and a node under
 `DiskPressure` too (its controller tolerates both taints), so a node that
 keeps evicting the downloader holds the standup until `daemonSetTimeout`
 (3600 s) and then fails it -- a `NoSchedule` taint of your own on that node
-takes it out of the count (seen on kermit: one cordoned node under
-DiskPressure since the day before, 16/17 for 22 minutes); the standup refuses a namespace whose
+takes it out of the count (seen once on a 17-node cluster: one cordoned node
+under DiskPressure since the day before, 16/17 for 22 minutes); the standup refuses a namespace whose
 `model-pvc` already sits on another storage class -- the harness keeps an
 existing claim, and a run that looks like it measured a local read while
 reading the shared volume is the wrong measurement -- so use a fresh
-namespace or delete the claim; and the harness's downloader mounts the
-hostPath directly (with `spc_t`), which needs Pod Security `privileged`
-or OpenShift's `hostmount-anyuid`, where `make weights` (the general form,
+namespace or delete the claim; and the harness's downloader is not
+`make weights`'s: it mounts the hostPath directly with `seLinuxOptions.type:
+spc_t` (Pod Security `privileged`; on OpenShift the `privileged` SCC -- the
+`hostmount-anyuid` binding the harness makes for itself does not admit
+`spc_t`), it runs with the harness ServiceAccount's token automounted, it
+`pip install`s an unpinned `huggingface_hub` from PyPI at every start, and
+`hf auth login` writes the token into the container's `/tmp`. `make weights`
+(the general form,
 [Weights on the node's disk](../../reference/workload-preparation.md#weights-on-the-nodes-disk))
-needs only `baseline`. Per node:
+mounts the claim, carries no token, runs the engine image's own library,
+and needs only `baseline`. Fix 12 gives the harness's volume a name that
+carries the namespace and a `claimRef` into it -- unpatched, the volume is
+named `model-pvc-hostpath-pv` cluster-wide with no `claimRef`, so any
+namespace's claim asking for the class takes it and a second benchmark
+namespace stays Pending forever -- and scopes the teardown's `kubectl
+delete pv -l usage=model-cache`, which unpatched removes every such volume
+in the cluster whenever any benchmark namespace is torn down. The placement
+is `make prepull`'s, `PREPULL_TOLERATIONS` included. Per node:
 
 ```bash
 kubectl get pods -n $BENCHMARK_NAMESPACE -l component=model-download -o wide   # one per accelerator node, Ready when the download finished

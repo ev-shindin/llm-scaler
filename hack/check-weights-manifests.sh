@@ -35,14 +35,16 @@ bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /mnt/loca
     --hf-token-secret hf-token/token --capacity 2Ti --node-selector example.com/accelerator=h200 --toleration example.com/dedicated \
     --dry-run > "$T/render.yaml"
 bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /mnt/local/models --image "$IMG" --dry-run > "$T/render-default.yaml"
+bash deploy/weights.sh apply -n check-ns --model gpt2 --path /mnt/local/models --image "$IMG" --hf-token-secret myonlysecret --dry-run > "$T/render-secret.yaml"
 # the same model in another namespace: a different volume, the same claim name
 bash deploy/weights.sh apply -n other-ns --model Qwen/Qwen3-32B --path /mnt/local/models --image "$IMG" --dry-run > "$T/render-other.yaml"
 
-"$PY" - "$T/render.yaml" "$T/render-default.yaml" "$T/render-other.yaml" deploy/lib/accelerator_labels.py <<'PYEOF' || FAILED=1
+"$PY" - "$T/render.yaml" "$T/render-default.yaml" "$T/render-other.yaml" deploy/lib/accelerator_labels.py "$T/render-secret.yaml" <<'PYEOF' || FAILED=1
 import re, sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")) if d]
 default = [d for d in yaml.safe_load_all(open(sys.argv[2], encoding="utf-8")) if d]
 other = [d for d in yaml.safe_load_all(open(sys.argv[3], encoding="utf-8")) if d]
+secret = [d for d in yaml.safe_load_all(open(sys.argv[5], encoding="utf-8")) if d]
 ns = {}
 exec(open(sys.argv[4], encoding="utf-8").read(), ns)
 product_keys = ns["PRODUCT_KEYS"]
@@ -110,6 +112,10 @@ if len(default) == 3:
     check(default[1]["spec"]["resources"]["requests"]["storage"] == "1Ti", "default capacity 1Ti")
     check("HF_TOKEN" not in {e["name"] for e in dps["containers"][0]["env"]}, "no --hf-token-secret: no HF_TOKEN env")
     check(dps["tolerations"] == [{"key": "nvidia.com/gpu", "operator": "Exists"}], "default toleration")
+if len(secret) == 3:
+    senv = {e["name"]: e for e in secret[2]["spec"]["template"]["spec"]["containers"][0]["env"]}
+    check(senv["HF_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": "myonlysecret", "key": "HF_TOKEN"}, "a Secret named without /KEY uses the key HF_TOKEN: %s" % senv["HF_TOKEN"])
+    check(senv["TARGET_DIR"]["value"] == "/weights/models/gpt2", "a model id with no org lands under models/<id>: %s" % senv["TARGET_DIR"]["value"])
 if len(other) == 3:
     check(other[0]["metadata"]["name"] != default[0]["metadata"]["name"], "the same model in another namespace gets its own (cluster-scoped) volume")
     check(other[1]["metadata"]["name"] == default[1]["metadata"]["name"], "and the same claim name (namespace-scoped)")
@@ -122,18 +128,26 @@ if bad:
 print("  ok   volume, claim and downloader rendered: bound pair, claim-mounted (no hostPath in the pod), marker probe, layout, placement, no GPU, no token")
 PYEOF
 
-for badmodel in 'a/b/c' '/x' 'x/' 'a b' 'a"b' ''; do
-    if bash deploy/weights.sh apply -n check-ns --model "$badmodel" --path /p --image "$IMG" --dry-run >/dev/null 2>&1; then fail "a --model of '$badmodel' must be refused"; fi
+refused=0
+for badmodel in 'a/b/c' '/x' 'x/' 'a b' 'a"b' '' '..' 'a/..' '../x' 'Qwen/..' '.hidden' 'Qwen--x' 'a-/b' 'a/b.'; do
+    if bash deploy/weights.sh apply -n check-ns --model "$badmodel" --path /mnt/local/models --image "$IMG" --dry-run >/dev/null 2>&1; then fail "a --model of '$badmodel' must be refused"; refused=1; fi
 done
-ok "a model id that is not [org/]name of Hugging Face characters is refused"
-for badpath in relative / 'a b' '/p"' ''; do
-    if bash deploy/weights.sh apply -n check-ns --model m --path "$badpath" --image "$IMG" --dry-run >/dev/null 2>&1; then fail "a --path of '$badpath' must be refused"; fi
+[ "$refused" -eq 0 ] && ok "a model id that is not [org/]name of Hugging Face characters, or carries .. / -- / a segment edge of . or -, is refused"
+refused=0
+for badpath in relative / 'a b' '/p"' '' /mnt /etc /etc/models /var/lib/kubelet /var/lib/containerd/x /tmp/models /home/me/models /proc/1 /mnt/local/models/ /mnt/local/../x; do
+    if bash deploy/weights.sh apply -n check-ns --model m --path "$badpath" --image "$IMG" --dry-run >/dev/null 2>&1; then fail "a --path of '$badpath' must be refused"; refused=1; fi
 done
-ok "a path that is not absolute and of path characters is refused"
-if bash deploy/weights.sh apply -n check-ns --model m --path /p --image "$IMG" --hf-token-secret 'a b' --dry-run >/dev/null 2>&1; then fail "a Secret reference with a space must be refused"; else ok "a Secret reference that is not NAME[/KEY] is refused"; fi
-if bash deploy/weights.sh apply -n check-ns --model m --path /p --image "$IMG" --capacity '1Ti; rm' --dry-run >/dev/null 2>&1; then fail "a capacity that is not a quantity must be refused"; else ok "a capacity that is not a quantity is refused"; fi
-if bash deploy/weights.sh apply -n check-ns --model m --path /p --dry-run >/dev/null 2>&1; then fail "apply without --image must be refused"; else ok "apply without --image is refused"; fi
-if bash deploy/weights.sh apply -n check-ns --model m --path /p --image "$IMG" --all --dry-run >/dev/null 2>&1; then fail "apply must refuse --all"; else ok "apply: --all is refused"; fi
+[ "$refused" -eq 0 ] && ok "a path that is not absolute, has one component, ends in /, holds .., or sits under a system prefix (/etc, /var/lib, /tmp, /home, ...) is refused"
+for goodpath in /mnt/local/models /data/models /opt/models /srv/weights; do
+    bash deploy/weights.sh apply -n check-ns --model m --path "$goodpath" --image "$IMG" --dry-run >/dev/null 2>&1 || fail "a --path of '$goodpath' must be accepted"
+done
+ok "a data directory of two or more components outside the system prefixes is accepted"
+# the refusal loops prove nothing if the good form is refused too
+bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --image "$IMG" --dry-run >/dev/null 2>&1 && ok "the form the refusal tests vary is itself accepted" || fail "the refusal tests' base invocation is refused, so they prove nothing"
+if bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --image "$IMG" --hf-token-secret 'a b' --dry-run >/dev/null 2>&1; then fail "a Secret reference with a space must be refused"; else ok "a Secret reference that is not NAME[/KEY] is refused"; fi
+if bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --image "$IMG" --capacity '1Ti; rm' --dry-run >/dev/null 2>&1; then fail "a capacity that is not a quantity must be refused"; else ok "a capacity that is not a quantity is refused"; fi
+if bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --dry-run >/dev/null 2>&1; then fail "apply without --image must be refused"; else ok "apply without --image is refused"; fi
+if bash deploy/weights.sh apply -n check-ns --model m --path /mnt/local/models --image "$IMG" --all --dry-run >/dev/null 2>&1; then fail "apply must refuse --all"; else ok "apply: --all is refused"; fi
 
 # ---------------------------------------------------------------------------
 # 2. status and delete, offline.
@@ -149,7 +163,8 @@ cat > "$T/nodes.json" <<EOF
  {"metadata":{"name":"node-failing", "labels":{"nvidia.com/gpu.product":"H200"}}},
  {"metadata":{"name":"node-nopod",   "labels":{"nvidia.com/gpu.product":"H200"}}},
  {"metadata":{"name":"node-cpu",     "labels":{"gpu.nvidia.com/model":""}}},
- {"metadata":{"name":"node-amd",     "labels":{"amd.com/gpu.product-name":"MI300X"}}}
+ {"metadata":{"name":"node-amd",     "labels":{"amd.com/gpu.product-name":"MI300X"}}},
+ {"metadata":{"name":"node-evicted", "labels":{"nvidia.com/gpu.product":"H200"}}}
 ]}
 EOF
 cat > "$T/pods.json" <<EOF
@@ -157,7 +172,8 @@ cat > "$T/pods.json" <<EOF
  {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-ready"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
  {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-loading"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"running":{}}}]}},
  {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-failing"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}},
- {"metadata":{"labels":{"wva.llmd.ai/weights":"other"}},"spec":{"nodeName":"node-nopod"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}}
+ {"metadata":{"labels":{"wva.llmd.ai/weights":"other"}},"spec":{"nodeName":"node-nopod"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
+ {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-evicted"},"status":{"phase":"Failed","reason":"Evicted","message":"The node had condition: [DiskPressure]."}}
 ]}
 EOF
 mkdir -p "$T/bin"
@@ -183,20 +199,36 @@ case "\$1 \$2" in
   "get pvc")
       want -n check-ns
       case "\$ARGV" in
-        *"jsonpath={.status.phase}"*) printf '%s' "\${STUB_PVC_PHASE-Bound}" ;;
-        *"jsonpath={range"*) printf '%s\n' "\${STUB_PVC_VOLUMES-${PVNAME}}" ;;
+        *"jsonpath={.status.phase}"*) case "\$ARGV" in *" ${NAME} "*) ;; *) echo "stub kubectl: the claim read names no claim:\$ARGV" >&2; exit 2 ;; esac; printf '%s' "\${STUB_PVC_PHASE-Bound}" ;;
+        *"jsonpath={range"*)
+            # real kubectl: a get by NAME answers one object, whose .items is
+            # empty for a range; only a get by -l answers a List
+            case "\$ARGV" in *" -l "*) printf '%s\n' "\${STUB_PVC_VOLUMES-${PVNAME}}" ;; *) : ;; esac ;;
+        *"jsonpath={.spec.volumeName}"*)
+            case "\$ARGV" in *" -l "*) echo "stub kubectl: a single-object jsonpath on a list get:\$ARGV" >&2; exit 2 ;; esac
+            case "\$ARGV" in *" ${NAME} "*) printf '%s\n' "\${STUB_PVC_VOLUMES-${PVNAME}}" ;; *) : ;; esac ;;
         *"model-pvc"*) printf '%s' "\${STUB_MODEL_PVC_CLASS:-}" ;;
         *) echo "stub kubectl: unexpected pvc read:\$ARGV" >&2; exit 2 ;;
       esac ;;
   "get events")  want -n check-ns; printf '%s' "\${STUB_EVENT:-}" ;;
   "apply -f")    cat >/dev/null; echo applied ;;
   "delete daemonset"|"delete pvc") want -n check-ns; echo deleted ;;
+  "get pv")      want -l "$LBL"; want -o json; refuse -n; cat "$T/pvs.json" ;;
   "delete pv")   refuse -n; echo deleted ;;
   *) echo "stub kubectl: unexpected \$*" >&2; exit 2 ;;
 esac
 EOF
 chmod +x "$T/bin/kubectl"
 STUB_PATH="$T/bin:$PATH"
+# the volumes carrying our labels: ours, the same model in another namespace,
+# and one whose claimRef is not a weights claim at all
+cat > "$T/pvs.json" <<EOF
+{"items":[
+ {"metadata":{"name":"${PVNAME}"},              "spec":{"claimRef":{"namespace":"check-ns","name":"${NAME}"}}},
+ {"metadata":{"name":"${NAME}-othernamespace"}, "spec":{"claimRef":{"namespace":"other-ns","name":"${NAME}"}}},
+ {"metadata":{"name":"weights-second-model-11111111-22222222"}, "spec":{"claimRef":{"namespace":"check-ns","name":"weights-second-model-11111111"}}}
+]}
+EOF
 
 set +e
 PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/status.out" 2>&1
@@ -208,14 +240,36 @@ expect_line node-loading downloading
 expect_line node-failing absent
 grep -qF 'node-failing                 absent       Running (not ready) CrashLoopBackOff' "$T/status.out" && ok "status: a CrashLoopBackOff downloader is not 'downloading'" || fail "status: failing line: $(grep node-failing "$T/status.out")"
 expect_line node-nopod   absent
+expect_line node-evicted absent
+grep -q 'node-evicted .*Evicted' "$T/status.out" && ok "status: an evicted downloader shows its reason" || fail "status: Evicted reason missing"
 grep -q '^  node-cpu ' "$T/status.out" && fail "status: a node with an empty product label was counted" || ok "status: the default placement leaves the empty-label node out"
 grep -q 'node-failing .*CrashLoopBackOff' "$T/status.out" && ok "status: a failing downloader shows its reason" || fail "status: reason missing"
-grep -q '1/5 nodes hold it; 4 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
+grep -q '1/6 nodes hold it; 5 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
 grep -q '1 node(s) carry an AMD, Intel or Gaudi accelerator label' "$T/status.out" && ok "status: a non-NVIDIA node under the default placement is named" || fail "status: vendor warning missing"
 grep -q "claim ${NAME}: Bound" "$T/status.out" && ok "status: reports the claim Bound" || fail "status: claim line: $(head -1 "$T/status.out")"
 [ "$rc" -ne 0 ] && ok "status: exits non-zero while a node lacks the weights" || fail "status: exit 0 with nodes lacking the weights"
 grep -q 'stub kubectl:' "$T/status.out" && fail "status: a kubectl call lacked its scope: $(grep 'stub kubectl:' "$T/status.out" | head -1)" || ok "status: every kubectl call carried -n / -l"
 grep -q "^Qwen/Qwen3-32B  (claim" "$T/status.out" && ok "status: with no --model the models are discovered from the DaemonSets" || fail "status: discovery: $(head -1 "$T/status.out")"
+: > "$T/calls"
+PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns --model Qwen/Qwen3-32B > "$T/explicit.out" 2>&1 || true
+grep -q '^  node-ready ' "$T/explicit.out" && ! grep -q "^get daemonset -n check-ns -l" "$T/calls" && ok "status --model: reports without discovering the DaemonSets" || fail "status --model: $(head -2 "$T/explicit.out"); calls: $(grep '^get daemonset' "$T/calls" | head -2 | tr '\n' ';')"
+if PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns --model 'a/b/c' >/dev/null 2>&1; then fail "status --model must refuse a bad model id"; else ok "status --model: a bad model id is refused"; fi
+# no holder anywhere: the DaemonSet's FailedCreate event
+cp "$T/pods.json" "$T/pods-all.json"; printf '{"items":[]}' > "$T/pods.json"
+if STUB_EVENT='pods "weights-x-" is forbidden: violates PodSecurity "restricted:latest"' PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/nopods.out" 2>&1; then fail "status with no downloader must fail"; else
+    grep -q 'cannot create its pods: pods "weights-x-" is forbidden' "$T/nopods.out" && ok "status: with no downloader anywhere the DaemonSet's FailedCreate event is printed" || fail "status: FailedCreate event missing: $(tail -2 "$T/nopods.out")"; fi
+cp "$T/pods-all.json" "$T/pods.json"
+# no jq: apply still succeeds with the report skipped; status refuses
+mkdir -p "$T/nojq"
+for tool in bash sed awk tr printf cat grep head cut mktemp rm sort uniq shasum sha256sum env dirname basename readlink date id uname wc true false; do
+    tp="$(command -v "$tool" 2>/dev/null || true)"; [ -n "$tp" ] && ln -sf "$tp" "$T/nojq/$tool"
+done
+if out="$(PATH="$T/bin:$T/nojq" bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /mnt/local/models --image "$IMG" 2>&1)"; then
+    case "$out" in *"jq is not installed"*) ok "apply: without jq the apply succeeds and the report is skipped with a warning" ;; *) fail "apply without jq: $out" ;; esac
+else
+    fail "apply must not fail for a missing jq after the manifests were applied: $out"
+fi
+if PATH="$T/bin:$T/nojq" bash deploy/weights.sh status -n check-ns >/dev/null 2>&1; then fail "status without jq must fail"; else ok "status: without jq refuses with a reason"; fi
 if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/pending.out" 2>&1; then fail "status must fail while the claim is not Bound"; else grep -q 'Pending' "$T/pending.out" && ok "status: an unbound claim is reported and fails" || fail "status: unbound claim: $(head -1 "$T/pending.out")"; fi
 if STUB_DAEMONSETS="" PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/none.out" 2>&1; then fail "status with nothing to check must fail"; else grep -q 'no weights DaemonSets' "$T/none.out" && ok "status: no DaemonSets and no --model is refused with a reason" || fail "status: $(tail -1 "$T/none.out")"; fi
 : > "$T/calls"
@@ -226,18 +280,30 @@ if STUB_DS_SELECTOR='a=b"c' PATH="$STUB_PATH" bash deploy/weights.sh status -n c
 if STUB_NODES_ERROR='error: unable to parse requirement' PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/nf.out" 2>&1; then fail "status must fail when nodes cannot be listed"; else
     grep -q 'unable to parse requirement' "$T/nf.out" && ! grep -q cluster-reader "$T/nf.out" && ok "status: a node-list failure that is not a Forbidden reports kubectl's reason" || fail "status non-Forbidden: $(tail -1 "$T/nf.out")"; fi
 
-# delete: DaemonSet and claim in the namespace, the volume by the name read off the claim
+# delete: DaemonSet and claim in the namespace; the volume found by OUR
+# labels and its claimRef into this namespace -- never by a name read off a
+# claim, which a tenant writes
 : > "$T/calls"
 PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --model Qwen/Qwen3-32B >/dev/null 2>&1
 grep -q "^delete daemonset -n check-ns ${NAME} --ignore-not-found" "$T/calls" && grep -q "^delete pvc -n check-ns ${NAME} --ignore-not-found" "$T/calls" \
-    && grep -q "^delete pv ${PVNAME} --ignore-not-found" "$T/calls" && ok "delete --model: DaemonSet, claim, and the volume read off the claim" || fail "delete --model issued: $(grep delete "$T/calls" | tr '\n' ';')"
-[ "$(grep -n '^get pvc' "$T/calls" | head -1 | cut -d: -f1)" -lt "$(grep -n '^delete pvc' "$T/calls" | head -1 | cut -d: -f1)" ] && ok "delete: the volume name is read before the claim goes" || fail "delete: claim deleted before its volume name was read"
+    && grep -q "^delete pv ${PVNAME} --ignore-not-found" "$T/calls" && ok "delete --model: DaemonSet, claim, and the volume whose claimRef is this claim" || fail "delete --model issued: $(grep delete "$T/calls" | tr '\n' ';')"
+grep -q '^get pvc' "$T/calls" && fail "delete: a claim was read for its volume name (a tenant writes that field)" || ok "delete: no claim is read for a volume name"
+grep -q "^delete pv .*othernamespace" "$T/calls" && fail "delete --model: another namespace's volume for the same model was deleted" || ok "delete --model: another namespace's volume for the same model is left alone"
+grep -q "^delete pv .*second-model" "$T/calls" && fail "delete --model: another model's volume was deleted" || ok "delete --model: another model's volume in this namespace is left alone"
 : > "$T/calls"
 PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --all >/dev/null 2>&1
 grep -q "^delete daemonset -n check-ns -l ${LBL} --ignore-not-found" "$T/calls" && grep -q "^delete pvc -n check-ns -l ${LBL} --ignore-not-found" "$T/calls" && ok "delete --all: by both labels" || fail "delete --all issued: $(grep delete "$T/calls" | tr '\n' ';')"
+line="$(grep '^delete pv ' "$T/calls" || true)"
+case "$line" in
+    "delete pv ${PVNAME} weights-second-model-11111111-22222222 --ignore-not-found"|"delete pv weights-second-model-11111111-22222222 ${PVNAME} --ignore-not-found") ok "delete --all: every volume with our labels whose claimRef is in this namespace, and no other" ;;
+    *) fail "delete --all pv delete: $line" ;;
+esac
+grep -q "^get pv -l ${LBL} -o json" "$T/calls" && ok "delete: the volumes are listed by our labels, cluster-scoped" || fail "delete: pv listing: $(grep '^get pv' "$T/calls")"
 : > "$T/calls"
-STUB_PVC_VOLUMES="" PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --all >/dev/null 2>&1
-grep -q '^delete pv ' "$T/calls" && fail "delete: with no claims there is no volume to delete" || ok "delete --all with nothing to delete issues no pv delete"
+printf '{"items":[]}' > "$T/pvs-none.json"; cp "$T/pvs.json" "$T/pvs-all.json"; cp "$T/pvs-none.json" "$T/pvs.json"
+PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --all >/dev/null 2>&1
+grep -q '^delete pv ' "$T/calls" && fail "delete: with no volume of ours there is nothing to delete" || ok "delete --all with no volume of ours issues no pv delete"
+cp "$T/pvs-all.json" "$T/pvs.json"
 : > "$T/calls"
 out="$(PATH="$STUB_PATH" bash deploy/weights.sh delete -n check-ns --all --dry-run 2>&1 || true)"
 grep -q '^delete' "$T/calls" && fail "delete --dry-run deleted: $(grep delete "$T/calls")" || { case "$out" in *"would run: kubectl delete daemonset"*) ok "delete --dry-run prints and deletes nothing" ;; *) fail "delete --dry-run: $out" ;; esac; }
@@ -295,7 +361,10 @@ print("  ok   model_hostpath: nested layout gets the block under common.storage 
 PYEOF
 grep -q '^#' "$T/n1.yaml" && ok "model_hostpath: the scenario keeps its comments (yq, not a dump)" || fail "model_hostpath: comments lost"
 cp "$T/shared.yaml" "$T/s1.yaml"
-PATH="$STUB_PATH" bash hack/benchmark/model_hostpath.sh "$T/s1.yaml" /mnt/local/wva check-ns example.com/accelerator=h200 > "$T/hp2.out" 2>&1 || fail "model_hostpath on the shared layout failed: $(cat "$T/hp2.out")"
+PATH="$STUB_PATH" bash hack/benchmark/model_hostpath.sh "$T/s1.yaml" /mnt/local/wva check-ns example.com/accelerator=h200 dedicated,example.com/pool > "$T/hp2.out" 2>&1 || fail "model_hostpath on the shared layout failed: $(cat "$T/hp2.out")"
+[ "$(yq -r '.shared.storage.hostPath.tolerations | map(.key) | join(",")' "$T/s1.yaml")" = "nvidia.com/gpu,dedicated,example.com/pool" ] && ok "model_hostpath: the taint keys reach the harness DaemonSet's tolerations, after nvidia.com/gpu" || fail "model_hostpath tolerations: $(yq '.shared.storage.hostPath.tolerations' "$T/s1.yaml")"
+cp "$T/nested.yaml" "$T/n7.yaml"
+if PATH="$STUB_PATH" bash hack/benchmark/model_hostpath.sh "$T/n7.yaml" /mnt/local/wva check-ns "" 'bad key' >/dev/null 2>&1; then fail "model_hostpath accepted a taint key with a space"; else ok "model_hostpath: a taint key that is not one is refused"; fi
 sel="$(yq -r '.shared.storage.hostPath.nodeSelector["example.com/accelerator"] // ""' "$T/s1.yaml")"
 [ "$sel" = h200 ] && [ "$(yq -r '.shared.storage.hostPath.affinity // "none"' "$T/s1.yaml")" = none ] && ok "model_hostpath: shared layout, and a KEY=VALUE becomes a nodeSelector with no affinity" || fail "model_hostpath shared: $(yq '.shared.storage.hostPath' "$T/s1.yaml")"
 [ "$(yq -r '.shared.storage.hostPath.capacity' "$T/s1.yaml")" = 32Gi ] && ok "model_hostpath: capacity follows the shared claim's size" || fail "model_hostpath: shared capacity"
@@ -312,6 +381,25 @@ done
 ok "model_hostpath: a relative, root or unusual path is refused"
 cp "$T/nested.yaml" "$T/n5.yaml"
 if PATH="$STUB_PATH" bash hack/benchmark/model_hostpath.sh "$T/n5.yaml" /mnt/local/wva check-ns 'a=b"' >/dev/null 2>&1; then fail "model_hostpath accepted a selector with a quote"; else ok "model_hostpath: a selector that is not one KEY=VALUE is refused"; fi
+cat > "$T/two.yaml" <<'EOF'
+scenario:
+  - name: a
+    common:
+      storage:
+        modelPvc:
+          size: 40Gi
+  - name: b
+    common:
+      storage:
+        modelPvc:
+          size: 80Gi
+EOF
+if PATH="$STUB_PATH" bash hack/benchmark/model_hostpath.sh "$T/two.yaml" /mnt/local/wva check-ns > "$T/two.out" 2>&1; then
+    a="$(yq -r '.scenario[0].common.storage.hostPath.capacity' "$T/two.yaml")"; b="$(yq -r '.scenario[1].common.storage.hostPath.capacity' "$T/two.yaml")"
+    [ "$a" = 40Gi ] && [ "$b" = 40Gi ] && grep -q '(2 storage block(s))' "$T/two.out" && ok "model_hostpath: two stacks both get the block, the first claim's size (one volume, one capacity), and the message counts two" || fail "model_hostpath two stacks: a=$a b=$b; $(tail -1 "$T/two.out")"
+else
+    fail "model_hostpath on two stacks failed: $(cat "$T/two.out")"
+fi
 printf 'scenario:\n  - name: x\n    common: {}\n' > "$T/n6.yaml"
 if PATH="$STUB_PATH" bash hack/benchmark/model_hostpath.sh "$T/n6.yaml" /mnt/local/wva check-ns >/dev/null 2>&1; then fail "model_hostpath must fail on a scenario with no model claim"; else ok "model_hostpath: a scenario with no modelPvc is refused, not silently left on the shared volume"; fi
 
@@ -325,6 +413,10 @@ case "$line" in
     *) fail "make weights expanded to: $line" ;;
 esac
 case "$line" in *--node-selector*) fail "make weights: an empty selector must pass no --node-selector" ;; *) ok "make weights: no selector means the product-key affinity" ;; esac
+line="$(make -n weights WEIGHTS_MODEL=m WEIGHTS_PATH=/p WEIGHTS_IMAGE=i NAMESPACE=ns PREPULL_NODE_SELECTOR=k=v 2>/dev/null | tr -d '\\\n' || true)"
+case "$line" in *'--node-selector "k=v"'*) ok "make weights: PREPULL_NODE_SELECTOR is inherited" ;; *) fail "make weights inheritance: $line" ;; esac
+line="$(make -n weights WEIGHTS_MODEL=m WEIGHTS_PATH=/p WEIGHTS_IMAGE=i NAMESPACE=ns PREPULL_NODE_SELECTOR=k=v WEIGHTS_NODE_SELECTOR=w=x 2>/dev/null | tr -d '\\\n' || true)"
+case "$line" in *'--node-selector "w=x"'*) ok "make weights: WEIGHTS_NODE_SELECTOR overrides PREPULL_NODE_SELECTOR" ;; *) fail "make weights override: $line" ;; esac
 line="$(make -n weights-delete NAMESPACE=ns 2>/dev/null | grep 'weights.sh delete' || true)"
 case "$line" in *"--all"*) ok "make weights-delete with no WEIGHTS_MODEL deletes every model's holder" ;; *) fail "weights-delete: $line" ;; esac
 : > "$T/calls"
@@ -333,9 +425,9 @@ if PATH="$STUB_PATH" make weights-status > "$T/make-nons.out" 2>&1; then fail "m
 : > "$T/calls"
 if PATH="$STUB_PATH" make weights WEIGHTS_PATH=/p WEIGHTS_IMAGE=i NAMESPACE=ns >/dev/null 2>&1; then fail "make weights without WEIGHTS_MODEL must be refused"; else
     [ ! -s "$T/calls" ] && ok "make weights without WEIGHTS_MODEL is refused before any kubectl call" || fail "make weights without WEIGHTS_MODEL called kubectl"; fi
-line="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_MODEL_HOSTPATH=/mnt/local/w BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -A2 'model_hostpath.sh' || true)"
+line="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_MODEL_HOSTPATH=/mnt/local/w BENCHMARK_SPEC=guides/pd-disaggregation PREPULL_TOLERATIONS=t1 2>/dev/null | grep -A2 'model_hostpath.sh' || true)"
 case "$line" in
-    *'model_hostpath.sh'*'guides/pd-disaggregation.yaml'*'"/mnt/local/w" "ns"'*) ok "benchmark-standup: BENCHMARK_MODEL_HOSTPATH runs model_hostpath.sh on the scenario copy with the namespace" ;;
+    *'model_hostpath.sh'*'guides/pd-disaggregation.yaml'*'"/mnt/local/w" "ns" "" "t1"'*) ok "benchmark-standup: BENCHMARK_MODEL_HOSTPATH runs model_hostpath.sh on the scenario copy with the namespace, selector and tolerations" ;;
     *) fail "benchmark-standup model_hostpath step: $line" ;;
 esac
 n="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_MODEL_HOSTPATH=/mnt/local/w BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -n 'model_hostpath.sh\|standup \\$' | head -2 | tr '\n' ' ')"
@@ -380,6 +472,56 @@ out="$("$PY" "$T/fix11.py" "$T/03-earlier.j2" 2>&1 || true)"
 case "$out" in *"chcon made best-effort"*) ok "fix 11: the earlier form (fatal chcon) is completed in place" ;; *) fail "fix 11 on the earlier form: $out" ;; esac
 sed 's/images.benchmark.repository/images.other.repository/' "$T/03-orig.j2" > "$T/03-drift.j2"
 if "$PY" "$T/fix11.py" "$T/03-drift.j2" >/dev/null 2>&1; then fail "fix 11 must fail on a missing anchor, not skip"; else ok "fix 11: a missing anchor is a hard error"; fi
+
+# ---------------------------------------------------------------------------
+# 6. patch_harness.sh fix 12: the harness volume named for its namespace,
+#    with a claimRef; the claim's volumeName follows; the teardown scoped.
+# ---------------------------------------------------------------------------
+sed -n '/fix 12 (hostPath PV owned by its namespace) failed"/,/^PYEOF$/p' hack/benchmark/patch_harness.sh | sed '1d;$d' > "$T/fix12.py"
+[ -s "$T/fix12.py" ] || fail "could not extract fix 12 from patch_harness.sh"
+mkdir -p "$T/h12"
+cat > "$T/h12/pv.j2" <<'EOF2'
+metadata:
+  name: {{ storage.modelPvc.name }}-hostpath-pv
+  labels:
+    app: {{ labels.app }}
+    usage: model-cache
+spec:
+  capacity:
+EOF2
+cat > "$T/h12/pvc.j2" <<'EOF2'
+  storageClassName: {{ storage.hostPath.storageClassName }}
+  volumeName: {{ storage.modelPvc.name }}-hostpath-pv
+EOF2
+cat > "$T/h12/td.py" <<'EOF2'
+class S:
+    def a(self, cmd, context):
+        pv_result = cmd.kube(
+            "delete",
+            "pv",
+            "-l",
+            "usage=model-cache",
+            "--ignore-not-found",
+        )
+    def b(self, cmd, context):
+        pv_result = cmd.kube(
+            "delete",
+            "pv",
+            "-l",
+            "usage=model-cache",
+            "--ignore-not-found",
+        )
+EOF2
+out="$("$PY" "$T/fix12.py" "$T/h12/pv.j2" "$T/h12/pvc.j2" "$T/h12/td.py" 2>&1 || true)"
+case "$out" in *"applied"*) ok "fix 12: applies to the upstream anchors" ;; *) fail "fix 12 on the fixtures: $out" ;; esac
+grep -q 'name: {{ storage.modelPvc.name }}-{{ namespace.name }}-hostpath-pv' "$T/h12/pv.j2" && grep -q 'volumeName: {{ storage.modelPvc.name }}-{{ namespace.name }}-hostpath-pv' "$T/h12/pvc.j2" && ok "fix 12: the volume is named for its namespace and the claim follows" || fail "fix 12: names"
+grep -A2 'claimRef:' "$T/h12/pv.j2" | grep -q 'namespace: {{ namespace.name }}' && ok "fix 12: the volume carries a claimRef into its namespace" || fail "fix 12: claimRef missing"
+grep -q 'wva.llmd.ai/model-namespace: {{ namespace.name }}' "$T/h12/pv.j2" && [ "$(grep -c 'usage=model-cache,wva.llmd.ai/model-namespace={context.require_namespace()}' "$T/h12/td.py")" -eq 2 ] && ok "fix 12: the teardown deletes only the volume labelled for the namespace being torn down (both sites)" || fail "fix 12: teardown scoping"
+"$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$T/h12/td.py" && ok "fix 12: the patched teardown still parses" || fail "fix 12: teardown does not parse"
+out="$("$PY" "$T/fix12.py" "$T/h12/pv.j2" "$T/h12/pvc.j2" "$T/h12/td.py" 2>&1 || true)"
+case "$out" in *"already applied"*) ok "fix 12: idempotent" ;; *) fail "fix 12 second run: $out" ;; esac
+sed -i 's/usage: model-cache$/usage: cache/' "$T/h12/pv.j2"; sed -i 's/{{ namespace.name }}-hostpath-pv/hostpath-pv/' "$T/h12/pv.j2"
+if "$PY" "$T/fix12.py" "$T/h12/pv.j2" "$T/h12/pvc.j2" "$T/h12/td.py" >/dev/null 2>&1; then fail "fix 12 must fail on a missing anchor"; else ok "fix 12: a missing anchor is a hard error"; fi
 
 if [ "$FAILED" -ne 0 ]; then
     echo "weights checks: FAIL"

@@ -826,3 +826,86 @@ io.open(path, "w", encoding="utf-8", newline="\n").write(src)
 print("  fix 11 (download DaemonSet readiness + affinity): applied")
 PYEOF
 fi
+
+# ---------------------------------------------------------------------------
+# Fix 12 -- the harness's hostPath PersistentVolume is nobody's, and the
+# teardown deletes every one of them in the cluster.
+#
+# 02a_pv_model-hostpath.yaml.j2 renders the volume with a fixed cluster-wide
+# name (model-pvc-hostpath-pv) and no claimRef. Its storage class is a name
+# no StorageClass object carries, so binding is by class match alone: a
+# claim in ANY namespace asking for that class takes it -- a namespace's
+# pods then mount the node directory read-write from a plain pod, on every
+# node -- and a second benchmark namespace standing up with the mode gets
+# AlreadyExists on the volume and a claim that stays Pending forever.
+# The name carries the namespace now and the volume has a claimRef into
+# it; 02_pvc_model-pvc.yaml.j2's volumeName follows. And the teardown's
+# `kubectl delete pv -l usage=model-cache` -- cluster-wide, run by every
+# `make benchmark-teardown` of any namespace -- is scoped to the volume the
+# namespace being torn down owns, through a label the volume carries.
+# ---------------------------------------------------------------------------
+PV_TPL="$REPO_DIR/config/templates/jinja/02a_pv_model-hostpath.yaml.j2"
+PVC_TPL="$REPO_DIR/config/templates/jinja/02_pvc_model-pvc.yaml.j2"
+TEARDOWN="$REPO_DIR/llmdbenchmark/teardown/steps/step_03_delete_resources.py"
+if [ ! -f "$PV_TPL" ] || [ ! -f "$PVC_TPL" ] || [ ! -f "$TEARDOWN" ]; then
+    note "fix 12 (hostPath PV owned by its namespace): a file is missing, skipped"
+else
+    "$PY" - "$PV_TPL" "$PVC_TPL" "$TEARDOWN" <<'PYEOF' || fail "fix 12 (hostPath PV owned by its namespace) failed"
+import io, sys
+
+def load(p):
+    return io.open(p, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+def save(p, s):
+    io.open(p, "w", encoding="utf-8", newline="\n").write(s)
+
+pv, pvc, td = sys.argv[1:4]
+edits = [
+    (pv, '''  name: {{ storage.modelPvc.name }}-hostpath-pv
+  labels:
+    app: {{ labels.app }}
+    usage: model-cache
+spec:
+''', '''  name: {{ storage.modelPvc.name }}-{{ namespace.name }}-hostpath-pv
+  labels:
+    app: {{ labels.app }}
+    usage: model-cache
+    # wva-patch: the teardown deletes this namespace's volume, not every one
+    wva.llmd.ai/model-namespace: {{ namespace.name }}
+spec:
+  # wva-patch: bound to this claim and no other; without a claimRef any
+  # claim in any namespace asking for the class takes it
+  claimRef:
+    namespace: {{ namespace.name }}
+    name: {{ storage.modelPvc.name }}
+'''),
+    (pvc, '''  volumeName: {{ storage.modelPvc.name }}-hostpath-pv
+''', '''  volumeName: {{ storage.modelPvc.name }}-{{ namespace.name }}-hostpath-pv
+'''),
+]
+done = 0
+for path, old, new in edits:
+    src = load(path)
+    if new in src:
+        done += 1
+        continue
+    if src.count(old) != 1:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): " + old.splitlines()[0].strip())
+    save(path, src.replace(old, new, 1))
+src = load(td)
+OLD = '''            "usage=model-cache",
+'''
+NEW = '''            f"usage=model-cache,wva.llmd.ai/model-namespace={context.require_namespace()}",  # wva-patch
+'''
+if NEW in src:
+    done += 1
+else:
+    if src.count(OLD) != 2:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): teardown pv delete, expected 2 sites, found %d" % src.count(OLD))
+    save(td, src.replace(OLD, NEW))
+if done == 3:
+    print("  fix 12 (hostPath PV owned by its namespace): already applied")
+else:
+    print("  fix 12 (hostPath PV owned by its namespace): applied")
+PYEOF
+fi

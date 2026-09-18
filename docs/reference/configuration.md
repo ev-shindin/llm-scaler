@@ -180,6 +180,42 @@ do is also reachable through plan-then-apply, which does not.
 `WVA_DEFAULT_SO_MIN` and `_MAX` are only the values the plan is *written* with.
 What gets applied is what the file says when you apply it, per entry.
 
+Scope follows the same rules as the ScaledObject plan above: `NAMESPACE=<ns>`
+pins the scan to one namespace, and without it a cluster-scoped install walks
+every namespace holding model servers.
+
+The scaling behaviour is written into every generated ScaledObject rather than
+inherited. Kubernetes' own defaults happen to match the windows above, so on a
+stock cluster only the policy periods differ — but those defaults belong to the
+API server, and a cluster that retunes them would quietly change how every
+workload WVA creates scales, with nothing in the object to show it. The
+asymmetry is deliberate: scale-up acts immediately because the wait is already
+paid in cold start, while scale-down is patient because removing a replica too
+early costs that cold start on the next request and keeping one too long only
+costs money.
+
+**Adopting an existing ScaledObject leaves its behaviour alone.** `apply: adopt`
+repoints the triggers and bounds; polling interval, cooldown, fallback and
+`behavior` stay as whoever tuned them left them.
+
+Set them on a deploy to do this during install:
+
+```bash
+make deploy-wva-on-k8s WVA_DEFAULT_SO=plan   # install, then show what it would create
+make deploy-wva-on-k8s WVA_DEFAULT_SO=true WVA_DEFAULT_SO_NS=all
+```
+
+Two things it will never do. It **does not touch a workload that already has a
+ScaledObject** — that one may be hand-tuned or GitOps-managed, and two
+ScaledObjects on one target is two HPAs fighting over a replica count. And it
+**skips any workload whose model it cannot determine** rather than guessing,
+because a wrong `modelID` groups a workload with a model it does not serve and
+mis-scales both.
+
+Generated objects use an `external-push` trigger, so KEDA holds a stream open and
+WVA pushes activation the moment it decides — the difference between waking a
+parked workload in about the detection interval and waiting out a poll.
+
 ### Workload readiness (`make workload-patch`)
 
 Two pod-spec settings decide whether autoscaling a model server is safe to turn
@@ -236,43 +272,7 @@ own disk. Full description in
 | `WEIGHTS_CAPACITY` | The volume's declared capacity; a declaration, hostPath has no quota | `1Ti` |
 | `WEIGHTS_NODE_SELECTOR` | As `PREPULL_NODE_SELECTOR` | `$(PREPULL_NODE_SELECTOR)` |
 | `WEIGHTS_TOLERATIONS` | As `PREPULL_TOLERATIONS` | `$(PREPULL_TOLERATIONS)` |
-| `BENCHMARK_MODEL_HOSTPATH` | A directory on the node: `benchmark-standup` then binds the harness's model claim to it and has the harness download the model on every accelerator node before the engines start. Empty: the shared volume | *(empty)* |
-
-Scope follows the same rules as the ScaledObject plan above: `NAMESPACE=<ns>`
-pins the scan to one namespace, and without it a cluster-scoped install walks
-every namespace holding model servers.
-
-The scaling behaviour is written into every generated ScaledObject rather than
-inherited. Kubernetes' own defaults happen to match the windows above, so on a
-stock cluster only the policy periods differ — but those defaults belong to the
-API server, and a cluster that retunes them would quietly change how every
-workload WVA creates scales, with nothing in the object to show it. The
-asymmetry is deliberate: scale-up acts immediately because the wait is already
-paid in cold start, while scale-down is patient because removing a replica too
-early costs that cold start on the next request and keeping one too long only
-costs money.
-
-**Adopting an existing ScaledObject leaves its behaviour alone.** `apply: adopt`
-repoints the triggers and bounds; polling interval, cooldown, fallback and
-`behavior` stay as whoever tuned them left them.
-
-Set them on a deploy to do this during install:
-
-```bash
-make deploy-wva-on-k8s WVA_DEFAULT_SO=plan   # install, then show what it would create
-make deploy-wva-on-k8s WVA_DEFAULT_SO=true WVA_DEFAULT_SO_NS=all
-```
-
-Two things it will never do. It **does not touch a workload that already has a
-ScaledObject** — that one may be hand-tuned or GitOps-managed, and two
-ScaledObjects on one target is two HPAs fighting over a replica count. And it
-**skips any workload whose model it cannot determine** rather than guessing,
-because a wrong `modelID` groups a workload with a model it does not serve and
-mis-scales both.
-
-Generated objects use an `external-push` trigger, so KEDA holds a stream open and
-WVA pushes activation the moment it decides — the difference between waking a
-parked workload in about the detection interval and waiting out a poll.
+| `BENCHMARK_MODEL_HOSTPATH` | A directory on the node: `benchmark-standup` then binds the harness's model claim to it and has the harness download the model on every accelerator node (the placement `make prepull` uses, `PREPULL_TOLERATIONS` included) before the engines start. Empty: the shared volume | *(empty)* |
 
 ## Pointing at an existing Prometheus
 

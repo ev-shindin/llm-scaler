@@ -14,7 +14,7 @@
 # mount any other; each node reads its own copy.
 #
 #   weights.sh apply  -n NS --model HFID --path DIR --image IMG [--dry-run]   download HFID under DIR on every accelerator node
-#   weights.sh status -n NS [--model HFID]                                    which nodes have it, which are still downloading
+#   weights.sh status -n NS [--model HFID] [--node-selector KEY=VALUE]        which nodes have it, which are still downloading
 #   weights.sh delete -n NS (--model HFID | --all) [--dry-run]                drop the claim, volume and downloader (files stay)
 #
 # Options:
@@ -33,7 +33,9 @@
 #                               default is any node carrying a known GPU
 #                               product label (deploy/lib/accelerator_nodes.sh);
 #                               set this to what your model servers select
-#                               on when they select on something
+#                               on when they select on something. `status`
+#                               lists the nodes each DaemonSet was applied
+#                               for; this overrides that
 #   --toleration KEY            tolerate a taint with KEY (any value, any
 #                               effect); nvidia.com/gpu is always tolerated
 #   --dry-run                   apply: print the manifests instead of
@@ -45,9 +47,14 @@
 # namespace tenant does not have -- ask the cluster admin to run apply, or
 # to create the volume. Nothing here uses a hostPath volume in a Pod (the
 # downloader mounts the claim), so Pod Security "baseline" admits it;
-# "restricted" does not (the image runs as root), and on OpenShift the
-# downloader needs the anyuid SCC -- the node directory is root-owned, and
-# restricted-v2 would run it as another UID that cannot write there.
+# "restricted" does not (the image runs as root). The node directory is
+# cluster-shared, root-writable state: every namespace pointed at the same
+# DIR shares it and trusts its marker, and nothing charges what is written
+# there to a quota -- one DIR per trust domain, on a disk that is not the
+# node's own. On SELinux-enforcing nodes (OpenShift) the directory has to
+# carry container_file_t before this can write to it (the kubelet does not
+# relabel a hostPath), and the downloader needs the anyuid SCC for the UID;
+# not yet run there.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +67,8 @@ NC='\033[0m'
 source "$HERE/lib/common.sh"
 # shellcheck source=lib/accelerator_nodes.sh
 source "$HERE/lib/accelerator_nodes.sh"
+# shellcheck source=lib/nodedir.sh
+source "$HERE/lib/nodedir.sh"
 # NOTE: log_error EXITS. Nothing may follow it that needs to run.
 
 NAMESPACE=""
@@ -103,27 +112,26 @@ pv_for() {
     printf '%s-%s' "$(name_for "$MODEL")" "$(wva_ns_suffix "${NAMESPACE}/${NODE_PATH}")"
 }
 
-# check_model refuses an id that is not one: [org/]name, the characters
-# Hugging Face allows. It is substituted into YAML, a path and a Python
-# string.
+# check_model refuses an id that is not one: [org/]name of the characters
+# Hugging Face allows, no '..' or '--', no segment starting or ending with
+# '.' or '-' -- the Hub's own rule, held here too because the id becomes a
+# directory (/weights/models/<id>) and the probe's path before the library
+# ever sees it.
 check_model() {
     case "$1" in
         "") log_error "--model must not be empty" ;;
         */*/*|/*|*/) log_error "not a Hugging Face model id: '$1' (expected org/name)" ;;
         *[!A-Za-z0-9._/-]*) log_error "not a Hugging Face model id: '$1' (letters, digits, . _ - and one /)" ;;
+        *..*|*--*) log_error "not a Hugging Face model id: '$1' (no '..' or '--')" ;;
+        .*|-*|*/.*|*/-*|*.|*-|*./*|*-/*) log_error "not a Hugging Face model id: '$1' (a segment must not start or end with '.' or '-')" ;;
     esac
 }
 
-# check_path refuses anything but an absolute path made of the characters a
-# hostPath and a YAML scalar take unquoted.
+# check_path refuses a node directory the volume must not point at
+# (deploy/lib/nodedir.sh says which and why).
 check_path() {
-    case "$1" in
-        "") log_error "--path must not be empty" ;;
-        /) log_error "--path must not be the root directory" ;;
-        *[!A-Za-z0-9._/-]*) log_error "not a node path: '$1' (absolute, letters, digits, . _ - /)" ;;
-        /*) ;;
-        *) log_error "--path must be absolute: '$1'" ;;
-    esac
+    local why
+    why="$(nodedir_ok "$1")" || log_error "--path: ${why}"
 }
 
 check_image() {
@@ -462,24 +470,33 @@ run_delete() {
 
 # cmd_delete removes the downloader, the claim and the volume. The files on
 # the nodes stay: they are the point, and the next apply finds the marker
-# and skips the download. The volume's name is read off the claim before
-# the claim goes (it hashes the path, which delete is not told).
+# and skips the download.
+#
+# The volumes to delete are found by what only this script (with volume
+# write rights) can set -- the labels on the PersistentVolume and its
+# claimRef into this namespace -- never by a name read off a claim: a claim
+# is a tenant's object, and a tenant who writes a foreign volume's name
+# into one must not have the admin's delete remove that volume.
 cmd_delete() {
     [ -n "$NAMESPACE" ] || log_error "delete needs -n NAMESPACE"
-    local selector=()
+    command -v jq >/dev/null 2>&1 || log_error "jq is required for delete (the volumes are matched on their claimRef with it)"
+    local selector=() claim=""
     if [ "$ALL" = true ]; then
         selector=(-l "$LABEL_COMPONENT")
     else
         [ -n "$MODEL" ] || log_error "delete needs --model HFID or --all"
         check_model "$MODEL"
-        selector=("$(name_for "$MODEL")")
+        claim="$(name_for "$MODEL")"
+        selector=("$claim")
     fi
     local volumes=()
     local line
     while IFS= read -r line; do
         [ -n "$line" ] && volumes+=("$line")
-    done < <(kubectl get pvc -n "$NAMESPACE" "${selector[@]}" --ignore-not-found \
-        -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}' 2>/dev/null || true)
+    done < <(kubectl get pv -l "$LABEL_COMPONENT" -o json 2>/dev/null \
+        | jq -r --arg ns "$NAMESPACE" --arg claim "$claim" \
+            '.items[] | select(.spec.claimRef.namespace == $ns and ($claim == "" or .spec.claimRef.name == $claim)) | .metadata.name' \
+        2>/dev/null || true)
     run_delete delete daemonset -n "$NAMESPACE" "${selector[@]}" --ignore-not-found
     run_delete delete pvc -n "$NAMESPACE" "${selector[@]}" --ignore-not-found
     [ "${#volumes[@]}" -eq 0 ] || run_delete delete pv "${volumes[@]}" --ignore-not-found

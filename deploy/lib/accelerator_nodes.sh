@@ -116,20 +116,6 @@ accelerator_keys_json() {
     printf '%s\n' "${ACCELERATOR_PRODUCT_KEYS[@]}" | jq -R . | jq -s .
 }
 
-# accelerator_affinity_json prints the same default placement as a JSON
-# `affinity` value -- for a manifest built by a tool that takes JSON (the
-# benchmark harness's scenario, edited with yq) rather than by this shell.
-accelerator_affinity_json() {
-    local key first=true
-    local out='{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":['
-    for key in "${ACCELERATOR_PRODUCT_KEYS[@]}"; do
-        [ "$first" = true ] || out="${out},"
-        first=false
-        out="${out}{\"matchExpressions\":[{\"key\":\"${key}\",\"operator\":\"Exists\"},{\"key\":\"${key}\",\"operator\":\"NotIn\",\"values\":[\"\"]}]}"
-    done
-    printf '%s]}}}' "$out"
-}
-
 # accelerator_nodes_json prints the node list (a v1 NodeList JSON document)
 # the placement for $1 would match: `kubectl get nodes -l KEY=VALUE`, or
 # every node carrying any product key. Fails as kubectl fails (a Forbidden

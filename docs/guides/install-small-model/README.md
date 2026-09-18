@@ -267,7 +267,11 @@ re-downloads on every scale-up anyway. What decides it is where the weights
 
 [Weights and the model
 cache](../../reference/workload-preparation.md#weights-and-the-model-cache) has the
-detail, including why it makes scale-up cheaper but not faster.
+detail, including why it makes scale-up cheaper but not faster. For a model
+large enough that reading it through the shared volume is the start path,
+`BENCHMARK_MODEL_HOSTPATH=<dir>` on the standup (or `make weights` for any
+deployment) puts a copy on every accelerator node's disk --
+[Weights on the node's disk](../../reference/workload-preparation.md#weights-on-the-nodes-disk).
 
 ## Next
 

@@ -1601,7 +1601,7 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 	@# read that silently read the shared volume is the wrong measurement.
 	@if [ -n "$(BENCHMARK_MODEL_HOSTPATH)" ]; then \
 		bash hack/benchmark/model_hostpath.sh "$(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml" \
-			"$(BENCHMARK_MODEL_HOSTPATH)" "$(BENCHMARK_NAMESPACE)" "$(PREPULL_NODE_SELECTOR)"; \
+			"$(BENCHMARK_MODEL_HOSTPATH)" "$(BENCHMARK_NAMESPACE)" "$(PREPULL_NODE_SELECTOR)" "$(PREPULL_TOLERATIONS)"; \
 	fi
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) standup \
 		-p $(BENCHMARK_NAMESPACE) \
@@ -2348,6 +2348,7 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash -n deploy/prepull.sh
 	@bash -n deploy/lib/accelerator_nodes.sh
 	@bash -n deploy/weights.sh
+	@bash -n deploy/lib/nodedir.sh
 	@bash -n hack/benchmark/model_hostpath.sh
 	@bash -n hack/benchmark/engine_image.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done

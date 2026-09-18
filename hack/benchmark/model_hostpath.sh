@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Turn on node-local weights in a benchmark scenario copy.
 #
-#   model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE]
+#   model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE] [TAINTKEY,...]
 #
 # The harness (llm-d-benchmark) has the mechanism -- storage.hostPath in a
 # scenario makes it create a static hostPath PersistentVolume, bind model-pvc
@@ -31,24 +31,30 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../deploy/lib/accelerator_nodes.sh
 source "$HERE/../../deploy/lib/accelerator_nodes.sh"
+# shellcheck source=../../deploy/lib/nodedir.sh
+source "$HERE/../../deploy/lib/nodedir.sh"
 # the lib's checks call log_error; here that is a plain failure
 log_error() { printf 'model_hostpath: %s\n' "$1" >&2; exit 1; }
 
-SCENARIO="${1:?usage: model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE]}"
-NODE_DIR="${2:?usage: model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE]}"
-NAMESPACE="${3:?usage: model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE]}"
+SCENARIO="${1:?usage: model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE] [TAINTKEY,...]}"
+NODE_DIR="${2:?usage: model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE] [TAINTKEY,...]}"
+NAMESPACE="${3:?usage: model_hostpath.sh <scenario.yaml> <node dir> <namespace> [KEY=VALUE] [TAINTKEY,...]}"
 SELECTOR="${4:-}"
+TOLERATIONS="${5:-}"   # comma list of taint keys beyond nvidia.com/gpu, as PREPULL_TOLERATIONS
 STORAGE_CLASS="node-local-weights"
 
 [ -f "$SCENARIO" ] || log_error "no scenario at ${SCENARIO}"
 command -v yq >/dev/null 2>&1 || log_error "yq is required (the standup edits the scenario with it)"
-case "$NODE_DIR" in
-    /) log_error "the node directory must not be the root directory" ;;
-    /*) ;;
-    *) log_error "the node directory must be absolute, got '${NODE_DIR}'" ;;
-esac
-case "$NODE_DIR" in *[!A-Za-z0-9._/-]*) log_error "not a node path: '${NODE_DIR}' (letters, digits, . _ - /)" ;; esac
+why="$(nodedir_ok "$NODE_DIR")" || log_error "the node directory: ${why}"
 accelerator_check_selector "$SELECTOR"
+tolerations_json='[{"key":"nvidia.com/gpu","operator":"Exists"}]'
+if [ -n "$TOLERATIONS" ]; then
+    IFS=',' read -r -a taint_keys <<< "$TOLERATIONS"
+    for t in "${taint_keys[@]}"; do
+        accelerator_check_toleration "$t"
+        tolerations_json="$(printf '%s' "$tolerations_json" | jq -c --arg k "$t" '. + [{"key": $k, "operator": "Exists"}]')"
+    done
+fi
 
 # An existing claim on another class is the silent failure described above.
 existing="$(kubectl get pvc -n "$NAMESPACE" model-pvc -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
@@ -65,13 +71,14 @@ placement_json='{}'
 if [ -n "$SELECTOR" ]; then
     placement_json="{\"nodeSelector\":{\"${SELECTOR%%=*}\":\"${SELECTOR#*=}\"}}"
 else
-    placement_json="{\"affinity\":$(accelerator_affinity_json)}"
+    # the one renderer of the default placement, read as JSON
+    placement_json="$(accelerator_placement_yaml "" | sed 's/^      //' | yq -o json '.')"
 fi
 hp="$(mktemp)"
 trap 'rm -f "$hp"' EXIT
-printf '{"enabled":true,"path":"%s","storageClassName":"%s","capacity":"%s","daemonSetTimeout":3600,"tolerations":[{"key":"nvidia.com/gpu","operator":"Exists"}]}' \
+printf '{"enabled":true,"path":"%s","storageClassName":"%s","capacity":"%s","daemonSetTimeout":3600}' \
     "$NODE_DIR" "$STORAGE_CLASS" "$size" \
-    | jq --argjson p "$placement_json" '. + $p' > "$hp"
+    | jq --argjson p "$placement_json" --argjson t "$tolerations_json" '. + $p + {tolerations: $t}' > "$hp"
 
 # every storage block that declares a model claim, wherever the scenario keeps it
 HP_FILE="$hp" yq -i '(.. | select(type == "!!map" and has("modelPvc"))).hostPath = load(strenv(HP_FILE))' "$SCENARIO"

@@ -78,7 +78,7 @@ and hold with or without a benchmark harness in front of the workload:
 | **`startupProbe` period.** | `periodSeconds` of a few seconds; a probe that fires every 30 s reports a started engine up to 30 s late, every time. Keep the time budget by raising `failureThreshold` (period 5 with threshold 360 is the same 30 minutes as period 30 with threshold 60). The first probes fail on connection refused while the server binds; that is what the threshold is for. |
 | **Engine caches that outlive the pod.** | vLLM writes its torch.compile artefacts, the FlashInfer autotune table and Triton's JIT cache under `/tmp` unless told otherwise, so every replica recompiles from nothing. Point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` at a read-write path shared across replicas -- a subPath of an RWX claim -- and the second replica finds the first one's. If the model claim is mounted read-only, use another claim rather than mounting it a second time: a CSI driver publishes a claim once per pod, and the second mount inherits read-only. And make the engine tolerate a cache path that turns out not to be writable -- a storage hiccup must cost one compile, not the replica; vLLM fails hard on a read-only cache directory unless the variable is unset first. The cache is keyed by a hash of the engine config, so a changed model, flag or version misses rather than hits stale. |
 | **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts, and the kubelet evicts unused images under disk pressure, so "it was pulled once" does not stay true. `make prepull IMAGES=<image> NAMESPACE=<ns>` holds the image open on every accelerator node (one DaemonSet per image, the image itself asleep, no accelerator requested), and `make prepull-status` says per node whether the kubelet has it -- see [Holding the image on the nodes](#holding-the-image-on-the-nodes). With the image held, a pinned tag should pull `IfNotPresent`: `Always` contacts the registry at every start for a digest that cannot have changed. |
-| **The weights** | are the section above. |
+| **The weights** | are the [section above](#weights-and-the-model-cache) -- the download; for a large model, also [Weights on the node's disk](#weights-on-the-nodes-disk) -- the read. |
 
 What is left after those is the cold process itself -- imports, the API
 server, the KV-transfer connector, the profile run -- and the weight load on a
@@ -189,25 +189,38 @@ What it costs, and what it needs:
 
 - Disk: the model's size on every accelerator node, and the download from
   Hugging Face once per node -- a 60 GB model on 16 nodes is a terabyte of
-  egress, once. The directory is the cluster's: pick one on the node's
-  local disk (`/mnt/local/...` on CoreWeave), not on a network mount, or
-  nothing was gained.
+  egress, once. The directory is the cluster's, and it is cluster-shared,
+  root-writable state that outlives every object here: every namespace
+  pointed at the same directory shares the files and trusts the marker
+  (the first to write wins, and the others download nothing), and nothing
+  charges what is written there to a quota -- a fill from one namespace is
+  `DiskPressure` for every pod on the node. One directory per trust domain
+  (`/mnt/local/weights/<namespace>`), on a disk that is not the node's own
+  (`/mnt/local/...` on CoreWeave), never a network mount, and never a
+  system path: the script refuses `/etc`, `/var/lib`, `/tmp`, `/home` and
+  their kind, a top-level directory on its own, and `..`.
 - Leave to create PersistentVolumes, which are cluster-scoped; a namespace
   tenant does not have it. Ask the cluster admin to run `make weights` or
   to create the volume; the rest is namespaced.
 - Pod Security `baseline` admits the downloader (it mounts the claim, not a
-  hostPath); `restricted` does not (the image runs as root). On OpenShift
-  the downloader needs the `anyuid` SCC: the node directory is root-owned,
-  and `restricted-v2` would run it as a UID that cannot write there. With
-  SELinux enforcing, pods of one namespace share a level, so the engines
-  read what the downloader wrote; another namespace's do not.
+  hostPath); `restricted` does not (the image runs as root). **Not yet run
+  on OpenShift or any SELinux-enforcing node**, where two more things
+  hold: the downloader needs the `anyuid` SCC (the node directory is
+  root-owned, and `restricted-v2` would run it as a UID that cannot write
+  there), and the directory has to carry `container_file_t` before any
+  container can write to it -- the kubelet does not relabel a hostPath, so
+  the admin labels it once on each node (`chcon -Rt container_file_t
+  <dir>`). On OpenShift the pods of one namespace share an SELinux level,
+  so the engines read what the downloader wrote and another namespace's
+  pods do not; on other distributions with SELinux enforcing, check the
+  runtime's category assignment before relying on that.
 - A node that joins later has no copy until the DaemonSet reaches it, and a
   replica scheduled there meanwhile reads from a directory that is being
   written. `weights-status` says which nodes are there yet. A cordoned node
   or one under `DiskPressure` still counts for the DaemonSet (its controller
   tolerates both), keeps evicting the downloader, and shows as `absent
-  Evicted` for as long as it is in that state; nothing in the namespace
-  fixes that node.
+  Failed (not ready) Evicted` for as long as it is in that state; nothing in
+  the namespace fixes that node.
 
 On node-local NVMe the engine's default loader (memory-mapped safetensors)
 is the right one; `--safetensors-load-strategy prefetch` exists for network
