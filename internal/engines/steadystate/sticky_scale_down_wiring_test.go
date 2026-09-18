@@ -38,14 +38,20 @@ const (
 	wiringTarget = "qwen-decode"
 )
 
-func stickyConfig(t *testing.T) *config.Config {
+// stickyConfig is a Config loaded the way the controller loads one, with the
+// switch at its default (on) or turned off.
+func stickyConfig(t *testing.T, on bool) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("PROMETHEUS_BASE_URL: \"https://prometheus:9090\"\nWVA_STICKY_SCALE_DOWN: \"true\"\n"), 0o600))
+	body := "PROMETHEUS_BASE_URL: \"https://prometheus:9090\"\n"
+	if !on {
+		body += "WVA_STICKY_SCALE_DOWN: \"false\"\n"
+	}
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
 	cfg, err := config.Load(nil, path)
 	require.NoError(t, err)
-	require.True(t, cfg.StickyScaleDownEnabled())
+	require.Equal(t, on, cfg.StickyScaleDownEnabled())
 	return cfg
 }
 
@@ -68,7 +74,7 @@ func wiringEngine(t *testing.T, objs ...client.Object) *Engine {
 	require.NoError(t, metrics.InitMetrics(prometheus.NewRegistry()))
 	return &Engine{
 		client:         c,
-		Config:         stickyConfig(t),
+		Config:         stickyConfig(t, true),
 		metricsEmitter: metrics.NewMetricsEmitter(),
 		policies:       newPolicyReporter(),
 	}
@@ -155,7 +161,7 @@ func TestStickyWiring_ABurstReleasesTheHold(t *testing.T) {
 
 func TestStickyWiring_OffIsTheOldBehaviour(t *testing.T) {
 	e := wiringEngine(t, wiringDeployment())
-	e.Config = config.NewTestConfig() // switch off
+	e.Config = stickyConfig(t, false)
 	require.EqualValues(t, 1, cycle(t, e, "fleet-1", wiringDecision(2, 1, 18770)))
 	// The crept-up target is published as is: the chatter, unchanged.
 	require.EqualValues(t, 2, cycle(t, e, "fleet-1", wiringDecision(2, 2, 20676)))

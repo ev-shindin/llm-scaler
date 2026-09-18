@@ -304,9 +304,10 @@ func (c *Config) ScaleToZeroEnabled() bool {
 
 // StickyScaleDownEnabled reports whether a published scale-down is held
 // against demand noise until the scale-UP threshold says otherwise
-// (WVA_STICKY_SCALE_DOWN, default off; see steadystate.holdPublishedScaleDown).
-// Internal switch: it changes what the controller publishes and is off until
-// the two-model benchmark has run both ways. Thread-safe.
+// (WVA_STICKY_SCALE_DOWN, default on; see steadystate.holdPublishedScaleDown).
+// The switch exists to turn the hold OFF for a comparison, not to turn it
+// on: off, a model idling near the scale-down boundary keeps a replica for
+// as long as its demand noise lasts. Thread-safe.
 func (c *Config) StickyScaleDownEnabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -542,6 +543,7 @@ func NewTestConfig() *Config {
 			scaleToZeroEnabled:          false,
 			limitedModeEnabled:          false,
 			scaleFromZeroMaxConcurrency: 10,
+			stickyScaleDownEnabled:      true,
 		},
 		saturation: scalingPolicyConfig{
 			global:           make(ScalingPolicySet),

@@ -219,22 +219,22 @@ SCALE_FROM_ZERO_ENGINE_MAX_CONCURRENCY: "5"
 	if cfg.ScaleFromZeroMaxConcurrency() != 5 {
 		t.Errorf("Expected ScaleFromZeroMaxConcurrency 5, got %d", cfg.ScaleFromZeroMaxConcurrency())
 	}
-	if cfg.StickyScaleDownEnabled() {
-		t.Error("Expected StickyScaleDownEnabled to be false when unset")
+	if !cfg.StickyScaleDownEnabled() {
+		t.Error("Expected StickyScaleDownEnabled to be true when unset: the hold is on by default")
 	}
 }
 
 func TestLoad_StickyScaleDownSwitch(t *testing.T) {
 	configFile := writeTestConfigFile(t, `
 PROMETHEUS_BASE_URL: "https://prometheus:9090"
-WVA_STICKY_SCALE_DOWN: "true"
+WVA_STICKY_SCALE_DOWN: "false"
 `)
 	cfg, err := Load(nil, configFile)
 	if err != nil {
 		t.Fatalf("Load() failed: %v", err)
 	}
-	if !cfg.StickyScaleDownEnabled() {
-		t.Error("Expected StickyScaleDownEnabled to be true")
+	if cfg.StickyScaleDownEnabled() {
+		t.Error("Expected StickyScaleDownEnabled to be false when the file turns it off")
 	}
 }
 

@@ -152,6 +152,9 @@ func (e *Engine) noteScaleTargetUID(key string, uid types.UID) {
 // what it costs. A no-decision CYCLE (a scrape gap, a skipped model) does
 // not have that effect: carryPublished republishes the held value there.
 //
+// On by default (WVA_STICKY_SCALE_DOWN); the switch exists to turn it off for
+// a comparison, since off is the behaviour this replaces.
+//
 // Reports whether it changed the decision. Inert without a published value,
 // with one older than maxAge (Engine.stickyAge) or below the variant's own
 // floor, without a descent in flight, or when the decision carries no
