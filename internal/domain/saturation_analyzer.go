@@ -39,6 +39,12 @@ const RolePrefill = "prefill"
 // RoleDecode represents the decode-only role in a P/D disaggregated deployment.
 const RoleDecode = "decode"
 
+// DemandUnpriced is the TotalDemand of a decision whose variant's share of
+// the demand could not be told: a variant with no rows this cycle while its
+// siblings had some. Nothing that re-prices a replica count may treat it as
+// zero.
+const DemandUnpriced = -1
+
 // DecisionStep represents a single step in the decision pipeline.
 // Each pipeline stage (saturation analysis, resource limiting, etc.) adds its own step.
 type DecisionStep struct {

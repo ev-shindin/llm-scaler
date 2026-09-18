@@ -322,7 +322,11 @@ func buildDecisionsWithOptimizer(
 		if rc, ok := satNamed.RoleCapacities[role]; ok {
 			demand = rc.TotalDemand
 		}
-		decision.TotalDemand = demand * variantDemandShare(satNamed.Result.VariantCapacities, vc.VariantName, role)
+		if share, ok := variantDemandShare(satNamed.Result.VariantCapacities, vc.VariantName, role); ok {
+			decision.TotalDemand = demand * share
+		} else {
+			decision.TotalDemand = domain.DemandUnpriced
+		}
 		decision.PerReplicaCapacity = vc.PerReplicaCapacity
 		decision.ScaleUpThreshold = satNamed.ScaleUpThreshold
 
@@ -335,8 +339,11 @@ func buildDecisionsWithOptimizer(
 // belongs to the named variant: its engine-local demand over the engine-local
 // demand of every variant of that role. One variant means 1. When nothing
 // reported, the share is even, so a variant is never priced at zero for want
-// of rows.
-func variantDemandShare(vcs []domain.VariantCapacity, variantName, role string) float64 {
+// of rows. When its siblings reported and it did not -- a rolling restart,
+// or the router pinning the traffic elsewhere -- its share is unknown, not
+// zero: a zero share would price any replica count at zero utilization and
+// nothing could ever release a hold on it. Reports ok=false in that case.
+func variantDemandShare(vcs []domain.VariantCapacity, variantName, role string) (float64, bool) {
 	var mine, all float64
 	var n int
 	for _, vc := range vcs {
@@ -355,11 +362,13 @@ func variantDemandShare(vcs []domain.VariantCapacity, variantName, role string) 
 	}
 	switch {
 	case n <= 1:
-		return 1
-	case all > 0:
-		return mine / all
+		return 1, true
+	case all == 0:
+		return 1 / float64(n), true
+	case mine == 0:
+		return 0, false
 	default:
-		return 1 / float64(n)
+		return mine / all, true
 	}
 }
 

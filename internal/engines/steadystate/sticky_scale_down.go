@@ -29,6 +29,14 @@ type decidedMark struct {
 // always did, so an operator who scaled the fleet by hand while metrics were
 // gone finds the HPA's window filled with the running count, not with a held
 // value that would undo the change the moment the carry stopped.
+//
+// The age bound is fixed on purpose, where the hold's follows the optimize
+// interval: it is the HPA's window that sets it, not the loop's cadence. So
+// the carry is cadence-limited -- it covers floor(4 min / interval) cycles,
+// four at the shipped 15 s, one at 4 min, none above that -- and a loop
+// slower than the window cannot be carried through a gap at all. That is
+// the physics of a max-window actuator, and a longer carry would only trade
+// it for undoing the operator's changes.
 const (
 	carryMaxCycles = 4
 	carryMaxAge    = 4 * time.Minute
@@ -175,7 +183,14 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 		// judge of a scale-up, and the optimizer's answer stands.
 		return d, false
 	}
-	if d.PerReplicaCapacity <= 0 || d.ScaleUpThreshold <= 0 {
+	if d.PerReplicaCapacity <= 0 || d.ScaleUpThreshold <= 0 || d.TotalDemand < 0 {
+		return d, false // nothing to price the published count with
+	}
+	if d.WasLimited {
+		// A target a GPU limiter bound is the limiter's answer, and its reason
+		// is what the ResourceConstrained event has to carry. The hold would
+		// overwrite that reason with its own and lower a count the limiter
+		// already priced; it stands down.
 		return d, false
 	}
 	utilAtPublished := d.TotalDemand / (float64(published) * d.PerReplicaCapacity)

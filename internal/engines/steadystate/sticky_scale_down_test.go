@@ -198,6 +198,25 @@ func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
 	assert.Equal(t, 0, carry(0, 1, fresh, true, nil, now))
 }
 
+func TestHoldPublishedScaleDown_LeavesALimitedDecisionAlone(t *testing.T) {
+	// A GPU limiter bound this target; its reason is what the constrained
+	// event carries, and the hold must not overwrite it or lower the count.
+	d := decisionFor(2, 2, 20676)
+	d.WasLimited = true
+	out, held := hold(d, 1, true)
+	assert.False(t, held)
+	assert.Equal(t, 2, out.TargetReplicas)
+}
+
+func TestHoldPublishedScaleDown_InertWhenTheShareIsUnknown(t *testing.T) {
+	// The variant reported no rows while a sibling did: its demand cannot be
+	// priced, and 0 would read as "never saturated".
+	d := decisionFor(2, 2, domain.DemandUnpriced)
+	out, held := hold(d, 1, true)
+	assert.False(t, held)
+	assert.Equal(t, 2, out.TargetReplicas)
+}
+
 func TestHoldPublishedScaleDown_NeverHoldsAScaleUp(t *testing.T) {
 	// Two variants: this one is the cheapest per capacity, so the optimizer
 	// adds the model's replicas here, but its own share of the demand is small.
