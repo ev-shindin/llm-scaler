@@ -98,8 +98,11 @@ make prepull-delete NAMESPACE=<ns>          # stop holding every image (or IMAGE
 `nvidia.com/gpu.present=true`, the GPU operator's label; set it to whatever
 the model servers select on). The holder runs the image itself, asleep, with a
 memory limit and no accelerator: a container that exited would not protect
-its image from the kubelet's garbage collection, a running one does. Several
-images are a comma-separated list. Nothing in WVA depends on the holder; it
+its image from the kubelet's garbage collection, a running one does. The
+image has to carry `/bin/sh` for that; one that does not is still pulled
+(the kubelet fetched it to create the container) and `status` says so --
+`pulled`, not `present` -- but nothing holds it. Several images are a
+comma-separated list. Nothing in WVA depends on the holder; it
 is a start-time measure, and `prepull-status` is how you know it worked --
 the node's own image list is compared against the reference, so an image
 named differently from what the pods pull shows as absent on every node.

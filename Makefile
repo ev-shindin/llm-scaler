@@ -588,6 +588,10 @@ model-cache: ## Create the weights PVC. NAMESPACE=<ns> WVA_MODEL_PVC_SIZE=<size>
 ## the model server's pod spec does. deploy/prepull.sh --help has the rest.
 PREPULL_NODE_SELECTOR ?= nvidia.com/gpu.present=true
 comma := ,
+# benchmark-standup holds the harness's engine image on the accelerator nodes
+# before deploying it. false skips; IMAGES overrides what the clone pins.
+BENCHMARK_PREPULL ?= true
+BENCHMARK_PREPULL_IMAGES ?=
 .PHONY: prepull prepull-status prepull-delete
 prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> picks the nodes.
 	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
@@ -1407,6 +1411,25 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 		mkdir -p "$(BENCHMARK_REPO_DIR)/config/specification/$$(dirname $(BENCHMARK_SPEC))"; \
 		cp "$(CURDIR)/hack/benchmark/scenarios/$(BENCHMARK_SPEC).yaml.j2" \
 		   "$(BENCHMARK_REPO_DIR)/config/specification/$(BENCHMARK_SPEC).yaml.j2"; \
+	fi
+	@# The engine image on every accelerator node BEFORE the harness deploys it:
+	@# a replica scheduled to a node without the image pulls 10-20 GB first, and
+	@# the autoscaler's first ramp is sized by that minute. The image is the
+	@# harness's own pin (hack/benchmark/engine_image.sh reads it from the clone),
+	@# or BENCHMARK_PREPULL_IMAGES; BENCHMARK_PREPULL=false skips the step. The
+	@# holders keep pulling while the standup goes on; `make prepull-status` is
+	@# the check, and the well-lit paths say when a run's nodes had the image.
+	@if [ "$(BENCHMARK_PREPULL)" != "false" ]; then \
+		imgs="$(BENCHMARK_PREPULL_IMAGES)"; \
+		[ -n "$$imgs" ] || imgs=$$(bash hack/benchmark/engine_image.sh "$(BENCHMARK_REPO_DIR)" || true); \
+		if [ -z "$$imgs" ]; then \
+			echo "WARNING: could not read the engine image from $(BENCHMARK_REPO_DIR)/config/templates/values/defaults.yaml; not pre-pulling (set BENCHMARK_PREPULL_IMAGES=<image>)"; \
+		else \
+			echo "Holding the engine image on the accelerator nodes: $$imgs (BENCHMARK_PREPULL=false skips; make prepull-status NAMESPACE=$(BENCHMARK_NAMESPACE) checks)"; \
+			bash deploy/prepull.sh apply -n "$(BENCHMARK_NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" \
+				$$(printf '%s' "$$imgs" | tr ',' '\n' | sed 's/^/--image /' | tr '\n' ' ') \
+				|| echo "WARNING: pre-pull did not apply; the standup continues without it"; \
+		fi; \
 	fi
 	@# Lives in a script, not inline here, so its branches can actually be run.
 	@# Inline it was reachable only by driving a whole standup, which is why it
@@ -2253,6 +2276,7 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash -n deploy/install.sh
 	@bash -n deploy/install-epp.sh
 	@bash -n deploy/prepull.sh
+	@bash -n hack/benchmark/engine_image.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done
 	@for script in deploy/*/install.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
 	@for script in deploy/kind-emulator/*.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done

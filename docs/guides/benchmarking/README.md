@@ -191,6 +191,9 @@ Optional, except `BENCHMARK_NAMESPACE`.
 | `BENCHMARK_KEDA_SCALE_DOWN_STABILIZATION` | `300` | `120` |
 | `BENCHMARK_ALLOW_EPP_REUSE` | `false` | `true` |
 | `BENCHMARK_WVA_DEPLOY` | `true` | `false` |
+| `BENCHMARK_PREPULL` | `true` | `false` |
+| `BENCHMARK_PREPULL_IMAGES` | the engine image the harness pins | `ghcr.io/you/engine:tag` |
+| `PREPULL_NODE_SELECTOR` | `nvidia.com/gpu.present=true` | `example.com/accelerator=h200` |
 
 **The harness image must match `BENCHMARK_REPO_REF`.** The harness pod always
 runs the checkout's scripts — they are copied in from a ConfigMap built from the
@@ -274,19 +277,27 @@ them measures the harness, not the autoscaler. The scenarios under
 should copy the same three blocks. A fourth is the cluster's, not the
 harness's, and comes first:
 
-**The image is on every accelerator node before the standup.** The harness
-pins the engine image (`docker.io/vllm/vllm-openai:v0.26.0` in v0.7.8's
-`defaults.yaml`); a replica scheduled to a node without it pulls 10-20 GB
-before its container starts, which on the shape-swap runs was the difference
-between a 63 s and a 175 s second replica. Hold it once per cluster:
+**The image is on every accelerator node before the harness deploys it.** A
+replica scheduled to a node without the engine image pulls 10-20 GB before
+its container starts, which on the shape-swap runs was the difference between
+a 63 s and a 175 s second replica. `make benchmark-standup` holds the image
+the harness pins (`docker.io/vllm/vllm-openai:v0.26.0` in v0.7.8's
+`defaults.yaml`, read from the clone) on every accelerator node before it
+deploys anything -- `BENCHMARK_PREPULL=false` skips it,
+`BENCHMARK_PREPULL_IMAGES=<image>[,<image>]` overrides it, and
+`PREPULL_NODE_SELECTOR` picks the nodes. The holders keep pulling while the
+standup goes on, so before the run:
 
 ```bash
-make prepull IMAGES=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=$BENCHMARK_NAMESPACE
 make prepull-status NAMESPACE=$BENCHMARK_NAMESPACE      # every accelerator node: present
 ```
 
-The scenarios pull the engine `IfNotPresent` for the same reason -- a pinned
-tag pulled `Always` still asks the registry at every start.
+The mechanism (one DaemonSet per image, the image itself asleep, no
+accelerator requested) is
+[Holding the image on the nodes](../../reference/workload-preparation.md#holding-the-image-on-the-nodes);
+it applies to any workload WVA scales, not only a benchmark. The scenarios
+pull the engine `IfNotPresent` for the same reason -- a pinned tag pulled
+`Always` still asks the registry at every start.
 
 **Package installs at engine start.** The `preprocess` init container
 (`set_llmdbench_environment.py`, from the harness image) writes

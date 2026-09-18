@@ -141,7 +141,10 @@ cmd_apply() {
         render "$image" | $KUBECTL apply -n "$NAMESPACE" -f - >/dev/null
         log_info "holding ${image} on nodes with ${NODE_SELECTOR} (DaemonSet $(name_for "$image"))"
     done
-    [ "$DRY_RUN" = true ] || cmd_status
+    # The status after an apply is a report, not a verdict: holders created a
+    # second ago are still pulling, and that is not a failure of the apply.
+    # `status` on its own returns non-zero for a node that lacks the image.
+    [ "$DRY_RUN" = true ] || cmd_status || true
 }
 
 # cmd_status lists, per selected node, whether the image is present and what
@@ -186,6 +189,15 @@ cmd_status() {
             if [ "$phase" = Running ] || [ "$listed" = listed ]; then
                 has=present
                 present=$((present + 1))
+            elif [ "$reason" = RunContainerError ] || [ "$reason" = CrashLoopBackOff ] || [ "$reason" = Error ] || [ "$reason" = Completed ]; then
+                # The container was created from the image (and could not exec
+                # /bin/sh, or ran and stopped), so the kubelet HAS the image;
+                # nothing is holding it, though, and garbage collection can
+                # take it back. Measured: an image without a shell reports
+                # RunContainerError on every node.
+                has=pulled
+                present=$((present + 1))
+                reason="${reason} (pulled, not held: the image runs no /bin/sh)"
             else
                 rc=1
             fi
