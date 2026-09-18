@@ -69,7 +69,8 @@ type SaturationAnalyzer struct {
 	// decodeSaturatedAt is, per namespace|model, the last cycle a decode
 	// replica was seen full and queued (roleSaturated). Prefill's readings
 	// are treated as decode's for DecodeSaturationMemory after it
-	// (rememberDecodeSaturation); pruned with the history.
+	// (rememberDecodeSaturation); swept by EvictStaleHistory beside the
+	// history, one time.Time per model that ever saturated.
 	decodeSaturatedAt map[string]time.Time
 	// now is the clock the memory reads; tests set it.
 	now func() time.Time
@@ -110,7 +111,10 @@ func (a *SaturationAnalyzer) Name() string {
 // It prunes the accelerator memo on the same timeout, and here rather than in a
 // second sweep so the two cannot drift: both are per-variant state that exists
 // only to key or stabilise capacity, and a variant that has gone quiet for the
-// timeout has no use for either. The returned count remains the number of
+// timeout has no use for either. The saturated-throughput windows and the
+// decode-saturation memory go the same way -- the latter is per
+// namespace|model rather than per variant, but a model quiet for the timeout
+// has no use for it either. The returned count remains the number of
 // HISTORY entries evicted, which is what its callers report.
 func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	a.mu.Lock()
@@ -357,7 +361,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	replicaDemand := rm.TokensInUse + localQueueDemand
 
 	// k1: memory-bound capacity
-	k1 := int64(float64(rm.TotalKvCapacityTokens) * config.KvCacheThreshold)
+	k1 := memoryBound(rm.TotalKvCapacityTokens, config.KvCacheThreshold)
 
 	// k2: compute-bound capacity
 	var engineParams *EngineParams
@@ -1295,11 +1299,18 @@ func roleSaturated(metrics []domain.ReplicaMetrics, rolesByVariant map[string]st
 		if rm.TokensInUse > rm.TotalKvCapacityTokens {
 			continue
 		}
-		if rm.TokensInUse >= int64(float64(rm.TotalKvCapacityTokens)*kvCacheThreshold) {
+		if rm.TokensInUse >= memoryBound(rm.TotalKvCapacityTokens, kvCacheThreshold) {
 			return true
 		}
 	}
 	return false
+}
+
+// memoryBound is k1: the KV cache times kvCacheThreshold, truncated -- the
+// one formula for it, so the gate's "full" is the capacity the replica is
+// priced at.
+func memoryBound(totalKvCapacityTokens int64, kvCacheThreshold float64) int64 {
+	return int64(float64(totalKvCapacityTokens) * kvCacheThreshold)
 }
 
 // roleHold is what holdPrefillDemand did to prefill's demand: the figure it
@@ -1326,12 +1337,10 @@ func holdPrefillDemand(roleDemand map[string]float64, variants []domain.VariantC
 	if !ok || rc.TotalAnticipatedSupply <= 0 {
 		return roleHold{}, false
 	}
-	h := roleHold{before: before, after: before, lo: scaleDown * rc.TotalSupply, hi: scaleUp * rc.TotalAnticipatedSupply}
-	if h.after > h.hi {
-		h.after = h.hi
-	}
-	if h.after < h.lo && h.lo <= h.hi {
-		h.after = h.lo
+	h := roleHold{before: before, lo: scaleDown * rc.TotalSupply, hi: scaleUp * rc.TotalAnticipatedSupply}
+	h.after = min(before, h.hi)
+	if h.lo <= h.hi {
+		h.after = max(h.after, h.lo)
 	}
 	if h.after == before {
 		return h, false

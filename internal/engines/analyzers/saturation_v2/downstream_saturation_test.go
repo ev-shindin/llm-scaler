@@ -240,6 +240,57 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey))
 	})
 
+	It("forgets at exactly the row window, and not a moment before", func() {
+		full := []domain.ReplicaMetrics{decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill()}
+		_, err := analyzer.Analyze(ctx, makeAnalyzerInput(full, states))
+		Expect(err).NotTo(HaveOccurred())
+		last := clock
+		drained := []domain.ReplicaMetrics{decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 0), prefill()}
+
+		clock = last.Add(DecodeSaturationMemory - time.Nanosecond)
+		_, err = analyzer.Analyze(ctx, makeAnalyzerInput(drained, states))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.computeCapacityHistory).NotTo(HaveKey(prefillKey), "inside the window, still decode's")
+
+		clock = last.Add(DecodeSaturationMemory)
+		_, err = analyzer.Analyze(ctx, makeAnalyzerInput(drained, states))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey), "a full window later, prefill's own")
+	})
+
+	It("remembers per model: one model's saturated decode says nothing about another's prefill", func() {
+		full := []domain.ReplicaMetrics{decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill()}
+		_, err := analyzer.Analyze(ctx, makeAnalyzerInput(full, states))
+		Expect(err).NotTo(HaveOccurred())
+
+		// The same rows under another model and namespace, decode idle: its
+		// prefill records, and its demand is not held.
+		other := makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 0), prefill()}, states)
+		other.ModelID, other.Namespace = "other-model", "other-ns"
+		result, err := analyzer.Analyze(ctx, other)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.computeCapacityHistory).To(HaveKey("other-model|H200|1|prefill|short|q5"))
+		Expect(analyzer.computeCapacityHistory).NotTo(HaveKey(prefillKey), "the first model is still gated")
+		Expect(analyzer.decodeSaturatedAt).To(HaveLen(1))
+		Expect(analyzer.decodeSaturatedAt).To(HaveKey("test-ns|test-model"))
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically(">", 0.85*prefillP(result)), "not held")
+	})
+
+	It("ages the memory out with the history it sits beside", func() {
+		full := []domain.ReplicaMetrics{decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill()}
+		_, err := analyzer.Analyze(ctx, makeAnalyzerInput(full, states))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.decodeSaturatedAt).To(HaveLen(1))
+		// EvictStaleHistory reads the wall clock, as the history does; an
+		// entry written under the test clock (2026-09-18) is older than an
+		// hour of wall time and younger than a century of it.
+		analyzer.EvictStaleHistory(100 * 365 * 24 * time.Hour)
+		Expect(analyzer.decodeSaturatedAt).To(HaveLen(1), "a fresh entry survives")
+		analyzer.EvictStaleHistory(time.Hour)
+		Expect(analyzer.decodeSaturatedAt).To(BeEmpty(), "a stale one is swept")
+	})
+
 	It("does not read a decode queue that is only KV transfers in flight as saturation", func() {
 		// vLLM counts a request waiting for its remote KV in
 		// num_requests_waiting: a large model over a slow link keeps five or
