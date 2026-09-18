@@ -119,6 +119,15 @@ Two things to know before relying on it:
   by default -- the controller's own read of nodes is granted by the
   cluster-admin setup, not to the person running `make`. Without it the
   DaemonSets still apply; the status is what fails, with a Forbidden.
+- The holder runs the engine image as that image runs -- as root, since
+  engine images are built that way and `runAsNonRoot` would fail the
+  container -- with no privilege, every capability dropped and the
+  runtime's default seccomp profile. That is admitted under Pod Security
+  `baseline` and under OpenShift's `restricted-v2` SCC, and rejected
+  under Pod Security `restricted` (which requires `runAsNonRoot`). When
+  no holder appears on any node, `prepull-status` prints the DaemonSet's
+  latest `FailedCreate` event, which is where a pod-security, quota or
+  LimitRange rejection is reported.
 - Held with `IfNotPresent` under a *tag*, a node keeps whatever that tag
   pointed at when it pulled; with `Always` the registry's current digest
   would win at every start. For a pinned release tag that is the point.

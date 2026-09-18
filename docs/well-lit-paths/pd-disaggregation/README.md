@@ -97,7 +97,7 @@ export KEDA_HELM_INSTALL=true              # only if the cluster has no KEDA
 
 make benchmark-install
 make benchmark-standup BENCHMARK_SPEC=guides/pd-disaggregation MODEL_ID=Qwen/Qwen3-0.6B
-make prepull-status                        # the standup held the engine image on the accelerator nodes; every node should read present
+make prepull-status NAMESPACE=$BENCHMARK_NAMESPACE   # the standup held the engine image on the accelerator nodes; every node should read present
 
 # The HPA behaviour the results below were measured under. deploy/ ships a
 # 300s scale-down window with a 100% step; this is the tighter shape.

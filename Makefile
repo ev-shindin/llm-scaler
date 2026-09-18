@@ -1419,6 +1419,9 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 	@# or BENCHMARK_PREPULL_IMAGES; BENCHMARK_PREPULL=false skips the step. The
 	@# holders keep pulling while the standup goes on; `make prepull-status` is
 	@# the check, and the well-lit paths say when a run's nodes had the image.
+	@# The namespace is created here, idempotently: the harness creates it
+	@# later, and a DaemonSet applied into a namespace that does not exist yet
+	@# is a NotFound the WARNING below would have swallowed.
 	@if [ "$(BENCHMARK_PREPULL)" != "false" ]; then \
 		imgs="$(BENCHMARK_PREPULL_IMAGES)"; \
 		[ -n "$$imgs" ] || imgs=$$(bash hack/benchmark/engine_image.sh "$(BENCHMARK_REPO_DIR)" || true); \
@@ -1426,7 +1429,8 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 			echo "WARNING: could not read the engine image from $(BENCHMARK_REPO_DIR)/config/templates/values/defaults.yaml; not pre-pulling (set BENCHMARK_PREPULL_IMAGES=<image>)"; \
 		else \
 			echo "Holding the engine image on the accelerator nodes: $$imgs (BENCHMARK_PREPULL=false skips; make prepull-status NAMESPACE=$(BENCHMARK_NAMESPACE) checks)"; \
-			bash deploy/prepull.sh apply -n "$(BENCHMARK_NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" \
+			kubectl create namespace "$(BENCHMARK_NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+				&& bash deploy/prepull.sh apply -n "$(BENCHMARK_NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" \
 				$$(printf '%s' "$$imgs" | tr ',' '\n' | sed 's/^/--image /' | tr '\n' ' ') \
 				|| echo "WARNING: pre-pull did not apply; the standup continues without it"; \
 		fi; \
