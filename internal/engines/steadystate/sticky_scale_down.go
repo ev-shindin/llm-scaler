@@ -40,6 +40,20 @@ const stickyStepName = "sticky-scale-down"
 // burst arriving mid-descent is not held down: at 0.85 of the published
 // count's capacity the hold releases and the fresh target stands.
 //
+// ONE-SIDED ON PURPOSE. The up direction already has its stickiness, from
+// the actuator: KEDA's HPA acts on a scale-up at its next sync (its scale-up
+// stabilization window is 0) and treats a published value that has dipped
+// back as a scale-DOWN request, which enters the same 300 s max-window the
+// higher value is still in -- so a target that chatters N, N+1, N, ... goes
+// to N+1 once and stays, and the measured runs show exactly that (3, 4, 3,
+// 4 during a burst; the fleet went to 4 once). The down direction is the one
+// where the published value falls through, because there the window IS the
+// stickiness and the chatter defeats it. A direct actuator with no window
+// behind it would need the mirror of this hold -- keep a published N+1 until
+// demand at N+1 drops under the scale-down boundary -- and that is the
+// release test with the other threshold, to be added behind the same switch
+// when such an actuator exists and can be measured.
+//
 // Reports whether it changed the decision. Inert without a published value,
 // without a descent in flight, or when the decision carries no capacity (a
 // path that did not go through the optimizer's decision builder).
