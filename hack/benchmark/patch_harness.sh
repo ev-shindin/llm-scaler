@@ -766,7 +766,7 @@ fi
 # And the downloader's `chcon -R -t container_file_t` -- the SELinux relabel
 # for OpenShift readers -- fails on a node without SELinux ("can't apply
 # partial context to unlabeled file"), and under the script's `set -e` that
-# ends it before the marker is written: measured on kermit (Ubuntu), all 16
+# ends it before the marker is written: measured on a Kubernetes cluster (Ubuntu nodes), all 16
 # downloaders crash-looped, each restart downloading the model again and
 # never marking it. The relabel is skipped on exactly that text now, and
 # fails as before on any other error (a wrong SCC on OpenShift must not
