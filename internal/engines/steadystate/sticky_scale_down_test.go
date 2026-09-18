@@ -61,9 +61,9 @@ func hold(d domain.VariantDecision, published int, have bool) (domain.VariantDec
 	return holdPublishedScaleDown(d, published, now.Add(-time.Second), have, stickyMaxAge, now)
 }
 
-// carry calls carryPublished with the default age bound.
+// carry calls carryPublished on the first missed cycle.
 func carry(resolved, published int, publishedAt time.Time, have bool, floor *int, now time.Time) int {
-	return carryPublished(resolved, published, publishedAt, have, floor, stickyMaxAge, now)
+	return carryPublished(resolved, published, publishedAt, have, floor, 1, now)
 }
 
 func TestHoldPublishedScaleDown_TheMeasuredChatterSettlesAtOne(t *testing.T) {
@@ -181,11 +181,28 @@ func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
 	// A publish whose deciding cycle is stale is a previous incarnation's, or
 	// an outage's: the resolved value stands, so a manual scale-up during a
 	// long metrics gap is not undone by a carry.
-	assert.Equal(t, 2, carry(2, 1, now.Add(-stickyMaxAge-time.Minute), true, nil, now))
-	// The value the no-decision path resolves for a variant without status is
-	// the running count read from the scale target; 0 means it could not, and
-	// nothing is carried against nothing.
-	assert.Equal(t, 0, carry(0, 1, fresh, true, nil, now))
+	assert.Equal(t, 2, carry(2, 1, now.Add(-carryMaxAge-time.Minute), true, nil, now))
+	// The carry stops strictly inside KEDA's 300 s window, by age and by cycles,
+	// so an operator's hand-scaled fleet during an outage is what fills the
+	// window, not a held value that would undo it when the carry stopped.
+	assert.Less(t, carryMaxAge, 5*time.Minute)
+	assert.Equal(t, 2, carryPublished(2, 1, fresh, true, nil, carryMaxCycles+1, now))
+	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, nil, carryMaxCycles, now))
+	// 0 is not a running count: the path could not read the scale target.
+	// Publishing it would read as "park", so the fresh held value stands in.
+	assert.Equal(t, 1, carry(0, 1, fresh, true, nil, now))
+	assert.Equal(t, 0, carry(0, 1, now.Add(-carryMaxAge-time.Minute), true, nil, now), "unless it is stale")
+}
+
+func TestHoldPublishedScaleDown_NeverHoldsAScaleUp(t *testing.T) {
+	// Two variants: this one is the cheapest per capacity, so the optimizer
+	// adds the model's replicas here, but its own share of the demand is small.
+	// A fresh target ABOVE the running count is a scale-up and stands, share or
+	// no share.
+	d := decisionFor(2, 3, 7500) // 7500/(1 x 28482) = 0.26 at the published 1
+	out, held := hold(d, 1, true)
+	assert.False(t, held)
+	assert.Equal(t, 3, out.TargetReplicas)
 }
 
 func TestPruneLastDecided_DropsWhatCannotBeTrusted(t *testing.T) {

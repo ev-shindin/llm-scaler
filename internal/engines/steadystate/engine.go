@@ -1677,9 +1677,14 @@ func (e *Engine) applySaturationDecisions(
 					"reason", decision.LastStep().Reason)
 			}
 		}
-		if hasDecision {
+		{
 			key := utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())
-			e.lastDecided[key] = decidedMark{at: time.Now(), uid: e.scaleTargetUIDs[key]}
+			if hasDecision {
+				e.lastDecided[key] = decidedMark{at: time.Now(), uid: e.scaleTargetUIDs[key]}
+			} else if mark, ok := e.lastDecided[key]; ok {
+				mark.missed++
+				e.lastDecided[key] = mark
+			}
 		}
 
 		if hasDecision {
@@ -1767,7 +1772,8 @@ func (e *Engine) applySaturationDecisions(
 					f := int(*va.Spec.MinReplicas)
 					floor = &f
 				}
-				if carried := carryPublished(targetReplicas, p, at, ok, floor, e.stickyAge(), time.Now()); carried != targetReplicas {
+				missed := e.lastDecided[utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())].missed
+				if carried := carryPublished(targetReplicas, p, at, ok, floor, missed, time.Now()); carried != targetReplicas {
 					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
 						"variant", vaName, "published", carried, "running", targetReplicas)
 					targetReplicas = carried

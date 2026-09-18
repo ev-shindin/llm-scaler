@@ -12,12 +12,27 @@ import (
 // stickyStepName is the pipeline step holdPublishedScaleDown records.
 const stickyStepName = "sticky-scale-down"
 
-// decidedMark is when a scale target was last decided for, and for which
-// incarnation of it (its UID at the time). See Engine.lastDecided.
+// decidedMark is when a scale target was last decided for, for which
+// incarnation of it (its UID at the time), and how many cycles since have
+// passed without a decision. See Engine.lastDecided.
 type decidedMark struct {
-	at  time.Time
-	uid types.UID
+	at     time.Time
+	uid    types.UID
+	missed int
 }
+
+// carryMaxCycles and carryMaxAge bound the carry: a held value is
+// republished through at most this many consecutive no-decision cycles and
+// for at most this long after the deciding cycle -- STRICTLY under KEDA's
+// default 300 s scale-down window. The carry covers a scrape gap, not an
+// outage: past it the no-decision path publishes the running count as it
+// always did, so an operator who scaled the fleet by hand while metrics were
+// gone finds the HPA's window filled with the running count, not with a held
+// value that would undo the change the moment the carry stopped.
+const (
+	carryMaxCycles = 4
+	carryMaxAge    = 4 * time.Minute
+)
 
 // pruneLastDecided drops marks too old to be trusted by the hold or the
 // carry, so the map follows the fleet rather than growing with every scale
@@ -149,6 +164,17 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 	if d.TargetReplicas <= published {
 		return d, false // descending further, or the same answer
 	}
+	if d.TargetReplicas > d.CurrentReplicas {
+		// A scale-up is never held. On a single variant the release test
+		// below would let it through anyway (a target above the running count
+		// means demand above the scale-up threshold of the running supply, let
+		// alone of the published one); on a model with several variants the
+		// optimizer adds replicas where they are cheapest per capacity, and
+		// that variant's own share of the demand can sit under the threshold
+		// while the model as a whole is short -- so the share cannot be the
+		// judge of a scale-up, and the optimizer's answer stands.
+		return d, false
+	}
 	if d.PerReplicaCapacity <= 0 || d.ScaleUpThreshold <= 0 {
 		return d, false
 	}
@@ -177,15 +203,24 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 // it is republished instead: a cycle with no metrics cannot justify raising
 // what the last cycle with metrics lowered. A floor the variant has since
 // been given stands above the carried value, as it does above the hold's.
-// Returns the value to publish.
-func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, floor *int, maxAge time.Duration, now time.Time) int {
-	if !havePublished || published <= 0 || now.Sub(publishedAt) > maxAge {
+//
+// resolved is 0 when the no-decision path could not read the scale target
+// at all. That is not a running count of zero -- publishing 0 would read to
+// the external scaler as "park this model" on a transient API error -- so a
+// fresh held value is republished over it. missed is how many consecutive
+// cycles have had no decision, counting this one. Returns the value to
+// publish.
+func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, floor *int, missed int, now time.Time) int {
+	if !havePublished || published <= 0 {
+		return resolved
+	}
+	if missed > carryMaxCycles || now.Sub(publishedAt) > carryMaxAge {
 		return resolved
 	}
 	if floor != nil && published < *floor {
 		return resolved
 	}
-	if published < resolved {
+	if resolved == 0 || published < resolved {
 		return published
 	}
 	return resolved
