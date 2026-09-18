@@ -22,9 +22,9 @@ type decidedMark struct {
 // pruneLastDecided drops marks too old to be trusted by the hold or the
 // carry, so the map follows the fleet rather than growing with every scale
 // target the controller has ever decided for.
-func (e *Engine) pruneLastDecided(now time.Time) {
+func (e *Engine) pruneLastDecided(maxAge time.Duration, now time.Time) {
 	for key, mark := range e.lastDecided {
-		if now.Sub(mark.at) > stickyMaxAge {
+		if now.Sub(mark.at) > maxAge {
 			delete(e.lastDecided, key)
 		}
 	}
@@ -38,17 +38,42 @@ func (e *Engine) pruneLastDecided(now time.Time) {
 // pipeline step and the log line.
 const stickyReason = "held the published scale-down: the fresh target crept back up while utilization at the published count stays under the scale-up threshold"
 
-// stickyMaxAge is how long ago the cycle that DECIDED a published value may
-// have run for the value still to be held or carried. The decision store
-// never evicts, so a Deployment deleted and re-created under the same name
-// would otherwise inherit a value published for a fleet that no longer
-// exists; and a carry that republishes through a metrics outage must stop
-// somewhere, or an operator's manual scale-up during the outage would be
-// undone by the HPA when its window closed. The age is the last deciding
-// cycle's (Engine.lastDecidedAt), not the store's write time, which the
-// carry itself refreshes. Past this, the no-decision path publishes the
-// running count as it always did.
+// stickyMaxAge is the floor on how long ago the cycle that DECIDED a
+// published value may have run for the value still to be held or carried;
+// Engine.stickyAge raises it with the optimize interval. A carry that
+// republishes through a metrics outage must stop somewhere, or an operator's
+// manual scale-up during the outage would be undone by the HPA when its
+// window closed. The age is the last deciding cycle's (Engine.lastDecided),
+// not the store's write time, which the carry itself refreshes. Past this,
+// the no-decision path publishes the running count as it always did.
 const stickyMaxAge = 5 * time.Minute
+
+// stickyAgeCycles is how many optimize cycles the bound covers at least: a
+// cycle's own length must fit under it several times over, or a deployment
+// with a long GLOBAL_OPT_INTERVAL would find every published value already
+// stale by the next cycle and the switch would silently do nothing.
+const stickyAgeCycles = 4
+
+// stickyAge is the age bound in force: stickyMaxAge, or stickyAgeCycles
+// optimize intervals when those are longer.
+func (e *Engine) stickyAge() time.Duration {
+	age := stickyMaxAge
+	if e.Config != nil {
+		if byInterval := stickyAgeCycles * e.Config.OptimizationInterval(); byInterval > age {
+			age = byInterval
+		}
+	}
+	return age
+}
+
+// noteScaleTargetUID records which incarnation of a scale target this cycle
+// read, so a published value decided for a different one is not trusted.
+func (e *Engine) noteScaleTargetUID(key string, uid types.UID) {
+	if e.scaleTargetUIDs == nil {
+		e.scaleTargetUIDs = make(map[string]types.UID)
+	}
+	e.scaleTargetUIDs[key] = uid
+}
 
 // holdPublishedScaleDown keeps a scale-down that WVA has already published
 // from being cancelled by demand noise, so the fleet actually descends.
@@ -105,14 +130,14 @@ const stickyMaxAge = 5 * time.Minute
 // not have that effect: carryPublished republishes the held value there.
 //
 // Reports whether it changed the decision. Inert without a published value,
-// with one older than stickyMaxAge or below the variant's own floor, without
-// a descent in flight, or when the decision carries no capacity (a path that
-// did not go through the optimizer's decision builder).
-func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt time.Time, havePublished bool, now time.Time) (domain.VariantDecision, bool) {
+// with one older than maxAge (Engine.stickyAge) or below the variant's own
+// floor, without a descent in flight, or when the decision carries no
+// capacity (a path that did not go through the optimizer's decision builder).
+func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt time.Time, havePublished bool, maxAge time.Duration, now time.Time) (domain.VariantDecision, bool) {
 	if !havePublished || published <= 0 {
 		return d, false
 	}
-	if now.Sub(publishedAt) > stickyMaxAge {
+	if now.Sub(publishedAt) > maxAge {
 		return d, false // published for a fleet this cycle cannot vouch for
 	}
 	if d.MinReplicas != nil && published < *d.MinReplicas {
@@ -153,8 +178,8 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 // what the last cycle with metrics lowered. A floor the variant has since
 // been given stands above the carried value, as it does above the hold's.
 // Returns the value to publish.
-func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, floor *int, now time.Time) int {
-	if !havePublished || published <= 0 || now.Sub(publishedAt) > stickyMaxAge {
+func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, floor *int, maxAge time.Duration, now time.Time) int {
+	if !havePublished || published <= 0 || now.Sub(publishedAt) > maxAge {
 		return resolved
 	}
 	if floor != nil && published < *floor {

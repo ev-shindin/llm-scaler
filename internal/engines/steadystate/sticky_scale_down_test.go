@@ -7,7 +7,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 )
 
@@ -56,7 +58,12 @@ func decisionFor(current, target int, demand float64) domain.VariantDecision {
 // hold calls holdPublishedScaleDown with a value published just now.
 func hold(d domain.VariantDecision, published int, have bool) (domain.VariantDecision, bool) {
 	now := time.Now()
-	return holdPublishedScaleDown(d, published, now.Add(-time.Second), have, now)
+	return holdPublishedScaleDown(d, published, now.Add(-time.Second), have, stickyMaxAge, now)
+}
+
+// carry calls carryPublished with the default age bound.
+func carry(resolved, published int, publishedAt time.Time, have bool, floor *int, now time.Time) int {
+	return carryPublished(resolved, published, publishedAt, have, floor, stickyMaxAge, now)
 }
 
 func TestHoldPublishedScaleDown_TheMeasuredChatterSettlesAtOne(t *testing.T) {
@@ -161,24 +168,24 @@ func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
 	now := time.Now()
 	fresh := now.Add(-time.Second)
 	// The no-decision path resolved the running count (2); 1 was published.
-	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, nil, now))
+	assert.Equal(t, 1, carry(2, 1, fresh, true, nil, now))
 	// Nothing published, or published is not lower: the resolved value stands.
-	assert.Equal(t, 2, carryPublished(2, 0, fresh, false, nil, now))
-	assert.Equal(t, 2, carryPublished(2, 2, fresh, true, nil, now))
-	assert.Equal(t, 2, carryPublished(2, 3, fresh, true, nil, now))
+	assert.Equal(t, 2, carry(2, 0, fresh, false, nil, now))
+	assert.Equal(t, 2, carry(2, 2, fresh, true, nil, now))
+	assert.Equal(t, 2, carry(2, 3, fresh, true, nil, now))
 	// A floor raised above the published value stands, as it does for the hold.
 	two := 2
-	assert.Equal(t, 2, carryPublished(2, 1, fresh, true, &two, now))
+	assert.Equal(t, 2, carry(2, 1, fresh, true, &two, now))
 	one := 1
-	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, &one, now))
+	assert.Equal(t, 1, carry(2, 1, fresh, true, &one, now))
 	// A publish whose deciding cycle is stale is a previous incarnation's, or
 	// an outage's: the resolved value stands, so a manual scale-up during a
 	// long metrics gap is not undone by a carry.
-	assert.Equal(t, 2, carryPublished(2, 1, now.Add(-stickyMaxAge-time.Minute), true, nil, now))
+	assert.Equal(t, 2, carry(2, 1, now.Add(-stickyMaxAge-time.Minute), true, nil, now))
 	// The value the no-decision path resolves for a variant without status is
 	// the running count read from the scale target; 0 means it could not, and
 	// nothing is carried against nothing.
-	assert.Equal(t, 0, carryPublished(0, 1, fresh, true, nil, now))
+	assert.Equal(t, 0, carry(0, 1, fresh, true, nil, now))
 }
 
 func TestPruneLastDecided_DropsWhatCannotBeTrusted(t *testing.T) {
@@ -187,9 +194,30 @@ func TestPruneLastDecided_DropsWhatCannotBeTrusted(t *testing.T) {
 		"ns/fresh": {at: now.Add(-time.Minute), uid: "a"},
 		"ns/stale": {at: now.Add(-stickyMaxAge - time.Minute), uid: "b"},
 	}}
-	e.pruneLastDecided(now)
+	e.pruneLastDecided(stickyMaxAge, now)
 	assert.Contains(t, e.lastDecided, "ns/fresh")
 	assert.NotContains(t, e.lastDecided, "ns/stale")
+}
+
+// The identity gate end to end, as the engine wires it: a value decided for
+// one incarnation of a target is not trusted for another, and a target the
+// cycle did not read keeps the trust its mark earned.
+func TestPublishedValueIsTrustedForOneIncarnationOnly(t *testing.T) {
+	e := &Engine{
+		lastDecided:     map[string]decidedMark{"ns/dep": {at: time.Now(), uid: "old"}},
+		scaleTargetUIDs: map[string]types.UID{"ns/dep": "new"},
+	}
+	// Mirrors the published() closure in applySaturationDecisions.
+	trusted := func(key string) bool {
+		mark, decided := e.lastDecided[key]
+		uid, known := e.scaleTargetUIDs[key]
+		return decided && (!known || mark.uid == uid)
+	}
+	assert.False(t, trusted("ns/dep"), "read this cycle under a different UID: a different fleet")
+	e.noteScaleTargetUID("ns/dep", "old")
+	assert.True(t, trusted("ns/dep"), "the same fleet")
+	e.scaleTargetUIDs = map[string]types.UID{}
+	assert.True(t, trusted("ns/dep"), "not read this cycle: the mark stands, bounded by its age")
 }
 
 func TestHoldPublishedScaleDown_RespectsARaisedFloor(t *testing.T) {
@@ -210,12 +238,27 @@ func TestHoldPublishedScaleDown_IgnoresAStalePublishedValue(t *testing.T) {
 	// the same scale target -- deleted and re-created under the same name --
 	// must not arm a hold on the new one.
 	now := time.Now()
-	d, held := holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-stickyMaxAge-time.Minute), true, now)
+	d, held := holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-stickyMaxAge-time.Minute), true, stickyMaxAge, now)
 	assert.False(t, held)
 	assert.Equal(t, 2, d.TargetReplicas)
 
 	// The same decision with the value published just now IS held -- so it is
 	// the age, and nothing else, that made the difference above.
-	_, held = holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-time.Second), true, now)
+	_, held = holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-time.Second), true, stickyMaxAge, now)
 	assert.True(t, held)
+
+	// And the same stale value under a bound that covers it is held too: the
+	// bound follows the optimize interval, so a slow loop is not stale to itself.
+	_, held = holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-stickyMaxAge-time.Minute), true, 2*stickyMaxAge, now)
+	assert.True(t, held)
+}
+
+func TestStickyAge_FollowsALongOptimizeInterval(t *testing.T) {
+	e := &Engine{}
+	assert.Equal(t, stickyMaxAge, e.stickyAge(), "no config: the floor")
+	e.Config = config.NewTestConfig()
+	config.SetOptimizationIntervalForTest(e.Config, 2*time.Minute)
+	assert.Equal(t, stickyAgeCycles*2*time.Minute, e.stickyAge(), "four cycles of a 2 m loop outrun the floor")
+	config.SetOptimizationIntervalForTest(e.Config, 15*time.Second)
+	assert.Equal(t, stickyMaxAge, e.stickyAge(), "four cycles of a 15 s loop do not")
 }

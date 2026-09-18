@@ -1040,7 +1040,7 @@ func (e *Engine) optimizeV2(
 	e.pruneLastGoodAnalysis(activeKeys)
 	e.pruneAnalyzerSeries(activeKeys)
 	e.pruneBlockedModels(activeKeys)
-	e.pruneLastDecided(time.Now())
+	e.pruneLastDecided(e.stickyAge(), time.Now())
 	e.scaleTargetUIDs = make(map[string]types.UID)
 
 	// Stage 1: Collect ModelScalingRequests for all models
@@ -1097,9 +1097,6 @@ func (e *Engine) optimizeV2(
 		requests = append(requests, *req)
 		modelReplicaMetrics[modelID] = data.replicaMetrics
 		modelScaleTargets[utils.GetNamespacedKey(namespace, modelID)] = data.scaleTargets
-		for name, st := range data.scaleTargets {
-			e.scaleTargetUIDs[utils.GetNamespacedKey(namespace, name)] = st.GetUID()
-		}
 	}
 
 	if len(requests) == 0 {
@@ -1528,6 +1525,11 @@ func (e *Engine) prepareModelData(
 
 		key := utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())
 		scaleTargets[key] = scaleTarget
+		// Recorded HERE, where the target was read, before anything below can
+		// return early: a model skipped for having no metrics this cycle still
+		// has a fleet with an identity, and the carry that runs for it must be
+		// able to tell that fleet from a re-created one.
+		e.noteScaleTargetUID(key, scaleTarget.GetUID())
 
 		variantKey := utils.GetNamespacedKey(va.Namespace, va.Name)
 		variantAutoscalings[variantKey] = va
@@ -1654,7 +1656,11 @@ func (e *Engine) applySaturationDecisions(
 		key := utils.GetNamespacedKey(namespace, target)
 		d, ok := decision.Get(namespace, target)
 		mark, decided := e.lastDecided[key]
-		sameFleet := decided && mark.uid == e.scaleTargetUIDs[key]
+		// A target this cycle did not read has no identity to compare; the
+		// mark is trusted, bounded by its age. Only a target READ this cycle
+		// under a different UID is a different fleet.
+		uid, known := e.scaleTargetUIDs[key]
+		sameFleet := decided && (!known || mark.uid == uid)
 		return int(d.DesiredReplicas), mark.at, ok && sameFleet
 	}
 
@@ -1665,7 +1671,7 @@ func (e *Engine) applySaturationDecisions(
 		if hasDecision && sticky {
 			p, at, ok := published(va.Namespace, va.GetScaleTargetName())
 			var held bool
-			if decision, held = holdPublishedScaleDown(decision, p, at, ok, time.Now()); held {
+			if decision, held = holdPublishedScaleDown(decision, p, at, ok, e.stickyAge(), time.Now()); held {
 				logger.Info("holding the published scale-down against a fresh target that crept back up",
 					"variant", vaName, "published", p, "current", decision.CurrentReplicas,
 					"reason", decision.LastStep().Reason)
@@ -1739,6 +1745,8 @@ func (e *Engine) applySaturationDecisions(
 						if targetReplicas == 0 && scaleTarget.GetReplicas() != nil {
 							targetReplicas = int(*scaleTarget.GetReplicas())
 						}
+						// This read is the identity the carry below compares against.
+						e.noteScaleTargetUID(utils.GetNamespacedKey(va.Namespace, scaleTargetName), scaleTarget.GetUID())
 					} else {
 						// If scaleTarget fetch fails, try VA label directly
 						acceleratorName = accel.GetAcceleratorNameFromScaleTarget(&updateVa, nil)
@@ -1759,7 +1767,7 @@ func (e *Engine) applySaturationDecisions(
 					f := int(*va.Spec.MinReplicas)
 					floor = &f
 				}
-				if carried := carryPublished(targetReplicas, p, at, ok, floor, time.Now()); carried != targetReplicas {
+				if carried := carryPublished(targetReplicas, p, at, ok, floor, e.stickyAge(), time.Now()); carried != targetReplicas {
 					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
 						"variant", vaName, "published", carried, "running", targetReplicas)
 					targetReplicas = carried
