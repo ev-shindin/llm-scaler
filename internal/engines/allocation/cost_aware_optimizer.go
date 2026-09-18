@@ -311,7 +311,17 @@ func buildDecisionsWithOptimizer(
 		}
 		decision.RequiredCapacity = reqCap
 		decision.SpareCapacity = spareCap
-		decision.TotalDemand = vc.TotalDemand
+		// The demand that PRICED the target, so a later stage re-pricing a
+		// different replica count uses the same figure: model-level (or per-role
+		// for a disaggregated model), which carries the scheduler-queue estimate
+		// the per-variant engine-local sum does not. Across variants of one model
+		// that overstates any single variant's share, which only ever makes a
+		// hold release sooner.
+		demand := satNamed.Result.TotalDemand
+		if rc, ok := satNamed.RoleCapacities[role]; ok {
+			demand = rc.TotalDemand
+		}
+		decision.TotalDemand = demand
 		decision.PerReplicaCapacity = vc.PerReplicaCapacity
 		decision.ScaleUpThreshold = satNamed.ScaleUpThreshold
 

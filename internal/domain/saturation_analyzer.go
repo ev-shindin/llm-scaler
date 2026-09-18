@@ -105,12 +105,14 @@ type VariantDecision struct {
 	// constants.UnitContinuous (a token magnitude). Exposed as the `unit`
 	// Prometheus label on wva_required_capacity and wva_spare_capacity.
 	RequiredCapacityUnit string
-	// TotalDemand and PerReplicaCapacity are the analyzer's demand and
-	// per-replica capacity for this variant, in RequiredCapacity's token
-	// units, and ScaleUpThreshold is the resolved threshold that priced
-	// RequiredCapacity. Carried so a later stage can ask what utilization a
-	// replica count OTHER than the current one would run at -- the question
-	// the sticky scale-down asks about the count already published.
+	// TotalDemand is the demand that priced this decision's target (the
+	// model's, or its role's when disaggregated -- scheduler queue included),
+	// PerReplicaCapacity the analyzer's per-replica capacity for this variant,
+	// both in RequiredCapacity's token units, and ScaleUpThreshold the resolved
+	// threshold that priced RequiredCapacity. Carried so a later stage can ask
+	// what utilization a replica count OTHER than the current one would run
+	// at -- the question the sticky scale-down asks about the count already
+	// published.
 	TotalDemand        float64
 	PerReplicaCapacity float64
 	ScaleUpThreshold   float64

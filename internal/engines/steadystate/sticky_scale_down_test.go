@@ -3,6 +3,7 @@ package steadystate
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,9 +14,11 @@ import (
 // The numbers are the two-model benchmark's, sparse shape, nopool arm, Qwen
 // at 3 rps after its first burst: per-replica capacity 28 482 tokens, the
 // shipped thresholds, and the demand the analyzer reported cycle by cycle
-// (wva_analyzer_demand, t=495..705 s). The stateless target flipped 1,1,1,1,
-// 2,2,2,1,2,2,2,2,2,2,2 over those cycles and the fleet held two replicas
-// for the whole quiet band.
+// (wva_analyzer_demand, t=495..705 s). Against that capacity the stateless
+// target is 1 for the first four cycles and 2 for every one after -- the
+// controller itself published one more "1" at t=600 s, where the capacity
+// estimate came from a different bucket (35 330) for one cycle -- and the
+// fleet held two replicas for the whole quiet band.
 const (
 	qwenCapacity = 28482.0
 	scaleUp      = 0.85
@@ -50,6 +53,12 @@ func decisionFor(current, target int, demand float64) domain.VariantDecision {
 	return d
 }
 
+// hold calls holdPublishedScaleDown with a value published just now.
+func hold(d domain.VariantDecision, published int, have bool) (domain.VariantDecision, bool) {
+	now := time.Now()
+	return holdPublishedScaleDown(d, published, now.Add(-time.Second), have, now)
+}
+
 func TestHoldPublishedScaleDown_TheMeasuredChatterSettlesAtOne(t *testing.T) {
 	// The measured sequence, with the fleet still at two replicas (KEDA has
 	// not acted yet) and the target recomputed from scratch each cycle.
@@ -59,7 +68,7 @@ func TestHoldPublishedScaleDown_TheMeasuredChatterSettlesAtOne(t *testing.T) {
 	for _, demand := range qwenDemand {
 		fresh := statelessTarget(demand)
 		stateless = append(stateless, fresh)
-		d, _ := holdPublishedScaleDown(decisionFor(2, fresh, demand), published, have)
+		d, _ := hold(decisionFor(2, fresh, demand), published, have)
 		sticky = append(sticky, d.TargetReplicas)
 		published, have = d.TargetReplicas, true
 	}
@@ -72,12 +81,12 @@ func TestHoldPublishedScaleDown_TheMeasuredChatterSettlesAtOne(t *testing.T) {
 func TestHoldPublishedScaleDown_ReleasesWhenThePublishedCountWouldSaturate(t *testing.T) {
 	// 0.85 x 28 482 = 24 210 tokens. Demand at that level on one replica is
 	// the scale-up case, and the hold must not stand in its way.
-	d, held := holdPublishedScaleDown(decisionFor(2, 2, 24300), 1, true)
+	d, held := hold(decisionFor(2, 2, 24300), 1, true)
 	assert.False(t, held)
 	assert.Equal(t, 2, d.TargetReplicas)
 
 	// Just under it, the hold stands.
-	d, held = holdPublishedScaleDown(decisionFor(2, 2, 24100), 1, true)
+	d, held = hold(decisionFor(2, 2, 24100), 1, true)
 	assert.True(t, held)
 	assert.Equal(t, 1, d.TargetReplicas)
 }
@@ -85,7 +94,7 @@ func TestHoldPublishedScaleDown_ReleasesWhenThePublishedCountWouldSaturate(t *te
 func TestHoldPublishedScaleDown_ABurstMidDescentIsNotHeldDown(t *testing.T) {
 	// Descending 4 -> 1 when a burst arrives: the fresh target is 3, demand
 	// at the published 1 would be far past the threshold. The burst wins.
-	d, held := holdPublishedScaleDown(decisionFor(4, 3, 60000), 1, true)
+	d, held := hold(decisionFor(4, 3, 60000), 1, true)
 	assert.False(t, held)
 	assert.Equal(t, 3, d.TargetReplicas)
 	assert.Equal(t, domain.ActionScaleDown, d.Action, "4 -> 3 is still a scale-down; the action is the optimizer's")
@@ -94,29 +103,29 @@ func TestHoldPublishedScaleDown_ABurstMidDescentIsNotHeldDown(t *testing.T) {
 func TestHoldPublishedScaleDown_DescendingFurtherIsTakenAsIs(t *testing.T) {
 	// Published 2 while running 4; the fresh target says 1. The descent
 	// continues -- the hold only stops targets that crept UP.
-	d, held := holdPublishedScaleDown(decisionFor(4, 1, 18000), 2, true)
+	d, held := hold(decisionFor(4, 1, 18000), 2, true)
 	assert.False(t, held)
 	assert.Equal(t, 1, d.TargetReplicas)
 }
 
 func TestHoldPublishedScaleDown_InertWithoutADescent(t *testing.T) {
 	// Nothing published yet.
-	d, held := holdPublishedScaleDown(decisionFor(2, 2, 20000), 0, false)
+	d, held := hold(decisionFor(2, 2, 20000), 0, false)
 	assert.False(t, held)
 	assert.Equal(t, 2, d.TargetReplicas)
 
 	// Published equals the running count: no descent in flight.
-	d, held = holdPublishedScaleDown(decisionFor(2, 2, 20000), 2, true)
+	d, held = hold(decisionFor(2, 2, 20000), 2, true)
 	assert.False(t, held)
 
 	// Published above the running count (a scale-up in flight) is not this
 	// stage's business either.
-	d, held = holdPublishedScaleDown(decisionFor(2, 3, 50000), 3, true)
+	d, held = hold(decisionFor(2, 3, 50000), 3, true)
 	assert.False(t, held)
 	assert.Equal(t, 3, d.TargetReplicas)
 
 	// Same answer as published: nothing to hold.
-	d, held = holdPublishedScaleDown(decisionFor(2, 1, 18000), 1, true)
+	d, held = hold(decisionFor(2, 1, 18000), 1, true)
 	assert.False(t, held)
 	assert.Equal(t, 1, d.TargetReplicas)
 }
@@ -124,18 +133,18 @@ func TestHoldPublishedScaleDown_InertWithoutADescent(t *testing.T) {
 func TestHoldPublishedScaleDown_InertWithoutCapacity(t *testing.T) {
 	d := decisionFor(2, 2, 20000)
 	d.PerReplicaCapacity = 0
-	out, held := holdPublishedScaleDown(d, 1, true)
+	out, held := hold(d, 1, true)
 	assert.False(t, held)
 	assert.Equal(t, 2, out.TargetReplicas)
 
 	d = decisionFor(2, 2, 20000)
 	d.ScaleUpThreshold = 0
-	_, held = holdPublishedScaleDown(d, 1, true)
+	_, held = hold(d, 1, true)
 	assert.False(t, held)
 }
 
 func TestHoldPublishedScaleDown_RecordsItsStep(t *testing.T) {
-	d, held := holdPublishedScaleDown(decisionFor(2, 2, 20676), 1, true)
+	d, held := hold(decisionFor(2, 2, 20676), 1, true)
 	require.True(t, held)
 	step := d.LastStep()
 	require.NotNil(t, step)
@@ -144,4 +153,33 @@ func TestHoldPublishedScaleDown_RecordsItsStep(t *testing.T) {
 	assert.Equal(t, 1, step.TargetReplicas)
 	assert.Equal(t, domain.ActionScaleDown, d.Action)
 	assert.Contains(t, step.Reason, "held the published 1 against a fresh target of 2")
+	assert.Equal(t, step.Reason, d.Reason(), "the event and the condition carry the hold's reason, not the optimizer's")
+}
+
+func TestHoldPublishedScaleDown_RespectsARaisedFloor(t *testing.T) {
+	// 2 running, 1 published, and the operator has since raised minReplicaCount
+	// to 2: the optimizer's floored target of 2 must stand, or the hold would
+	// publish 1 below the floor forever -- KEDA never applies it, so the
+	// published value never catches up with the running count.
+	d := decisionFor(2, 2, 20000)
+	two := 2
+	d.MinReplicas = &two
+	out, held := hold(d, 1, true)
+	assert.False(t, held)
+	assert.Equal(t, 2, out.TargetReplicas)
+}
+
+func TestHoldPublishedScaleDown_IgnoresAStalePublishedValue(t *testing.T) {
+	// The store never evicts. A value published for a previous incarnation of
+	// the same scale target -- deleted and re-created under the same name --
+	// must not arm a hold on the new one.
+	now := time.Now()
+	d, held := holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-stickyMaxAge-time.Minute), true, now)
+	assert.False(t, held)
+	assert.Equal(t, 2, d.TargetReplicas)
+
+	// The same decision with the value published just now IS held -- so it is
+	// the age, and nothing else, that made the difference above.
+	_, held = holdPublishedScaleDown(decisionFor(3, 2, 20000), 1, now.Add(-time.Second), true, now)
+	assert.True(t, held)
 }

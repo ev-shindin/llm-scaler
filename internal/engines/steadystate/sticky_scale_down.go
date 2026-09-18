@@ -2,12 +2,22 @@ package steadystate
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 )
 
 // stickyStepName is the pipeline step holdPublishedScaleDown records.
 const stickyStepName = "sticky-scale-down"
+
+// stickyMaxAge is how old a published value may be and still be held. The
+// decision store never evicts, so a Deployment deleted and re-created under
+// the same name would otherwise inherit a value published for a fleet that
+// no longer exists. The optimize loop republishes every cycle it decides, so
+// anything older than this belongs to a previous incarnation or to a
+// controller that has been silent long enough for KEDA's window to have
+// closed anyway.
+const stickyMaxAge = 5 * time.Minute
 
 // holdPublishedScaleDown keeps a scale-down that WVA has already published
 // from being cancelled by demand noise, so the fleet actually descends.
@@ -54,12 +64,27 @@ const stickyStepName = "sticky-scale-down"
 // release test with the other threshold, to be added behind the same switch
 // when such an actuator exists and can be measured.
 //
+// What it cannot survive: the published value lives in memory, so a
+// controller restart forgets it, and the safety net that runs while the
+// engine has nothing to say publishes the previous desired from the
+// variant's status when there is one and the current count when there is
+// not -- a restart mid-descent therefore re-arms KEDA's window once. That is
+// the pre-existing behaviour on that path, and one window per restart is
+// what it costs.
+//
 // Reports whether it changed the decision. Inert without a published value,
-// without a descent in flight, or when the decision carries no capacity (a
-// path that did not go through the optimizer's decision builder).
-func holdPublishedScaleDown(d domain.VariantDecision, published int, havePublished bool) (domain.VariantDecision, bool) {
+// with one older than stickyMaxAge or below the variant's own floor, without
+// a descent in flight, or when the decision carries no capacity (a path that
+// did not go through the optimizer's decision builder).
+func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt time.Time, havePublished bool, now time.Time) (domain.VariantDecision, bool) {
 	if !havePublished || published <= 0 {
 		return d, false
+	}
+	if now.Sub(publishedAt) > stickyMaxAge {
+		return d, false // published for a fleet this cycle cannot vouch for
+	}
+	if d.MinReplicas != nil && published < *d.MinReplicas {
+		return d, false // the floor has moved above it; the floored target stands
 	}
 	if published >= d.CurrentReplicas {
 		return d, false // nothing is descending
@@ -76,9 +101,13 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, havePublish
 	}
 	crept := d.TargetReplicas
 	d.TargetReplicas = published
-	d.Action = domain.ActionScaleDown
-	d.AddDecisionStep(stickyStepName, fmt.Sprintf(
+	reason := fmt.Sprintf(
 		"held the published %d against a fresh target of %d: utilization at %d would be %.2f, under the scale-up threshold %.2f",
-		published, crept, published, utilAtPublished, d.ScaleUpThreshold), true)
+		published, crept, published, utilAtPublished, d.ScaleUpThreshold)
+	// Through SetDecisionReason, the one writer of Action, so the event and the
+	// condition that carry Reason() say what happened rather than repeating the
+	// optimizer's text under a different action.
+	d.SetDecisionReason(domain.ActionScaleDown, d.ReasonCategory(), reason)
+	d.AddDecisionStep(stickyStepName, reason, true)
 	return d, true
 }
