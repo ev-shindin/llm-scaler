@@ -151,6 +151,14 @@ type Engine struct {
 	// sequentially in one goroutine and models are processed serially.
 	lastAnalyzerSeries map[string]analyzerSeries
 
+	// lastDecidedAt is when the optimize loop last DECIDED for a scale target
+	// (keyed namespace/target), as opposed to republished for it. The sticky
+	// scale-down trusts a published value only this fresh: the decision store's
+	// own timestamp is refreshed by every publish, including the carry that
+	// republishes a held value through a cycle with no metrics, so it cannot
+	// tell "decided lately" from "silent, but repeating itself".
+	lastDecidedAt map[string]time.Time
+
 	// lastBlockedModels records, keyed identically, every model this engine has
 	// published wva_model_scaling_blocked reasons for. Same reason as
 	// lastAnalyzerSeries — a GaugeVec cannot enumerate its own children — but the
@@ -1623,9 +1631,15 @@ func (e *Engine) applySaturationDecisions(
 	// running: the two differ for the whole of KEDA's stabilization window,
 	// which is exactly when a target that has crept back up cancels the descent.
 	sticky := e.Config != nil && e.Config.StickyScaleDownEnabled()
+	if e.lastDecidedAt == nil {
+		e.lastDecidedAt = make(map[string]time.Time)
+	}
+	// The published value with the time of the last cycle that DECIDED it, not
+	// the time it was last written -- see lastDecidedAt.
 	published := func(namespace, target string) (int, time.Time, bool) {
 		d, ok := decision.Get(namespace, target)
-		return int(d.DesiredReplicas), d.UpdatedAt, ok
+		at, decided := e.lastDecidedAt[utils.GetNamespacedKey(namespace, target)]
+		return int(d.DesiredReplicas), at, ok && decided
 	}
 
 	// Iterate over ALL active VAs to ensure we update status and trigger reconciliation for everyone
@@ -1640,6 +1654,9 @@ func (e *Engine) applySaturationDecisions(
 					"variant", vaName, "published", p, "current", decision.CurrentReplicas,
 					"reason", decision.LastStep().Reason)
 			}
+		}
+		if hasDecision {
+			e.lastDecidedAt[utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())] = time.Now()
 		}
 
 		if hasDecision {
@@ -1685,12 +1702,6 @@ func (e *Engine) applySaturationDecisions(
 			} else if curr, ok := currentAllocations[vaName]; ok {
 				targetReplicas = curr.NumReplicas
 			}
-			if sticky {
-				// A cycle with no metrics cannot justify raising what the last
-				// cycle with metrics lowered; see carryPublished.
-				p, at, ok := published(va.Namespace, va.GetScaleTargetName())
-				targetReplicas = carryPublished(targetReplicas, p, at, ok, time.Now())
-			}
 			// Keep existing accelerator or use current (skip sentinel values)
 			if acc := updateVa.Status.DesiredOptimizedAlloc.Accelerator; constants.IsAcceleratorResolved(acc) {
 				acceleratorName = acc
@@ -1715,6 +1726,21 @@ func (e *Engine) applySaturationDecisions(
 						// If scaleTarget fetch fails, try VA label directly
 						acceleratorName = accel.GetAcceleratorNameFromScaleTarget(&updateVa, nil)
 					}
+				}
+			}
+
+			if sticky {
+				// AFTER the fallback above has resolved the running count -- a
+				// variant synthesized from a ScaledObject has no status and the
+				// allocations map is empty, so before it targetReplicas is 0 for
+				// every real variant and there would be nothing to carry against.
+				// A cycle with no metrics cannot justify raising what the last
+				// cycle with metrics lowered; see carryPublished.
+				p, at, ok := published(va.Namespace, va.GetScaleTargetName())
+				if carried := carryPublished(targetReplicas, p, at, ok, time.Now()); carried != targetReplicas {
+					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
+						"variant", vaName, "published", carried, "running", targetReplicas)
+					targetReplicas = carried
 				}
 			}
 

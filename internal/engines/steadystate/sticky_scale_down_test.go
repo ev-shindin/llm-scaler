@@ -166,8 +166,14 @@ func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
 	assert.Equal(t, 2, carryPublished(2, 0, fresh, false, now))
 	assert.Equal(t, 2, carryPublished(2, 2, fresh, true, now))
 	assert.Equal(t, 2, carryPublished(2, 3, fresh, true, now))
-	// A stale publish is a previous incarnation's: the resolved value stands.
+	// A publish whose deciding cycle is stale is a previous incarnation's, or
+	// an outage's: the resolved value stands, so a manual scale-up during a
+	// long metrics gap is not undone by a carry.
 	assert.Equal(t, 2, carryPublished(2, 1, now.Add(-stickyMaxAge-time.Minute), true, now))
+	// The value the no-decision path resolves for a variant without status is
+	// the running count read from the scale target; 0 means it could not, and
+	// nothing is carried against nothing.
+	assert.Equal(t, 0, carryPublished(0, 1, fresh, true, now))
 }
 
 func TestHoldPublishedScaleDown_RespectsARaisedFloor(t *testing.T) {

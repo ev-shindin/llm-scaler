@@ -18,13 +18,16 @@ const stickyStepName = "sticky-scale-down"
 // pipeline step and the log line.
 const stickyReason = "held the published scale-down: the fresh target crept back up while utilization at the published count stays under the scale-up threshold"
 
-// stickyMaxAge is how old a published value may be and still be held. The
-// decision store never evicts, so a Deployment deleted and re-created under
-// the same name would otherwise inherit a value published for a fleet that
-// no longer exists. The optimize loop republishes every cycle it decides, so
-// anything older than this belongs to a previous incarnation or to a
-// controller that has been silent long enough for KEDA's window to have
-// closed anyway.
+// stickyMaxAge is how long ago the cycle that DECIDED a published value may
+// have run for the value still to be held or carried. The decision store
+// never evicts, so a Deployment deleted and re-created under the same name
+// would otherwise inherit a value published for a fleet that no longer
+// exists; and a carry that republishes through a metrics outage must stop
+// somewhere, or an operator's manual scale-up during the outage would be
+// undone by the HPA when its window closed. The age is the last deciding
+// cycle's (Engine.lastDecidedAt), not the store's write time, which the
+// carry itself refreshes. Past this, the no-decision path publishes the
+// running count as it always did.
 const stickyMaxAge = 5 * time.Minute
 
 // holdPublishedScaleDown keeps a scale-down that WVA has already published
