@@ -7,6 +7,8 @@
 #                                     the CONTROLLER resolves a node through
 #   deploy/lib/accelerator_labels.py  what warmpool.sh plan and sizing read
 #   deploy/warmpool.sh                what `create` PINS a pool on
+#   deploy/lib/accelerator_nodes.sh   where the per-node DaemonSets (prepull,
+#                                     weights) land by default
 #
 # They cannot share one source: the controller is Go, the planning tools run
 # without a Go toolchain, and the create path is shell that runs from a release
@@ -26,8 +28,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GO_FILE="$ROOT/internal/constants/constants.go"
 PY_FILE="$ROOT/deploy/lib/accelerator_labels.py"
 SH_FILE="$ROOT/deploy/warmpool.sh"
+NODES_FILE="$ROOT/deploy/lib/accelerator_nodes.sh"
 
-for f in "$GO_FILE" "$PY_FILE" "$SH_FILE"; do
+for f in "$GO_FILE" "$PY_FILE" "$SH_FILE" "$NODES_FILE"; do
     [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
 
@@ -87,10 +90,24 @@ tr -d '\r' < "$SH_FILE" | awk '
     }
 ' | sort -u > "$tmp/sh"
 
+# The DaemonSet lib: the strings inside ACCELERATOR_PRODUCT_KEYS=( ... ).
+tr -d '\r' < "$NODES_FILE" | awk '
+    /^ACCELERATOR_PRODUCT_KEYS=\(/ { inblock = 1; next }
+    inblock && /^\)/            { inblock = 0 }
+    inblock {
+        line = $0
+        while (match(line, /"[^"]+"/)) {
+            key = substr(line, RSTART + 1, RLENGTH - 2)
+            if (key ~ /\//) print key
+            line = substr(line, RSTART + RLENGTH)
+        }
+    }
+' | sort -u > "$tmp/nodes"
+
 # An empty extraction and an identical one produce the same silent pass, so
 # every side has to have found something before any of them are compared.
 status=0
-for side in go py sh; do
+for side in go py sh nodes; do
     n="$(wc -l < "$tmp/$side")"
     if [ "$n" -lt 2 ]; then
         echo "ERROR: extracted $n key(s) from the $side side -- the parser found" >&2
@@ -114,6 +131,8 @@ report "constants.go" "$tmp/go" "accelerator_labels.py" "$tmp/py"
 report "accelerator_labels.py" "$tmp/py" "constants.go" "$tmp/go"
 report "constants.go" "$tmp/go" "warmpool.sh" "$tmp/sh"
 report "warmpool.sh" "$tmp/sh" "constants.go" "$tmp/go"
+report "constants.go" "$tmp/go" "accelerator_nodes.sh" "$tmp/nodes"
+report "accelerator_nodes.sh" "$tmp/nodes" "constants.go" "$tmp/go"
 
 if [ "$status" -ne 0 ]; then
     cat >&2 <<'MSG'

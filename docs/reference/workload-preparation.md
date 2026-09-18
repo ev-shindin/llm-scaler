@@ -77,13 +77,78 @@ and hold with or without a benchmark harness in front of the workload:
 | **Nothing installed at container start.** | The container's command runs the engine and nothing else: no `apt`, `pip`, `curl` or clone before it. Anything the engine needs is in the image. A start that depends on a package mirror is as slow as the mirror that day, which is the one term that makes start time *vary* between otherwise identical replicas. |
 | **`startupProbe` period.** | `periodSeconds` of a few seconds; a probe that fires every 30 s reports a started engine up to 30 s late, every time. Keep the time budget by raising `failureThreshold` (period 5 with threshold 360 is the same 30 minutes as period 30 with threshold 60). The first probes fail on connection refused while the server binds; that is what the threshold is for. |
 | **Engine caches that outlive the pod.** | vLLM writes its torch.compile artefacts, the FlashInfer autotune table and Triton's JIT cache under `/tmp` unless told otherwise, so every replica recompiles from nothing. Point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` at a read-write path shared across replicas -- a subPath of an RWX claim -- and the second replica finds the first one's. If the model claim is mounted read-only, use another claim rather than mounting it a second time: a CSI driver publishes a claim once per pod, and the second mount inherits read-only. And make the engine tolerate a cache path that turns out not to be writable -- a storage hiccup must cost one compile, not the replica; vLLM fails hard on a read-only cache directory unless the variable is unset first. The cache is keyed by a hash of the engine config, so a changed model, flag or version misses rather than hits stale. |
-| **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts. Pre-pull on every node the workload can schedule to, or keep that set of nodes small and warm. |
+| **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts, and the kubelet evicts unused images under disk pressure, so "it was pulled once" does not stay true. `make prepull IMAGES=<image> NAMESPACE=<ns>` holds the image open on every accelerator node (one DaemonSet per image, the image itself asleep, no accelerator requested), and `make prepull-status` says per node whether the kubelet has it -- see [Holding the image on the nodes](#holding-the-image-on-the-nodes). With the image held, a pinned tag should pull `IfNotPresent`: `Always` contacts the registry at every start for a digest that cannot have changed. |
 | **The weights** | are the section above. |
 
 What is left after those is the cold process itself -- imports, the API
 server, the KV-transfer connector, the profile run -- and the weight load on a
 large model. Below that floor the only lever is not starting cold: the
 [warm pool](../guides/warm-pool/), or a minimum replica count of two.
+
+### Holding the image on the nodes
+
+```bash
+# exactly the reference the model server's pod spec names, tag or digest included
+make prepull IMAGES=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=<ns>
+make prepull-status NAMESPACE=<ns>          # per accelerator node: present / absent, and the holder's state
+make prepull-delete NAMESPACE=<ns>          # stop holding every image (or IMAGES=<image> for one)
+```
+
+By default the holder lands on every node carrying any known GPU product
+label -- GPU Feature Discovery's, CoreWeave's, GKE's, EKS's, Karpenter's,
+the AMD operator's; the list in `deploy/lib/accelerator_nodes.sh`, the same
+one the controller resolves nodes through. What places the model servers
+is their accelerator *resource* request, not a label, so on a cluster of
+one vendor these are the same nodes; on a cluster mixing vendors the
+default also holds a CUDA image on AMD, Intel or Gaudi nodes, where the
+engine can never run -- `prepull-status` names those nodes and warns, and
+there `PREPULL_NODE_SELECTOR=<key=value>` is required, not optional: set it
+to what the model servers select on.
+`PREPULL_TOLERATIONS=<key>[,<key>]` adds taints beyond `nvidia.com/gpu`,
+which is always tolerated: a holder `Pending` on every node with no reason
+is a taint it does not tolerate. `prepull-status` lists the nodes each
+DaemonSet was applied for (the selector is recorded on it), so it needs no
+selector of its own. The holder runs the image itself, asleep, with a
+memory limit and no accelerator: a container that exited would not protect
+its image from the kubelet's garbage collection, a running one does. The
+image has to carry `/bin/sh` for that; one that does not is still pulled
+(the kubelet fetched it to create the container) and `status` says so --
+`pulled`, not `present` -- but nothing holds it. Several images are a
+comma-separated list. Nothing in WVA depends on the holder; it
+is a start-time measure, and `prepull-status` is how you know it worked --
+the node's own image list is compared against the reference, so an image
+named differently from what the pods pull shows as absent on every node.
+A node whose holder reads `Failed Evicted` is under `DiskPressure`: the
+kubelet is evicting pods and garbage-collecting images there, a replica
+scheduled to it would pull from scratch, and nothing in the namespace can
+fix that -- it is the node's disk. (Seen on the first run of this on a
+17-node cluster: 16 held the image within two minutes, one was that node.)
+
+Three things to know before relying on it:
+
+- `prepull-status` (and the report `prepull` prints after applying) lists
+  nodes, which is cluster-scoped. A namespace tenant has no `list nodes`
+  by default -- the controller's own read of nodes is granted by the
+  cluster-admin setup, not to the person running `make`. Without it the
+  DaemonSets still apply; the status is what fails, with a Forbidden.
+- The holder runs the engine image as that image runs -- as root, since
+  engine images are built that way and `runAsNonRoot` would fail the
+  container -- with no privilege, every capability dropped, a read-only
+  root filesystem and the runtime's default seccomp profile. Engine images
+  bake in `NVIDIA_VISIBLE_DEVICES=all`, which the NVIDIA runtime honours
+  even from a container that requested no GPU; the holder sets it to
+  `void`, so no device is injected. That is admitted under Pod Security
+  `baseline` and under OpenShift's `restricted-v2` SCC, and rejected
+  under Pod Security `restricted` (which requires `runAsNonRoot`). When
+  no holder appears on any node, `prepull-status` prints the DaemonSet's
+  latest `FailedCreate` event, which is where a pod-security, quota or
+  LimitRange rejection is reported.
+- Held with `IfNotPresent` under a *tag*, a node keeps whatever that tag
+  pointed at when it pulled; with `Always` the registry's current digest
+  would win at every start. For a pinned release tag that is the point.
+  If the tag can move under you and that matters, name the image by
+  digest (`repo@sha256:...`) -- the holder, `status` and the model
+  server's pod spec all take one.
 
 The benchmark harness this repository uses puts its own steps on the engine's
 start path; what they are and how the benchmark scenarios handle them is in

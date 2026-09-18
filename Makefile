@@ -581,6 +581,45 @@ model-cache: ## Create the weights PVC. NAMESPACE=<ns> WVA_MODEL_PVC_SIZE=<size>
 		$(if $(WVA_MODEL_PVC_CLASS),WVA_MODEL_PVC_CLASS=$(WVA_MODEL_PVC_CLASS),) \
 		bash -c 'source deploy/lib/common.sh; source deploy/lib/scaledobject.sh; wva_bootstrap_env; wva_model_cache "$(if $(filter command line environment,$(origin NAMESPACE)),$(NAMESPACE),$${WVA_NS})"'
 
+## Keep an engine image on every accelerator node, so a scale-up never starts
+## with a pull. One DaemonSet per image, holding the image open (no accelerator
+## requested, a few megabytes); `prepull-status` says per node whether the
+## kubelet has it. IMAGES is comma-separated and must name the image exactly as
+## the model server's pod spec does. deploy/prepull.sh --help has the rest.
+##
+## PREPULL_NODE_SELECTOR is empty by default: the holder then lands on every
+## node carrying any known GPU product label (deploy/lib/accelerator_nodes.sh),
+## which is what the model servers schedule to when they select on nothing.
+## Set it to KEY=VALUE when they select on something. PREPULL_TOLERATIONS is a
+## comma list of taint keys beyond nvidia.com/gpu.
+##
+## NAMESPACE has a Makefile default (the install's), so these targets take it
+## only from the command line or an exported variable (the guides' `export
+## NAMESPACE=...` convention) -- a status of, or holders in, a namespace nobody
+## named is the wrong answer. Same idiom as model-cache and workload-patch.
+PREPULL_NODE_SELECTOR ?=
+PREPULL_TOLERATIONS ?=
+PREPULL_ARGS = $(if $(PREPULL_NODE_SELECTOR),--node-selector "$(PREPULL_NODE_SELECTOR)",) $(foreach t,$(subst $(comma), ,$(PREPULL_TOLERATIONS)),--toleration $(t))
+prepull_namespace_given = $(filter command line environment,$(origin NAMESPACE))
+comma := ,
+# benchmark-standup holds the harness's engine image on the accelerator nodes
+# before deploying it. false skips; IMAGES overrides what the clone pins.
+BENCHMARK_PREPULL ?= true
+BENCHMARK_PREPULL_IMAGES ?=
+.PHONY: prepull prepull-status prepull-delete
+prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> narrows the nodes, PREPULL_TOLERATIONS=<key>[,<key>] adds taints.
+	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
+	@test -n "$(prepull_namespace_given)" || { echo "prepull: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/prepull.sh apply -n "$(NAMESPACE)" $(PREPULL_ARGS) $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
+
+prepull-status: ## Per accelerator node: is each held image present, and what its holder is doing. NAMESPACE=<ns> [IMAGES=<img>]
+	@test -n "$(prepull_namespace_given)" || { echo "prepull-status: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/prepull.sh status -n "$(NAMESPACE)" $(if $(PREPULL_NODE_SELECTOR),--node-selector "$(PREPULL_NODE_SELECTOR)",) $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
+
+prepull-delete: ## Stop holding IMAGES=<img>[,<img>] (or every held image with IMAGES unset) in NAMESPACE=<ns>.
+	@test -n "$(prepull_namespace_given)" || { echo "prepull-delete: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/prepull.sh delete -n "$(NAMESPACE)" $(if $(IMAGES),$(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i)),--all)
+
 .PHONY: workload-patch
 workload-patch: ## Write a patch for model servers that do not drain on scale-down, or download weights outside every volume they mount. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the volume, after `make model-cache`).
 	@# NAMESPACE pins the SCAN, not just the connection. Without the
@@ -1386,6 +1425,29 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 		mkdir -p "$(BENCHMARK_REPO_DIR)/config/specification/$$(dirname $(BENCHMARK_SPEC))"; \
 		cp "$(CURDIR)/hack/benchmark/scenarios/$(BENCHMARK_SPEC).yaml.j2" \
 		   "$(BENCHMARK_REPO_DIR)/config/specification/$(BENCHMARK_SPEC).yaml.j2"; \
+	fi
+	@# The engine image on every accelerator node BEFORE the harness deploys it:
+	@# a replica scheduled to a node without the image pulls 10-20 GB first, and
+	@# the autoscaler's first ramp is sized by that minute. The image is the
+	@# harness's own pin (hack/benchmark/engine_image.sh reads it from the clone),
+	@# or BENCHMARK_PREPULL_IMAGES; BENCHMARK_PREPULL=false skips the step. The
+	@# holders keep pulling while the standup goes on; `make prepull-status` is
+	@# the check, and the well-lit paths say when a run's nodes had the image.
+	@# The namespace is created here, idempotently: the harness creates it
+	@# later, and a DaemonSet applied into a namespace that does not exist yet
+	@# is a NotFound the WARNING below would have swallowed.
+	@if [ "$(BENCHMARK_PREPULL)" != "false" ]; then \
+		imgs="$(BENCHMARK_PREPULL_IMAGES)"; \
+		[ -n "$$imgs" ] || imgs=$$(bash hack/benchmark/engine_image.sh "$(BENCHMARK_REPO_DIR)" || true); \
+		if [ -z "$$imgs" ]; then \
+			echo "WARNING: could not read the engine image from $(BENCHMARK_REPO_DIR)/config/templates/values/defaults.yaml; not pre-pulling (set BENCHMARK_PREPULL_IMAGES=<image>)"; \
+		else \
+			echo "Holding the engine image on the accelerator nodes: $$imgs (BENCHMARK_PREPULL=false skips; make prepull-status NAMESPACE=$(BENCHMARK_NAMESPACE) checks)"; \
+			kubectl create namespace "$(BENCHMARK_NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+				&& bash deploy/prepull.sh apply -n "$(BENCHMARK_NAMESPACE)" $(PREPULL_ARGS) \
+				$$(printf '%s' "$$imgs" | tr ',' '\n' | sed 's/^/--image /' | tr '\n' ' ') \
+				|| echo "WARNING: pre-pull did not apply; the standup continues without it"; \
+		fi; \
 	fi
 	@# Lives in a script, not inline here, so its branches can actually be run.
 	@# Inline it was reachable only by driving a whole standup, which is why it
@@ -2231,6 +2293,9 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@echo "Syntax-checking deploy shell scripts..."
 	@bash -n deploy/install.sh
 	@bash -n deploy/install-epp.sh
+	@bash -n deploy/prepull.sh
+	@bash -n deploy/lib/accelerator_nodes.sh
+	@bash -n hack/benchmark/engine_image.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done
 	@for script in deploy/*/install.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
 	@for script in deploy/kind-emulator/*.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
@@ -2259,6 +2324,10 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# name, a missing ScaledObject (so the pool is never discovered), a worker
 	@# template carrying the proxy (so the group never becomes Ready).
 	@bash hack/check-warmpool-manifests.sh
+	@echo "Checking what prepull.sh actually emits..."
+	@# A holder that requests an accelerator, a selector that lands on every
+	@# node, two images sharing one DaemonSet name: all parse, all wrong.
+	@bash hack/check-prepull-manifests.sh
 	@echo "Checking the accelerator label keys agree..."
 	@# The controller (Go), the planning tools (Python) and the create path
 	@# (shell) each carry their own copy of the node label keys that name a GPU

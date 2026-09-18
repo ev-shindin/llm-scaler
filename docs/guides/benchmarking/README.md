@@ -191,6 +191,10 @@ Optional, except `BENCHMARK_NAMESPACE`.
 | `BENCHMARK_KEDA_SCALE_DOWN_STABILIZATION` | `300` | `120` |
 | `BENCHMARK_ALLOW_EPP_REUSE` | `false` | `true` |
 | `BENCHMARK_WVA_DEPLOY` | `true` | `false` |
+| `BENCHMARK_PREPULL` | `true` | `false` |
+| `BENCHMARK_PREPULL_IMAGES` | the engine image the harness pins | `ghcr.io/you/engine:tag` |
+| `PREPULL_NODE_SELECTOR` | *(empty: every node with a known GPU product label)* | `example.com/accelerator=h200` |
+| `PREPULL_TOLERATIONS` | *(empty: `nvidia.com/gpu` only)* | `dedicated,example.com/pool` |
 
 **The harness image must match `BENCHMARK_REPO_REF`.** The harness pod always
 runs the checkout's scripts — they are copied in from a ConfigMap built from the
@@ -271,7 +275,31 @@ become Ready ([why](../../reference/workload-preparation.md#the-rest-of-the-star
 llm-d-benchmark adds steps of its own to that path, and a benchmark that keeps
 them measures the harness, not the autoscaler. The scenarios under
 `hack/benchmark/scenarios/guides/` handle three of them; a scenario of your own
-should copy the same three blocks.
+should copy the same three blocks. A fourth is the cluster's, not the
+harness's, and comes first:
+
+**The image is on every accelerator node before the harness deploys it.** A
+replica scheduled to a node without the engine image pulls 10-20 GB before
+its container starts -- a minute or more on top of the start path above, and
+the one term of it that differs from node to node. `make benchmark-standup` holds the image
+the harness pins (`docker.io/vllm/vllm-openai:v0.26.0` in v0.7.8's
+`defaults.yaml`, read from the clone) on every accelerator node before it
+deploys anything -- `BENCHMARK_PREPULL=false` skips it,
+`BENCHMARK_PREPULL_IMAGES=<image>[,<image>]` overrides it,
+`PREPULL_NODE_SELECTOR` narrows the nodes (the default is every node with a
+known GPU product label) and `PREPULL_TOLERATIONS` adds taints. The holders
+keep pulling while the standup goes on, so before the run:
+
+```bash
+make prepull-status NAMESPACE=$BENCHMARK_NAMESPACE      # every accelerator node: present
+```
+
+The mechanism (one DaemonSet per image, the image itself asleep, no
+accelerator requested) is
+[Holding the image on the nodes](../../reference/workload-preparation.md#holding-the-image-on-the-nodes);
+it applies to any workload WVA scales, not only a benchmark. The scenarios
+pull the engine `IfNotPresent` for the same reason -- a pinned tag pulled
+`Always` still asks the registry at every start.
 
 **Package installs at engine start.** The `preprocess` init container
 (`set_llmdbench_environment.py`, from the harness image) writes
@@ -322,6 +350,8 @@ kubectl exec -n $BENCHMARK_NAMESPACE $D -c vllm -- grep -c apt-get /shared-confi
 # the second replica should report a compile-cache hit, not a compile; a
 # "not writable" line here means the guard fell back to the engine default
 kubectl logs -n $BENCHMARK_NAMESPACE $D -c vllm | grep -E 'torch.compile took|Using cache directory|not writable'
+# the image was on the node: container started within seconds of scheduling
+kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].lastTransitionTime}{" scheduled, container up "}{.status.containerStatuses[?(@.name=="vllm")].state.running.startedAt}{"\n"}'
 ```
 
 ## Snapshotting a run
