@@ -17,11 +17,14 @@
 #   weights.sh status -n NS [--model HFID] [--node-selector KEY=VALUE]        which nodes have it, which are still downloading
 #   weights.sh delete -n NS (--model HFID | --all) [--dry-run]                drop the claim, volume and downloader (files stay)
 #
+#   -n, --namespace NS          the namespace the claim and downloader live in
+#
 # Options:
 #   --model HFID                Hugging Face id, e.g. Qwen/Qwen3-32B
-#   --path DIR                  directory on the node, e.g. /mnt/local/models
-#                               (/var/mnt/models on RHCOS, where /mnt is the
-#                               root disk); the model lands under DIR/models/HFID
+#   --path DIR                  directory on the node, e.g. /mnt/local/weights/<ns>
+#                               (/var/mnt/weights/<ns> on RHCOS, under /var;
+#                               /var/mnt itself is the root disk); the model
+#                               lands under DIR/models/HFID
 #   --image IMG                 image to download with: any image carrying
 #                               huggingface_hub -- the engine image itself
 #                               is the natural choice, and it is then held
@@ -55,7 +58,10 @@
 # is written there to a quota (the claim's --capacity IS charged to a
 # storage quota) -- one DIR per trust domain, on a disk that is not the
 # node's own. The downloader runs as its own ServiceAccount,
-# weights-downloader, so anything granted for it is granted to it alone.
+# weights-downloader, so a grant for it does not land on the namespace's
+# default ServiceAccount -- but an SCC bound to it reaches every pod in
+# the namespace that names it, which anyone with pods/create can do: it is
+# a namespace-wide root grant, not a private one.
 #
 # On OpenShift -- NOT YET RUN THERE -- restricted-v2 admits the downloader
 # and runs it as the project's range UID with GID 0, which cannot write a
@@ -64,10 +70,15 @@
 # debug node/<n> -- chroot /host): mkdir -p DIR && chgrp 0 DIR && chmod
 # 2775 DIR && chcon -t container_file_t DIR; or mount the disk at DIR with
 # a MachineConfig mount unit carrying context=system_u:object_r:
-# container_file_t:s0. No SCC grant is then needed. `status` says when a
-# downloader died on a permission error. Granting anyuid to
-# weights-downloader is the other way, and it needs an SCC that also
-# allows the runtime/default seccomp profile (stock anyuid does not).
+# container_file_t:s0. No SCC grant is then needed. Files land at the
+# project's SELinux level, so one DIR per project (a context= mount labels
+# everything s0 and loses that separation). `status` says when a
+# downloader died on a permission error. The other way is an SCC that runs
+# it as root -- a copy of anyuid that also allows the runtime/default
+# seccomp profile, which stock anyuid does not -- granted to
+# weights-downloader; it removes the chgrp/chmod, not the chcon (the
+# kubelet still does not relabel the hostPath), and it is root for every
+# pod creator in the namespace.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,8 +185,9 @@ metadata:
     app.kubernetes.io/component: node-local-weights
     app.kubernetes.io/managed-by: wva-weights
 # The downloader's own identity: what an admin grants for it (an SCC on
-# OpenShift) is granted to it alone, not to every pod that names no
-# ServiceAccount. It makes no API call, so no token.
+# OpenShift) does not land on the namespace's default ServiceAccount --
+# though any pod in the namespace may name this one, so a grant is still
+# namespace-wide. It makes no API call, so no token.
 automountServiceAccountToken: false
 ---
 apiVersion: v1
@@ -350,6 +362,13 @@ cmd_apply() {
         render
         return
     fi
+    # Four documents in one apply: without leave for the cluster-scoped
+    # volume, kubectl would still create the ServiceAccount, the claim and
+    # the DaemonSet -- a Pending claim and pods that never schedule -- and
+    # report only the volume's Forbidden. Ask first, land nothing otherwise.
+    if ! kubectl auth can-i create persistentvolumes -A -q 2>/dev/null; then
+        log_error "apply needs leave to create PersistentVolumes (cluster-scoped), which a namespace tenant does not have -- ask the cluster admin to run apply (storage-admin on OpenShift)"
+    fi
     render | kubectl apply -f - >/dev/null
     log_info "downloading ${MODEL} under ${NODE_PATH} on $(accelerator_selector_text "$NODE_SELECTOR"); claim $(name_for "$MODEL") -- mount pvc://$(name_for "$MODEL")/models/${MODEL}"
     # On OpenShift the downloader runs as the project's range UID and the
@@ -455,10 +474,17 @@ cmd_status() {
         local bound
         bound="$(kubectl get pvc -n "$NAMESPACE" "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         echo "${model}  (claim ${name}: ${bound:-missing}; nodes: $(accelerator_selector_text "$selector"))"
-        [ "$bound" = Bound ] || rc=1
+        if [ "$bound" != Bound ]; then
+            rc=1
+            [ -z "$bound" ] || echo "  the claim is not bound: its volume is cluster-scoped and was not created -- apply needs leave to create PersistentVolumes (ask the cluster admin to run apply)"
+        fi
         printf '  %-28s %-12s %s\n' NODE WEIGHTS DOWNLOADER
         local eacces=0
-        while IFS=$'\t' read -r node phase reason podname message; do
+        # Not a tab: bash treats a tab in IFS as whitespace, and an empty
+        # field between two tabs (the reason, on every healthy row) is
+        # swallowed, shifting the pod name into its place. The unit
+        # separator is not whitespace and keeps empty fields.
+        while IFS=$'\x1f' read -r node phase reason podname message; do
             local has=absent
             [ "$phase" = "no pod" ] || holders=$((holders + 1))
             if [ "$phase" = Ready ]; then
@@ -485,17 +511,20 @@ cmd_status() {
             esac
         done < <(printf '%s' "$nodes_json" | jq -r --arg ds "$name" --slurpfile pods "$pods_file" \
             '.items[] as $node
-             | ($pods[0].items | map(select(.spec.nodeName == $node.metadata.name and .metadata.labels["wva.llmd.ai/weights"] == $ds)) | first) as $pod
+             | ($pods[0].items | map(select(.metadata.labels["wva.llmd.ai/weights"] == $ds
+                  and (.spec.nodeName == $node.metadata.name
+                       or ((.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // [])[0].matchFields // [])[0].values[0]? == $node.metadata.name))) | first) as $pod
              | [ $node.metadata.name,
                  (if $pod == null then "no pod"
                   elif $pod.status.phase == "Running" and (($pod.status.containerStatuses // []) | map(.ready) | all) then "Ready"
                   elif $pod.status.phase == "Running" and ((($pod.status.containerStatuses // [])[0].state // {}) | has("running")) then "Downloading"
                   else $pod.status.phase + " (not ready)" end),
                  (if $pod == null then ""
-                  else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // ""))) end),
+                  else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // "")))
+                       + ((($pod.status.containerStatuses // [])[0].lastState.terminated) | if . then " (last exit " + (.exitCode | tostring) + (if .reason then " " + .reason else "" end) + ")" else "" end) end),
                  ($pod.metadata.name // ""),
                  (if $pod == null then "" else (((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.message // "")) | gsub("[\\t\\n]"; " ")) end)
-               ] | @tsv')
+               ] | join("\u001f")')
         if [ "$eacces" -gt 0 ]; then
             echo "  ${eacces} node(s): the node directory is not writable by the downloader. On Kubernetes the downloader is root and the kubelet creates the directory root-owned, so this is a mount that is read-only or not there; on OpenShift it runs as the project UID (GID 0) under restricted-v2 and the directory is not relabelled -- on each node: mkdir -p DIR && chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR, or a MachineConfig mount with context=...:container_file_t:s0 (weights.sh --help)"
         fi

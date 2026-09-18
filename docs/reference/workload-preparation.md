@@ -175,7 +175,7 @@ removes the read term when it is the one that dominates.
 # the engine image is any image carrying huggingface_hub; the claim is printed
 make weights WEIGHTS_MODEL=Qwen/Qwen3-32B WEIGHTS_PATH=/mnt/local/models \
      WEIGHTS_IMAGE=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=<ns>
-# on RHCOS (OpenShift) the directory is under /var: WEIGHTS_PATH=/var/mnt/weights
+# on RHCOS (OpenShift) the directory is under /var, one per project: WEIGHTS_PATH=/var/mnt/weights/<ns>
 make weights-status NAMESPACE=<ns>          # per accelerator node: present / downloading, and why not
 make weights-delete NAMESPACE=<ns>          # drop the claim, volume and downloader; the files stay
 ```
@@ -205,10 +205,11 @@ What it costs, and what it needs:
   `DiskPressure` for every pod on the node. One directory per trust domain
   (`/mnt/local/weights/<namespace>`), on a disk that is not the node's own
   (`/mnt/local/...` on CoreWeave), never a network mount, and never a
-  system path: the script refuses `/etc`, `/var/lib`, `/tmp`, `/home` and
-  their kind (and where RHCOS keeps them: `/var/home`, `/var/roothome`,
-  `/var/usrlocal`, `/sysroot`, `/ostree`), a top-level directory on its
-  own, and `..`.
+  system path: the script refuses `/etc`, `/var/lib`, `/var/spool`,
+  `/tmp`, `/home`, `/opt/bin` and their kind (and where RHCOS keeps them:
+  `/var/home`, `/var/roothome`, `/var/usrlocal`, `/sysroot`, `/ostree`),
+  `/var/mnt` and `/var/srv` themselves, a top-level directory on its own,
+  and `..`.
 - Leave to create PersistentVolumes, which are cluster-scoped; a namespace
   tenant does not have it (on OpenShift the `storage-admin` role carries
   it). Ask the cluster admin to run `make weights` or to create the
@@ -220,8 +221,10 @@ What it costs, and what it needs:
 - Pod Security `baseline` admits the downloader (it mounts the claim, not a
   hostPath); `restricted` does not. On Kubernetes it runs as root, which
   is what writing the root-owned directory the kubelet creates takes. It
-  runs as its own ServiceAccount, `weights-downloader`, so anything an
-  admin grants for it is granted to it alone.
+  runs as its own ServiceAccount, `weights-downloader`, so a grant for it
+  does not land on the namespace's `default` ServiceAccount -- but any pod
+  in the namespace may name that ServiceAccount, so an SCC bound to it is
+  root for everyone with `pods/create` there, not a private grant.
 
 **On OpenShift** -- by analysis; not yet run there, and `make weights`
 says so when the cluster has SecurityContextConstraints:
@@ -235,20 +238,23 @@ says so when the cluster has SecurityContextConstraints:
   run, so prepare the directory on each node **before** `make weights`:
   ```bash
   oc debug node/<node> -- chroot /host sh -c \
-    'mkdir -p /var/mnt/weights && chgrp 0 /var/mnt/weights && chmod 2775 /var/mnt/weights && chcon -t container_file_t /var/mnt/weights'
+    'mkdir -p /var/mnt/weights/<ns> && chgrp 0 /var/mnt/weights/<ns> && chmod 2775 /var/mnt/weights/<ns> && chcon -t container_file_t /var/mnt/weights/<ns>'
   ```
   or, for an extra disk, a MachineConfig mount unit at that path with
   `Options=context=system_u:object_r:container_file_t:s0`, which labels
   the whole disk for containers and survives everything (and puts every
   file at level `s0`, so the per-project isolation below no longer
   applies -- the directory split is then the only separation). No SCC
-  grant is needed on this path. The alternative is root: `oc adm policy
-  add-scc-to-user <scc> -z weights-downloader -n <ns>`, where the SCC has
-  to allow the `runtime/default` seccomp profile the pod sets -- stock
-  `anyuid` does not, and admission then falls through to `restricted-v2`
-  as if nothing had been granted (`oc get pod <p> -o
+  grant is needed on this path. The alternative is an SCC that runs the
+  downloader as root: `oc adm policy add-scc-to-user <scc> -z
+  weights-downloader -n <ns>`, where the SCC has to allow the
+  `runtime/default` seccomp profile the pod sets -- stock `anyuid` does
+  not, and admission then falls through to `restricted-v2` as if nothing
+  had been granted (`oc get pod <p> -o
   jsonpath='{.metadata.annotations.openshift\.io/scc}'` says which SCC
-  took the pod).
+  took the pod). It removes the `chgrp`/`chmod`, not the `chcon` (the
+  kubelet still does not relabel the hostPath), and it is root for every
+  pod creator in the project.
 - The directory is under `/var` on RHCOS (`/var/mnt/<x>`, `/var/srv/<x>`):
   the root is read-only, `/mnt`, `/home`, `/opt`, `/srv` are symlinks into
   `/var`, and `/var/mnt` on its own is the root disk -- the one the

@@ -6,9 +6,10 @@
 # next install. Fixes therefore live here, in a versioned script, and are
 # reapplied after every install.
 #
-# Both bugs below are upstream's, both are present in v0.7.8 AND on origin/main,
-# so there is no release to upgrade to. Both are reported upstream; delete the
-# corresponding block here when a release carries the fix.
+# The fixes below are upstream's bugs unless a block says otherwise (fix 3 is
+# ours), present in v0.7.8 and on origin/main, so there is no release to
+# upgrade to. Each block says whether it is reported upstream; delete a block
+# when a release carries the fix.
 #
 # Why patching the clone reaches the cluster at all: step_06 builds the
 # `llmdbench-harness-scripts` ConfigMap from the CHECKED-OUT tree --
@@ -760,6 +761,7 @@ fi
 # nodeSelector, which cannot express "any of these product labels"; an
 # optional storage.hostPath.affinity renders as the pod's affinity, which is
 # how hack/benchmark/model_hostpath.sh places it on every accelerator node.
+# Not yet reported upstream.
 #
 # And the downloader's `chcon -R -t container_file_t` -- the SELinux relabel
 # for OpenShift readers -- fails on a node without SELinux ("can't apply
@@ -860,6 +862,7 @@ fi
 # `kubectl delete pv -l usage=model-cache` -- cluster-wide, run by every
 # `make benchmark-teardown` of any namespace -- is scoped to the volume the
 # namespace being torn down owns, through a label the volume carries.
+# Not yet reported upstream.
 # ---------------------------------------------------------------------------
 PV_TPL="$REPO_DIR/config/templates/jinja/02a_pv_model-hostpath.yaml.j2"
 PVC_TPL="$REPO_DIR/config/templates/jinja/02_pvc_model-pvc.yaml.j2"

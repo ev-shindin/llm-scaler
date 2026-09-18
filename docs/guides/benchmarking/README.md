@@ -310,10 +310,11 @@ every accelerator node (the placement `make prepull` uses; `PREPULL_NODE_SELECTO
 narrows it), and the engines deploy only once every node holds it --
 `patch_harness.sh` fix 11 gives that DaemonSet a readiness probe on the
 completion marker, since the harness's wait reads `numberReady` and a
-container with no probe is Ready the moment it starts, and makes its SELinux
-relabel best-effort: on a node without SELinux `chcon` fails, and under the
+container with no probe is Ready the moment it starts, and skips its SELinux
+relabel only on a node without SELinux (where `chcon` fails, and under the
 downloader's `set -e` that ended the script before the marker -- every
-downloader crash-looped, re-downloading on each restart. The download Job is
+downloader crash-looped, re-downloading on each restart); any other `chcon`
+error still fails the download. The download Job is
 skipped. The benchmark uses the harness's downloader, not `make weights`,
 because the harness owns `model-pvc`'s name and the engine's `pvc://` uri,
 keeps an existing claim, and only its own mode skips the download Job and
@@ -337,9 +338,8 @@ harness makes for itself admits nothing it needs, and the harness grants
 admin-prerequisites step, which is why the standup is cluster-admin-only on
 OpenShift), it runs with the harness ServiceAccount's token automounted, it
 `pip install`s an unpinned `huggingface_hub` from PyPI at every start, and
-`hf auth login` writes the token into the container's `/tmp`. Fix 11 also
-makes its `chcon` relabel fail on anything but the no-SELinux case and
-label at level `s0`, since the `spc_t` downloader writes at whatever level
+`hf auth login` writes the token into the container's `/tmp`. Fix 11
+labels at level `s0`, since the `spc_t` downloader writes at whatever level
 the runtime gave it and the engines read at the project's. On RHCOS the
 directory is under `/var` (`BENCHMARK_MODEL_HOSTPATH=/var/mnt/wva-bench`,
 with a disk mounted there). None of this has been run on OpenShift yet. `make weights`

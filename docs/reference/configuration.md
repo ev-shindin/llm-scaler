@@ -266,10 +266,10 @@ own disk. Full description in
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WEIGHTS_MODEL` | Hugging Face model id | *(required for `weights`)* |
-| `WEIGHTS_PATH` | Absolute directory on the node (under `/var` on RHCOS, e.g. `/var/mnt/weights`; system paths refused); the model lands under `<path>/models/<id>` | *(required for `weights`)* |
+| `WEIGHTS_PATH` | Absolute directory on the node, one per namespace (under `/var` on RHCOS, e.g. `/var/mnt/weights/<ns>`; system paths refused); the model lands under `<path>/models/<id>` | *(required for `weights`)* |
 | `WEIGHTS_IMAGE` | Image to download with -- any image carrying `huggingface_hub`, i.e. the engine image | *(required for `weights`)* |
 | `WEIGHTS_HF_TOKEN_SECRET` | `<secret>[/<key>]` holding a Hugging Face token, for gated models (key defaults to `HF_TOKEN`) | *(none)* |
-| `WEIGHTS_CAPACITY` | The volume's declared capacity; a declaration, hostPath has no quota | `1Ti` |
+| `WEIGHTS_CAPACITY` | The claim's declared capacity -- no disk limit (hostPath has none), but a `requests.storage` quota charges it; set it near the model's size in a quota'd project | `1Ti` |
 | `WEIGHTS_NODE_SELECTOR` | As `PREPULL_NODE_SELECTOR` | `$(PREPULL_NODE_SELECTOR)` |
 | `WEIGHTS_TOLERATIONS` | As `PREPULL_TOLERATIONS` | `$(PREPULL_TOLERATIONS)` |
 | `BENCHMARK_MODEL_HOSTPATH` | A directory on the node: `benchmark-standup` then binds the harness's model claim to it and has the harness download the model on every accelerator node (the placement `make prepull` uses, `PREPULL_TOLERATIONS` included) before the engines start. Empty: the shared volume | *(empty)* |

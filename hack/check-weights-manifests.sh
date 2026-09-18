@@ -57,7 +57,7 @@ check([d["kind"] for d in docs] == ["ServiceAccount", "PersistentVolume", "Persi
 sa, pv, pvc, ds = docs
 check(sa["metadata"]["name"] == "weights-downloader" and sa["metadata"]["namespace"] == "check-ns" and sa.get("automountServiceAccountToken") is False,
       "a ServiceAccount of its own, with no token: %s" % sa)
-check(ds["spec"]["template"]["spec"].get("serviceAccountName") == "weights-downloader", "the downloader runs as its own ServiceAccount, so an SCC granted for it is granted to it alone")
+check(ds["spec"]["template"]["spec"].get("serviceAccountName") == "weights-downloader", "the downloader runs as its own ServiceAccount, so a grant for it does not land on the default one")
 label = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 check(bool(label.match(pvc["metadata"]["name"])) and bool(label.match(ds["metadata"]["name"])), "claim/DaemonSet names are DNS-1123 labels")
 check(pvc["metadata"]["name"] == ds["metadata"]["name"], "claim and DaemonSet share a name")
@@ -138,7 +138,7 @@ for badmodel in 'a/b/c' '/x' 'x/' 'a b' 'a"b' '' '..' 'a/..' '../x' 'Qwen/..' '.
 done
 [ "$refused" -eq 0 ] && ok "a model id that is not [org/]name of Hugging Face characters, or carries .. / -- / a segment edge of . or -, is refused"
 refused=0
-for badpath in relative / 'a b' '/p"' '' /mnt /etc /etc/models /var/lib/kubelet /var/lib/containerd/x /tmp/models /home/me/models /proc/1 /mnt/local/models/ /mnt/local/../x /var/home/core/w /var/roothome/w /var/usrlocal/w /var/opt/cni/w /sysroot/ostree/x /ostree/x; do
+for badpath in relative / 'a b' '/p"' '' /mnt /etc /etc/models /var/lib/kubelet /var/lib/containerd/x /tmp/models /home/me/models /proc/1 /mnt/local/models/ /mnt/local/../x /var/home/core/w /var/roothome/w /var/usrlocal/w /var/opt/cni/w /sysroot/ostree/x /ostree/x /var/mnt /var/srv /opt/bin/x /var/spool/cron /var/opt/bin/x; do
     if bash deploy/weights.sh apply -n check-ns --model m --path "$badpath" --image "$IMG" --dry-run >/dev/null 2>&1; then fail "a --path of '$badpath' must be refused"; refused=1; fi
 done
 [ "$refused" -eq 0 ] && ok "a path that is not absolute, has one component, ends in /, holds .., or sits under a system prefix (/etc, /var/lib, /tmp, /home, ...) is refused"
@@ -168,16 +168,20 @@ cat > "$T/nodes.json" <<EOF
  {"metadata":{"name":"node-nopod",   "labels":{"nvidia.com/gpu.product":"H200"}}},
  {"metadata":{"name":"node-cpu",     "labels":{"gpu.nvidia.com/model":""}}},
  {"metadata":{"name":"node-amd",     "labels":{"amd.com/gpu.product-name":"MI300X"}}},
- {"metadata":{"name":"node-evicted", "labels":{"nvidia.com/gpu.product":"H200"}}}
+ {"metadata":{"name":"node-evicted", "labels":{"nvidia.com/gpu.product":"H200"}}},
+ {"metadata":{"name":"node-unsched", "labels":{"nvidia.com/gpu.product":"H200"}}},
+ {"metadata":{"name":"node-oom",     "labels":{"nvidia.com/gpu.product":"H200"}}}
 ]}
 EOF
 cat > "$T/pods.json" <<EOF
 {"items":[
- {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-ready"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
- {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-loading"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"running":{}}}]}},
- {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-failing"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}},
+ {"metadata":{"name":"dl-ready","labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-ready"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
+ {"metadata":{"name":"dl-loading","labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-loading"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"running":{}}}]}},
+ {"metadata":{"name":"dl-failing","labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-failing"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}},
  {"metadata":{"labels":{"wva.llmd.ai/weights":"other"}},"spec":{"nodeName":"node-nopod"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
- {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-evicted"},"status":{"phase":"Failed","reason":"Evicted","message":"The node had condition: [DiskPressure]."}}
+ {"metadata":{"labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-evicted"},"status":{"phase":"Failed","reason":"Evicted","message":"The node had condition: [DiskPressure]."}},
+ {"metadata":{"name":"dl-unsched","labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchFields":[{"key":"metadata.name","operator":"In","values":["node-unsched"]}]}]}}}},"status":{"phase":"Pending"}},
+ {"metadata":{"name":"dl-oom","labels":{"wva.llmd.ai/weights":"${NAME}"}},"spec":{"nodeName":"node-oom"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}},"lastState":{"terminated":{"exitCode":137,"reason":"OOMKilled"}}}]}}
 ]}
 EOF
 mkdir -p "$T/bin"
@@ -216,6 +220,7 @@ case "\$1 \$2" in
       esac ;;
   "get events")  want -n check-ns; printf '%s' "\${STUB_EVENT:-}" ;;
   "logs -n")     want -n check-ns; printf '%s\n' "\${STUB_LOG:-}" ;;
+  "auth can-i")  case "\$ARGV" in *" create persistentvolumes -A -q "*) [ -z "\${STUB_NO_PV:-}" ] || exit 1; exit 0 ;; *) echo "stub kubectl: unexpected can-i:\$ARGV" >&2; exit 2 ;; esac ;;
   "api-resources --api-group=security.openshift.io") [ -n "\${STUB_OPENSHIFT:-}" ] && echo "securitycontextconstraints scc security.openshift.io/v1 false SecurityContextConstraints"; : ;;
   "delete serviceaccount") want -n check-ns; echo deleted ;;
   "apply -f")    cat >/dev/null; echo applied ;;
@@ -243,18 +248,23 @@ rc=$?
 set -e
 expect_line() { if grep -qE "^  $1 +$2 " "$T/status.out"; then ok "status: $1 -> $2"; else fail "status: $1 expected $2; got: $(grep -E "^  $1 " "$T/status.out" || echo none)"; fi; }
 expect_line node-ready   present
+grep -qE '^  node-ready +present +Ready *$' "$T/status.out" && ok "status: a healthy row ends at its phase (an empty reason is not swallowed, shifting the pod name into it)" || fail "status: healthy row: $(grep '^  node-ready' "$T/status.out")"
 expect_line node-loading downloading
 expect_line node-failing absent
 grep -qF 'node-failing                 absent       Running (not ready) CrashLoopBackOff' "$T/status.out" && ok "status: a CrashLoopBackOff downloader is not 'downloading'" || fail "status: failing line: $(grep node-failing "$T/status.out")"
 expect_line node-nopod   absent
 expect_line node-evicted absent
+expect_line node-unsched absent
+grep -qE '^  node-unsched +absent +Pending \(not ready\)' "$T/status.out" && ok "status: a pod the DaemonSet made for a node but that never scheduled (no nodeName) shows on that node as Pending, not as no pod" || fail "status: unscheduled pod: $(grep '^  node-unsched' "$T/status.out")"
+grep -q 'node-oom .*CrashLoopBackOff (last exit 137 OOMKilled)' "$T/status.out" && ok "status: a crash-looping downloader carries its last exit (an OOMKilled shows for a sub-second window otherwise)" || fail "status: last exit: $(grep '^  node-oom' "$T/status.out")"
 grep -q 'node-evicted .*Evicted' "$T/status.out" && ok "status: an evicted downloader shows its reason" || fail "status: Evicted reason missing"
 grep -q '^  node-cpu ' "$T/status.out" && fail "status: a node with an empty product label was counted" || ok "status: the default placement leaves the empty-label node out"
 grep -q 'node-failing .*CrashLoopBackOff' "$T/status.out" && ok "status: a failing downloader shows its reason" || fail "status: reason missing"
 grep -q 'Permission denied' "$T/status.out" && fail "status: a permission diagnosis with no permission error in the log" || ok "status: no permission diagnosis when the log shows none"
 STUB_LOG='PermissionError: [Errno 13] Permission denied: /weights/models/Qwen' PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/eacces.out" 2>&1 || true
 grep -q 'cannot write .*Permission denied in its log' "$T/eacces.out" && grep -q 'chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR' "$T/eacces.out" && ok "status: a downloader dying on Permission denied is named, with the node-directory steps (OpenShift: project UID, no relabel)" || fail "status EACCES diagnosis: $(grep -c 'Permission' "$T/eacces.out") line(s)"
-grep -q '1/6 nodes hold it; 5 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
+grep -q '^logs -n check-ns dl-failing --tail=20$' "$T/calls" && ok "status: the log read names the failing pod, no other" || fail "status: log read: $(grep '^logs' "$T/calls" | head -2 | tr '\n' ';')"
+grep -q '1/8 nodes hold it; 7 do not' "$T/status.out" && ok "status: the tally counts only Ready (download complete) as holding" || fail "status: tally: $(grep 'nodes hold' "$T/status.out")"
 grep -q '1 node(s) carry an AMD, Intel or Gaudi accelerator label' "$T/status.out" && ok "status: a non-NVIDIA node under the default placement is named" || fail "status: vendor warning missing"
 grep -q "claim ${NAME}: Bound" "$T/status.out" && ok "status: reports the claim Bound" || fail "status: claim line: $(head -1 "$T/status.out")"
 [ "$rc" -ne 0 ] && ok "status: exits non-zero while a node lacks the weights" || fail "status: exit 0 with nodes lacking the weights"
@@ -284,7 +294,11 @@ STUB_OPENSHIFT=1 PATH="$STUB_PATH" bash deploy/weights.sh apply -n check-ns --mo
 grep -q 'OpenShift: the downloader runs as the project UID' "$T/ocp.out" && grep -q 'chcon -t container_file_t /var/mnt/weights' "$T/ocp.out" && ok "apply: on a cluster with SecurityContextConstraints the OpenShift node-directory steps are printed once, with the path" || fail "apply on OpenShift: $(grep -c OpenShift "$T/ocp.out") notice(s)"
 PATH="$STUB_PATH" bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /mnt/local/models --image "$IMG" > "$T/k8s.out" 2>&1 || true
 grep -q 'OpenShift:' "$T/k8s.out" && fail "apply: the OpenShift notice printed on a cluster without SCCs" || ok "apply: no OpenShift notice on a cluster without SecurityContextConstraints"
-if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/pending.out" 2>&1; then fail "status must fail while the claim is not Bound"; else grep -q 'Pending' "$T/pending.out" && ok "status: an unbound claim is reported and fails" || fail "status: unbound claim: $(head -1 "$T/pending.out")"; fi
+if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/pending.out" 2>&1; then fail "status must fail while the claim is not Bound"; else grep -q 'Pending' "$T/pending.out" && grep -q 'the claim is not bound: its volume is cluster-scoped and was not created' "$T/pending.out" && ok "status: an unbound claim is reported with why (the volume needs PersistentVolume create) and fails" || fail "status: unbound claim: $(head -2 "$T/pending.out" | tr '\n' ';')"; fi
+# apply refuses before anything lands when the volume cannot be created
+: > "$T/calls"
+if STUB_NO_PV=1 PATH="$STUB_PATH" bash deploy/weights.sh apply -n check-ns --model Qwen/Qwen3-32B --path /mnt/local/models --image "$IMG" > "$T/nopv.out" 2>&1; then fail "apply must refuse without leave to create PersistentVolumes"; else
+    grep -q 'leave to create PersistentVolumes' "$T/nopv.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: without leave to create PersistentVolumes nothing is applied, and the reason names the cluster admin" || fail "apply without PV rights: $(tail -1 "$T/nopv.out"); calls: $(grep '^apply' "$T/calls")"; fi
 if STUB_DAEMONSETS="" PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns > "$T/none.out" 2>&1; then fail "status with nothing to check must fail"; else grep -q 'no weights DaemonSets' "$T/none.out" && ok "status: no DaemonSets and no --model is refused with a reason" || fail "status: $(tail -1 "$T/none.out")"; fi
 : > "$T/calls"
 STUB_DS_SELECTOR=example.com/accelerator=h200 STUB_SELECTOR=example.com/accelerator=h200 PATH="$STUB_PATH" bash deploy/weights.sh status -n check-ns >/dev/null 2>&1 || true
