@@ -32,7 +32,7 @@ Total events captured: 796
 
 ## Variant: qwen-qwe-3db867ce-en3-0-6b-decode-wva
 
-One row per optimize cycle, totalled across every ready replica of this variant that cycle (N). KVinUse/LocalQ/EPPq/TotalDemand are all in tokens; Priority lists every k2 tier that fired across N replicas this cycle (P1-obs=observed, P2-hist=historical average, P3-k2=derived from deployment args, P4-k1=no signal, memory-bound only). Time is HH:MM:SS on the run date above.
+One row per optimize cycle, totalled across every ready replica of this variant that cycle (N). KVinUse/LocalQ/EPPq/TotalDemand are all in tokens; Priority lists every k2 tier that fired across N replicas this cycle (P1-obs=observed, P2-hist=historical average, P3-k2=derived from deployment args, P4-k1=no signal, memory-bound only; P1-obs-invalid and P1-obs-downstream mark an observation that was NOT recorded -- above the KV ceiling, or a prefill saturation while decode was saturated -- and are followed by the tier it fell through to). Time is HH:MM:SS on the run date above.
 
 Legend — Bound: k1=memory-bound won, k2=compute-bound won.  Decision: DN = the controller decided N replicas (post scale-to-zero/min-replica enforcement).
 

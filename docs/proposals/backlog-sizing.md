@@ -212,7 +212,8 @@ Proposed direction, not built:
   do not fix. On this run every prefill replica beyond the first was ordered
   by this term. Prefill's mu is never observed (its queue does not fill), so
   its EPP share would be the fallback until it is; the fallback should be
-  bounded by prefill's own occupancy, not the whole queue.
+  bounded by prefill's own occupancy, not the whole queue. (It did fill,
+  once, under a saturated decode -- see the 2026-09-18 section at the end.)
 
 A second, smaller question in the same area: cold decode replicas report
 `avgOutputTokens` 0 for their first minutes and read k2 from the `short`
@@ -455,9 +456,10 @@ ordered, and kept for the rest of the run:
 
 Decode GPU-minutes came out lower than the run before (95.7 against 105.8,
 one fewer flap at the second peak) and the all-pod figure higher (167.8
-against 144.6): the second prefill replica cost 35 GPU-minutes and prefilled
-nothing a single one could not -- both prefill pods read 0 running, 0
-waiting and ~0 % KV on every harness scrape after +330 s.
+against 144.6): the second prefill replica cost 33 GPU-minutes (Ready at
++331 s to the end of the load) and prefilled nothing a single one could not
+-- both prefill pods read 0 running, 0 waiting and under 3 % KV on 95 % of
+the harness scrapes after +330 s.
 
 Where it came from, cycle by cycle from the controller log:
 
@@ -473,19 +475,28 @@ Where it came from, cycle by cycle from the controller log:
 
 The prefill replica saturated -- by the analyzer's definition, queue over
 the threshold with tokens resident -- exactly and only while both decode
-replicas were saturated at their k1. A prefill request completes when decode
+replicas were saturated at their k1. A prefill request is done when decode
 admits it and pulls its KV; with decode full, the prefill engine held 385k
-tokens of finished prompts it could not hand off (its KV read 20 % on the
-harness scrape at +129 s, the only non-zero reading of the run), its queue
-filled behind them, and its completion rate was decode's admission rate.
-Recorded as prefill's: k2 = 357 800 against a k1 of 919 859, so the one
-replica's own occupancy read 100 % and `roleRC` for prefill went to 63 141
-at 15:01:33 -- the order; and `mu` = 5.57 req/s, below the 6 req/s offered,
-so `lambda / mu` read 1.07-1.15 replicas for the rest of the run
-(`replicasImplied` on 137 `throughput-demand-floor` lines for prefill) while
+tokens of finished prompts awaiting a pull that takes ~0.1 s when decode is
+healthy (its KV peaked at 39 % on the harness scrapes around +130 s and
+read under 3 % on 95 % of them), its arrivals came from the scheduler's
+flow control in bursts (the EPP queue read 4, 124, 51, 49, 107, 0 over
+these cycles), a queue of 30 stood behind them, and its completion rate was
+decode's admission rate. Which of the held blocks and the bursts put the 30
+in the queue is not settled -- prefill's KV was at 31 % of its cache, so it
+was not block-starved -- and does not matter to the reading: every one of
+those numbers is decode's. Recorded as prefill's: k2 = 357 800 against a k1
+of 919 859, so the one replica's own occupancy read 100 % and `roleRC` for
+prefill went to 63 141 at 15:01:33 -- the order; and `mu` = 5.57 req/s,
+below the 6 req/s offered, so `lambda / mu` read 1.08 replicas at the
+median for the rest of the run (0.98-1.17 between the 10th and 90th
+percentile, above 1.0 on 86 % of the 133 `throughput-demand-floor` lines
+for prefill after the episode; the arrival rate jitters) while
 `residentDemand` on the same lines read 0-54k. Two prefill replicas never
 saturate again, so no later reading could displace either figure: the
-window keeps a max, and the history evicts after 24 h. The warm pass that
+window keeps a max, and the history evicts after 24 h. (The rows above are
+in the full controller log of the pass, `wva_controller_full.log` beside
+the results; the harness's own copy starts at 15:09:46.) The warm pass that
 followed on the same controller (run `guidellm-1789746634-pov4xp_1`) shows
 what a persisted figure does on its own: at +51 s, with `residentDemand` 0
 on every prefill line and no decode replica anywhere near saturation, the
@@ -502,26 +513,53 @@ sample admission must be strict, because persistence makes a bad sample
 permanent): a prefill P1 reading taken in a
 cycle where any decode replica is over the queue threshold is left
 unrecorded (`P1-obs-downstream`), for both k2 and `mu`. Decode's own reading
-in the same cycle records as before. A prefill fleet that is itself the
-bottleneck starves decode, so decode is not saturated then and prefill's
-reading records. On the run's rows, the gated cycle prices prefill at k1
-with a demand of 357 800 + 30 x 6000 = 537 800 -- 58 % of one replica, no
-order (`downstream_saturation_test.go` replays it).
+in the same cycle records as before. A prefill bottleneck reduces decode's
+arrivals, so the two saturate at once only when decode is short at
+prefill's completion rate; prefill's reading then waits for decode to
+recover. On the run's rows, the gated cycle prices prefill at k1 with a
+demand of 357 800 + 30 x 6000 = 537 800 -- 58 % of one replica, no order
+(`downstream_saturation_test.go` replays it).
 
-Still charged as residency, and left so:
+The demand side of the same cycle is decode's too, and the gate alone
+leaves it acting on the decision. Review found the two cases: a prefill k2
+learned earlier on a genuine saturation is small, as a compute bound is
+(one step's prompts plus the hand-off -- 80 000, say), and against it the
+537 800 that decode's backlog puts on prefill is `RC = 537 800 / 0.85 -
+80 000`, seven extra prefill replicas ordered on every decode saturation of
+a fleet whose prefill was ever the bottleneck and released through the
+scale-down window when decode recovers; and against k1 on a fleet of two,
+537 800 on 1 839 718 is 29 %, one replica removed while decode is saturated
+and re-ordered when it recovers. So on a gated cycle prefill's demand is
+clamped into the band where the engine neither orders nor releases,
+`[scaleDown x supply, scaleUp x anticipated supply]`, and the cycle logs
+`prefill-demand-held` with the figure it found and the one it left. Prefill
+keeps what it has until decode's numbers are its own again. What that
+costs: a genuine prefill order -- both roles short at once -- is deferred
+for as long as decode stays saturated, one decode start ordinarily; the
+cycle decode recovers, prefill's own occupancy and floor stand.
 
-- Prefill's own queue and its held KV *during* a decode saturation. Both are
-  decode's backlog too, but they are transient (gone the cycle decode
-  admits), bounded by prefill's k1, and an order needs `inUse + queue x
-  input` to reach 0.85 x k1 -- about 40 more queued 6000-token prompts than
-  the run showed. Dropping them would make prefill's demand read zero in
-  exactly the cycles decode is short, and on a larger fleet that is a
-  prefill scale-down mid-burst.
-- The four "readings" above are one Prometheus sample seen four times (the
-  rows repeat to the token), which is what let a single saturated moment
-  clear `MinThroughputSamplesToOrder`. The gate makes it moot for prefill;
-  for decode the repeated rows are the same under-read repeated, and the
+Two things about the decode test, left as they are:
+
+- It is the queue, and vLLM counts a decode request waiting for its remote
+  KV in `num_requests_waiting`. A fleet whose KV transfer keeps as many in
+  flight as the threshold (a large model over TCP, say) reads decode
+  saturated every cycle, and prefill then never records: it stays
+  memory-bound, which is what a prefill fleet that never saturates is
+  today. The same rows make decode's own P1 fire every cycle, which is the
+  older problem and not this one. Decode's occupancy against its k1 was
+  tried as the test instead -- decode not admitting because it is full,
+  which the measured cycle satisfies (970k and 1 039k against 919 859) --
+  and rejected on the same rows: the Prometheus windows are not aligned,
+  decode's occupancy had dropped below k1 on the fourth cycle (589k and
+  825k) while its queue (65, 81) and prefill's stale row had not, and that
+  row would have recorded.
+- The four "readings" are one Prometheus sample seen four times (the rows
+  repeat to the token), which is what let a single saturated moment clear
+  `MinThroughputSamplesToOrder`. The gate makes it moot for prefill; for
+  decode the repeated rows are the same under-read repeated, and the
   window's max is unaffected.
 
-Not yet re-run on a cluster with the gate in place; the replay above is
-arithmetic on the logged rows.
+Not yet re-run on a cluster with the gate and the hold in place; the replay
+above is arithmetic on the logged rows. The re-run should capture prefill's
+`num_requests_running`, its KV at the queue peak and the EPP flow-control
+queue, which is what separates held blocks from bursts.

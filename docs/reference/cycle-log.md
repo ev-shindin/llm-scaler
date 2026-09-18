@@ -100,13 +100,13 @@ the saturation V2 analyzer sets one of these values:
 | `P3-k2` | k2 was **derived** from deployment parameters (vLLM model args). Never fires for a **prefill** variant: the formula assumes a real per-request output length, which prefill's own avgOutput (~0-1, it hands off before generating anything) collapses to just the batch-token budget echoed back -- not a derived signal |
 | `P4-k1` | k2 was unavailable; **fell back** to k1 (memory-bound capacity). For prefill this is the common case, not a degraded one -- see `P3-k2` above |
 
-One further value appears in the `k2-decision` line's `priority` field but never
-as a variant's `reason`, because no capacity comes from it:
+Two further values appear in the `k2-decision` line's `priority` field but never
+as a variant's `reason`, because no capacity comes from either:
 
 | value | meaning |
 | --- | --- |
 | `P1-obs-invalid` | an observation was discarded for exceeding the KV cache's **physical** ceiling, i.e. a scrape artifact. Note the bound is the ceiling, not k1: k1 is the ceiling times `kvCacheThreshold` (0.80 by default), so occupancy between the two is legitimate and is kept. The analyzer falls through to the next priority |
-| `P1-obs-downstream` | a **prefill** replica's saturated queue was left unrecorded because the **decode** role was saturated in the same cycle. A prefill request completes only when decode admits it and pulls its KV, so with decode over its threshold the prefill engine holds finished prompts it cannot hand off and its queue fills behind them: that is decode's saturation seen from upstream, not a reading of prefill. Neither k2 nor the saturated throughput (`throughput-demand-floor`) is recorded from it; the analyzer falls through to the next priority. A prefill fleet that is itself the bottleneck starves decode, so decode is not saturated then and the reading records as usual |
+| `P1-obs-downstream` | a **prefill** replica's saturated queue was left unrecorded because a **decode** replica was over its queue threshold in the same cycle. A prefill request is done only when decode admits it and pulls its KV, so with decode saturated what prefill shows -- held KV, a queue, a completion rate -- is metered by decode: decode's saturation seen from upstream, not a reading of prefill. Neither k2 nor the saturated throughput (`throughput-demand-floor`) is recorded from it; the analyzer falls through to the next priority, and prefill's demand for the cycle is held where it neither orders nor releases (`prefill-demand-held`). A prefill bottleneck reduces decode's arrivals, so both saturate at once only when decode is short at prefill's completion rate; prefill's reading then waits for decode to recover |
 | `no-data` | no ready replicas, no stored record, no compatible variant — capacity is 0 this cycle (normal for newly deployed variants) |
 | `error` | K2 priority not in known set — indicates an unlabelled code path; should not occur in normal operation |
 

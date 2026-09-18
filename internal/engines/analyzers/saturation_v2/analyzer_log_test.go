@@ -58,14 +58,20 @@ var logContract = map[string][]string{
 	// mu (throughput_floor.go); the line is what explains the gap between
 	// scheduler-queue-demand's byRole and RoleDemand.
 	"scheduler-queue-prefill-share-dropped": {"modelID", "namespace", "eppQueueSize", "droppedTokens", "prefillDemandBefore", "prefillDemandAfter"},
-	"replica-capacity-skipped":              {"modelID", "namespace", "variant", "reason"},
-	"replica-capacity-store-fallback":       {"modelID", "namespace", "variant", "reason"},
-	"variant-capacity-source":               {"modelID", "namespace", "variant", "reason"},
-	"zero-replica-capacity-estimate":        {"modelID", "namespace", "variant", "source"},
+	// Prefill's demand is held in the no-order/no-release band while decode
+	// is saturated (analyzer.go, holdPrefillDemand); the line is what explains
+	// a prefill RoleDemand that matches neither its rows nor its floor.
+	"prefill-demand-held":             {"modelID", "namespace", "demandBefore", "demandHeld", "holdFloor", "holdCap"},
+	"replica-capacity-skipped":        {"modelID", "namespace", "variant", "reason"},
+	"replica-capacity-store-fallback": {"modelID", "namespace", "variant", "reason"},
+	"variant-capacity-source":         {"modelID", "namespace", "variant", "reason"},
+	"zero-replica-capacity-estimate":  {"modelID", "namespace", "variant", "source"},
 }
 
-// k2PriorityLabels is the closed vocabulary the report's Priority column
-// renders. dump_k2_decisions.py documents exactly these four in its legend.
+// k2PriorityLabels is the vocabulary a k2 SOURCE is labelled with; the
+// report's Priority column renders these four, plus the two diagnostic values
+// (k2ReasonObsImplausible, k2ReasonObsDownstream) that precede the tier a
+// declined observation fell through to. dump_k2_decisions.py legends all six.
 var k2PriorityLabels = map[string]bool{
 	"P1-obs": true, "P2-hist": true, "P3-k2": true, "P4-k1": true,
 }

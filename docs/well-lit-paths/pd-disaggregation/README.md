@@ -170,7 +170,11 @@ the last minute of the wait and is priced as work to drain within 60 s
 (`backlogRequests` on the `throughput-demand-floor` line), which is one more
 replica, not five: the target peaks at 3, the queue is gone in a minute, and
 the third replica is released at +6 min. Prefill is never ordered: prompts
-waiting at the scheduler are no longer charged to it as resident KV.
+waiting at the scheduler are no longer charged to it as resident KV. (A
+later cold pass ordered one by a second path -- a prefill saturation
+recorded while decode was saturated -- which the analyzer now declines; see
+"A prefill saturation records only while decode is not saturated" in the
+[floor guide](../../developer-guide/saturation-demand-floor.md).)
 
 **The first phase, steady** (minutes 5-18). Occupancy is a fraction of one
 replica (5-15% KV) -- the reading that, taken alone, would size the fleet to

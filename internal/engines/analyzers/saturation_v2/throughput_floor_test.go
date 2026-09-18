@@ -515,8 +515,11 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		// prefill replicas that had nothing to prefill. A prefill replica holds
 		// a prompt for its prefill time plus the hand-off; the queue is decode's
 		// to drain.
+		// Decode is not over its queue threshold here: with decode saturated,
+		// prefill's whole demand is held in the no-order/no-release band
+		// (holdPrefillDemand), which would mask what this spec is about.
 		in := makeAnalyzerInput(
-			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 180, runMu), prefill("prefill-0", 66_183)},
+			[]domain.ReplicaMetrics{decode("decode-0", 900_000, 0, runMu), prefill("prefill-0", 66_183)},
 			states(1, 1))
 		in.ArrivalRate = runLambda
 		in.SchedulerQueue = &domain.SchedulerQueueMetrics{QueueSize: 200, QueueBytes: 200 * 6000 * 4}

@@ -54,13 +54,13 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		{VariantName: decodeVariant, Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: 2, GPUsPerReplica: 1},
 		{VariantName: prefillVariant, Role: domain.RolePrefill, AcceleratorName: "H200", CurrentReplicas: 1, GPUsPerReplica: 1},
 	}
-	perReplica := func(result *domain.AnalyzerResult, variant string) float64 {
+	prefillP := func(result *domain.AnalyzerResult) float64 {
 		for _, vc := range result.VariantCapacities {
-			if vc.VariantName == variant {
+			if vc.VariantName == prefillVariant {
 				return vc.PerReplicaCapacity
 			}
 		}
-		Fail("no capacity for " + variant)
+		Fail("no capacity for " + prefillVariant)
 		return 0
 	}
 
@@ -78,12 +78,16 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 			Expect(err).NotTo(HaveOccurred())
 		}
 
-		Expect(perReplica(result, prefillVariant)).To(Equal(prefillK1),
+		Expect(prefillP(result)).To(Equal(prefillK1),
 			"prefill stays memory-bound: 357 800 resident tokens while decode is full is decode's backlog, not prefill's capacity")
 		Expect(analyzer.computeCapacityHistory).NotTo(HaveKey(prefillKey), "no k2 history for prefill")
 		Expect(analyzer.saturatedThroughput).NotTo(HaveKey(prefillKey), "no mu for prefill")
-		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 357_800+30*6000, 1),
-			"prefill's demand this cycle is its resident KV plus its own queue at input-only footprint, as for any role without a mu")
+		// Its demand -- 357 800 held plus 30 x 6000 queued at input-only
+		// footprint, 537 800, as for any role without a mu -- is 58 % of the
+		// one replica: under the 0.70 release boundary, so without the hold
+		// a two-replica prefill fleet would have been cut to one here.
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 0.7*prefillK1, 1),
+			"held at the release boundary: prefill is neither ordered nor released on decode's backlog")
 
 		By("recording decode's saturation as decode's, in the same cycles")
 		Expect(analyzer.computeCapacityHistory).To(HaveKey(decodeKey))
@@ -103,10 +107,89 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		result, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(perReplica(result, prefillVariant)).To(Equal(357_800.0))
+		Expect(prefillP(result)).To(Equal(357_800.0))
 		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey))
 		Expect(analyzer.saturatedThroughput).To(HaveKey(prefillKey))
 		Expect(analyzer.saturatedThroughput[prefillKey].Max()).To(Equal(4.77))
+	})
+
+	It("holds prefill in the band where the engine neither orders nor releases", func() {
+		// The reviewer's arithmetic: a prefill k2 learned on a genuine
+		// saturation is small, as a compute bound is (one step's prompts
+		// plus the hand-off). Against 80 000, the 537 800 that decode's
+		// backlog puts on prefill is RC = 537 800 / 0.85 - 80 000 = 552 706,
+		// seven extra prefill replicas -- ordered on every decode saturation
+		// of a fleet whose prefill was ever the bottleneck, and released
+		// through the scale-down window once decode recovers.
+		seedP := makeReplicaMetrics("prefill-0", prefillVariant, 80_000, prefillKv, 30, 6000, 1)
+		seedP.RequestRate, seedP.Ready = 30, true
+		_, err := analyzer.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 0), seedP}, states))
+		Expect(err).NotTo(HaveOccurred())
+
+		By("capping the demand at the scale-up threshold of the anticipated supply")
+		result, err := analyzer.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill()}, states))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(prefillP(result)).To(Equal(80_000.0), "P2-hist")
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 0.85*80_000, 1),
+			"RC = 0: the held KV orders nothing")
+
+		By("flooring it at the release boundary of the supply, on a fleet of two")
+		two := []domain.VariantReplicaState{states[0],
+			{VariantName: prefillVariant, Role: domain.RolePrefill, AcceleratorName: "H200", CurrentReplicas: 2, GPUsPerReplica: 1}}
+		p1 := prefill()
+		p1.PodName = "prefill-1"
+		p1.TokensInUse, p1.QueueLength = 0, 0
+		fresh := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		result, err = fresh.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill(), p1}, two))
+		Expect(err).NotTo(HaveOccurred())
+		// 537 800 on a supply of 2 x 919 449 is 29 %: SC would have been
+		// 1 839 718 - 537 800 / 0.7 = 1 071 432, one replica removed while
+		// decode is saturated, then re-ordered when it recovers.
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 0.7*2*prefillK1, 1),
+			"SC = 0: nothing is released on decode's backlog")
+		Expect(result.TotalDemand).To(BeNumerically("~",
+			result.RoleDemand[domain.RoleDecode]+result.RoleDemand[domain.RolePrefill], 1),
+			"the model-level total moved with the role")
+
+		By("leaving prefill alone the cycle decode is not saturated")
+		// The same held KV, no queue behind it, decode keeping up: the
+		// measured demand stands, and with it the release.
+		p0 := prefill()
+		p0.QueueLength = 0
+		result, err = fresh.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 2), p0, p1}, two))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 357_800, 1))
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("<", 0.7*2*prefillK1))
+	})
+
+	It("falls through to prefill's own history once it has one, not to k1", func() {
+		// A history seeded on a cycle decode was keeping up in. The gate only
+		// declines the fresh reading; the priorities below it still apply,
+		// so a gated cycle reads P2-hist -- returning k1 from the gate
+		// directly would forget what prefill was measured at.
+		seed := makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 300_000, 0),
+			decode("decode-1", 280_000, 0),
+			prefill(),
+		}, states)
+		_, err := analyzer.Analyze(ctx, seed)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey))
+
+		gated := makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 970_475, 36),
+			decode("decode-1", 1_039_474, 81),
+			prefill(),
+		}, states)
+		result, err := analyzer.Analyze(ctx, gated)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(prefillP(result)).To(Equal(357_800.0), "the seeded history, at P2-hist")
+		Expect(analyzer.computeCapacityHistory[prefillKey].Len()).To(Equal(1), "the gated reading was not added to it")
+		Expect(analyzer.saturatedThroughput[prefillKey].Len()).To(Equal(1), "nor to the throughput window")
 	})
 
 	It("does not gate decode on prefill, nor a non-disaggregated fleet on anything", func() {
@@ -144,6 +227,54 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 	})
 })
 
+var _ = Describe("holdPrefillDemand", func() {
+	variants := []domain.VariantCapacity{
+		{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 2, PendingReplicas: 1, PerReplicaCapacity: 100},
+		{VariantName: "d", Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: 100},
+	}
+	It("clamps into [scaleDown x supply, scaleUp x anticipated] and says what it did", func() {
+		// supply 200, anticipated 300: the band is [140, 255].
+		rd := map[string]float64{domain.RolePrefill: 900, domain.RoleDecode: 50}
+		h, held := holdPrefillDemand(rd, variants, 0.85, 0.7)
+		Expect(held).To(BeTrue())
+		Expect(h).To(Equal(roleHold{before: 900, after: 255, lo: 140, hi: 255}))
+		Expect(rd[domain.RolePrefill]).To(Equal(255.0))
+		Expect(rd[domain.RoleDecode]).To(Equal(50.0), "another role is not touched")
+
+		rd[domain.RolePrefill] = 10
+		h, held = holdPrefillDemand(rd, variants, 0.85, 0.7)
+		Expect(held).To(BeTrue())
+		Expect(h.after).To(Equal(140.0))
+
+		rd[domain.RolePrefill] = 200
+		_, held = holdPrefillDemand(rd, variants, 0.85, 0.7)
+		Expect(held).To(BeFalse(), "inside the band: nothing to do")
+		Expect(rd[domain.RolePrefill]).To(Equal(200.0))
+	})
+	It("does nothing for a role with no demand entry, no supply, or no thresholds", func() {
+		_, held := holdPrefillDemand(map[string]float64{domain.RoleDecode: 50}, variants, 0.85, 0.7)
+		Expect(held).To(BeFalse())
+		noSupply := []domain.VariantCapacity{{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 0, PerReplicaCapacity: 100}}
+		_, held = holdPrefillDemand(map[string]float64{domain.RolePrefill: 900}, noSupply, 0.85, 0.7)
+		Expect(held).To(BeFalse())
+		_, held = holdPrefillDemand(map[string]float64{domain.RolePrefill: 900}, variants, 0, 0.7)
+		Expect(held).To(BeFalse())
+	})
+	It("lets the cap win when the band is empty", func() {
+		// An in-flight scale-down: 3 running, target 2 -- anticipated below
+		// supply, so 0.7 x 300 = 210 is above 0.85 x 200 = 170.
+		down := []domain.VariantCapacity{{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 3, PendingReplicas: -1, PerReplicaCapacity: 100}}
+		rd := map[string]float64{domain.RolePrefill: 900}
+		h, held := holdPrefillDemand(rd, down, 0.85, 0.7)
+		Expect(held).To(BeTrue())
+		Expect(h.after).To(Equal(170.0), "never an order")
+		rd[domain.RolePrefill] = 10
+		h, held = holdPrefillDemand(rd, down, 0.85, 0.7)
+		Expect(held).To(BeFalse(), "and no floor to raise to, so the release stands")
+		Expect(h.after).To(Equal(10.0))
+	})
+})
+
 var _ = Describe("roleSaturated", func() {
 	roles := map[string]string{"d": domain.RoleDecode, "p": domain.RolePrefill, "": ""}
 	It("is the P1-obs admission test applied across a role", func() {
@@ -156,6 +287,12 @@ var _ = Describe("roleSaturated", func() {
 		Expect(roleSaturated([]domain.ReplicaMetrics{
 			{VariantName: "d", QueueLength: 50, TokensInUse: 0},
 		}, roles, domain.RoleDecode, 5)).To(BeFalse(), "a queue on a replica holding nothing is not a saturation, as computeK2 would not admit it either")
+		Expect(roleSaturated([]domain.ReplicaMetrics{
+			{VariantName: "d", QueueLength: 50, TokensInUse: 2_000_000, TotalKvCapacityTokens: 1_162_240},
+		}, roles, domain.RoleDecode, 5)).To(BeFalse(), "resident tokens above the physical ceiling are the scrape artifact P1 discards as invalid")
+		Expect(roleSaturated([]domain.ReplicaMetrics{
+			{VariantName: "d", QueueLength: 50, TokensInUse: 1_100_000, TotalKvCapacityTokens: 1_162_240},
+		}, roles, domain.RoleDecode, 5)).To(BeTrue(), "between k1 and the ceiling is the most informative reading there is")
 		Expect(roleSaturated([]domain.ReplicaMetrics{
 			{VariantName: "p", QueueLength: 50, TokensInUse: 1},
 		}, roles, domain.RoleDecode, 5)).To(BeFalse(), "another role's saturation is not this one's")
@@ -211,4 +348,12 @@ func TestLogContract_PrefillSaturationUnderDecodeIsLabelled(t *testing.T) {
 		}
 		return ""
 	}(), "decode's own saturation is recorded in the same cycle")
+
+	// And the hold on prefill's demand, which changes the decision, says
+	// what it found and what it left.
+	held := requireLogged(t, logs, "prefill-demand-held")
+	assert.InDelta(t, 357_800+30*6000, held["demandBefore"], 1)
+	assert.InDelta(t, 0.7*919_449, held["demandHeld"], 1)
+	assert.InDelta(t, 0.7*919_449, held["holdFloor"], 1)
+	assert.InDelta(t, 0.85*919_449, held["holdCap"], 1)
 }

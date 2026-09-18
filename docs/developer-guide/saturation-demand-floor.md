@@ -95,26 +95,44 @@ Properties, each with a spec in `throughput_floor_test.go`:
   the pool's, not the variant's.
 - **Silent for a role never seen saturated.** Prefill, in practice: its queue
   is rarely the one that fills. No opinion rather than a guess.
-- **A prefill saturation records only while decode is not saturated.** A
-  prefill request completes when decode admits it and pulls its KV, so with
-  decode over its queue threshold the prefill engine holds finished prompts it
-  cannot hand off, its queue fills behind them, and its completion rate is
-  decode's admission rate: decode's saturation seen from upstream. Measured on
-  the shape-swap benchmark's cold pass (2026-09-18): the one prefill replica
-  read queue 30 and 357 800 resident tokens for the four cycles both decode
-  replicas were over the threshold (+220..+265 s after load start), was
-  priced at k2 = 357 800 against a k1 of 919 859 and `mu` = 5.57 req/s, and
-  its own occupancy read 100 % of that k2 and ordered a second prefill
-  replica on the spot. The `mu`, under the 6 req/s offered, then held both
-  (`lambda / mu` = 1.08 replicas) for the remaining 35 minutes while their
-  resident KV read zero -- and nothing could correct either figure, since a
-  prefill fleet of two never saturates again. The analyzer now leaves such a
-  reading unrecorded (`P1-obs-downstream` on the `k2-decision` line; k2 falls
-  through to history or k1, and no `mu` is written). A prefill fleet that is
-  itself the bottleneck starves decode, so decode is not saturated then and
-  the reading records as before. The cycle after the gate on the same run's
-  numbers: prefill at k1, demand 357 800 + 30 x 6000 = 537 800 against a
-  supply of 919 859 -- no order.
+- **A prefill saturation records only while decode is not saturated, and
+  prefill is held meanwhile.** A prefill request is done when decode admits
+  it and pulls its KV, so with a decode replica over its queue threshold what
+  prefill shows -- the KV of finished prompts held until the pull, arrivals
+  the scheduler's flow control releases in bursts, a completion rate that is
+  decode's admission rate -- is metered by decode: decode's saturation seen
+  from upstream. Measured on the shape-swap benchmark's cold pass
+  (2026-09-18): the one prefill replica read queue 30 and 357 800 resident
+  tokens for the four cycles both decode replicas were over the threshold
+  (+220..+265 s after load start), was priced at k2 = 357 800 against a k1
+  of 919 859 and `mu` = 5.57 req/s, and its own occupancy read 100 % of that
+  k2 and ordered a second prefill replica on the spot. The `mu`, under the
+  6 req/s offered, then held both (`lambda / mu` 1.08 at the median, 0.98
+  to 1.17 between the 10th and 90th percentile of the cycles) for the
+  remaining 33 minutes while their resident KV read at most 54k -- and
+  nothing could correct either figure, since a prefill fleet of two never
+  saturates again. The correlation is what was measured; the path is not
+  settled (prefill's KV sat at 31 % of its cache on those rows, so it was
+  not block-starved). The analyzer now leaves such a reading unrecorded
+  (`P1-obs-downstream` on the `k2-decision` line; k2 falls through to
+  history or k1, and no `mu` is written), and clamps prefill's demand for
+  the cycle into the band where the engine neither orders nor releases,
+  `[scaleDown x supply, scaleUp x anticipated supply]`
+  (`prefill-demand-held`): against a small prefill k2 learned on some
+  earlier, genuine saturation the held KV alone would read as several
+  replicas, and against k1 on a fleet of two it reads as a release (537 800
+  on 1 839 718 is 29 %). A genuine prefill order is deferred by as long as
+  decode stays saturated -- one decode start, ordinarily. A prefill
+  bottleneck reduces decode's arrivals, so the two saturate at once only
+  when decode is short at prefill's completion rate. The decode test is the
+  queue, and vLLM counts a request waiting for its remote KV in it: a fleet
+  whose transfer keeps as many in flight as the threshold reads decode
+  saturated every cycle and prefill then never records -- it stays
+  memory-bound, as a prefill fleet that never saturates does today. Decode's
+  KV against its k1 was tried as the test and rejected on the run's own
+  rows: the Prometheus windows are not aligned, and decode's occupancy had
+  dropped below k1 on the fourth cycle while its queue and prefill's stale
+  row had not.
 - **Keyed by output length**, in factor-of-two buckets above 500 tokens
   (`classifyOutputLength`). `mu` falls roughly with output length, and two
   shapes sharing a bucket share a window whose max is the shorter shape's --
@@ -209,6 +227,6 @@ is a property of the load.
 | A 350-request backlog charged as residency ordered five extra replicas that arrived after it was gone | Measured, run `biran-20260915-102548-571` |
 | `(lambda + B/T) / mu` orders the second replica at +62 s and sizes the first-ramp backlog at 3 replicas | Measured, run `guidellm-1789645863-l32fnc_1` (warm controller) and `guidellm-1789642083-9yngog_1` (cold) |
 | The first reading at a saturation under-reads and the window's max corrects it | Measured, same cold run: 3.67, 5.23, 7.13 req/s on three consecutive saturated cycles |
-| A prefill saturation under a saturated decode, recorded as prefill's, ordered a second prefill replica and held it 35 minutes at zero resident KV | Measured, run `guidellm-1789743465-ckjz7y_1` (cold): prefill `P1-obs` at 15:01:33-15:02:18 with both decode replicas at queue 36-81, then `replicasImplied` 1.07-1.15 for prefill through 15:36 |
+| A prefill saturation under a saturated decode, recorded as prefill's, ordered a second prefill replica and held it 33 minutes at near-zero resident KV | Measured, run `guidellm-1789743465-ckjz7y_1` (cold), full controller log of the pass (`wva_controller_full.log` beside the results; the harness's own copy starts at 15:09:46): prefill `P1-obs` at 15:01:33-15:02:18 with both decode replicas at queue 36-81, then `replicasImplied` for prefill 1.08 at the median (p10-p90 0.98-1.17, above 1.0 on 86 % of 133 cycles) through 15:35 |
 | The persisted prefill `mu` alone ordered a second prefill replica at +51 s on the warm pass that followed, at zero resident KV | Measured, run `guidellm-1789746634-pov4xp_1`: `throughput-demand-floor` for prefill at 15:51:35, `arrivalRate` 5.5, `saturatedThroughput` 5.57, `residentDemand` 0, `replicasImplied` 0.99 |
 | Left unrecorded, the same cycle prices prefill at k1 with no order | Replayed from the run's rows in `downstream_saturation_test.go`; not yet re-run on a cluster |
