@@ -1885,12 +1885,18 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@# Substituted by NAME, not by matching `rate:` lines. Staged ladders (bursty,
 	@# sharegpt) carry several rates whose SHAPE is the scenario, and a pattern
 	@# that rewrote every rate line would flatten them into one number.
+	@#
+	@# A replay profile schedules from a trace it names by an in-pod path; the
+	@# trace is committed beside the profile, and copying the profile alone sent
+	@# a harness pod to die five minutes in on "Trace file not found" -- with a
+	@# report. workload_traces.sh copies what the profile names, or refuses.
 	@if [ -f "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD).yaml.in" ]; then \
 		echo "Copying local workload $(BENCHMARK_WORKLOAD).yaml.in to the $(BENCHMARK_HARNESS) harness (REQUEST_RATE=$(REQUEST_RATE))..."; \
 		sed -e 's/__REQUEST_RATE__/$(REQUEST_RATE)/g' -e 's/__MAX_DURATION__/$(MAX_DURATION)/g' \
 		   "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD).yaml.in" \
 		   > "$(BENCHMARK_REPO_DIR)/workload/profiles/$(BENCHMARK_HARNESS)/$(BENCHMARK_WORKLOAD).yaml.in"; \
 		rm -f "$(BENCHMARK_REPO_DIR)/workload/profiles/$(BENCHMARK_HARNESS)/$(BENCHMARK_WORKLOAD).yaml"; \
+		bash hack/benchmark/workload_traces.sh "$(BENCHMARK_REPO_DIR)/workload/profiles/$(BENCHMARK_HARNESS)/$(BENCHMARK_WORKLOAD).yaml.in" "$(BENCHMARK_SCENARIOS_DIR)" "$(BENCHMARK_REPO_DIR)/workload/profiles/$(BENCHMARK_HARNESS)" "$(BENCHMARK_HARNESS)"; \
 	elif [ -f "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD).in" ]; then \
 		cp "$(BENCHMARK_SCENARIOS_DIR)/$(BENCHMARK_WORKLOAD).in" \
 		   "$(BENCHMARK_REPO_DIR)/workload/profiles/$(BENCHMARK_HARNESS)/$(BENCHMARK_WORKLOAD).in"; \
@@ -2345,6 +2351,7 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@echo "Syntax-checking deploy shell scripts..."
 	@bash -n deploy/install.sh
 	@bash -n deploy/install-epp.sh
+	@bash -n hack/benchmark/workload_traces.sh
 	@bash -n deploy/prepull.sh
 	@bash -n deploy/lib/accelerator_nodes.sh
 	@bash -n deploy/weights.sh
@@ -2418,6 +2425,8 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# recognises both schemas -- one that called everything unknown would reject
 	@# correct pairings instead.
 	@bash hack/check-benchmark-profiles.sh
+	@echo "Checking each replay profile's trace is committed and gets copied..."
+	@bash hack/check-workload-traces.sh
 	@echo "Checking the limiter the installer declares..."
 	@# WVA_LIMITER=quota wrote `[{type: quota}]`, which the controller REJECTS on
 	@# read -- and a rejected entry costs the whole `default` policy and leaves no
