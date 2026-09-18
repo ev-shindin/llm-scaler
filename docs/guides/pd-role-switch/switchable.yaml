@@ -1,0 +1,152 @@
+# A model on llm-d with replicas that can change P/D role in place.
+#
+# Model-neutral by design: nothing here depends on which model is served,
+# because the property that matters is structural -- llm-d.ai/role is kept
+# out of every selector. Set the model on the `- zai-org/...` line below;
+# it is the only place it appears.
+#
+# The one structural difference from a stock llm-d guide: llm-d.ai/role is NOT
+# in the Deployment selector, so it is an ordinary mutable pod label. A guide
+# puts it in the selector, and because a Deployment's selector is immutable and
+# it owns exactly the pods matching it, relabelling a pod there ORPHANS it and
+# triggers a cold replacement. Measured, both ways -- see check-label-semantics.sh.
+#
+# Every replica is one 8-GPU node at EP=8. The RATIO is which pods carry which
+# role label; the Deployment only maintains total capacity.
+#
+#   kubectl apply -f pd-switchable.yaml
+#   ./switch-role.sh <pod> decode
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pd-switchable
+  namespace: evgensh-pdswitch
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-switchable
+  namespace: evgensh-pdswitch
+  labels:
+    llm-d.ai/guide: pd-switchable
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      # llm-d.ai/role is deliberately ABSENT. Adding it here would make every
+      # role change orphan the pod and start a cold replacement.
+      llm-d.ai/guide: pd-switchable
+      llm-d.ai/model: pd-switchable
+      llm-d.ai/engine-type: vllm
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: pd-switchable
+        llm-d.ai/model: pd-switchable
+        llm-d.ai/engine-type: vllm
+        llm-d.ai/accelerator-vendor: nvidia
+        llm-d.ai/accelerator-variant: gpu
+        llm-d.ai/role: prefill        # starting role only; mutable from here
+    spec:
+      serviceAccountName: pd-switchable
+      containers:
+        - name: modelserver
+          # Either an image built from this branch, or stock vllm/vllm-openai:v0.28.0
+          # with the injection in README step 1b applied at startup.
+          image: vllm/vllm-openai:v0.28.0
+          command: ["vllm", "serve"]
+          args:
+            - zai-org/GLM-5.3          # the model: change this line
+            - --trust-remote-code
+            - --port=8000
+            - --data-parallel-size=8
+            - --data-parallel-size-local=8
+            - --enable-expert-parallel
+            - --tensor-parallel-size=1
+            - --all2all-backend=deepep_v2
+            - --block-size=64
+            - --kv-cache-dtype=fp8
+            - --max-model-len=8192
+            - --gpu-memory-utilization=0.90
+            - --max-num-seqs=128
+            # Boot at the PREFILL budget. This figure also sizes the input
+            # buffers, the compile range and the attention workspace at init, so
+            # a switch may LOWER it but must never raise it past launch.
+            - --max-num-batched-tokens=2048
+            # kv_both covers both directions, which is what a switchable engine
+            # needs, and it is what llm-d sets on both roles. The switch leaves
+            # it alone (see test_kv_role.py).
+            - --kv-transfer-config
+            - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+          env:
+            # Must be the pod's own IP: the peer dials this for the KV handshake.
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            # /switch_pd_role is a development route. Without this the engine
+            # serves normally and every switch returns 404 -- which reads as a
+            # 6 ms switch, not as a missing route.
+            - { name: VLLM_SERVER_DEV_MODE, value: "1" }
+            # 1 on a single-node replica, 0 across nodes. The value inverts.
+            - { name: VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE, value: "1" }
+            # deepep_v2 pads its layout; deep_gemm derives the expert count from
+            # the padded tensor and asserts.
+            - { name: VLLM_USE_DEEP_GEMM, value: "0" }
+            # Park the outgoing buffer: keeps captured CUDA graphs valid and
+            # makes the return switch a reuse rather than a rebuild.
+            - { name: VLLM_PD_KEEP_PREVIOUS, value: "1" }
+            - { name: HF_HOME, value: /hf-cache }
+          ports:
+            - { containerPort: 8000, name: modelserver }
+            - { containerPort: 5600, name: nixl }
+          resources:
+            limits: { nvidia.com/gpu: "8", rdma/ib: "8", cpu: "64", memory: 1200Gi }
+            requests: { nvidia.com/gpu: "8", rdma/ib: "8", cpu: "64", memory: 1200Gi }
+          securityContext:
+            capabilities: { add: ["IPC_LOCK"] }
+          livenessProbe:
+            httpGet: { path: /health, port: modelserver }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /v1/models, port: modelserver }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            # A 700 GB model loads slowly. 120 x 30s = 60 min before giving up.
+            httpGet: { path: /v1/models, port: modelserver }
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 120
+          volumeMounts:
+            - { name: hf, mountPath: /hf-cache }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: hf
+          hostPath: { path: /mnt/local/hf-cache, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 200Gi }
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: pd-switchable
+  namespace: evgensh-pdswitch
+spec:
+  appProtocol: http
+  # Membership keys on the guide, which never changes -- so a role switch never
+  # ejects a replica from the pool.
+  selector:
+    matchLabels:
+      llm-d.ai/guide: pd-switchable
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    group: ""
+    kind: Service
+    name: pd-switchable-epp
+    port:
+      number: 9002
+    failureMode: FailOpen

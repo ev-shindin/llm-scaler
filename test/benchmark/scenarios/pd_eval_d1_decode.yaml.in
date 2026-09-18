@@ -1,0 +1,29 @@
+metadata:
+  labels:
+    name: pd-eval-d1-decode
+    description: |
+      Decode isolation: short prompt, long generation.
+
+      P/D role-switch evaluation. Derived from the GLM-5.2 production platform
+      overview: not a production shape -- deliberately inverted so decode is the bottleneck.
+      512 input / 2,048 output, so prefill cannot mask the decode measurement.
+
+      Rate is one rung of a ladder, not a production figure -- production rates
+      are fleet-wide across 9P+8D and this drives a single group. See
+      docs/proposals/pd-role-switch-evaluation.md.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: poisson
+    rate: __REQUEST_RATE__
+  data:
+  - kind: synthetic_text
+    prompt_tokens: 512
+    output_tokens: 2048
+  constraints:
+  - kind: max_duration
+    seconds: __MAX_DURATION__

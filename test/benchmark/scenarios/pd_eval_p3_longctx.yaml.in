@@ -1,0 +1,29 @@
+metadata:
+  labels:
+    name: pd-eval-p3-longctx
+    description: |
+      Longest measured context: cyber and coding episodes with large histories.
+
+      P/D role-switch evaluation. Derived from the GLM-5.2 production platform
+      overview: CyberGym, 968 req/min carrying 110.9M input tokens/min.
+      115,000 input / 600 output. Reference TTFT p90 17.6 s.
+
+      Rate is one rung of a ladder, not a production figure -- production rates
+      are fleet-wide across 9P+8D and this drives a single group. See
+      docs/proposals/pd-role-switch-evaluation.md.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: poisson
+    rate: __REQUEST_RATE__
+  data:
+  - kind: synthetic_text
+    prompt_tokens: 115000
+    output_tokens: 600
+  constraints:
+  - kind: max_duration
+    seconds: __MAX_DURATION__
