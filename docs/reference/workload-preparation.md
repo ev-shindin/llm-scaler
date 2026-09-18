@@ -77,13 +77,37 @@ and hold with or without a benchmark harness in front of the workload:
 | **Nothing installed at container start.** | The container's command runs the engine and nothing else: no `apt`, `pip`, `curl` or clone before it. Anything the engine needs is in the image. A start that depends on a package mirror is as slow as the mirror that day, which is the one term that makes start time *vary* between otherwise identical replicas. |
 | **`startupProbe` period.** | `periodSeconds` of a few seconds; a probe that fires every 30 s reports a started engine up to 30 s late, every time. Keep the time budget by raising `failureThreshold` (period 5 with threshold 360 is the same 30 minutes as period 30 with threshold 60). The first probes fail on connection refused while the server binds; that is what the threshold is for. |
 | **Engine caches that outlive the pod.** | vLLM writes its torch.compile artefacts, the FlashInfer autotune table and Triton's JIT cache under `/tmp` unless told otherwise, so every replica recompiles from nothing. Point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` at a read-write path shared across replicas -- a subPath of an RWX claim -- and the second replica finds the first one's. If the model claim is mounted read-only, use another claim rather than mounting it a second time: a CSI driver publishes a claim once per pod, and the second mount inherits read-only. And make the engine tolerate a cache path that turns out not to be writable -- a storage hiccup must cost one compile, not the replica; vLLM fails hard on a read-only cache directory unless the variable is unset first. The cache is keyed by a hash of the engine config, so a changed model, flag or version misses rather than hits stale. |
-| **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts. Pre-pull on every node the workload can schedule to, or keep that set of nodes small and warm. |
+| **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts, and the kubelet evicts unused images under disk pressure, so "it was pulled once" does not stay true. `make prepull IMAGES=<image> NAMESPACE=<ns>` holds the image open on every accelerator node (one DaemonSet per image, the image itself asleep, no accelerator requested), and `make prepull-status` says per node whether the kubelet has it -- see [Holding the image on the nodes](#holding-the-image-on-the-nodes). With the image held, a pinned tag should pull `IfNotPresent`: `Always` contacts the registry at every start for a digest that cannot have changed. |
 | **The weights** | are the section above. |
 
 What is left after those is the cold process itself -- imports, the API
 server, the KV-transfer connector, the profile run -- and the weight load on a
 large model. Below that floor the only lever is not starting cold: the
 [warm pool](../guides/warm-pool/), or a minimum replica count of two.
+
+### Holding the image on the nodes
+
+```bash
+# exactly the reference the model server's pod spec names, tag or digest included
+make prepull IMAGES=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=<ns>
+make prepull-status NAMESPACE=<ns>          # per accelerator node: present / absent, and the holder's state
+make prepull-delete NAMESPACE=<ns>          # stop holding every image (or IMAGES=<image> for one)
+```
+
+`PREPULL_NODE_SELECTOR=<key=value>` picks the nodes (default
+`nvidia.com/gpu.present=true`, the GPU operator's label; set it to whatever
+the model servers select on). The holder runs the image itself, asleep, with a
+memory limit and no accelerator: a container that exited would not protect
+its image from the kubelet's garbage collection, a running one does. Several
+images are a comma-separated list. Nothing in WVA depends on the holder; it
+is a start-time measure, and `prepull-status` is how you know it worked --
+the node's own image list is compared against the reference, so an image
+named differently from what the pods pull shows as absent on every node.
+A node whose holder reads `Failed Evicted` is under `DiskPressure`: the
+kubelet is evicting pods and garbage-collecting images there, a replica
+scheduled to it would pull from scratch, and nothing in the namespace can
+fix that -- it is the node's disk. (Seen on the first run of this on a
+17-node cluster: 16 held the image within two minutes, one was that node.)
 
 The benchmark harness this repository uses puts its own steps on the engine's
 start path; what they are and how the benchmark scenarios handle them is in

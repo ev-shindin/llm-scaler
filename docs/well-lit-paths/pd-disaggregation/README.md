@@ -96,6 +96,9 @@ export IMG=<the image under test>          # what is measured is what you set he
 export KEDA_HELM_INSTALL=true              # only if the cluster has no KEDA
 
 make benchmark-install
+# The engine image on every accelerator node first: a replica that has to
+# pull it starts a minute late, and the first ramp is sized by that minute.
+make prepull IMAGES=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=$BENCHMARK_NAMESPACE
 make benchmark-standup BENCHMARK_SPEC=guides/pd-disaggregation MODEL_ID=Qwen/Qwen3-0.6B
 
 # The HPA behaviour the results below were measured under. deploy/ ships a

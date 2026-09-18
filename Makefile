@@ -581,6 +581,27 @@ model-cache: ## Create the weights PVC. NAMESPACE=<ns> WVA_MODEL_PVC_SIZE=<size>
 		$(if $(WVA_MODEL_PVC_CLASS),WVA_MODEL_PVC_CLASS=$(WVA_MODEL_PVC_CLASS),) \
 		bash -c 'source deploy/lib/common.sh; source deploy/lib/scaledobject.sh; wva_bootstrap_env; wva_model_cache "$(if $(filter command line environment,$(origin NAMESPACE)),$(NAMESPACE),$${WVA_NS})"'
 
+## Keep an engine image on every accelerator node, so a scale-up never starts
+## with a pull. One DaemonSet per image, holding the image open (no accelerator
+## requested, a few megabytes); `prepull-status` says per node whether the
+## kubelet has it. IMAGES is comma-separated and must name the image exactly as
+## the model server's pod spec does. deploy/prepull.sh --help has the rest.
+PREPULL_NODE_SELECTOR ?= nvidia.com/gpu.present=true
+comma := ,
+.PHONY: prepull prepull-status prepull-delete
+prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> picks the nodes.
+	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
+	@test -n "$(NAMESPACE)" || { echo "prepull: set NAMESPACE=<ns>" >&2; exit 1; }
+	@bash deploy/prepull.sh apply -n "$(NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
+
+prepull-status: ## Per accelerator node: is each held image present, and what its holder is doing. NAMESPACE=<ns> [IMAGES=<img>]
+	@test -n "$(NAMESPACE)" || { echo "prepull-status: set NAMESPACE=<ns>" >&2; exit 1; }
+	@bash deploy/prepull.sh status -n "$(NAMESPACE)" --node-selector "$(PREPULL_NODE_SELECTOR)" $(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i))
+
+prepull-delete: ## Stop holding IMAGES=<img>[,<img>] (or every held image with IMAGES unset) in NAMESPACE=<ns>.
+	@test -n "$(NAMESPACE)" || { echo "prepull-delete: set NAMESPACE=<ns>" >&2; exit 1; }
+	@bash deploy/prepull.sh delete -n "$(NAMESPACE)" $(if $(IMAGES),$(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i)),--all)
+
 .PHONY: workload-patch
 workload-patch: ## Write a patch for model servers that do not drain on scale-down, or download weights outside every volume they mount. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the volume, after `make model-cache`).
 	@# NAMESPACE pins the SCAN, not just the connection. Without the
@@ -2231,6 +2252,7 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@echo "Syntax-checking deploy shell scripts..."
 	@bash -n deploy/install.sh
 	@bash -n deploy/install-epp.sh
+	@bash -n deploy/prepull.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done
 	@for script in deploy/*/install.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
 	@for script in deploy/kind-emulator/*.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
@@ -2259,6 +2281,10 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# name, a missing ScaledObject (so the pool is never discovered), a worker
 	@# template carrying the proxy (so the group never becomes Ready).
 	@bash hack/check-warmpool-manifests.sh
+	@echo "Checking what prepull.sh actually emits..."
+	@# A holder that requests an accelerator, a selector that lands on every
+	@# node, two images sharing one DaemonSet name: all parse, all wrong.
+	@bash hack/check-prepull-manifests.sh
 	@echo "Checking the accelerator label keys agree..."
 	@# The controller (Go), the planning tools (Python) and the create path
 	@# (shell) each carry their own copy of the node label keys that name a GPU

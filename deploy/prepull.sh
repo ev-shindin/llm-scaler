@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Keep an engine image present on every accelerator node, so a scale-up never
+# starts with a pull.
+#
+# A replica's start time is what the autoscaler's first ramp is sized by, and
+# on a node that does not have the image a 10-20 GB engine image is the largest
+# single term in it -- a minute or more before the container even starts. This
+# runs one DaemonSet per image on the accelerator nodes, holding the image OPEN
+# (the image itself, asleep) rather than pulling it once: a container that
+# exited does not protect its image from the kubelet's image garbage collection
+# under disk pressure, a running one does. It requests no accelerator and a few
+# megabytes of memory.
+#
+#   prepull.sh apply  -n NS --image IMG [--image IMG ...]   pre-pull IMG on every accelerator node
+#   prepull.sh status -n NS [--image IMG]                   which nodes have it, which do not
+#   prepull.sh delete -n NS [--image IMG | --all]           stop holding it
+#
+# Options:
+#   --node-selector KEY=VALUE   which nodes count as accelerator nodes
+#                               (default nvidia.com/gpu.present=true, the GPU
+#                               operator's / NFD's label; set it to whatever
+#                               your model servers select on)
+#   --toleration KEY            tolerate a taint with KEY (any value, any
+#                               effect); nvidia.com/gpu is always tolerated
+#   --dry-run                   print the manifests instead of applying them
+#
+# The image string must be EXACTLY what the model server's pod spec names --
+# same registry prefix, same tag or digest -- or the kubelet has pulled
+# something else. `status` compares against the node's own image list, so a
+# mismatch shows as "absent" on every node, which is the right answer.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BLUE='[0;34m'
+GREEN='[0;32m'
+YELLOW='[1;33m'
+RED='[0;31m'
+NC='[0m'
+# shellcheck source=lib/common.sh
+source "$HERE/lib/common.sh"
+# NOTE: log_error EXITS. Nothing may follow it that needs to run.
+
+KUBECTL="${KUBECTL:-kubectl}"
+NAMESPACE=""
+IMAGES=()
+NODE_SELECTOR="${WVA_PREPULL_NODE_SELECTOR:-nvidia.com/gpu.present=true}"
+TOLERATIONS=("nvidia.com/gpu")
+DRY_RUN=false
+ALL=false
+LABEL_COMPONENT="app.kubernetes.io/component=image-prepull"
+
+usage() {
+    sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+    exit 0
+}
+
+# name_for turns an image reference into a DaemonSet name: the last path
+# element and tag, lower-cased, with everything that is not [a-z0-9-] replaced,
+# truncated to leave room for a hash of the FULL reference -- two images that
+# differ only in registry or digest must not collide on the name.
+name_for() {
+    local image="$1"
+    local base hash
+    base="$(printf '%s' "$image" | sed 's#.*/##; s/@sha256:/-/; s/:/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//')"
+    hash="$(printf '%s' "$image" | sha256sum | cut -c1-8)"
+    printf 'prepull-%s-%s' "${base:0:40}" "$hash" | sed 's/-\{2,\}/-/g'
+}
+
+# render prints the DaemonSet for one image. The pod runs the image itself and
+# sleeps: no accelerator request, no ports, a few megabytes. The image must
+# carry /bin/sh, which every engine image here does; one that does not shows
+# up in `status` as a pod that never became Ready, with the reason.
+render() {
+    local image="$1"
+    local name
+    name="$(name_for "$image")"
+    local key="${NODE_SELECTOR%%=*}"
+    local value="${NODE_SELECTOR#*=}"
+    cat <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ${name}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: image-prepull
+    app.kubernetes.io/component: image-prepull
+    app.kubernetes.io/managed-by: wva-prepull
+  annotations:
+    wva.llmd.ai/prepull-image: "${image}"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: image-prepull
+      wva.llmd.ai/prepull: ${name}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: image-prepull
+        app.kubernetes.io/component: image-prepull
+        wva.llmd.ai/prepull: ${name}
+      annotations:
+        wva.llmd.ai/prepull-image: "${image}"
+    spec:
+      nodeSelector:
+        ${key}: "${value}"
+      tolerations:
+$(for t in "${TOLERATIONS[@]}"; do printf '        - key: "%s"\n          operator: Exists\n' "$t"; done)
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: hold
+          image: "${image}"
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait \$!; done"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+EOF
+}
+
+cmd_apply() {
+    [ -n "$NAMESPACE" ] || log_error "apply needs -n NAMESPACE"
+    [ "${#IMAGES[@]}" -gt 0 ] || log_error "apply needs at least one --image"
+    for image in "${IMAGES[@]}"; do
+        if [ "$DRY_RUN" = true ]; then
+            render "$image"
+            echo "---"
+            continue
+        fi
+        render "$image" | $KUBECTL apply -n "$NAMESPACE" -f - >/dev/null
+        log_info "holding ${image} on nodes with ${NODE_SELECTOR} (DaemonSet $(name_for "$image"))"
+    done
+    [ "$DRY_RUN" = true ] || cmd_status
+}
+
+# cmd_status lists, per selected node, whether the image is present and what
+# the holder pod on that node is doing. "present" is either of two facts: the
+# holder is Running (its container IS the image, so the kubelet has it), or
+# the node's own image list names the reference. The second alone is not
+# enough: the kubelet reports at most 50 images per node (--node-status-max-
+# images), so on a busy node an image can be present and unlisted. A node
+# whose holder is Failed with a reason (Evicted under DiskPressure, an image
+# the registry will not serve) shows that reason: that node is the one a
+# replica would start slowly on, and the holder cannot fix it from inside.
+cmd_status() {
+    [ -n "$NAMESPACE" ] || log_error "status needs -n NAMESPACE"
+    local images=("${IMAGES[@]}")
+    if [ "${#images[@]}" -eq 0 ]; then
+        # every image a holder in this namespace declares
+        mapfile -t images < <($KUBECTL get daemonset -n "$NAMESPACE" -l "$LABEL_COMPONENT" \
+            -o jsonpath='{range .items[*]}{.metadata.annotations.wva\.llmd\.ai/prepull-image}{"\n"}{end}' 2>/dev/null | sed '/^$/d')
+    fi
+    [ "${#images[@]}" -gt 0 ] || log_error "no pre-pull DaemonSets in ${NAMESPACE} and no --image given"
+    local nodes_json
+    nodes_json="$($KUBECTL get nodes -l "$NODE_SELECTOR" -o json)"
+    local node_count
+    node_count="$(printf '%s' "$nodes_json" | jq '.items | length')"
+    [ "$node_count" -gt 0 ] || log_error "no nodes match ${NODE_SELECTOR}; set --node-selector to the label your model servers select on"
+    # The pod list goes through a file: as a jq argument it exceeds the argv
+    # limit on a cluster of any size.
+    local pods_file
+    pods_file="$(mktemp)"
+    $KUBECTL get pods -n "$NAMESPACE" -l "$LABEL_COMPONENT" -o json > "$pods_file"
+    local rc=0
+    for image in "${images[@]}"; do
+        local name present
+        name="$(name_for "$image")"
+        present=0
+        echo "${image}"
+        printf '  %-28s %-8s %s\n' NODE IMAGE HOLDER
+        # Per node: listed-by-kubelet, holder phase, holder reason (the pod's
+        # own status.reason first -- Evicted -- then the container state's).
+        while IFS=$'\t' read -r node listed phase reason; do
+            local has=absent
+            if [ "$phase" = Running ] || [ "$listed" = listed ]; then
+                has=present
+                present=$((present + 1))
+            else
+                rc=1
+            fi
+            printf '  %-28s %-8s %s %s\n' "$node" "$has" "$phase" "$reason"
+        done < <(printf '%s' "$nodes_json" | jq -r --arg img "$image" --arg ds "$name" --slurpfile pods "$pods_file" \
+            '.items[] as $node
+             | ($pods[0].items | map(select(.spec.nodeName == $node.metadata.name and .metadata.labels["wva.llmd.ai/prepull"] == $ds)) | first) as $pod
+             | [ $node.metadata.name,
+                 (if ([$node.status.images[]?.names[]?] | index($img)) != null then "listed" else "unlisted" end),
+                 (if $pod == null then "no pod"
+                  elif $pod.status.phase == "Running" and (($pod.status.containerStatuses // []) | map(.ready) | all) then "Running"
+                  else $pod.status.phase + " (not ready)" end),
+                 (if $pod == null then ""
+                  else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // ""))) end)
+               ] | @tsv')
+        echo "  ${present}/${node_count} nodes hold it; $((node_count - present)) do not"
+    done
+    rm -f "$pods_file"
+    return $rc
+}
+
+cmd_delete() {
+    [ -n "$NAMESPACE" ] || log_error "delete needs -n NAMESPACE"
+    if [ "$ALL" = true ]; then
+        $KUBECTL delete daemonset -n "$NAMESPACE" -l "$LABEL_COMPONENT" --ignore-not-found
+        return
+    fi
+    [ "${#IMAGES[@]}" -gt 0 ] || log_error "delete needs --image IMG or --all"
+    for image in "${IMAGES[@]}"; do
+        $KUBECTL delete daemonset -n "$NAMESPACE" "$(name_for "$image")" --ignore-not-found
+    done
+}
+
+CMD="${1:-}"
+[ -n "$CMD" ] || usage
+shift
+case "$CMD" in
+    -h|--help|help) usage ;;
+    apply|status|delete) ;;
+    *) log_error "unknown command: ${CMD} (apply | status | delete)" ;;
+esac
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--namespace) NAMESPACE="$2"; shift 2 ;;
+        --image) IMAGES+=("$2"); shift 2 ;;
+        --node-selector) NODE_SELECTOR="$2"; shift 2 ;;
+        --toleration) TOLERATIONS+=("$2"); shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --all) ALL=true; shift ;;
+        -h|--help) usage ;;
+        *) log_error "unknown option: $1" ;;
+    esac
+done
+case "$NODE_SELECTOR" in
+    *=*) ;;
+    *) log_error "--node-selector must be KEY=VALUE, got '${NODE_SELECTOR}'" ;;
+esac
+
+"cmd_${CMD}"

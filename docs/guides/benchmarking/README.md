@@ -271,7 +271,22 @@ become Ready ([why](../../reference/workload-preparation.md#the-rest-of-the-star
 llm-d-benchmark adds steps of its own to that path, and a benchmark that keeps
 them measures the harness, not the autoscaler. The scenarios under
 `hack/benchmark/scenarios/guides/` handle three of them; a scenario of your own
-should copy the same three blocks.
+should copy the same three blocks. A fourth is the cluster's, not the
+harness's, and comes first:
+
+**The image is on every accelerator node before the standup.** The harness
+pins the engine image (`docker.io/vllm/vllm-openai:v0.26.0` in v0.7.8's
+`defaults.yaml`); a replica scheduled to a node without it pulls 10-20 GB
+before its container starts, which on the shape-swap runs was the difference
+between a 63 s and a 175 s second replica. Hold it once per cluster:
+
+```bash
+make prepull IMAGES=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=$BENCHMARK_NAMESPACE
+make prepull-status NAMESPACE=$BENCHMARK_NAMESPACE      # every accelerator node: present
+```
+
+The scenarios pull the engine `IfNotPresent` for the same reason -- a pinned
+tag pulled `Always` still asks the registry at every start.
 
 **Package installs at engine start.** The `preprocess` init container
 (`set_llmdbench_environment.py`, from the harness image) writes
@@ -322,6 +337,8 @@ kubectl exec -n $BENCHMARK_NAMESPACE $D -c vllm -- grep -c apt-get /shared-confi
 # the second replica should report a compile-cache hit, not a compile; a
 # "not writable" line here means the guard fell back to the engine default
 kubectl logs -n $BENCHMARK_NAMESPACE $D -c vllm | grep -E 'torch.compile took|Using cache directory|not writable'
+# the image was on the node: container started within seconds of scheduling
+kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].lastTransitionTime}{" scheduled, container up "}{.status.containerStatuses[?(@.name=="vllm")].state.running.startedAt}{"\n"}'
 ```
 
 ## Snapshotting a run

@@ -453,7 +453,12 @@ shared:
               - "SYS_RAWIO"
           runAsGroup: 0
           runAsUser: 0
-        imagePullPolicy: Always
+        # IfNotPresent, not Always: the engine tag is pinned, and Always contacts the
+        # registry at every pod start -- a second when it answers, a failed start
+        # when it does not -- for a digest that cannot have changed. Pre-pull the
+        # image on the accelerator nodes with `make prepull` and the start never
+        # waits on the registry at all.
+        imagePullPolicy: IfNotPresent
 
       vllm:
         # `${accelerator.*}` fragments and `$MODEL_PATH` / `$MODEL_NAME` /
