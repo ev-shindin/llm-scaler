@@ -97,9 +97,13 @@ make prepull-delete NAMESPACE=<ns>          # stop holding every image (or IMAGE
 By default the holder lands on every node carrying any known GPU product
 label -- GPU Feature Discovery's, CoreWeave's, GKE's, EKS's, Karpenter's,
 the AMD operator's; the list in `deploy/lib/accelerator_nodes.sh`, the same
-one the controller resolves nodes through -- which is where the model
-servers go when they select on nothing. `PREPULL_NODE_SELECTOR=<key=value>`
-narrows that to what the model servers select on, when they do.
+one the controller resolves nodes through. What places the model servers
+is their accelerator *resource* request, not a label, so on a cluster of
+one vendor these are the same nodes; on a cluster mixing vendors the
+default also holds a CUDA image on AMD, Intel or Gaudi nodes, where the
+engine can never run -- `prepull-status` names those nodes and warns, and
+there `PREPULL_NODE_SELECTOR=<key=value>` is required, not optional: set it
+to what the model servers select on.
 `PREPULL_TOLERATIONS=<key>[,<key>]` adds taints beyond `nvidia.com/gpu`,
 which is always tolerated: a holder `Pending` on every node with no reason
 is a taint it does not tolerate. `prepull-status` lists the nodes each

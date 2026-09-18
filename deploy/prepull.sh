@@ -246,29 +246,55 @@ cmd_status() {
         holders=0
         selector="$NODE_SELECTOR"
         if [ "$NODE_SELECTOR_GIVEN" = false ]; then
+            # Off the live DaemonSet's pod template, not an annotation: a
+            # nodeSelector is the KEY=VALUE it was applied with (a DaemonSet
+            # from before this script recorded anything included), none is
+            # the affinity default.
             selector="$(kubectl get daemonset -n "$NAMESPACE" "$name" \
-                -o jsonpath='{.metadata.annotations.wva\.llmd\.ai/prepull-node-selector}' 2>/dev/null || true)"
+                -o jsonpath='{.spec.template.spec.nodeSelector}' 2>/dev/null \
+                | jq -r 'to_entries | map(.key + "=" + .value) | first // ""' 2>/dev/null || true)"
+            # Read off an object a namespace tenant can edit; held to the
+            # same rule as the flag before it reaches kubectl.
+            local why
+            if ! why="$(accelerator_selector_ok "$selector")"; then
+                if [ "$mode" = report ]; then
+                    log_warning "DaemonSet ${name} carries a nodeSelector this script did not write (${why}); pass --node-selector to report on it"
+                    rc=1
+                    continue
+                fi
+                log_error "DaemonSet ${name} carries a nodeSelector this script did not write (${why}); pass --node-selector to report on it"
+            fi
         fi
-        local nodes_json
+        local nodes_json err_file
+        err_file="$(mktemp)"
         # Caught on the line: in report mode this runs under `|| true`, which
         # turns set -e off inside the function, and a Forbidden (a namespace
         # tenant listing nodes) must be a failure with a reason, not a report
-        # of "0/ nodes".
-        if ! nodes_json="$(accelerator_nodes_json "$selector")"; then
-            if [ "$mode" = report ]; then
-                log_warning "cannot list nodes (a namespace tenant may not); the DaemonSets are applied, but this report needs cluster-scoped node read -- ask for cluster-reader or check with the cluster admin"
-                rm -f "$pods_file"
-                return 1
+        # of "0/ nodes". The reason is kubectl's, and only a Forbidden is the
+        # permission story.
+        if ! nodes_json="$(accelerator_nodes_json "$selector" 2>"$err_file")"; then
+            local why
+            if grep -q Forbidden "$err_file"; then
+                why="a namespace tenant may not list nodes; this needs cluster-scoped node read (cluster-reader) -- ask for it or check with the cluster admin"
+            else
+                why="$(tr '\n' ' ' < "$err_file")"
             fi
-            log_error "cannot list nodes: status needs cluster-scoped node read (cluster-reader), which a namespace tenant does not have"
+            rm -f "$err_file"
+            if [ "$mode" = report ]; then
+                log_warning "cannot list nodes for ${image}: ${why}"
+                rc=1
+                continue
+            fi
+            log_error "cannot list nodes: ${why}"
         fi
+        rm -f "$err_file"
         local node_count
         node_count="$(printf '%s' "$nodes_json" | jq '.items | length')"
         if [ "$node_count" -eq 0 ]; then
             if [ "$mode" = report ]; then
-                log_warning "no node matches $(accelerator_selector_text "$selector"); the holder will run nowhere (--node-selector picks the nodes)"
-                rm -f "$pods_file"
-                return 1
+                log_warning "no node matches $(accelerator_selector_text "$selector"); ${image} will be held nowhere (--node-selector picks the nodes)"
+                rc=1
+                continue
             fi
             log_error "no node matches $(accelerator_selector_text "$selector") (--node-selector picks the nodes)"
         fi
@@ -307,6 +333,7 @@ cmd_status() {
                   else ($pod.status.reason // ((($pod.status.containerStatuses // [])[0].state // {}) | to_entries | (.[0].value.reason // ""))) end)
                ] | @tsv')
         echo "  $((present + pulled))/${node_count} nodes have it (${present} held, ${pulled} pulled but not held); $((node_count - present - pulled)) do not"
+        [ -n "$selector" ] || printf '%s' "$nodes_json" | accelerator_vendor_warning
         # No holder anywhere is the DaemonSet controller failing to create
         # pods -- a Pod Security "restricted" namespace (runAsNonRoot), a
         # ResourceQuota, a LimitRange -- and the reason is on the DaemonSet's

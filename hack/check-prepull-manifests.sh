@@ -136,12 +136,14 @@ if bad:
 print("  ok   %d DaemonSets rendered: names, placement (selector or product-key affinity), tolerations, no accelerator, no SA token, no GPU injection, seccomp, IfNotPresent" % len(docs))
 PYEOF
 
+selbad=0
 for badsel in notakeyvalue 'a=b"' 'a=b,c=d' '=v' 'a b=c'; do
     if bash deploy/prepull.sh apply -n check-ns --image a:1 --node-selector "$badsel" --dry-run >/dev/null 2>&1; then
-        fail "a --node-selector of '$badsel' must be refused"
+        fail "a --node-selector of '$badsel' must be refused"; selbad=1
     fi
 done
-ok "a --node-selector that is not one KEY=VALUE of label characters is refused"
+[ "$selbad" -eq 0 ] && ok "a --node-selector that is not one KEY=VALUE of label characters is refused"
+if bash deploy/prepull.sh status -n check-ns --dry-run >/dev/null 2>&1; then fail "status must refuse --dry-run"; else ok "status: --dry-run is refused (an apply/delete option)"; fi
 if bash deploy/prepull.sh apply -n check-ns --image a:1 --toleration '' --dry-run >/dev/null 2>&1; then
     fail "an empty --toleration (which tolerates every taint) must be refused"
 else
@@ -200,7 +202,8 @@ cat > "$T/nodes.json" <<EOF
  {"metadata":{"name":"node-nopod",    "labels":{"nvidia.com/gpu.product":"H200"}}, "status":{"images":[{"names":["something/else:1"]}]}},
  {"metadata":{"name":"node-noimages", "labels":{"nvidia.com/gpu.product":"H200"}}},
  {"metadata":{"name":"node-cpu",      "labels":{"kubernetes.io/os":"linux"}},       "status":{"images":[{"names":["${IMG}"]}]}},
- {"metadata":{"name":"node-cpu-cw",   "labels":{"gpu.nvidia.com/model":"","gpu.nvidia.com/class":""}}, "status":{"images":[]}}
+ {"metadata":{"name":"node-cpu-cw",   "labels":{"gpu.nvidia.com/model":"","gpu.nvidia.com/class":""}}, "status":{"images":[]}},
+ {"metadata":{"name":"node-amd",      "labels":{"amd.com/gpu.product-name":"MI300X"}}, "status":{"images":[]}}
 ]}
 EOF
 cat > "$T/pods.json" <<EOF
@@ -231,13 +234,16 @@ case "\$1 \$2" in
   "get nodes")
       if [ -n "\${STUB_SELECTOR:-}" ]; then want -l "\$STUB_SELECTOR"; else refuse -l; fi
       [ -n "\${STUB_NODES_FORBIDDEN:-}" ] && { echo 'Error from server (Forbidden): nodes is forbidden' >&2; exit 1; }
+      [ -n "\${STUB_NODES_ERROR:-}" ] && { echo "\$STUB_NODES_ERROR" >&2; exit 1; }
       cat "$T/nodes.json" ;;
   "get pods")      want -n check-ns; want -l "$LBL"; cat "$T/pods.json" ;;
   "get daemonset")
       want -n check-ns
       case " \$* " in
         *" -l "*) want -l "$LBL"; printf '%s\n' "\${STUB_DAEMONSETS-${IMG}}" ;;
-        *) printf '%s' "\${STUB_DS_SELECTOR:-}" ;;
+        *) want -o "jsonpath={.spec.template.spec.nodeSelector}"
+           case "\$ARGV" in *" ${DS} "*|*" \${STUB_DS_NAME:-${DS}} "*) ;; *) echo "stub kubectl: get daemonset for a name that is not the DaemonSet:\$ARGV" >&2; exit 2 ;; esac
+           if [ -n "\${STUB_DS_SELECTOR:-}" ]; then jq -cn --arg k "\${STUB_DS_SELECTOR%%=*}" --arg v "\${STUB_DS_SELECTOR#*=}" '{(\$k): \$v}'; else printf '{}'; fi ;;
       esac ;;
   "get events")    want -n check-ns; printf '%s' "\${STUB_EVENT:-}" ;;
   "apply -n")      want -n check-ns; cat >/dev/null; echo "daemonset.apps/x configured" ;;
@@ -269,7 +275,9 @@ grep -q '^  node-cpu ' "$T/status.out" && fail "status: a node with no product l
 grep -q '^  node-cpu-cw ' "$T/status.out" && fail "status: a node whose product labels are EMPTY (a CoreWeave CPU node) was counted" || ok "status: the default placement leaves a node with empty product labels out"
 grep -q 'node-evicted .*Evicted' "$T/status.out" && ok "status: the evicted holder shows its reason" || fail "status: Evicted reason missing"
 grep -q 'node-pulled .*not held' "$T/status.out" && ok "status: a pulled-but-unheld image says so" || fail "status: pulled/not-held note missing"
-grep -q '5/8 nodes have it (2 held, 3 pulled but not held); 3 do not' "$T/status.out" && ok "status: the tally separates held from pulled-not-held" || fail "status: tally wrong: $(grep 'nodes have' "$T/status.out")"
+grep -q '5/9 nodes have it (2 held, 3 pulled but not held); 4 do not' "$T/status.out" && ok "status: the tally separates held from pulled-not-held" || fail "status: tally wrong: $(grep 'nodes have' "$T/status.out")"
+grep -q '1 node(s) carry an AMD, Intel or Gaudi accelerator label' "$T/status.out" && ok "status: under the default placement a non-NVIDIA node is named as held for nothing" || fail "status: vendor warning missing"
+grep -q 'carry an AMD' "$T/sel.out" 2>/dev/null && fail "status: the vendor warning must not print under an explicit selector" || true
 [ "$rc" -ne 0 ] && ok "status: exits non-zero while a node lacks the image" || fail "status: exit 0 with nodes lacking the image"
 grep -q "^${IMG}  (nodes: any node carrying" "$T/status.out" && ok "status: with no --image the held images are discovered from the DaemonSets, with the recorded placement" || fail "status: discovery from DaemonSets failed: $(head -1 "$T/status.out")"
 grep -q 'stub kubectl:' "$T/status.out" && fail "status: a kubectl call lacked its scope arguments: $(grep 'stub kubectl:' "$T/status.out" | head -1)" || ok "status: every kubectl call carried -n / -l, and none an -l for nodes under the default placement"
@@ -277,10 +285,21 @@ grep -q 'stub kubectl:' "$T/status.out" && fail "status: a kubectl call lacked i
 # the DaemonSet's recorded selector is what status lists nodes with; the flag overrides
 : > "$T/calls"
 STUB_DS_SELECTOR=example.com/accelerator=h200 STUB_SELECTOR=example.com/accelerator=h200 PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns > "$T/recorded.out" 2>&1 || true
-grep -q 'get nodes -l example.com/accelerator=h200' "$T/calls" && ok "status: lists the nodes the DaemonSet was applied for (its recorded selector)" || fail "status: recorded selector not used: $(grep 'get nodes' "$T/calls")"
+grep -q 'get nodes -l example.com/accelerator=h200' "$T/calls" && ok "status: lists the nodes the DaemonSet was applied for (its live nodeSelector, so a DaemonSet from before this script counts too)" || fail "status: live selector not used: $(grep 'get nodes' "$T/calls")"
 : > "$T/calls"
 STUB_DS_SELECTOR=example.com/accelerator=h200 STUB_SELECTOR=other/key=v PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns --image "$IMG" --node-selector other/key=v >/dev/null 2>&1 || true
 grep -q 'get nodes -l other/key=v' "$T/calls" && ok "status: --node-selector overrides the recorded one" || fail "status: override not passed: $(grep 'get nodes' "$T/calls")"
+STUB_SELECTOR=example.com/accelerator=h200 PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns --image "$IMG" --node-selector example.com/accelerator=h200 > "$T/sel.out" 2>&1 || true
+grep -q "^${IMG}  (nodes: example.com/accelerator=h200)" "$T/sel.out" && ok "status: an explicit selector is named in the per-image header" || fail "status: selector text: $(head -1 "$T/sel.out")"
+# a DaemonSet whose live nodeSelector is not one this script writes (a tenant edited it)
+if STUB_DS_SELECTOR='a=b"c' PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns --image "$IMG" > "$T/edited.out" 2>&1; then fail "status must refuse a DaemonSet nodeSelector that is not label characters"; else
+    grep -q 'this script did not write' "$T/edited.out" && ok "status: a DaemonSet nodeSelector this script did not write is refused before it reaches kubectl" || fail "status on an edited DaemonSet: $(tail -1 "$T/edited.out")"; fi
+: > "$T/calls"
+STUB_DS_SELECTOR='a=b"c' PATH="$STUB_PATH" bash deploy/prepull.sh apply -n check-ns --image "$IMG" > "$T/edited-apply.out" 2>&1 || true
+grep -q 'get nodes' "$T/calls" && fail "apply's report passed an unvalidated nodeSelector to kubectl" || ok "apply: the report warns on an edited nodeSelector and never lists nodes with it"
+# nodes cannot be listed for a reason that is not a Forbidden: that reason, not the permission story
+if STUB_NODES_ERROR='error: unable to parse requirement' PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns --image "$IMG" > "$T/notforbidden.out" 2>&1; then fail "status must fail when nodes cannot be listed"; else
+    grep -q 'unable to parse requirement' "$T/notforbidden.out" && ! grep -q 'cluster-reader' "$T/notforbidden.out" && ok "status: a node-list failure that is not a Forbidden reports kubectl's reason, not the permission story" || fail "status non-Forbidden failure: $(tail -1 "$T/notforbidden.out")"; fi
 
 # no DaemonSets and no --image: a clear refusal, not a silent empty walk
 if STUB_DAEMONSETS="" PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns > "$T/none.out" 2>&1; then fail "status with nothing to check must fail"; else
@@ -301,6 +320,9 @@ if STUB_NODES_FORBIDDEN=1 PATH="$STUB_PATH" bash deploy/prepull.sh apply -n chec
 else
     fail "apply must succeed when the report cannot list nodes"
 fi
+# one image's placement problem does not hide the next image's report
+STUB_NODES_FORBIDDEN=1 PATH="$STUB_PATH" bash deploy/prepull.sh apply -n check-ns --image "$IMG" --image ghcr.io/other/engine:1 > "$T/apply-two.out" 2>&1 || true
+[ "$(grep -c 'cannot list nodes' "$T/apply-two.out")" -eq 2 ] && ok "apply: with two images, the report continues past the first image's problem" || fail "apply two images under Forbidden: $(grep -c 'cannot list nodes' "$T/apply-two.out") warning(s)"
 
 # no jq: apply still succeeds (the report is skipped with a warning), status refuses
 mkdir -p "$T/nojq"
@@ -318,7 +340,7 @@ if PATH="$T/bin:$T/nojq" bash deploy/prepull.sh status -n check-ns --image "$IMG
 cp "$T/nodes.json" "$T/nodes-all.json"; printf '{"items":[]}' > "$T/nodes.json"
 if PATH="$STUB_PATH" bash deploy/prepull.sh status -n check-ns --image "$IMG" >/dev/null 2>&1; then fail "status with no matching node must fail"; else ok "status: no matching node is an error"; fi
 if PATH="$STUB_PATH" bash deploy/prepull.sh apply -n check-ns --image "$IMG" > "$T/apply.out" 2>&1; then
-    grep -q 'will run nowhere' "$T/apply.out" && ok "apply: a placement matching no node warns and still succeeds" || fail "apply: the no-node warning is missing"
+    grep -q 'held nowhere' "$T/apply.out" && ok "apply: a placement matching no node warns and still succeeds" || fail "apply: the no-node warning is missing"
 else
     fail "apply must not fail because no node matched (log_error inside status ended the process)"
 fi
@@ -382,11 +404,25 @@ if PATH="$STUB_PATH" make prepull-status > "$T/make-nons.out" 2>&1; then fail "m
 : > "$T/calls"
 PATH="$STUB_PATH" make prepull-status NAMESPACE=check-ns > "$T/make-ns.out" 2>&1 || true
 grep -q '^  node-running ' "$T/make-ns.out" && ok "make prepull-status NAMESPACE=<ns> runs the status against that namespace" || fail "make prepull-status NAMESPACE=check-ns: $(tail -2 "$T/make-ns.out")"
+NAMESPACE=check-ns PATH="$STUB_PATH" make prepull-status > "$T/make-env.out" 2>&1 || true
+grep -q '^  node-running ' "$T/make-env.out" && ok "make prepull-status takes an exported NAMESPACE too (the guides' export convention, as model-cache does)" || fail "make prepull-status with an exported NAMESPACE: $(tail -2 "$T/make-env.out")"
 
 # the standup's pre-pull block, executed: the namespace is created before
 # the apply, BENCHMARK_PREPULL=false skips, BENCHMARK_PREPULL_IMAGES overrides
-block="$(sed -n '/The engine image on every accelerator node BEFORE/,/Lives in a script, not inline here/p' Makefile | sed '1d;$d' | grep -v '^	@#' | sed 's/^	@//; s/\$\$/$/g; s/\$(BENCHMARK_PREPULL)/${BENCHMARK_PREPULL}/g; s/\$(BENCHMARK_PREPULL_IMAGES)/${BENCHMARK_PREPULL_IMAGES}/g; s/\$(BENCHMARK_REPO_DIR)/${BENCHMARK_REPO_DIR}/g; s/\$(BENCHMARK_NAMESPACE)/${BENCHMARK_NAMESPACE}/g; s/\$(PREPULL_ARGS)//g')"
+# tr -d: a CRLF checkout (Windows) turns each recipe continuation into a
+# backslash-CR, which bash does not read as a continuation.
+block="$(tr -d '\r' < Makefile | sed -n '/The engine image on every accelerator node BEFORE/,/Lives in a script, not inline here/p' | sed '1d;$d' | grep -v '^	@#' | sed 's/^	@//; s/\$\$/$/g; s/\$(BENCHMARK_PREPULL)/${BENCHMARK_PREPULL}/g; s/\$(BENCHMARK_PREPULL_IMAGES)/${BENCHMARK_PREPULL_IMAGES}/g; s/\$(BENCHMARK_REPO_DIR)/${BENCHMARK_REPO_DIR}/g; s/\$(BENCHMARK_NAMESPACE)/${BENCHMARK_NAMESPACE}/g; s/\$(PREPULL_ARGS)//g')"
 [ -n "$block" ] || fail "could not extract the benchmark-standup pre-pull block from the Makefile"
+# A make variable the substitution list above does not know would reach
+# bash as a command substitution -- `$(CURDIR)` runs a command named CURDIR,
+# prints "command not found" to stderr and, as an argument, trips nothing.
+# Refuse to run such a block rather than replay a mistranslation.
+if printf '%s' "$block" | grep -Eq '[$][(][A-Z_]+[)]'; then
+    fail "the extracted standup block still holds a make reference the check does not translate: $(printf '%s' "$block" | grep -Eo '[$][(][A-Z_]+[)]' | sort -u | tr '
+' ' ')"
+else
+    ok "standup: the extracted block holds no untranslated make reference (a shell substitution is lowercase)"
+fi
 run_block() { env BENCHMARK_NAMESPACE=check-ns BENCHMARK_REPO_DIR="$T/clone" PATH="$STUB_PATH" "$@" bash -c "$block"; }
 : > "$T/calls"
 run_block BENCHMARK_PREPULL=true BENCHMARK_PREPULL_IMAGES= > "$T/standup.out" 2>&1 || fail "standup block failed: $(cat "$T/standup.out")"

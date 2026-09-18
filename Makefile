@@ -593,8 +593,9 @@ model-cache: ## Create the weights PVC. NAMESPACE=<ns> WVA_MODEL_PVC_SIZE=<size>
 ## Set it to KEY=VALUE when they select on something. PREPULL_TOLERATIONS is a
 ## comma list of taint keys beyond nvidia.com/gpu.
 ##
-## NAMESPACE has a Makefile default (the install's), so these targets require
-## it on the command line -- a status of, or holders in, a namespace nobody
+## NAMESPACE has a Makefile default (the install's), so these targets take it
+## only from the command line or an exported variable (the guides' `export
+## NAMESPACE=...` convention) -- a status of, or holders in, a namespace nobody
 ## named is the wrong answer. Same idiom as model-cache and workload-patch.
 PREPULL_NODE_SELECTOR ?=
 PREPULL_TOLERATIONS ?=
