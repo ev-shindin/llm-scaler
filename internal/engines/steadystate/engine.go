@@ -1617,9 +1617,30 @@ func (e *Engine) applySaturationDecisions(
 		decisionMap[utils.GetNamespacedKey(d.Namespace, d.VariantName)] = d
 	}
 
+	// What the actuator last PUBLISHED per scale target, read before the loop
+	// variable below shadows the decision package. The sticky scale-down judges
+	// a fresh target against this, not against the count the target is
+	// running: the two differ for the whole of KEDA's stabilization window,
+	// which is exactly when a target that has crept back up cancels the descent.
+	sticky := e.Config != nil && e.Config.StickyScaleDownEnabled()
+	published := func(namespace, target string) (int, bool) {
+		d, ok := decision.Get(namespace, target)
+		return int(d.DesiredReplicas), ok
+	}
+
 	// Iterate over ALL active VAs to ensure we update status and trigger reconciliation for everyone
 	for vaName, va := range vaMap {
 		decision, hasDecision := decisionMap[vaName]
+
+		if hasDecision && sticky {
+			p, ok := published(va.Namespace, va.GetScaleTargetName())
+			var held bool
+			if decision, held = holdPublishedScaleDown(decision, p, ok); held {
+				logger.Info("holding the published scale-down against a fresh target that crept back up",
+					"variant", vaName, "published", p, "current", decision.CurrentReplicas,
+					"reason", decision.LastStep().Reason)
+			}
+		}
 
 		if hasDecision {
 			logger.Info("Processing decision for VA",

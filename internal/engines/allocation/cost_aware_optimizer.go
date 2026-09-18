@@ -311,6 +311,9 @@ func buildDecisionsWithOptimizer(
 		}
 		decision.RequiredCapacity = reqCap
 		decision.SpareCapacity = spareCap
+		decision.TotalDemand = vc.TotalDemand
+		decision.PerReplicaCapacity = vc.PerReplicaCapacity
+		decision.ScaleUpThreshold = satNamed.ScaleUpThreshold
 
 		decisions = append(decisions, decision)
 	}
