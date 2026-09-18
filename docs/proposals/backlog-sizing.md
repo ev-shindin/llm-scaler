@@ -597,17 +597,17 @@ Same trace, cluster, stack and HPA policy; image built from this branch at
 (warm, same controller).
 
 ```
-                          run 8 cold      run 9 cold      run 8 warm      run 9 warm
-prefill replicas          2 from +331 s   1 throughout    2 from +51 s    1 throughout
-all-pod GPU-min           167.8           137.9           168.0           132.9
-decode GPU-min            95.7            99.1            93.1            94.2
-2nd decode ordered/Ready  +85 / +168      +70 / +221      +66 / +153      +48 / +133
-first-ramp peak           3               4               3               3
-TTFT p95 / p99            7.9 s / 25.2 s  25.3 s / 49.8 s 243 ms / 17.3 s 194 ms / 3.3 s
-p95, minutes 0-5          5.0 s           21.5 s          5.8 s           0.59 s
-p95, minutes 20-25        4.1 s           4.4 s           0.22 s          0.22 s
-P1-obs-downstream lines   --              0               --              0
-prefill-demand-held       --              11 (+130..+340) --              9
+                          run 8 cold      run 9 cold      run 9 cold, 2nd  run 8 warm      run 9 warm
+prefill replicas          2 from +331 s   1 throughout    1 throughout     2 from +51 s    1 throughout
+all-pod GPU-min           167.8           137.9           142.1            168.0           132.9
+decode GPU-min            95.7            99.1            103.4            93.1            94.2
+2nd decode ordered/Ready  +85 / +168      +70 / +221      +77 / +165       +66 / +153      +48 / +133
+first-ramp peak           3               4               3                3               3
+TTFT p95 / p99            7.9 s / 25.2 s  25.3 s / 49.8 s 241 ms / 14.1 s  243 ms / 17.3 s 194 ms / 3.3 s
+p95, minutes 0-5          5.0 s           21.5 s          2.9 s            5.8 s           0.59 s
+p95, minutes 20-25        4.1 s           4.4 s           0.21 s           0.22 s          0.22 s
+P1-obs-downstream lines   --              0               0                --              0
+prefill-demand-held       --              11 (+130..+340) 9 (+137..+257)   --              9
 ```
 
 Prefill never left one replica on either pass: 30-35 GPU-minutes per pass
@@ -626,8 +626,17 @@ same volume. The lone replica tipped at its usual ~+90 s, the backlog ran
 two minutes instead of one, and the throughput floor priced it as a fourth
 replica at +265 s and released it at +355 s. Nothing here touches decode's
 demand or a pod's start; the phase switch at +1200 s, where the same
-paths run without a start, is 4.4 s against 4.1 and 3.5 s. A second cold
-pass on the same image is below.
+paths run without a start, is 4.4 s against 4.1 and 3.5 s. The second
+cold pass (run `guidellm-1789768002-eb450o_1`, controller restarted, 0
+history lines before the load) drew a 67 s start for its second decode
+replica, Ready at +165 s, and its first window is 2.9 s at p95 -- the
+lowest cold ramp of the series (7.3, 5.0 and 21.5 s before it) -- with
+prefill again at one and the hold again on the cycles decode was full and
+queued. Its decode GPU-minutes are the highest of the cold passes (103.4)
+for a reason outside this change: the decode target chattered 3, 2, 3, 2
+from +272 s to +1023 s and the HPA's window kept the third replica until
++1202 s, the descent that PR #73's sticky scale-down exists for, which is
+not in this image.
 
 The re-run did not get the signals that separate held blocks from bursts
 (prefill's `num_requests_running`, its KV at the queue peak, the EPP
