@@ -10,7 +10,7 @@ This page is the operational entry point. Two longer subjects have their own:
 >   that answer specific questions, and reading the logs.
 > - **[Preparing a workload to be scaled](workload-preparation.md)** -- the model
 >   cache, draining before scale-down, `make workload-patch`, and the rest of
->   the start path (`make prepull`).
+>   the start path (`make prepull`, `make weights`).
 
 ## Verifying the install
 

@@ -745,3 +745,84 @@ io.open(path, "w", encoding="utf-8", newline="\n").write(src)
 print("  fix 10 (startup probe period): applied")
 PYEOF
 fi
+
+# ---------------------------------------------------------------------------
+# Fix 11 -- 03_download_daemonset.yaml.j2: "ready" means the download is done,
+# and the downloader can be placed by affinity.
+#
+# storage.hostPath (node-local weights, docs/reference/workload-preparation.md)
+# has the standup wait for the download DaemonSet with wait_for_daemonset,
+# which succeeds on numberReady == desired. The downloader has no readiness
+# probe, so a container is Ready the moment it starts -- the wait returned
+# while every node was still downloading, and the engines then started on a
+# half-written model directory. A readinessProbe on the completion marker
+# makes Ready mean what the wait assumes. And the template takes only a
+# nodeSelector, which cannot express "any of these product labels"; an
+# optional storage.hostPath.affinity renders as the pod's affinity, which is
+# how hack/benchmark/model_hostpath.sh places it on every accelerator node.
+#
+# And the downloader's `chcon -R -t container_file_t` -- the SELinux relabel
+# for OpenShift readers -- fails on a node without SELinux ("can't apply
+# partial context to unlabeled file"), and under the script's `set -e` that
+# ends it before the marker is written: measured on kermit (Ubuntu), all 16
+# downloaders crash-looped, each restart downloading the model again and
+# never marking it. The relabel is best-effort now.
+# ---------------------------------------------------------------------------
+DS_TPL="$REPO_DIR/config/templates/jinja/03_download_daemonset.yaml.j2"
+if [ ! -f "$DS_TPL" ]; then
+    note "fix 11 (download DaemonSet readiness + affinity): no template, skipped"
+else
+    "$PY" - "$DS_TPL" <<'PYEOF' || fail "fix 11 (download DaemonSet readiness + affinity) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+PROBE_OLD = '''          image: {{ images.benchmark.repository }}:{{ images.benchmark.tag }}
+          command: ["/bin/sh", "-c"]
+'''
+PROBE_NEW = '''          image: {{ images.benchmark.repository }}:{{ images.benchmark.tag }}
+          # wva-patch: Ready is "the download finished on this node", which is
+          # what the standup's wait for this DaemonSet assumes.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "{{ storage.hostPath.path }}/{{ model.path }}/.download-complete"]
+            periodSeconds: 10
+          command: ["/bin/sh", "-c"]
+'''
+AFF_OLD = '''{% if storage.hostPath.tolerations is defined and storage.hostPath.tolerations %}
+      tolerations:
+{{ storage.hostPath.tolerations | toyaml | indent(8, true) }}
+{% endif %}
+'''
+AFF_NEW = '''{% if storage.hostPath.tolerations is defined and storage.hostPath.tolerations %}
+      tolerations:
+{{ storage.hostPath.tolerations | toyaml | indent(8, true) }}
+{% endif %}
+{# wva-patch: an affinity, for a placement a nodeSelector cannot express #}
+{% if storage.hostPath.affinity is defined and storage.hostPath.affinity %}
+      affinity:
+{{ storage.hostPath.affinity | toyaml | indent(8, true) }}
+{% endif %}
+'''
+CHCON_OLD = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}"
+'''
+CHCON_NEW = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null || echo "Relabelling skipped: no SELinux on this node (wva-patch)."
+'''
+if PROBE_NEW in src and AFF_NEW in src and CHCON_NEW in src:
+    print("  fix 11 (download DaemonSet readiness + affinity): already applied")
+    sys.exit(0)
+# an earlier form of this fix lacked the chcon part; complete it
+if PROBE_NEW in src and AFF_NEW in src and src.count(CHCON_OLD) == 1:
+    src = src.replace(CHCON_OLD, CHCON_NEW, 1)
+    io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+    print("  fix 11 (download DaemonSet readiness + affinity): chcon made best-effort")
+    sys.exit(0)
+for old in (PROBE_OLD, AFF_OLD, CHCON_OLD):
+    if src.count(old) != 1:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): " + old.splitlines()[0].strip())
+src = src.replace(PROBE_OLD, PROBE_NEW, 1).replace(AFF_OLD, AFF_NEW, 1).replace(CHCON_OLD, CHCON_NEW, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 11 (download DaemonSet readiness + affinity): applied")
+PYEOF
+fi

@@ -150,6 +150,74 @@ Three things to know before relying on it:
   digest (`repo@sha256:...`) -- the holder, `status` and the model
   server's pod spec all take one.
 
+
+### Weights on the node's disk
+
+The shared cache above is where the weights are; it is not where they are
+read fastest. Every replica reads the whole model through the network
+filesystem behind the claim, and replicas starting together -- which is
+what a scale-up is -- share that pipe. For a small model on a fast shared
+class that is seconds and not worth a second copy. For a large one it is
+the start path: on one cluster, two nodes reading one 700 GB model from
+the shared volume took 1403 s against ~104 s from the node's own NVMe --
+past the engine's 600 s startup timeout, so the replica never came up at
+all. The load term the previous section describes stays either way; this
+removes the read term when it is the one that dominates.
+
+```bash
+# the engine image is any image carrying huggingface_hub; the claim is printed
+make weights WEIGHTS_MODEL=Qwen/Qwen3-32B WEIGHTS_PATH=/mnt/local/models \
+     WEIGHTS_IMAGE=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=<ns>
+make weights-status NAMESPACE=<ns>          # per accelerator node: present / downloading, and why not
+make weights-delete NAMESPACE=<ns>          # drop the claim, volume and downloader; the files stay
+```
+
+One static `hostPath` PersistentVolume, one claim bound to it (and to no
+other: the volume carries a `claimRef`), and one DaemonSet that downloads
+the model onto every accelerator node -- the same placement as the image
+holder, `WEIGHTS_NODE_SELECTOR` / `WEIGHTS_TOLERATIONS` defaulting to the
+`PREPULL_*` values -- and then reports Ready, so `weights-status` and the
+DaemonSet's own `numberReady` both mean "the download finished on this
+node". The model lands under `<dir>/models/<id>`, the layout the benchmark
+harness uses, and a model server mounts it as `pvc://<claim>/models/<id>`,
+the way it mounts any claim: each node then reads its own copy, and nothing
+in the pod spec says hostPath. A gated model takes
+`WEIGHTS_HF_TOKEN_SECRET=<secret>[/<key>]`. Deleting keeps the files; the
+next apply finds the marker and downloads nothing.
+
+What it costs, and what it needs:
+
+- Disk: the model's size on every accelerator node, and the download from
+  Hugging Face once per node -- a 60 GB model on 16 nodes is a terabyte of
+  egress, once. The directory is the cluster's: pick one on the node's
+  local disk (`/mnt/local/...` on CoreWeave), not on a network mount, or
+  nothing was gained.
+- Leave to create PersistentVolumes, which are cluster-scoped; a namespace
+  tenant does not have it. Ask the cluster admin to run `make weights` or
+  to create the volume; the rest is namespaced.
+- Pod Security `baseline` admits the downloader (it mounts the claim, not a
+  hostPath); `restricted` does not (the image runs as root). On OpenShift
+  the downloader needs the `anyuid` SCC: the node directory is root-owned,
+  and `restricted-v2` would run it as a UID that cannot write there. With
+  SELinux enforcing, pods of one namespace share a level, so the engines
+  read what the downloader wrote; another namespace's do not.
+- A node that joins later has no copy until the DaemonSet reaches it, and a
+  replica scheduled there meanwhile reads from a directory that is being
+  written. `weights-status` says which nodes are there yet. A cordoned node
+  or one under `DiskPressure` still counts for the DaemonSet (its controller
+  tolerates both), keeps evicting the downloader, and shows as `absent
+  Evicted` for as long as it is in that state; nothing in the namespace
+  fixes that node.
+
+On node-local NVMe the engine's default loader (memory-mapped safetensors)
+is the right one; `--safetensors-load-strategy prefetch` exists for network
+filesystems and buys nothing here. Loaders that read with direct I/O and
+many threads exist and are a further step, unmeasured here.
+
+The benchmark standup has the same measure under
+`BENCHMARK_MODEL_HOSTPATH=<dir>`; what the harness does with it is in
+[Benchmark WVA](../guides/benchmarking/README.md#replica-start-time-in-the-harness).
+
 The benchmark harness this repository uses puts its own steps on the engine's
 start path; what they are and how the benchmark scenarios handle them is in
 [Benchmark WVA](../guides/benchmarking/README.md#replica-start-time-in-the-harness).

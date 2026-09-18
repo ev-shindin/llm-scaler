@@ -195,6 +195,7 @@ Optional, except `BENCHMARK_NAMESPACE`.
 | `BENCHMARK_PREPULL_IMAGES` | the engine image the harness pins | `ghcr.io/you/engine:tag` |
 | `PREPULL_NODE_SELECTOR` | *(empty: every node with a known GPU product label)* | `example.com/accelerator=h200` |
 | `PREPULL_TOLERATIONS` | *(empty: `nvidia.com/gpu` only)* | `dedicated,example.com/pool` |
+| `BENCHMARK_MODEL_HOSTPATH` | *(empty: the shared volume)* | `/mnt/local/wva-weights` |
 
 **The harness image must match `BENCHMARK_REPO_REF`.** The harness pod always
 runs the checkout's scripts — they are copied in from a ConfigMap built from the
@@ -300,6 +301,42 @@ accelerator requested) is
 it applies to any workload WVA scales, not only a benchmark. The scenarios
 pull the engine `IfNotPresent` for the same reason -- a pinned tag pulled
 `Always` still asks the registry at every start.
+
+**The weights can be on every accelerator node's disk before the run.**
+`BENCHMARK_MODEL_HOSTPATH=<directory on the node>` makes the standup turn on
+the harness's own node-local mode in the scenario copy: `model-pvc` binds
+to a static hostPath volume there, a DaemonSet downloads the model onto
+every accelerator node (the placement `make prepull` uses; `PREPULL_NODE_SELECTOR`
+narrows it), and the engines deploy only once every node holds it --
+`patch_harness.sh` fix 11 gives that DaemonSet a readiness probe on the
+completion marker, since the harness's wait reads `numberReady` and a
+container with no probe is Ready the moment it starts, and makes its SELinux
+relabel best-effort: on a node without SELinux `chcon` fails, and under the
+downloader's `set -e` that ended the script before the marker -- every
+downloader crash-looped, re-downloading on each restart. The download Job is
+skipped. Three things to know: the harness waits for EVERY node the
+DaemonSet counts, and a DaemonSet counts a cordoned node and a node under
+`DiskPressure` too (its controller tolerates both taints), so a node that
+keeps evicting the downloader holds the standup until `daemonSetTimeout`
+(3600 s) and then fails it -- a `NoSchedule` taint of your own on that node
+takes it out of the count (seen on kermit: one cordoned node under
+DiskPressure since the day before, 16/17 for 22 minutes); the standup refuses a namespace whose
+`model-pvc` already sits on another storage class -- the harness keeps an
+existing claim, and a run that looks like it measured a local read while
+reading the shared volume is the wrong measurement -- so use a fresh
+namespace or delete the claim; and the harness's downloader mounts the
+hostPath directly (with `spc_t`), which needs Pod Security `privileged`
+or OpenShift's `hostmount-anyuid`, where `make weights` (the general form,
+[Weights on the node's disk](../../reference/workload-preparation.md#weights-on-the-nodes-disk))
+needs only `baseline`. Per node:
+
+```bash
+kubectl get pods -n $BENCHMARK_NAMESPACE -l component=model-download -o wide   # one per accelerator node, Ready when the download finished
+```
+
+For the 0.6B model the runs above use, this changes nothing measurable: the
+read is a second. It is for the model sizes where the read through the
+shared volume is the start path.
 
 **Package installs at engine start.** The `preprocess` init container
 (`set_llmdbench_environment.py`, from the harness image) writes

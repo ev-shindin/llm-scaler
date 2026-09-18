@@ -219,6 +219,25 @@ node, so a scale-up never starts with a pull. Full description in
 | `BENCHMARK_PREPULL` | `false` makes `benchmark-standup` skip the pre-pull | `true` |
 | `BENCHMARK_PREPULL_IMAGES` | What `benchmark-standup` holds instead of the image the harness pins | *(the harness's pin)* |
 
+### Weights on the node's disk (`make weights`)
+
+One static hostPath volume, one claim, one DaemonSet downloading the model
+onto every accelerator node, so a replica reads its weights from the node's
+own disk. Full description in
+[Weights on the node's disk](workload-preparation.md#weights-on-the-nodes-disk).
+`NAMESPACE` must be given on the command line for these targets.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `WEIGHTS_MODEL` | Hugging Face model id | *(required for `weights`)* |
+| `WEIGHTS_PATH` | Absolute directory on the node; the model lands under `<path>/models/<id>` | *(required for `weights`)* |
+| `WEIGHTS_IMAGE` | Image to download with -- any image carrying `huggingface_hub`, i.e. the engine image | *(required for `weights`)* |
+| `WEIGHTS_HF_TOKEN_SECRET` | `<secret>[/<key>]` holding a Hugging Face token, for gated models (key defaults to `HF_TOKEN`) | *(none)* |
+| `WEIGHTS_CAPACITY` | The volume's declared capacity; a declaration, hostPath has no quota | `1Ti` |
+| `WEIGHTS_NODE_SELECTOR` | As `PREPULL_NODE_SELECTOR` | `$(PREPULL_NODE_SELECTOR)` |
+| `WEIGHTS_TOLERATIONS` | As `PREPULL_TOLERATIONS` | `$(PREPULL_TOLERATIONS)` |
+| `BENCHMARK_MODEL_HOSTPATH` | A directory on the node: `benchmark-standup` then binds the harness's model claim to it and has the harness download the model on every accelerator node before the engines start. Empty: the shared volume | *(empty)* |
+
 Scope follows the same rules as the ScaledObject plan above: `NAMESPACE=<ns>`
 pins the scan to one namespace, and without it a cluster-scoped install walks
 every namespace holding model servers.
