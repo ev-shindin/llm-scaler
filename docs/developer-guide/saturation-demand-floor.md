@@ -121,18 +121,36 @@ Properties, each with a spec in `throughput_floor_test.go`:
   (`prefill-demand-held`): against a small prefill k2 learned on some
   earlier, genuine saturation the held KV alone would read as several
   replicas, and against k1 on a fleet of two it reads as a release (537 800
-  on 1 839 718 is 29 %). A genuine prefill order is deferred by as long as
-  decode stays saturated -- one decode start, ordinarily. A prefill
-  bottleneck reduces decode's arrivals, so the two saturate at once only
-  when decode is short at prefill's completion rate. The decode test is the
-  queue, and vLLM counts a request waiting for its remote KV in it: a fleet
-  whose transfer keeps as many in flight as the threshold reads decode
-  saturated every cycle and prefill then never records -- it stays
-  memory-bound, as a prefill fleet that never saturates does today. Decode's
-  KV against its k1 was tried as the test and rejected on the run's own
-  rows: the Prometheus windows are not aligned, and decode's occupancy had
-  dropped below k1 on the fourth cycle while its queue and prefill's stale
-  row had not.
+  on 1 839 718 is 29 %). What the floor of the band buys is not a re-order
+  avoided -- a replica released mid-episode would stay released, prefill
+  reads near zero after one -- but the burst that ends an episode: the
+  scheduler's flow control releases what it held in one go (124 requests,
+  744k prompt tokens against a 919k k1 on the measured run), and it lands
+  on prefill first. A genuine prefill order is deferred for as long as any
+  decode replica's one-minute peak reads full and queued, plus the memory
+  below: 195 s and two decode starts replayed on the measured cold pass,
+  135 s and one on the warm, unbounded while decode is capped and cannot
+  grow. A prefill bottleneck
+  reduces decode's arrivals, so the two saturate at once only when decode
+  is short at prefill's completion rate. "Decode saturated" is a decode
+  replica full AND queued -- resident KV at its k1, queue at the
+  threshold -- not the queue alone: vLLM counts a request waiting for its
+  remote KV in `num_requests_waiting`, so a fleet whose transfer keeps as
+  many in flight as the threshold (a large model over a slow link) would
+  read saturated every cycle on the queue alone, and prefill would then
+  never record and, held, never be ordered. Full is decode unable to
+  allocate the blocks a pull needs, which the transfer pipeline does not
+  produce. The test is remembered for the collector's row window
+  (`DecodeSaturationMemory`, one minute): on the measured episode decode's
+  occupancy dropped under k1 on the fourth cycle while its queue and
+  prefill's row -- a one-minute max, repeated to the token -- had not
+  moved, and that row would otherwise have recorded. A decode bound by its
+  sequence ceiling before its KV does not gate; that is a prefill
+  mislearned low, which costs money, where a prefill that cannot be
+  ordered costs latency. Newer vLLM splits the waiting count by reason
+  (`vllm:num_requests_waiting_by_reason`, `reason="capacity"` for the
+  scheduler's own queue); reading that for both this test and P1 itself is
+  the follow-up, once the vLLM the stack ships is known to carry it.
 - **Keyed by output length**, in factor-of-two buckets above 500 tokens
   (`classifyOutputLength`). `mu` falls roughly with output length, and two
   shapes sharing a bucket share a window whose max is the shorter shape's --

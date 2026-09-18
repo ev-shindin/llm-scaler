@@ -5,7 +5,7 @@ markdown report of which fallback tier fired, when, and why.
 
 Reads the following log lines:
   - k2-decision                    (saturation_v2) per replica, per cycle:
-                                    which of the four k2 priority tiers fired
+                                    which of the four k2 priority tiers fired (or which observation was declined)
                                     (observed / historical / derived /
                                     fallback-to-k1)
   - replica-capacity-decision      (saturation_v2) per replica, per cycle:

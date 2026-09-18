@@ -318,9 +318,16 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	var (
 		analyzer *SaturationAnalyzer
 		ctx      context.Context
+		clock    time.Time
 	)
 	BeforeEach(func() {
 		analyzer = NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		// The saturating cycles below are decode full and queued, which
+		// the analyzer remembers for DecodeSaturationMemory and holds
+		// prefill's demand through (holdPrefillDemand); the specs here are
+		// about the floor, so each saturation moves the clock past it.
+		clock = time.Date(2026, 9, 17, 10, 48, 9, 0, time.UTC)
+		analyzer.now = func() time.Time { return clock }
 		ctx = context.Background()
 	})
 
@@ -359,6 +366,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		for i := 0; i < MinThroughputSamplesToOrder; i++ {
 			saturateOnce()
 		}
+		clock = clock.Add(DecodeSaturationMemory + time.Second)
 	}
 
 	It("holds the decode role at lambda / mu once the fleet has caught up", func() {

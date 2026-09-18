@@ -528,38 +528,66 @@ learned earlier on a genuine saturation is small, as a compute bound is
 80 000`, seven extra prefill replicas ordered on every decode saturation of
 a fleet whose prefill was ever the bottleneck and released through the
 scale-down window when decode recovers; and against k1 on a fleet of two,
-537 800 on 1 839 718 is 29 %, one replica removed while decode is saturated
-and re-ordered when it recovers. So on a gated cycle prefill's demand is
-clamped into the band where the engine neither orders nor releases,
-`[scaleDown x supply, scaleUp x anticipated supply]`, and the cycle logs
-`prefill-demand-held` with the figure it found and the one it left. Prefill
-keeps what it has until decode's numbers are its own again. What that
-costs: a genuine prefill order -- both roles short at once -- is deferred
-for as long as decode stays saturated, one decode start ordinarily; the
-cycle decode recovers, prefill's own occupancy and floor stand.
+537 800 on 1 839 718 is 29 %, one replica removed while decode is
+saturated. (The release can only happen on the gated cycles where decode's
+own order is already pending -- while decode is ordering, the optimizer
+runs no scale-down at all -- and a replica released then would stay
+released: prefill read 54k, 12k, 0 after the episode. What the floor of
+the band buys is the burst that ends an episode: the scheduler's flow
+control releases what it held in one go, 124 requests and 744k prompt
+tokens against a 919k k1 on this run, and it lands on prefill first.) So
+on a gated cycle prefill's demand is clamped into the band where the
+engine neither orders nor releases, `[scaleDown x supply, scaleUp x
+anticipated supply]`, and the cycle logs `prefill-demand-held` with the
+figure it found and the one it left. Prefill keeps what it has until
+decode's numbers are its own again. What that costs: a genuine prefill
+order -- both roles short at once -- is deferred for as long as any decode
+replica's one-minute peak reads full and queued, plus a minute of memory
+(below): replayed on this run's cold pass the episode runs +115 s to
++310 s, 195 s and two decode starts, a minute of it the memory; the warm
+pass's 135 s across one; the phase switch, where decode queued without
+filling, none at all. Unbounded while decode is capped and cannot grow.
+The cycle decode recovers, prefill's own occupancy and floor stand.
 
-Two things about the decode test, left as they are:
+The decode test, and why it is what it is:
 
-- It is the queue, and vLLM counts a decode request waiting for its remote
-  KV in `num_requests_waiting`. A fleet whose KV transfer keeps as many in
-  flight as the threshold (a large model over TCP, say) reads decode
-  saturated every cycle, and prefill then never records: it stays
-  memory-bound, which is what a prefill fleet that never saturates is
-  today. The same rows make decode's own P1 fire every cycle, which is the
-  older problem and not this one. Decode's occupancy against its k1 was
-  tried as the test instead -- decode not admitting because it is full,
-  which the measured cycle satisfies (970k and 1 039k against 919 859) --
-  and rejected on the same rows: the Prometheus windows are not aligned,
-  decode's occupancy had dropped below k1 on the fourth cycle (589k and
-  825k) while its queue (65, 81) and prefill's stale row had not, and that
-  row would have recorded.
+- It is a decode replica full AND queued -- resident KV at its k1, queue
+  at the threshold -- not the queue alone. vLLM counts a decode request
+  waiting for its remote KV in `num_requests_waiting` (it sits in the
+  scheduler's waiting queue as `WAITING_FOR_REMOTE_KVS` until the transfer
+  lands), so a fleet whose KV transfer keeps as many in flight as the
+  threshold -- a 70B-class model at 6 req/s over 10 GbE is 1-2 s and
+  ~2 GB per prompt, and the collector takes the minute's peak -- reads
+  decode saturated every cycle on the queue alone. With the gate that is
+  a prefill that never records; with the hold it is a prefill that can
+  never be ordered, on a fleet where prefill may be the one that is
+  short. Full is decode unable to allocate the blocks a pull needs, which
+  the transfer pipeline does not produce; the measured cycles satisfy it
+  (970k and 1 039k against decode k1s of 929 894 and 930 508). The same
+  in-flight rows make decode's own P1 fire every cycle, which is the older
+  problem and not this one; newer vLLM splits the count by reason
+  (`vllm:num_requests_waiting_by_reason`, `reason="capacity"`), and
+  reading that for both is the follow-up once the vLLM the stack ships is
+  known to carry it.
+- The test is remembered for the collector's row window
+  (`DecodeSaturationMemory`, one minute). The KV bound alone fails on this
+  run's own rows: the Prometheus windows are not aligned, and on the fourth
+  cycle decode's occupancy had dropped under k1 (589k and 825k) while its
+  queue (65, 81) and prefill's row -- a one-minute max, repeated to the
+  token -- had not moved; that row would have recorded. With the memory
+  the episode's last cycle is still decode's.
+- A decode bound by its sequence ceiling before its KV does not gate; that
+  is a prefill mislearned low, which costs money, where a prefill that
+  cannot be ordered costs latency.
 - The four "readings" are one Prometheus sample seen four times (the rows
   repeat to the token), which is what let a single saturated moment clear
   `MinThroughputSamplesToOrder`. The gate makes it moot for prefill; for
   decode the repeated rows are the same under-read repeated, and the
   window's max is unaffected.
 
-Not yet re-run on a cluster with the gate and the hold in place; the replay
-above is arithmetic on the logged rows. The re-run should capture prefill's
+Not yet re-run on a cluster with the gate, the hold and the memory in
+place; the replay above is arithmetic on the logged rows (the gate would
+have been on for 13 of the cold pass's 210 cycles and 9 of the warm pass's,
+one contiguous episode each). The re-run should capture prefill's
 `num_requests_running`, its KV at the queue peak and the EPP flow-control
 queue, which is what separates held blocks from bursts.
