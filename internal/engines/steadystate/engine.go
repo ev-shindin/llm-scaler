@@ -1725,10 +1725,19 @@ func (e *Engine) applySaturationDecisions(
 		} else {
 			// No change/decision: Keep current target or default to current replicas
 			// We effectively explicitly "decide" to keep things as they are if no decision was made
+			//
+			// resolvedRead says whether targetReplicas below is a count that was
+			// actually READ -- from status, from the allocations, or from the
+			// scale target -- as opposed to the 0 it starts as. The carry needs
+			// the difference: a read 0 is a fleet somebody scaled to zero and
+			// must be published as 0; an unread 0 is a fetch that failed.
+			resolvedRead := false
 			if updateVa.Status.DesiredOptimizedAlloc.NumReplicas != nil && *updateVa.Status.DesiredOptimizedAlloc.NumReplicas > 0 {
 				targetReplicas = int(*updateVa.Status.DesiredOptimizedAlloc.NumReplicas)
+				resolvedRead = true
 			} else if curr, ok := currentAllocations[vaName]; ok {
 				targetReplicas = curr.NumReplicas
+				resolvedRead = true
 			}
 			// Keep existing accelerator or use current (skip sentinel values)
 			if acc := updateVa.Status.DesiredOptimizedAlloc.Accelerator; constants.IsAcceleratorResolved(acc) {
@@ -1749,6 +1758,7 @@ func (e *Engine) applySaturationDecisions(
 						acceleratorName = accel.GetAcceleratorNameFromScaleTarget(&updateVa, scaleTarget)
 						if targetReplicas == 0 && scaleTarget.GetReplicas() != nil {
 							targetReplicas = int(*scaleTarget.GetReplicas())
+							resolvedRead = true
 						}
 						// This read is the identity the carry below compares against.
 						e.noteScaleTargetUID(utils.GetNamespacedKey(va.Namespace, scaleTargetName), scaleTarget.GetUID())
@@ -1773,7 +1783,7 @@ func (e *Engine) applySaturationDecisions(
 					floor = &f
 				}
 				missed := e.lastDecided[utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())].missed
-				if carried := carryPublished(targetReplicas, p, at, ok, floor, missed, time.Now()); carried != targetReplicas {
+				if carried := carryPublished(targetReplicas, resolvedRead, p, at, ok, floor, missed, time.Now()); carried != targetReplicas {
 					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
 						"variant", vaName, "published", carried, "running", targetReplicas)
 					targetReplicas = carried

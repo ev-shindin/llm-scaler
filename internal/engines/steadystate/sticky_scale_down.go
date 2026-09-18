@@ -204,13 +204,16 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 // what the last cycle with metrics lowered. A floor the variant has since
 // been given stands above the carried value, as it does above the hold's.
 //
-// resolved is 0 when the no-decision path could not read the scale target
-// at all. That is not a running count of zero -- publishing 0 would read to
-// the external scaler as "park this model" on a transient API error -- so a
-// fresh held value is republished over it. missed is how many consecutive
-// cycles have had no decision, counting this one. Returns the value to
-// publish.
-func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, floor *int, missed int, now time.Time) int {
+// read says whether resolved was actually read -- from status, the
+// allocations or the scale target -- rather than left at the 0 it starts as
+// when every read failed. The two zeros must not be confused: a READ 0 is a
+// fleet somebody scaled to zero by hand, which must be published as 0 or the
+// external scaler reports it active and KEDA wakes what the operator just
+// parked; an UNREAD 0 is a transient API error, and publishing it would park a
+// live model, so a fresh held value is republished over it. missed is how
+// many consecutive cycles have had no decision, counting this one. Returns
+// the value to publish.
+func carryPublished(resolved int, read bool, published int, publishedAt time.Time, havePublished bool, floor *int, missed int, now time.Time) int {
 	if !havePublished || published <= 0 {
 		return resolved
 	}
@@ -220,7 +223,7 @@ func carryPublished(resolved, published int, publishedAt time.Time, havePublishe
 	if floor != nil && published < *floor {
 		return resolved
 	}
-	if resolved == 0 || published < resolved {
+	if !read || published < resolved {
 		return published
 	}
 	return resolved

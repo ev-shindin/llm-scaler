@@ -61,9 +61,10 @@ func hold(d domain.VariantDecision, published int, have bool) (domain.VariantDec
 	return holdPublishedScaleDown(d, published, now.Add(-time.Second), have, stickyMaxAge, now)
 }
 
-// carry calls carryPublished on the first missed cycle.
+// carry calls carryPublished on the first missed cycle, with the running
+// count read.
 func carry(resolved, published int, publishedAt time.Time, have bool, floor *int, now time.Time) int {
-	return carryPublished(resolved, published, publishedAt, have, floor, 1, now)
+	return carryPublished(resolved, true, published, publishedAt, have, floor, 1, now)
 }
 
 func TestHoldPublishedScaleDown_TheMeasuredChatterSettlesAtOne(t *testing.T) {
@@ -186,12 +187,15 @@ func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
 	// so an operator's hand-scaled fleet during an outage is what fills the
 	// window, not a held value that would undo it when the carry stopped.
 	assert.Less(t, carryMaxAge, 5*time.Minute)
-	assert.Equal(t, 2, carryPublished(2, 1, fresh, true, nil, carryMaxCycles+1, now))
-	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, nil, carryMaxCycles, now))
-	// 0 is not a running count: the path could not read the scale target.
-	// Publishing it would read as "park", so the fresh held value stands in.
-	assert.Equal(t, 1, carry(0, 1, fresh, true, nil, now))
-	assert.Equal(t, 0, carry(0, 1, now.Add(-carryMaxAge-time.Minute), true, nil, now), "unless it is stale")
+	assert.Equal(t, 2, carryPublished(2, true, 1, fresh, true, nil, carryMaxCycles+1, now))
+	assert.Equal(t, 1, carryPublished(2, true, 1, fresh, true, nil, carryMaxCycles, now))
+	// Two zeros. UNREAD: the path could not read the scale target, and
+	// publishing 0 would read as "park", so the fresh held value stands in.
+	assert.Equal(t, 1, carryPublished(0, false, 1, fresh, true, nil, 1, now))
+	assert.Equal(t, 0, carryPublished(0, false, 1, now.Add(-carryMaxAge-time.Minute), true, nil, 1, now), "unless it is stale")
+	// READ: somebody scaled the fleet to zero by hand. That is what is
+	// published; a carried 1 here would wake what the operator just parked.
+	assert.Equal(t, 0, carry(0, 1, fresh, true, nil, now))
 }
 
 func TestHoldPublishedScaleDown_NeverHoldsAScaleUp(t *testing.T) {
