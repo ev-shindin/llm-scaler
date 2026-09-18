@@ -171,6 +171,13 @@ OVERLAP_SECONDS="${OVERLAP_SECONDS:-90}"
 # downloads; each container reports whether it made it, and the driver refuses
 # the arm if either did not.
 PRELOAD_GRACE="${PRELOAD_GRACE:-420}"
+# How long past the schedule the loaders may take to DRAIN their last stage and
+# WRITE their reports. inference-perf's report step alone was measured at ~5
+# minutes (09:18:46 "Generating Reports" to 09:23:53 first file written, the
+# nopool arm of 2026-09-18), on top of the last stage draining, which the
+# bursting model does slowly. 600s was not enough: a floor arm whose load
+# finished on schedule was thrown away 3 minutes before its reports landed.
+RESULT_GRACE="${RESULT_GRACE:-1200}"
 
 MAX_REPLICAS="${MAX_REPLICAS:-3}"
 MIN_REPLICAS="${MIN_REPLICAS:-1}"
@@ -1512,7 +1519,7 @@ verb_run() {
     # alive afterwards on purpose -- `kubectl cp` is exec+tar and cannot run in
     # a terminated container, so waiting for Completed and then copying loses
     # the results of every successful run.
-    local budget=$(( PRELOAD_GRACE + total + 600 ))
+    local budget=$(( PRELOAD_GRACE + total + RESULT_GRACE ))
     info "waiting for both loaders to report their results (up to ${budget}s)..."
     local deadline=$(( $(date +%s) + budget )) pod="" done=0 log=""
     while [ "$(date +%s)" -lt "$deadline" ]; do

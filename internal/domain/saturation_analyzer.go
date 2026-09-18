@@ -39,6 +39,12 @@ const RolePrefill = "prefill"
 // RoleDecode represents the decode-only role in a P/D disaggregated deployment.
 const RoleDecode = "decode"
 
+// DemandUnpriced is the TotalDemand of a decision whose variant's share of
+// the demand could not be told: a variant with no rows this cycle while its
+// siblings had some. Nothing that re-prices a replica count may treat it as
+// zero.
+const DemandUnpriced = -1
+
 // DecisionStep represents a single step in the decision pipeline.
 // Each pipeline stage (saturation analysis, resource limiting, etc.) adds its own step.
 type DecisionStep struct {
@@ -105,6 +111,17 @@ type VariantDecision struct {
 	// constants.UnitContinuous (a token magnitude). Exposed as the `unit`
 	// Prometheus label on wva_required_capacity and wva_spare_capacity.
 	RequiredCapacityUnit string
+	// TotalDemand is the demand that priced this decision's target (the
+	// model's, or its role's when disaggregated -- scheduler queue included),
+	// PerReplicaCapacity the analyzer's per-replica capacity for this variant,
+	// both in RequiredCapacity's token units, and ScaleUpThreshold the resolved
+	// threshold that priced RequiredCapacity. Carried so a later stage can ask
+	// what utilization a replica count OTHER than the current one would run
+	// at -- the question the sticky scale-down asks about the count already
+	// published.
+	TotalDemand        float64
+	PerReplicaCapacity float64
+	ScaleUpThreshold   float64
 	// ScaleTargetRef references the Deployment/StatefulSet for scheduling constraints
 	ScaleTargetRef *autoscalingv2.CrossVersionObjectReference
 

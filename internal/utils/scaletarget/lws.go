@@ -3,6 +3,7 @@ package scaletarget
 import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	lwsv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/resources"
@@ -59,6 +60,10 @@ func (r *lwsAccessor) GetTotalGPUsPerReplica() int {
 func (r *lwsAccessor) GetDeletionTimestamp() *v1.Time {
 	// r.lws is always not nil
 	return r.lws.DeletionTimestamp
+}
+
+func (r *lwsAccessor) GetUID() types.UID {
+	return r.lws.UID
 }
 
 func (r *lwsAccessor) GetLeaderPodTemplateSpec() *corev1.PodTemplateSpec {

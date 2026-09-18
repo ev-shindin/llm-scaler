@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -150,6 +151,21 @@ type Engine struct {
 	// Unguarded for the same reason as lastGoodAnalysis: optimize cycles run
 	// sequentially in one goroutine and models are processed serially.
 	lastAnalyzerSeries map[string]analyzerSeries
+
+	// lastDecided records, per scale target (keyed namespace/target), when the
+	// optimize loop last DECIDED for it -- as opposed to republished for it --
+	// and which incarnation of the target that decision was about. The sticky
+	// scale-down trusts a published value only when both still hold: the
+	// decision store's own timestamp is refreshed by every publish, including
+	// the carry that republishes a held value through a cycle with no metrics,
+	// so it cannot tell "decided lately" from "silent, but repeating itself";
+	// and a target deleted and re-created under the same name is a different
+	// fleet, whose first cycles must not inherit the old one's descent.
+	// Entries are swept once they are too old to be trusted.
+	lastDecided map[string]decidedMark
+	// scaleTargetUIDs is this cycle's identity per scale target, refilled by
+	// optimizeV2 from what collection read.
+	scaleTargetUIDs map[string]types.UID
 
 	// lastBlockedModels records, keyed identically, every model this engine has
 	// published wva_model_scaling_blocked reasons for. Same reason as
@@ -1024,6 +1040,8 @@ func (e *Engine) optimizeV2(
 	e.pruneLastGoodAnalysis(activeKeys)
 	e.pruneAnalyzerSeries(activeKeys)
 	e.pruneBlockedModels(activeKeys)
+	e.pruneLastDecided(e.stickyAge(), time.Now())
+	e.scaleTargetUIDs = make(map[string]types.UID)
 
 	// Stage 1: Collect ModelScalingRequests for all models
 	requests := make([]allocation.ModelScalingRequest, 0, len(modelGroups))
@@ -1507,6 +1525,11 @@ func (e *Engine) prepareModelData(
 
 		key := utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())
 		scaleTargets[key] = scaleTarget
+		// Recorded HERE, where the target was read, before anything below can
+		// return early: a model skipped for having no metrics this cycle still
+		// has a fleet with an identity, and the carry that runs for it must be
+		// able to tell that fleet from a re-created one.
+		e.noteScaleTargetUID(key, scaleTarget.GetUID())
 
 		variantKey := utils.GetNamespacedKey(va.Namespace, va.Name)
 		variantAutoscalings[variantKey] = va
@@ -1617,9 +1640,52 @@ func (e *Engine) applySaturationDecisions(
 		decisionMap[utils.GetNamespacedKey(d.Namespace, d.VariantName)] = d
 	}
 
+	// What the actuator last PUBLISHED per scale target, read before the loop
+	// variable below shadows the decision package. The sticky scale-down judges
+	// a fresh target against this, not against the count the target is
+	// running: the two differ for the whole of KEDA's stabilization window,
+	// which is exactly when a target that has crept back up cancels the descent.
+	sticky := e.Config != nil && e.Config.StickyScaleDownEnabled()
+	if e.lastDecided == nil {
+		e.lastDecided = make(map[string]decidedMark)
+	}
+	// The published value with the time of the last cycle that DECIDED it, not
+	// the time it was last written, and only if that decision was about the
+	// incarnation of the target running now -- see lastDecided.
+	published := func(namespace, target string) (int, time.Time, bool) {
+		key := utils.GetNamespacedKey(namespace, target)
+		d, ok := decision.Get(namespace, target)
+		mark, decided := e.lastDecided[key]
+		// A target this cycle did not read has no identity to compare; the
+		// mark is trusted, bounded by its age. Only a target READ this cycle
+		// under a different UID is a different fleet.
+		uid, known := e.scaleTargetUIDs[key]
+		sameFleet := decided && (!known || mark.uid == uid)
+		return int(d.DesiredReplicas), mark.at, ok && sameFleet
+	}
+
 	// Iterate over ALL active VAs to ensure we update status and trigger reconciliation for everyone
 	for vaName, va := range vaMap {
 		decision, hasDecision := decisionMap[vaName]
+
+		if hasDecision && sticky {
+			p, at, ok := published(va.Namespace, va.GetScaleTargetName())
+			var held bool
+			if decision, held = holdPublishedScaleDown(decision, p, at, ok, e.stickyAge(), time.Now()); held {
+				logger.Info("holding the published scale-down against a fresh target that crept back up",
+					"variant", vaName, "published", p, "current", decision.CurrentReplicas,
+					"reason", decision.LastStep().Reason)
+			}
+		}
+		{
+			key := utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())
+			if hasDecision {
+				e.lastDecided[key] = decidedMark{at: time.Now(), uid: e.scaleTargetUIDs[key]}
+			} else if mark, ok := e.lastDecided[key]; ok {
+				mark.missed++
+				e.lastDecided[key] = mark
+			}
+		}
 
 		if hasDecision {
 			logger.Info("Processing decision for VA",
@@ -1659,10 +1725,19 @@ func (e *Engine) applySaturationDecisions(
 		} else {
 			// No change/decision: Keep current target or default to current replicas
 			// We effectively explicitly "decide" to keep things as they are if no decision was made
+			//
+			// resolvedRead says whether targetReplicas below is a count that was
+			// actually READ -- from status, from the allocations, or from the
+			// scale target -- as opposed to the 0 it starts as. The carry needs
+			// the difference: a read 0 is a fleet somebody scaled to zero and
+			// must be published as 0; an unread 0 is a fetch that failed.
+			resolvedRead := false
 			if updateVa.Status.DesiredOptimizedAlloc.NumReplicas != nil && *updateVa.Status.DesiredOptimizedAlloc.NumReplicas > 0 {
 				targetReplicas = int(*updateVa.Status.DesiredOptimizedAlloc.NumReplicas)
+				resolvedRead = true
 			} else if curr, ok := currentAllocations[vaName]; ok {
 				targetReplicas = curr.NumReplicas
+				resolvedRead = true
 			}
 			// Keep existing accelerator or use current (skip sentinel values)
 			if acc := updateVa.Status.DesiredOptimizedAlloc.Accelerator; constants.IsAcceleratorResolved(acc) {
@@ -1683,11 +1758,35 @@ func (e *Engine) applySaturationDecisions(
 						acceleratorName = accel.GetAcceleratorNameFromScaleTarget(&updateVa, scaleTarget)
 						if targetReplicas == 0 && scaleTarget.GetReplicas() != nil {
 							targetReplicas = int(*scaleTarget.GetReplicas())
+							resolvedRead = true
 						}
+						// This read is the identity the carry below compares against.
+						e.noteScaleTargetUID(utils.GetNamespacedKey(va.Namespace, scaleTargetName), scaleTarget.GetUID())
 					} else {
 						// If scaleTarget fetch fails, try VA label directly
 						acceleratorName = accel.GetAcceleratorNameFromScaleTarget(&updateVa, nil)
 					}
+				}
+			}
+
+			if sticky {
+				// AFTER the fallback above has resolved the running count -- a
+				// variant synthesized from a ScaledObject has no status and the
+				// allocations map is empty, so before it targetReplicas is 0 for
+				// every real variant and there would be nothing to carry against.
+				// A cycle with no metrics cannot justify raising what the last
+				// cycle with metrics lowered; see carryPublished.
+				p, at, ok := published(va.Namespace, va.GetScaleTargetName())
+				var floor *int
+				if va.Spec.MinReplicas != nil {
+					f := int(*va.Spec.MinReplicas)
+					floor = &f
+				}
+				missed := e.lastDecided[utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())].missed
+				if carried := carryPublished(targetReplicas, resolvedRead, p, at, ok, floor, missed, time.Now()); carried != targetReplicas {
+					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
+						"variant", vaName, "published", carried, "running", targetReplicas)
+					targetReplicas = carried
 				}
 			}
 

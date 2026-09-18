@@ -6,9 +6,19 @@ one to a variant that is scaling up. The borrowed Pod joins the model's
 InferencePool and serves while the ordinary replica loads, then is handed back
 the moment that replica is ready.
 
-**Use it when** your spikes arrive faster than a replica starts, and the cost of
-the gap — queued requests, missed TTFT, a load shed — is worth holding
-accelerators to cover.
+**Use it when** spikes arrive faster than a replica starts and the cost of the
+gap — queued requests, missed TTFT, a load shed — is worth holding accelerators
+to cover. Two shapes of traffic make that true:
+
+- **several models with bursty traffic** that does not all burst at once: one
+  pool Pod holding all of them bridges every model's rise, and the more models
+  share it the cheaper each one's insurance gets;
+- **scale-to-zero with a fast scale-up requirement**: a parked model's first
+  request would otherwise wait for a cold start, and the bridge serves it
+  while the ordinary replica loads.
+
+How much it buys, and what it costs against a floor of held replicas, is
+[measured](measured.md).
 
 **Do not use it when** load is steady, or when accelerators are the scarce
 thing. The pool is **insurance, not capacity**: every pool Pod holds its
@@ -112,10 +122,10 @@ often you spike and how long a replica takes to start — never by peak load.
 of phase with quiet stretches between, autoscaling alone against a one-Pod
 pool against a floor of two replicas, with the tables, the plots and the make
 targets to repeat it on your cluster. The short version: the pool turns
-2.5–12.6 s rises into 0.1–0.9 s, within tens of milliseconds of the floor,
-for 9 % less than the floor and about what autoscaling alone costs. The
-pool's advantage grows with the number of models sharing it, not with more
-quiet; when a model is always bursting, a floor is the cheaper insurance.
+5–9 s rises into 0.1–0.8 s, within tens of milliseconds of the floor, for
+17 % more than autoscaling alone and 12 % less than the floor. The pool's
+advantage grows with the number of models sharing it, not with more quiet;
+when a model is always bursting, a floor is the cheaper insurance.
 
 ## How it is tested
 

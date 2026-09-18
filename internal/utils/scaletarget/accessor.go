@@ -3,6 +3,7 @@ package scaletarget
 import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // ScaleTargetAccessor provides a uniform interface to extract scaling-relevant
@@ -17,6 +18,9 @@ type ScaleTargetAccessor interface {
 	// GetReplicas returns current spec replicas.
 	GetReplicas() *int32
 	GetDeletionTimestamp() *v1.Time
+	// GetUID identifies this incarnation of the scale target: a target deleted
+	// and re-created under the same name is a different fleet.
+	GetUID() types.UID
 
 	// GetStatusReplicas returns status replicas (actual running).
 	GetStatusReplicas() int32
