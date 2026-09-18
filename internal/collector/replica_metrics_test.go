@@ -30,6 +30,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1018,6 +1019,7 @@ func (m *mockScaleTargetAccessor) GetName() string                              
 func (m *mockScaleTargetAccessor) GetNamespace() string                              { return "" }
 func (m *mockScaleTargetAccessor) GetReplicas() *int32                               { return nil }
 func (m *mockScaleTargetAccessor) GetDeletionTimestamp() *metav1.Time                { return nil }
+func (m *mockScaleTargetAccessor) GetUID() types.UID                                 { return "" }
 func (m *mockScaleTargetAccessor) GetStatusReplicas() int32                          { return 0 }
 func (m *mockScaleTargetAccessor) GetStatusReadyReplicas() int32                     { return m.readyReplicas }
 func (m *mockScaleTargetAccessor) GetTotalGPUsPerReplica() int                       { return 0 }

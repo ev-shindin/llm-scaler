@@ -161,19 +161,35 @@ func TestCarryPublished_ANoDecisionCycleKeepsTheHeldValue(t *testing.T) {
 	now := time.Now()
 	fresh := now.Add(-time.Second)
 	// The no-decision path resolved the running count (2); 1 was published.
-	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, now))
+	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, nil, now))
 	// Nothing published, or published is not lower: the resolved value stands.
-	assert.Equal(t, 2, carryPublished(2, 0, fresh, false, now))
-	assert.Equal(t, 2, carryPublished(2, 2, fresh, true, now))
-	assert.Equal(t, 2, carryPublished(2, 3, fresh, true, now))
+	assert.Equal(t, 2, carryPublished(2, 0, fresh, false, nil, now))
+	assert.Equal(t, 2, carryPublished(2, 2, fresh, true, nil, now))
+	assert.Equal(t, 2, carryPublished(2, 3, fresh, true, nil, now))
+	// A floor raised above the published value stands, as it does for the hold.
+	two := 2
+	assert.Equal(t, 2, carryPublished(2, 1, fresh, true, &two, now))
+	one := 1
+	assert.Equal(t, 1, carryPublished(2, 1, fresh, true, &one, now))
 	// A publish whose deciding cycle is stale is a previous incarnation's, or
 	// an outage's: the resolved value stands, so a manual scale-up during a
 	// long metrics gap is not undone by a carry.
-	assert.Equal(t, 2, carryPublished(2, 1, now.Add(-stickyMaxAge-time.Minute), true, now))
+	assert.Equal(t, 2, carryPublished(2, 1, now.Add(-stickyMaxAge-time.Minute), true, nil, now))
 	// The value the no-decision path resolves for a variant without status is
 	// the running count read from the scale target; 0 means it could not, and
 	// nothing is carried against nothing.
-	assert.Equal(t, 0, carryPublished(0, 1, fresh, true, now))
+	assert.Equal(t, 0, carryPublished(0, 1, fresh, true, nil, now))
+}
+
+func TestPruneLastDecided_DropsWhatCannotBeTrusted(t *testing.T) {
+	now := time.Now()
+	e := &Engine{lastDecided: map[string]decidedMark{
+		"ns/fresh": {at: now.Add(-time.Minute), uid: "a"},
+		"ns/stale": {at: now.Add(-stickyMaxAge - time.Minute), uid: "b"},
+	}}
+	e.pruneLastDecided(now)
+	assert.Contains(t, e.lastDecided, "ns/fresh")
+	assert.NotContains(t, e.lastDecided, "ns/stale")
 }
 
 func TestHoldPublishedScaleDown_RespectsARaisedFloor(t *testing.T) {

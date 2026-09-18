@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -151,13 +152,20 @@ type Engine struct {
 	// sequentially in one goroutine and models are processed serially.
 	lastAnalyzerSeries map[string]analyzerSeries
 
-	// lastDecidedAt is when the optimize loop last DECIDED for a scale target
-	// (keyed namespace/target), as opposed to republished for it. The sticky
-	// scale-down trusts a published value only this fresh: the decision store's
-	// own timestamp is refreshed by every publish, including the carry that
-	// republishes a held value through a cycle with no metrics, so it cannot
-	// tell "decided lately" from "silent, but repeating itself".
-	lastDecidedAt map[string]time.Time
+	// lastDecided records, per scale target (keyed namespace/target), when the
+	// optimize loop last DECIDED for it -- as opposed to republished for it --
+	// and which incarnation of the target that decision was about. The sticky
+	// scale-down trusts a published value only when both still hold: the
+	// decision store's own timestamp is refreshed by every publish, including
+	// the carry that republishes a held value through a cycle with no metrics,
+	// so it cannot tell "decided lately" from "silent, but repeating itself";
+	// and a target deleted and re-created under the same name is a different
+	// fleet, whose first cycles must not inherit the old one's descent.
+	// Entries are swept once they are too old to be trusted.
+	lastDecided map[string]decidedMark
+	// scaleTargetUIDs is this cycle's identity per scale target, refilled by
+	// optimizeV2 from what collection read.
+	scaleTargetUIDs map[string]types.UID
 
 	// lastBlockedModels records, keyed identically, every model this engine has
 	// published wva_model_scaling_blocked reasons for. Same reason as
@@ -1032,6 +1040,8 @@ func (e *Engine) optimizeV2(
 	e.pruneLastGoodAnalysis(activeKeys)
 	e.pruneAnalyzerSeries(activeKeys)
 	e.pruneBlockedModels(activeKeys)
+	e.pruneLastDecided(time.Now())
+	e.scaleTargetUIDs = make(map[string]types.UID)
 
 	// Stage 1: Collect ModelScalingRequests for all models
 	requests := make([]allocation.ModelScalingRequest, 0, len(modelGroups))
@@ -1087,6 +1097,9 @@ func (e *Engine) optimizeV2(
 		requests = append(requests, *req)
 		modelReplicaMetrics[modelID] = data.replicaMetrics
 		modelScaleTargets[utils.GetNamespacedKey(namespace, modelID)] = data.scaleTargets
+		for name, st := range data.scaleTargets {
+			e.scaleTargetUIDs[utils.GetNamespacedKey(namespace, name)] = st.GetUID()
+		}
 	}
 
 	if len(requests) == 0 {
@@ -1631,15 +1644,18 @@ func (e *Engine) applySaturationDecisions(
 	// running: the two differ for the whole of KEDA's stabilization window,
 	// which is exactly when a target that has crept back up cancels the descent.
 	sticky := e.Config != nil && e.Config.StickyScaleDownEnabled()
-	if e.lastDecidedAt == nil {
-		e.lastDecidedAt = make(map[string]time.Time)
+	if e.lastDecided == nil {
+		e.lastDecided = make(map[string]decidedMark)
 	}
 	// The published value with the time of the last cycle that DECIDED it, not
-	// the time it was last written -- see lastDecidedAt.
+	// the time it was last written, and only if that decision was about the
+	// incarnation of the target running now -- see lastDecided.
 	published := func(namespace, target string) (int, time.Time, bool) {
+		key := utils.GetNamespacedKey(namespace, target)
 		d, ok := decision.Get(namespace, target)
-		at, decided := e.lastDecidedAt[utils.GetNamespacedKey(namespace, target)]
-		return int(d.DesiredReplicas), at, ok && decided
+		mark, decided := e.lastDecided[key]
+		sameFleet := decided && mark.uid == e.scaleTargetUIDs[key]
+		return int(d.DesiredReplicas), mark.at, ok && sameFleet
 	}
 
 	// Iterate over ALL active VAs to ensure we update status and trigger reconciliation for everyone
@@ -1656,7 +1672,8 @@ func (e *Engine) applySaturationDecisions(
 			}
 		}
 		if hasDecision {
-			e.lastDecidedAt[utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())] = time.Now()
+			key := utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())
+			e.lastDecided[key] = decidedMark{at: time.Now(), uid: e.scaleTargetUIDs[key]}
 		}
 
 		if hasDecision {
@@ -1737,7 +1754,12 @@ func (e *Engine) applySaturationDecisions(
 				// A cycle with no metrics cannot justify raising what the last
 				// cycle with metrics lowered; see carryPublished.
 				p, at, ok := published(va.Namespace, va.GetScaleTargetName())
-				if carried := carryPublished(targetReplicas, p, at, ok, time.Now()); carried != targetReplicas {
+				var floor *int
+				if va.Spec.MinReplicas != nil {
+					f := int(*va.Spec.MinReplicas)
+					floor = &f
+				}
+				if carried := carryPublished(targetReplicas, p, at, ok, floor, time.Now()); carried != targetReplicas {
 					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
 						"variant", vaName, "published", carried, "running", targetReplicas)
 					targetReplicas = carried

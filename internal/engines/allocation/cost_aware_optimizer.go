@@ -314,20 +314,53 @@ func buildDecisionsWithOptimizer(
 		// The demand that PRICED the target, so a later stage re-pricing a
 		// different replica count uses the same figure: model-level (or per-role
 		// for a disaggregated model), which carries the scheduler-queue estimate
-		// the per-variant engine-local sum does not. Across variants of one model
-		// that overstates any single variant's share, which only ever makes a
-		// hold release sooner.
+		// the per-variant engine-local sum does not -- taken at THIS variant's
+		// share of it, or the other variants' traffic would be priced against
+		// this one's replicas and no hold could ever survive on a model with
+		// two variants of the same role.
 		demand := satNamed.Result.TotalDemand
 		if rc, ok := satNamed.RoleCapacities[role]; ok {
 			demand = rc.TotalDemand
 		}
-		decision.TotalDemand = demand
+		decision.TotalDemand = demand * variantDemandShare(satNamed.Result.VariantCapacities, vc.VariantName, role)
 		decision.PerReplicaCapacity = vc.PerReplicaCapacity
 		decision.ScaleUpThreshold = satNamed.ScaleUpThreshold
 
 		decisions = append(decisions, decision)
 	}
 	return decisions
+}
+
+// variantDemandShare is the fraction of a model's (or role's) demand that
+// belongs to the named variant: its engine-local demand over the engine-local
+// demand of every variant of that role. One variant means 1. When nothing
+// reported, the share is even, so a variant is never priced at zero for want
+// of rows.
+func variantDemandShare(vcs []domain.VariantCapacity, variantName, role string) float64 {
+	var mine, all float64
+	var n int
+	for _, vc := range vcs {
+		r := vc.Role
+		if r == "" {
+			r = domain.RoleBoth
+		}
+		if r != role {
+			continue
+		}
+		n++
+		all += vc.TotalDemand
+		if vc.VariantName == variantName {
+			mine = vc.TotalDemand
+		}
+	}
+	switch {
+	case n <= 1:
+		return 1
+	case all > 0:
+		return mine / all
+	default:
+		return 1 / float64(n)
+	}
 }
 
 // mergeConstraints combines GPU budget constraints from multiple providers.

@@ -4,11 +4,31 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 )
 
 // stickyStepName is the pipeline step holdPublishedScaleDown records.
 const stickyStepName = "sticky-scale-down"
+
+// decidedMark is when a scale target was last decided for, and for which
+// incarnation of it (its UID at the time). See Engine.lastDecided.
+type decidedMark struct {
+	at  time.Time
+	uid types.UID
+}
+
+// pruneLastDecided drops marks too old to be trusted by the hold or the
+// carry, so the map follows the fleet rather than growing with every scale
+// target the controller has ever decided for.
+func (e *Engine) pruneLastDecided(now time.Time) {
+	for key, mark := range e.lastDecided {
+		if now.Sub(mark.at) > stickyMaxAge {
+			delete(e.lastDecided, key)
+		}
+	}
+}
 
 // stickyReason is the decision reason a held scale-down carries. It reaches
 // the ScaledDown event and the OptimizationReady condition, and it is
@@ -130,9 +150,14 @@ func holdPublishedScaleDown(d domain.VariantDecision, published int, publishedAt
 // ScaledObject lacks -- and the running count is exactly the value that
 // re-arms KEDA's window mid-descent. When a fresh published value is lower,
 // it is republished instead: a cycle with no metrics cannot justify raising
-// what the last cycle with metrics lowered. Returns the value to publish.
-func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, now time.Time) int {
+// what the last cycle with metrics lowered. A floor the variant has since
+// been given stands above the carried value, as it does above the hold's.
+// Returns the value to publish.
+func carryPublished(resolved, published int, publishedAt time.Time, havePublished bool, floor *int, now time.Time) int {
 	if !havePublished || published <= 0 || now.Sub(publishedAt) > stickyMaxAge {
+		return resolved
+	}
+	if floor != nil && published < *floor {
 		return resolved
 	}
 	if published < resolved {
