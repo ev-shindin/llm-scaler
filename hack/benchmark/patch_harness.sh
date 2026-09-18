@@ -6,9 +6,10 @@
 # next install. Fixes therefore live here, in a versioned script, and are
 # reapplied after every install.
 #
-# Both bugs below are upstream's, both are present in v0.7.8 AND on origin/main,
-# so there is no release to upgrade to. Both are reported upstream; delete the
-# corresponding block here when a release carries the fix.
+# The fixes below are upstream's bugs unless a block says otherwise (fix 3 is
+# ours), present in v0.7.8 and on origin/main, so there is no release to
+# upgrade to. Each block says whether it is reported upstream; delete a block
+# when a release carries the fix.
 #
 # Why patching the clone reaches the cluster at all: step_06 builds the
 # `llmdbench-harness-scripts` ConfigMap from the CHECKED-OUT tree --
@@ -743,5 +744,188 @@ if src.count(OLD) != 1:
 src = src.replace(OLD, NEW, 1)
 io.open(path, "w", encoding="utf-8", newline="\n").write(src)
 print("  fix 10 (startup probe period): applied")
+PYEOF
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 11 -- 03_download_daemonset.yaml.j2: "ready" means the download is done,
+# and the downloader can be placed by affinity.
+#
+# storage.hostPath (node-local weights, docs/reference/workload-preparation.md)
+# has the standup wait for the download DaemonSet with wait_for_daemonset,
+# which succeeds on numberReady == desired. The downloader has no readiness
+# probe, so a container is Ready the moment it starts -- the wait returned
+# while every node was still downloading, and the engines then started on a
+# half-written model directory. A readinessProbe on the completion marker
+# makes Ready mean what the wait assumes. And the template takes only a
+# nodeSelector, which cannot express "any of these product labels"; an
+# optional storage.hostPath.affinity renders as the pod's affinity, which is
+# how hack/benchmark/model_hostpath.sh places it on every accelerator node.
+# Not yet reported upstream.
+#
+# And the downloader's `chcon -R -t container_file_t` -- the SELinux relabel
+# for OpenShift readers -- fails on a node without SELinux ("can't apply
+# partial context to unlabeled file"), and under the script's `set -e` that
+# ends it before the marker is written: measured on a Kubernetes cluster (Ubuntu nodes), all 16
+# downloaders crash-looped, each restart downloading the model again and
+# never marking it. The relabel is skipped on exactly that text now, and
+# fails as before on any other error (a wrong SCC on OpenShift must not
+# leave a marked directory the engines cannot read); it also sets the level
+# to s0, since the spc_t downloader writes at whatever level the runtime
+# gave it and the engines read at the namespace's.
+# ---------------------------------------------------------------------------
+DS_TPL="$REPO_DIR/config/templates/jinja/03_download_daemonset.yaml.j2"
+if [ ! -f "$DS_TPL" ]; then
+    note "fix 11 (download DaemonSet readiness + affinity): no template, skipped"
+else
+    "$PY" - "$DS_TPL" <<'PYEOF' || fail "fix 11 (download DaemonSet readiness + affinity) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+PROBE_OLD = '''          image: {{ images.benchmark.repository }}:{{ images.benchmark.tag }}
+          command: ["/bin/sh", "-c"]
+'''
+PROBE_NEW = '''          image: {{ images.benchmark.repository }}:{{ images.benchmark.tag }}
+          # wva-patch: Ready is "the download finished on this node", which is
+          # what the standup's wait for this DaemonSet assumes.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "{{ storage.hostPath.path }}/{{ model.path }}/.download-complete"]
+            periodSeconds: 10
+          command: ["/bin/sh", "-c"]
+'''
+AFF_OLD = '''{% if storage.hostPath.tolerations is defined and storage.hostPath.tolerations %}
+      tolerations:
+{{ storage.hostPath.tolerations | toyaml | indent(8, true) }}
+{% endif %}
+'''
+AFF_NEW = '''{% if storage.hostPath.tolerations is defined and storage.hostPath.tolerations %}
+      tolerations:
+{{ storage.hostPath.tolerations | toyaml | indent(8, true) }}
+{% endif %}
+{# wva-patch: an affinity, for a placement a nodeSelector cannot express #}
+{% if storage.hostPath.affinity is defined and storage.hostPath.affinity %}
+      affinity:
+{{ storage.hostPath.affinity | toyaml | indent(8, true) }}
+{% endif %}
+'''
+CHCON_OLD = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}"
+'''
+CHCON_NEW = '''              # wva-patch: skipped only where there is no SELinux (the text
+              # chcon prints for an unlabelled filesystem); any other failure
+              # is real and the marker must not be written. Level s0: readable
+              # at every namespace level, since spc_t wrote at a random one.
+              if ! chcon -R -t container_file_t -l s0 "{{ storage.hostPath.path }}" 2>/tmp/chcon.err; then
+                if grep -q "unlabeled file\\|Operation not supported" /tmp/chcon.err; then
+                  echo "Relabelling skipped: no SELinux on this node (wva-patch)."
+                else
+                  cat /tmp/chcon.err; exit 1
+                fi
+              fi
+'''
+if PROBE_NEW in src and AFF_NEW in src and CHCON_NEW in src:
+    print("  fix 11 (download DaemonSet readiness + affinity): already applied")
+    sys.exit(0)
+# earlier forms of this fix: the chcon still fatal, or swallowed on any error
+CHCON_PREV = '''              chcon -R -t container_file_t "{{ storage.hostPath.path }}" 2>/dev/null || echo "Relabelling skipped: no SELinux on this node (wva-patch)."
+'''
+for earlier, what in ((CHCON_OLD, "chcon made best-effort"), (CHCON_PREV, "chcon skip gated on the no-SELinux text, level s0")):
+    if PROBE_NEW in src and AFF_NEW in src and src.count(earlier) == 1:
+        src = src.replace(earlier, CHCON_NEW, 1)
+        io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+        print("  fix 11 (download DaemonSet readiness + affinity): " + what)
+        sys.exit(0)
+for old in (PROBE_OLD, AFF_OLD, CHCON_OLD):
+    if src.count(old) != 1:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): " + old.splitlines()[0].strip())
+src = src.replace(PROBE_OLD, PROBE_NEW, 1).replace(AFF_OLD, AFF_NEW, 1).replace(CHCON_OLD, CHCON_NEW, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 11 (download DaemonSet readiness + affinity): applied")
+PYEOF
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 12 -- the harness's hostPath PersistentVolume is nobody's, and the
+# teardown deletes every one of them in the cluster.
+#
+# 02a_pv_model-hostpath.yaml.j2 renders the volume with a fixed cluster-wide
+# name (model-pvc-hostpath-pv) and no claimRef. Its storage class is a name
+# no StorageClass object carries, so binding is by class match alone: a
+# claim in ANY namespace asking for that class takes it -- a namespace's
+# pods then mount the node directory read-write from a plain pod, on every
+# node -- and a second benchmark namespace standing up with the mode gets
+# AlreadyExists on the volume and a claim that stays Pending forever.
+# The name carries the namespace now and the volume has a claimRef into
+# it; 02_pvc_model-pvc.yaml.j2's volumeName follows. And the teardown's
+# `kubectl delete pv -l usage=model-cache` -- cluster-wide, run by every
+# `make benchmark-teardown` of any namespace -- is scoped to the volume the
+# namespace being torn down owns, through a label the volume carries.
+# Not yet reported upstream.
+# ---------------------------------------------------------------------------
+PV_TPL="$REPO_DIR/config/templates/jinja/02a_pv_model-hostpath.yaml.j2"
+PVC_TPL="$REPO_DIR/config/templates/jinja/02_pvc_model-pvc.yaml.j2"
+TEARDOWN="$REPO_DIR/llmdbenchmark/teardown/steps/step_03_delete_resources.py"
+if [ ! -f "$PV_TPL" ] || [ ! -f "$PVC_TPL" ] || [ ! -f "$TEARDOWN" ]; then
+    note "fix 12 (hostPath PV owned by its namespace): a file is missing, skipped"
+else
+    "$PY" - "$PV_TPL" "$PVC_TPL" "$TEARDOWN" <<'PYEOF' || fail "fix 12 (hostPath PV owned by its namespace) failed"
+import io, sys
+
+def load(p):
+    return io.open(p, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+def save(p, s):
+    io.open(p, "w", encoding="utf-8", newline="\n").write(s)
+
+pv, pvc, td = sys.argv[1:4]
+edits = [
+    (pv, '''  name: {{ storage.modelPvc.name }}-hostpath-pv
+  labels:
+    app: {{ labels.app }}
+    usage: model-cache
+spec:
+''', '''  name: {{ storage.modelPvc.name }}-{{ namespace.name }}-hostpath-pv
+  labels:
+    app: {{ labels.app }}
+    usage: model-cache
+    # wva-patch: the teardown deletes this namespace's volume, not every one
+    wva.llmd.ai/model-namespace: {{ namespace.name }}
+spec:
+  # wva-patch: bound to this claim and no other; without a claimRef any
+  # claim in any namespace asking for the class takes it
+  claimRef:
+    namespace: {{ namespace.name }}
+    name: {{ storage.modelPvc.name }}
+'''),
+    (pvc, '''  volumeName: {{ storage.modelPvc.name }}-hostpath-pv
+''', '''  volumeName: {{ storage.modelPvc.name }}-{{ namespace.name }}-hostpath-pv
+'''),
+]
+done = 0
+for path, old, new in edits:
+    src = load(path)
+    if new in src:
+        done += 1
+        continue
+    if src.count(old) != 1:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): " + old.splitlines()[0].strip())
+    save(path, src.replace(old, new, 1))
+src = load(td)
+OLD = '''            "usage=model-cache",
+'''
+NEW = '''            f"usage=model-cache,wva.llmd.ai/model-namespace={context.require_namespace()}",  # wva-patch
+'''
+if NEW in src:
+    done += 1
+else:
+    if src.count(OLD) != 2:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): teardown pv delete, expected 2 sites, found %d" % src.count(OLD))
+    save(td, src.replace(OLD, NEW))
+if done == 3:
+    print("  fix 12 (hostPath PV owned by its namespace): already applied")
+else:
+    print("  fix 12 (hostPath PV owned by its namespace): applied")
 PYEOF
 fi

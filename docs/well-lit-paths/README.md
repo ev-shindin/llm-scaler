@@ -27,7 +27,10 @@ Everything here also assumes a replica starts as fast as it can. Every ramp on
 every path is sized by the queue the running replicas build while the new one
 starts, so seconds lost on the way to Ready come back as over-ordered replicas.
 The first of those seconds is the image pull: `make prepull IMAGES=<engine image>
-NAMESPACE=<ns>` before anything scales.
+NAMESPACE=<ns>` before anything scales. For a large model the next is the
+weight read through the shared volume:
+[`make weights`](../reference/workload-preparation.md#weights-on-the-nodes-disk)
+puts a copy on every accelerator node's disk.
 The checklist is in
 [Preparing a workload](../reference/workload-preparation.md#the-rest-of-the-start-path);
 read it before the path you take. Paths that are benchmarked also point at what

@@ -41,7 +41,7 @@ source docs/guides/env.sh
 | [Configuration](../reference/configuration.md) | every variable the installer reads |
 | [After the install](../reference/operations.md) | verifying the install, first-line troubleshooting |
 | [Watching what WVA decides](../reference/monitoring.md) | the dashboard, the metrics, the logs |
-| [Preparing a workload](../reference/workload-preparation.md) | the model cache, draining, `make workload-patch`, the start path (`make prepull`) |
+| [Preparing a workload](../reference/workload-preparation.md) | the model cache, draining, `make workload-patch`, the start path (`make prepull`, `make weights`) |
 | [Install methods](../reference/install-methods.md) | GitOps, direct Kustomize, what the script does |
 | [The GPU limiter](../reference/gpu-limiter.md) | where policy lives, and the accelerator precondition |
 

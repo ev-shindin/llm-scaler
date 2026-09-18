@@ -606,6 +606,13 @@ comma := ,
 # before deploying it. false skips; IMAGES overrides what the clone pins.
 BENCHMARK_PREPULL ?= true
 BENCHMARK_PREPULL_IMAGES ?=
+# benchmark-standup puts the model's weights on every accelerator node's
+# local disk when this names a directory there (docs/reference/
+# workload-preparation.md, "Weights on the node's disk"): the harness binds
+# model-pvc to a hostPath volume and downloads the model on each node before
+# the engines start. Empty: the shared volume, as before. Needs leave to
+# create PersistentVolumes.
+BENCHMARK_MODEL_HOSTPATH ?=
 .PHONY: prepull prepull-status prepull-delete
 prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> narrows the nodes, PREPULL_TOLERATIONS=<key>[,<key>] adds taints.
 	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
@@ -619,6 +626,42 @@ prepull-status: ## Per accelerator node: is each held image present, and what it
 prepull-delete: ## Stop holding IMAGES=<img>[,<img>] (or every held image with IMAGES unset) in NAMESPACE=<ns>.
 	@test -n "$(prepull_namespace_given)" || { echo "prepull-delete: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
 	@bash deploy/prepull.sh delete -n "$(NAMESPACE)" $(if $(IMAGES),$(foreach i,$(subst $(comma), ,$(IMAGES)),--image $(i)),--all)
+
+## Keep a model's weights on every accelerator node's local disk, so a replica
+## reads them at the node's own speed instead of the shared volume's. One
+## static hostPath volume, one claim bound to it, one DaemonSet downloading
+## the model onto every accelerator node; `weights-status` says per node
+## whether the download finished. WEIGHTS_MODEL is the Hugging Face id,
+## WEIGHTS_PATH the directory on the node, WEIGHTS_IMAGE any image carrying
+## huggingface_hub (the engine image). The claim is printed by apply; model
+## servers mount pvc://<claim>/models/<id>. Needs leave to create
+## PersistentVolumes. deploy/weights.sh --help has the rest; the nodes are
+## picked as for prepull (WEIGHTS_NODE_SELECTOR / WEIGHTS_TOLERATIONS default
+## to the PREPULL_* values).
+WEIGHTS_MODEL ?=
+WEIGHTS_PATH ?=
+WEIGHTS_IMAGE ?=
+WEIGHTS_HF_TOKEN_SECRET ?=
+WEIGHTS_CAPACITY ?=
+WEIGHTS_NODE_SELECTOR ?= $(PREPULL_NODE_SELECTOR)
+WEIGHTS_TOLERATIONS ?= $(PREPULL_TOLERATIONS)
+WEIGHTS_ARGS = $(if $(WEIGHTS_NODE_SELECTOR),--node-selector "$(WEIGHTS_NODE_SELECTOR)",) $(foreach t,$(subst $(comma), ,$(WEIGHTS_TOLERATIONS)),--toleration $(t))
+.PHONY: weights weights-status weights-delete
+weights: ## Download WEIGHTS_MODEL=<hf id> under WEIGHTS_PATH=<node dir> on every accelerator node of NAMESPACE=<ns>, with WEIGHTS_IMAGE=<image>. [WEIGHTS_HF_TOKEN_SECRET=<secret>[/<key>]] [WEIGHTS_CAPACITY=<size>]
+	@test -n "$(WEIGHTS_MODEL)" || { echo "weights: set WEIGHTS_MODEL=<hugging face id>" >&2; exit 1; }
+	@test -n "$(WEIGHTS_PATH)" || { echo "weights: set WEIGHTS_PATH=<absolute directory on the node>" >&2; exit 1; }
+	@test -n "$(WEIGHTS_IMAGE)" || { echo "weights: set WEIGHTS_IMAGE=<an image with huggingface_hub; the engine image>" >&2; exit 1; }
+	@test -n "$(prepull_namespace_given)" || { echo "weights: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/weights.sh apply -n "$(NAMESPACE)" --model "$(WEIGHTS_MODEL)" --path "$(WEIGHTS_PATH)" --image "$(WEIGHTS_IMAGE)" \
+		$(if $(WEIGHTS_HF_TOKEN_SECRET),--hf-token-secret "$(WEIGHTS_HF_TOKEN_SECRET)",) $(if $(WEIGHTS_CAPACITY),--capacity "$(WEIGHTS_CAPACITY)",) $(WEIGHTS_ARGS)
+
+weights-status: ## Per accelerator node: does it hold the weights, or is the download still running. NAMESPACE=<ns> [WEIGHTS_MODEL=<hf id>]
+	@test -n "$(prepull_namespace_given)" || { echo "weights-status: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/weights.sh status -n "$(NAMESPACE)" $(if $(WEIGHTS_MODEL),--model "$(WEIGHTS_MODEL)",) $(if $(WEIGHTS_NODE_SELECTOR),--node-selector "$(WEIGHTS_NODE_SELECTOR)",)
+
+weights-delete: ## Drop the claim, volume and downloader for WEIGHTS_MODEL=<hf id> (or every model with it unset) in NAMESPACE=<ns>. The files on the nodes stay.
+	@test -n "$(prepull_namespace_given)" || { echo "weights-delete: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/weights.sh delete -n "$(NAMESPACE)" $(if $(WEIGHTS_MODEL),--model "$(WEIGHTS_MODEL)",--all)
 
 .PHONY: workload-patch
 workload-patch: ## Write a patch for model servers that do not drain on scale-down, or download weights outside every volume they mount. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the volume, after `make model-cache`).
@@ -1551,6 +1594,15 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 	@yq -i '(.scenario[] | select(has("common")) | .common.images.benchmark.tag) = "$(BENCHMARK_IMAGE_TAG)"' \
 		$(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml && \
 		echo "Harness image tag=$(BENCHMARK_IMAGE_TAG) (defaults.yaml pins v0.7.0 regardless of ref)."
+	@# Node-local weights, last of the scenario edits: the script refuses a
+	@# namespace whose model-pvc is already on another class (the harness
+	@# keeps an existing claim, and the volume would never bind), and it
+	@# fails the standup rather than warn -- a run meant to measure a local
+	@# read that silently read the shared volume is the wrong measurement.
+	@if [ -n "$(BENCHMARK_MODEL_HOSTPATH)" ]; then \
+		bash hack/benchmark/model_hostpath.sh "$(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml" \
+			"$(BENCHMARK_MODEL_HOSTPATH)" "$(BENCHMARK_NAMESPACE)" "$(PREPULL_NODE_SELECTOR)" "$(PREPULL_TOLERATIONS)"; \
+	fi
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) standup \
 		-p $(BENCHMARK_NAMESPACE) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
@@ -2295,6 +2347,9 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash -n deploy/install-epp.sh
 	@bash -n deploy/prepull.sh
 	@bash -n deploy/lib/accelerator_nodes.sh
+	@bash -n deploy/weights.sh
+	@bash -n deploy/lib/nodedir.sh
+	@bash -n hack/benchmark/model_hostpath.sh
 	@bash -n hack/benchmark/engine_image.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done
 	@for script in deploy/*/install.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
@@ -2328,6 +2383,8 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# A holder that requests an accelerator, a selector that lands on every
 	@# node, two images sharing one DaemonSet name: all parse, all wrong.
 	@bash hack/check-prepull-manifests.sh
+	@echo "Checking what weights.sh and model_hostpath.sh actually emit..."
+	@bash hack/check-weights-manifests.sh
 	@echo "Checking the accelerator label keys agree..."
 	@# The controller (Go), the planning tools (Python) and the create path
 	@# (shell) each carry their own copy of the node label keys that name a GPU

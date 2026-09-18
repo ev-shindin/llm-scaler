@@ -12,7 +12,7 @@
 # megabytes of memory.
 #
 #   prepull.sh apply  -n NS --image IMG [--image IMG ...] [--dry-run]   pre-pull IMG on every accelerator node
-#   prepull.sh status -n NS [--image IMG]                               which nodes have it, which do not
+#   prepull.sh status -n NS [--image IMG] [--node-selector KEY=VALUE]   which nodes have it, which do not
 #   prepull.sh delete -n NS (--image IMG | --all) [--dry-run]           stop holding it
 #
 # Options:
