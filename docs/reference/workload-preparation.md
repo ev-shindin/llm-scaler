@@ -112,6 +112,20 @@ scheduled to it would pull from scratch, and nothing in the namespace can
 fix that -- it is the node's disk. (Seen on the first run of this on a
 17-node cluster: 16 held the image within two minutes, one was that node.)
 
+Two things to know before relying on it:
+
+- `prepull-status` (and the report `prepull` prints after applying) lists
+  nodes, which is cluster-scoped. A namespace tenant has no `list nodes`
+  by default -- the controller's own read of nodes is granted by the
+  cluster-admin setup, not to the person running `make`. Without it the
+  DaemonSets still apply; the status is what fails, with a Forbidden.
+- Held with `IfNotPresent` under a *tag*, a node keeps whatever that tag
+  pointed at when it pulled; with `Always` the registry's current digest
+  would win at every start. For a pinned release tag that is the point.
+  If the tag can move under you and that matters, name the image by
+  digest (`repo@sha256:...`) -- the holder, `status` and the model
+  server's pod spec all take one.
+
 The benchmark harness this repository uses puts its own steps on the engine's
 start path; what they are and how the benchmark scenarios handle them is in
 [Benchmark WVA](../guides/benchmarking/README.md#replica-start-time-in-the-harness).

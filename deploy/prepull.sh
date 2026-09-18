@@ -31,11 +31,11 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BLUE='[0;34m'
-GREEN='[0;32m'
-YELLOW='[1;33m'
-RED='[0;31m'
-NC='[0m'
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 # shellcheck source=lib/common.sh
 source "$HERE/lib/common.sh"
 # NOTE: log_error EXITS. Nothing may follow it that needs to run.
@@ -62,7 +62,7 @@ name_for() {
     local image="$1"
     local base hash
     base="$(printf '%s' "$image" | sed 's#.*/##; s/@sha256:/-/; s/:/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//')"
-    hash="$(printf '%s' "$image" | sha256sum | cut -c1-8)"
+    hash="$(wva_ns_suffix "$image")"
     printf 'prepull-%s-%s' "${base:0:40}" "$hash" | sed 's/-\{2,\}/-/g'
 }
 
@@ -106,6 +106,13 @@ spec:
       annotations:
         wva.llmd.ai/prepull-image: "${image}"
     spec:
+      # The holder makes no API call; a token in a long-lived root shell on
+      # every accelerator node is surface with no use. Same stance as the
+      # warm pool's Pods.
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       nodeSelector:
         ${key}: "${value}"
       tolerations:
@@ -144,7 +151,10 @@ cmd_apply() {
     # The status after an apply is a report, not a verdict: holders created a
     # second ago are still pulling, and that is not a failure of the apply.
     # `status` on its own returns non-zero for a node that lacks the image.
-    [ "$DRY_RUN" = true ] || cmd_status || true
+    # "report" mode turns the one exit inside cmd_status (no node matches the
+    # selector) into a warning: log_error exits the process, and no `|| true`
+    # on this line could catch that.
+    [ "$DRY_RUN" = true ] || cmd_status report || true
 }
 
 # cmd_status lists, per selected node, whether the image is present and what
@@ -157,19 +167,34 @@ cmd_apply() {
 # the registry will not serve) shows that reason: that node is the one a
 # replica would start slowly on, and the holder cannot fix it from inside.
 cmd_status() {
+    local mode="${1:-verdict}"
     [ -n "$NAMESPACE" ] || log_error "status needs -n NAMESPACE"
-    local images=("${IMAGES[@]}")
+    # `${arr[@]+"${arr[@]}"}`: an empty array expanded under set -u is an
+    # unbound variable on bash before 4.4, and no --image is the documented
+    # way to call status.
+    local images=(${IMAGES[@]+"${IMAGES[@]}"})
     if [ "${#images[@]}" -eq 0 ]; then
-        # every image a holder in this namespace declares
-        mapfile -t images < <($KUBECTL get daemonset -n "$NAMESPACE" -l "$LABEL_COMPONENT" \
-            -o jsonpath='{range .items[*]}{.metadata.annotations.wva\.llmd\.ai/prepull-image}{"\n"}{end}' 2>/dev/null | sed '/^$/d')
+        # every image a holder in this namespace declares. A while-read, not
+        # mapfile: the deploy scripts run on macOS's bash 3.2 too
+        # (deploy/lib/prereqs.sh says why).
+        local line
+        while IFS= read -r line; do
+            [ -n "$line" ] && images+=("$line")
+        done < <($KUBECTL get daemonset -n "$NAMESPACE" -l "$LABEL_COMPONENT" \
+            -o jsonpath='{range .items[*]}{.metadata.annotations.wva\.llmd\.ai/prepull-image}{"\n"}{end}')
     fi
     [ "${#images[@]}" -gt 0 ] || log_error "no pre-pull DaemonSets in ${NAMESPACE} and no --image given"
     local nodes_json
     nodes_json="$($KUBECTL get nodes -l "$NODE_SELECTOR" -o json)"
     local node_count
     node_count="$(printf '%s' "$nodes_json" | jq '.items | length')"
-    [ "$node_count" -gt 0 ] || log_error "no nodes match ${NODE_SELECTOR}; set --node-selector to the label your model servers select on"
+    if [ "$node_count" -eq 0 ]; then
+        if [ "$mode" = report ]; then
+            log_warning "no nodes match ${NODE_SELECTOR}; the DaemonSets are applied but will run nowhere until --node-selector names the label your model servers select on"
+            return 1
+        fi
+        log_error "no nodes match ${NODE_SELECTOR}; set --node-selector to the label your model servers select on"
+    fi
     # The pod list goes through a file: as a jq argument it exceeds the argv
     # limit on a cluster of any size.
     local pods_file
