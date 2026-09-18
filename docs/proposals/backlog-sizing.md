@@ -485,7 +485,13 @@ so `lambda / mu` read 1.07-1.15 replicas for the rest of the run
 (`replicasImplied` on 137 `throughput-demand-floor` lines for prefill) while
 `residentDemand` on the same lines read 0-54k. Two prefill replicas never
 saturate again, so no later reading could displace either figure: the
-window keeps a max, and the history evicts after 24 h.
+window keeps a max, and the history evicts after 24 h. The warm pass that
+followed on the same controller (run `guidellm-1789746634-pov4xp_1`) shows
+what a persisted figure does on its own: at +51 s, with `residentDemand` 0
+on every prefill line and no decode replica anywhere near saturation, the
+floor read `lambda / mu` = 5.5 / 5.57 = 0.99 replicas -- 98.8 % of the one
+prefill replica's 357 800 -- and ordered the second before the decode
+fleet had ordered its own; both prefill replicas then ran to the end.
 
 This is the convention the throughput floor removed for the queues,
 surfacing one layer down: a backlog that belongs to decode, charged to
