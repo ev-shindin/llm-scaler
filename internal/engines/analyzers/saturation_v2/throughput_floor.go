@@ -61,7 +61,7 @@ import (
 // saturation and never drifts down); what a late order cost was five to
 // seven replicas at the first ramp of every run.
 //
-// Two readings are not trusted with the full order. A mu BORROWED from a
+// Two readings are not trusted with an order, only with a hold. A mu BORROWED from a
 // neighbouring bucket (nearestSaturatedThroughput) is wrong in a known
 // direction and, from a longer shape, over-orders: the old cap at scaleUp x
 // anticipated supply stays, a hold and no more. A window with a SINGLE
@@ -193,9 +193,8 @@ type throughputTerm struct {
 // of 2026-09-19 one decode replica's 3.43 stood on four consecutive cycles
 // -- two scrape pairs -- and let the floor order on it. The 35 minutes of
 // a third replica that followed were the under-read itself, which
-// occupancy would have ordered 30 s later (15-75 s across the three cold
-// passes) and the floor then held either way; the sample count is what
-// this fixes, not that.
+// occupancy would have ordered 30 s later and the floor then held either
+// way; the sample count is what this fixes, not that.
 //
 // Same window size and staleness rule as k2 history, and pruned beside it in
 // EvictStaleHistory.

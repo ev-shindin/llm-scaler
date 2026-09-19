@@ -162,8 +162,7 @@ Properties, each with a spec in `throughput_floor_test.go`:
   against a true ~5.4 -- was the under-read itself: occupancy would have
   ordered the third replica 30 s later, and the floor, uncapped at three
   once it exists, held it either way. The spacing fixes what the guard
-  counts and the cap bounds the first order; an under-read that no later
-  saturation corrects is still open.
+  counts; an under-read that no later saturation corrects is still open.
 - **A backlog is throughput, not residency.** 350 queued requests at 6 req/s
   arriving are 58 s of arrivals; two replicas at 5.4 req/s each clear them in
   about two minutes and three in one. Charged as resident KV they were five

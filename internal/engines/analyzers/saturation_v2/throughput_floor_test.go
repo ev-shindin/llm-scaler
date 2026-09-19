@@ -198,13 +198,20 @@ var _ = Describe("the saturated-throughput window", func() {
 	It("keeps the max, because a saturated completion rate under-reads while the replica is full", func() {
 		// The readings a saturated decode replica produced on the run, in
 		// order: 5.4 (a full minute saturated), then 3.3 and 3.5 under KV
-		// pressure with preemptions. The mean would be 4.07 and imply 1.47
-		// replicas; the replica was demonstrably completing 5.4.
+		// pressure with preemptions, each a rate window apart so each is
+		// a sample (inside the spacing the fold would make them one, and
+		// the max of one is its mean). The mean would be 4.07 and imply
+		// 1.47 replicas; the replica was demonstrably completing 5.4.
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		now := time.Date(2026, 9, 17, 10, 50, 20, 0, time.UTC)
+		a.now = func() time.Time { return now }
 		k := "m|H200|1|decode|long|q5"
-		a.recordSaturatedThroughput(k, 5.4)
-		a.recordSaturatedThroughput(k, 3.3)
-		a.recordSaturatedThroughput(k, 3.5)
+		for _, rate := range []float64{5.4, 3.3, 3.5} {
+			a.recordSaturatedThroughput(k, rate)
+			now = now.Add(ThroughputSampleSpacing)
+		}
+		Expect(a.saturatedThroughput[k].Len()).To(Equal(3))
+		Expect(a.saturatedThroughput[k].Average()).To(BeNumerically("~", 4.07, 0.01), "the mean the window does not use")
 		mu, bucket := a.saturatedThroughputFor(k)
 		Expect(mu).To(Equal(5.4))
 		Expect(bucket).To(Equal("long"))
@@ -557,7 +564,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			}
 		}
 		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", runLambda/3.6*decodeP, 1),
-			"lambda / mu = 1.67 replicas' worth on two: under the one-replica cap, and RC = 0 on a fleet of two")
+			"lambda / mu = 1.67 replicas' worth on two: under the hold at 0.85 x two, and RC = 0 on a fleet of two")
 
 		By("and the next window, a minute on, is the second reading")
 		clock = clock.Add(ThroughputSampleSpacing)
