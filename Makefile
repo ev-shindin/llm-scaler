@@ -2396,6 +2396,8 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@# 30s on the engine PodMonitor is 0..30s of jitter on every scaling
 	@# decision; the P/D scenario took the harness default and paid it.
 	@bash hack/check-scrape-interval.sh
+	@echo "Checking the engine launch preamble asks the loader cache, not a walk of /..."
+	@bash hack/check-launch-preamble.sh
 	@echo "Checking the accelerator label keys agree..."
 	@# The controller (Go), the planning tools (Python) and the create path
 	@# (shell) each carry their own copy of the node label keys that name a GPU
