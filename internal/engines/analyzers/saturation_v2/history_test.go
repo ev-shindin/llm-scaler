@@ -31,6 +31,20 @@ var _ = Describe("Rolling Average", func() {
 			Expect(ra.Average()).To(Equal(4.0)) // (3+4+5)/3
 			Expect(ra.Len()).To(Equal(3))
 		})
+
+		It("holds a value exactly, and forgets it once it is evicted", func() {
+			ra := newRollingAverage(3)
+			ra.Add(1.5)
+			Expect(ra.Contains(1.5)).To(BeTrue())
+			Expect(ra.Contains(1.5000001)).To(BeFalse(), "to the digit")
+			ra.Add(2)
+			ra.Add(3)
+			ra.Add(4) // evicts 1.5
+			Expect(ra.Contains(1.5)).To(BeFalse(), "an evicted value is not held against a new reading")
+			ra.Add(1.5)
+			Expect(ra.Len()).To(Equal(3))
+			Expect(ra.Contains(1.5)).To(BeTrue())
+		})
 	})
 
 	Describe("Empty average", func() {

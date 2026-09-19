@@ -44,17 +44,18 @@ func (r *rollingAverage) Average() float64 {
 	return sum / float64(len(r.values))
 }
 
-// Len returns the number of values currently stored.
 // Contains reports whether value is already in the window, exactly.
 func (r *rollingAverage) Contains(value float64) bool {
-	for _, v := range r.values {
-		if v == value {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(r.values, value)
 }
 
+// Touch marks the window as used now without adding to it: a reading seen
+// again is still the window being observed, and Stale asks about that.
+func (r *rollingAverage) Touch() {
+	r.lastUpdated = time.Now()
+}
+
+// Len returns the number of values currently stored.
 func (r *rollingAverage) Len() int {
 	return len(r.values)
 }

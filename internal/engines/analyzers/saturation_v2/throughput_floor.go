@@ -136,18 +136,28 @@ type throughputTerm struct {
 // accepts: a floor that is too LOW holds back, where occupancy still carries
 // a real shortfall.
 //
-// A reading the window already holds, to the digit, is the same Prometheus
-// sample seen again and is not folded in a second time. The collector's rows
-// are one-minute maxima re-read every cycle, so one saturated moment shows
-// up on four consecutive cycles with the same completion rate; counted four
-// times it clears MinThroughputSamplesToOrder on its own, and the floor
-// orders on the one reading that guard exists to hold on. Measured on the
-// shape-swap trace's cold pass (2026-09-19): one decode replica's single
-// saturated sample (1 150 207 resident, queue 20, 3.43 req/s against a true
-// ~5.4) recorded four times, and the floor held a third decode replica for
-// the remaining 35 minutes at lambda / mu = 1.75. Two rates from two
-// scrapes are never equal to the digit -- a rate is a counter delta over
-// the window -- so equality is the test.
+// A reading counts as a SAMPLE of its own only when it is a new value AND
+// lands ThroughputSampleSpacing after the last one that counted. The rate is
+// rate(...[1m]) evaluated afresh every 15 s cycle, so the next cycle reads
+// mostly the same window -- at 30 s scrapes, exactly the same two samples,
+// and the same value to the digit -- and one saturated moment shows up on
+// several consecutive cycles. Counted each time, two cycles cleared
+// MinThroughputSamplesToOrder on the first window's under-read: the guard
+// was dead at that scrape interval. Value equality alone is not the test
+// either: the rate is an integer count of completions over the scrape
+// interval, so two different windows agree to the digit a few percent of
+// the time, and two replicas saturating in one cycle read two values from
+// the same moment. A minute apart, two readings share no samples. Readings
+// inside the spacing keep the window observed (Touch) and enter nothing:
+// what the next window says, the next counted reading will.
+//
+// Measured on the shape-swap trace: every saturated rate logged over four
+// passes is N/30 (103/30 = 3.43, 110/30 = 3.67, 165/30 = 5.5 ...), and on
+// the cold pass of 2026-09-19 one decode replica's 3.43 stood on four
+// consecutive cycles -- two scrape pairs -- and let the floor order on it.
+// The 35 minutes of a third replica that followed were the under-read
+// itself, which occupancy would have ordered 30 s later and the floor then
+// held either way; the sample count is what this fixes, not that.
 //
 // Same window size and staleness rule as k2 history, and pruned beside it in
 // EvictStaleHistory.
@@ -155,17 +165,21 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 	if !(rate > 0) {
 		return
 	}
+	now := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ra, ok := a.saturatedThroughput[key]
 	if !ok || ra.Stale(HistoryEvictionTimeout) {
 		ra = newRollingAverage(RollingAverageWindowSize)
 		a.saturatedThroughput[key] = ra
+		delete(a.throughputSampledAt, key)
 	}
-	if ra.Contains(rate) {
+	if last, sampled := a.throughputSampledAt[key]; ra.Contains(rate) || (sampled && now.Sub(last) < ThroughputSampleSpacing) {
+		ra.Touch() // observed, not a second measurement: the window is not going stale
 		return
 	}
 	ra.Add(rate)
+	a.throughputSampledAt[key] = now
 }
 
 // saturatedThroughputFor returns the saturated completion rate on record for

@@ -246,18 +246,34 @@ var _ = Describe("the saturated-throughput window", func() {
 		// clear MinThroughputSamplesToOrder and let the floor order at
 		// lambda / 3.43 = 1.75 replicas' worth on one under-read.
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		t0 := time.Date(2026, 9, 19, 7, 44, 41, 0, time.UTC)
+		now := t0
+		a.now = func() time.Time { return now }
 		for i := 0; i < 4; i++ {
+			now = t0.Add(time.Duration(i) * 15 * time.Second)
 			a.recordSaturatedThroughput("k", 3.433333333333333)
 		}
 		Expect(a.saturatedThroughput["k"].Len()).To(Equal(1), "one reading, however often the row repeats")
 		Expect(a.saturatedThroughputReading("k").samples).To(Equal(1))
 
-		By("counting a reading that differs, however slightly")
+		By("still counting as observed: a re-read row does not let the window go stale")
+		a.saturatedThroughput["k"].lastUpdated = time.Now().Add(-2 * time.Hour)
+		a.recordSaturatedThroughput("k", 3.433333333333333)
+		Expect(a.saturatedThroughput["k"].Stale(time.Hour)).To(BeFalse())
+		Expect(a.saturatedThroughput["k"].Len()).To(Equal(1))
+
+		By("not counting a different value inside the spacing either: two replicas, one moment")
+		a.recordSaturatedThroughput("k", 3.6)
+		Expect(a.saturatedThroughput["k"].Len()).To(Equal(1), "the next window will say what it says")
+
+		By("counting a reading that differs and lands a rate window after the last counted one")
+		now = t0.Add(ThroughputSampleSpacing)
 		a.recordSaturatedThroughput("k", 3.4333333333333336)
 		Expect(a.saturatedThroughput["k"].Len()).To(Equal(2))
 		Expect(a.saturatedThroughput["k"].Max()).To(BeNumerically("~", 3.4333333333333336, 1e-12))
 
-		By("and one the window already holds from earlier is still the same sample")
+		By("and one the window already holds, a window later, is one it has: a repeat is a few-percent event, and costs a cycle")
+		now = now.Add(ThroughputSampleSpacing)
 		a.recordSaturatedThroughput("k", 3.433333333333333)
 		Expect(a.saturatedThroughput["k"].Len()).To(Equal(2))
 	})
@@ -384,14 +400,16 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 	}
-	// Each cycle a reading of its own: two scrapes never agree to the digit,
-	// and the window does not count one twice (recordSaturatedThroughput).
+	// Each cycle a reading of its own, a rate window apart: the window counts
+	// a reading as a sample only when it is a new value that lands
+	// ThroughputSampleSpacing after the last one (recordSaturatedThroughput).
 	// The first is the under-read, the last is runMu, which the max keeps.
+	// The last step also moves the clock past DecodeSaturationMemory.
 	saturate := func() {
 		for i := MinThroughputSamplesToOrder - 1; i >= 0; i-- {
 			saturateOnce(runMu - 0.01*float64(i))
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
 		}
-		clock = clock.Add(DecodeSaturationMemory + time.Second)
 	}
 
 	It("holds the decode role at lambda / mu once the fleet has caught up", func() {
@@ -434,11 +452,61 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(bare.RoleDemand[domain.RoleDecode]).To(BeNumerically("<", want/5))
 	})
 
+	It("does not order on one saturated sample, however many cycles the row shows it", func() {
+		// The measured failure: one decode replica's saturated sample --
+		// 1 150 207 resident, queue 20, 3.43 req/s against a true ~5.4 --
+		// re-read on four consecutive cycles. Counted four times it cleared
+		// MinThroughputSamplesToOrder, and the floor ordered a third replica
+		// at lambda / 3.43 = 1.75 replicas' worth and held it for the rest of
+		// the run.
+		for i := 0; i < 4; i++ {
+			in := makeAnalyzerInput(
+				[]domain.ReplicaMetrics{decode("decode-0", 1_150_207, 20, 3.433333333333333), prefill("prefill-0", 66_183)},
+				states(1, 1))
+			in.ArrivalRate = runLambda
+			_, err := analyzer.Analyze(ctx, in)
+			Expect(err).NotTo(HaveOccurred())
+			clock = clock.Add(15 * time.Second)
+		}
+		Expect(analyzer.saturatedThroughputReading("test-model|H200|1|decode|long|q5").samples).To(Equal(1))
+
+		// Two replicas running now, occupancy a fraction of one: the one
+		// reading may hold the fleet at what it has, not order the third.
+		in := makeAnalyzerInput(
+			[]domain.ReplicaMetrics{decode("decode-0", 200_000, 0, runLambda/2), decode("decode-1", 200_000, 0, runLambda/2), prefill("prefill-0", 0)},
+			states(2, 1))
+		in.ArrivalRate = runLambda
+		result, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		var decodeP float64
+		for _, vc := range result.VariantCapacities {
+			if vc.VariantName == decodeVariant {
+				decodeP = vc.PerReplicaCapacity
+			}
+		}
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 0.85*2*decodeP, 1),
+			"held at the scale-up threshold of the two: RC = 0, no third replica")
+
+		By("ordering once a second reading of its own is on record, a rate window later")
+		clock = clock.Add(ThroughputSampleSpacing)
+		sat := makeAnalyzerInput(
+			[]domain.ReplicaMetrics{decode("decode-0", 1_150_207, 20, 3.5), prefill("prefill-0", 66_183)},
+			states(1, 1))
+		sat.ArrivalRate = runLambda
+		_, err = analyzer.Analyze(ctx, sat)
+		Expect(err).NotTo(HaveOccurred())
+		result, err = analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", runLambda/3.5*decodeP, 1),
+			"lambda / mu, uncapped: 1.71 replicas' worth on a fleet of two -- RC = 0 still, and it would order on a fleet of one")
+	})
+
 	It("orders the second replica from lambda / mu on a fleet of one", func() {
 		// After ONE saturated cycle the window holds a single reading and the
 		// floor holds the fleet where it is (RC = 0 exactly); after the second
-		// -- a reading of its own, not the first re-read -- it orders.
+		// -- a reading of its own, a rate window later -- it orders.
 		saturateOnce(runMu - 0.01)
+		clock = clock.Add(ThroughputSampleSpacing)
 		in0 := makeAnalyzerInput(
 			[]domain.ReplicaMetrics{decode("decode-0", 200_000, 0, runLambda), prefill("prefill-0", 0)},
 			states(1, 1))
@@ -738,7 +806,8 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 
-		in.ReplicaMetrics[0].RequestRate = runMu - 0.01 // a second reading, not the first re-read
+		in.ReplicaMetrics[0].RequestRate = runMu - 0.01 // a second reading, a rate window later
+		clock = clock.Add(ThroughputSampleSpacing)
 		_, err = analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred(), "the second saturated cycle, so the window may order")
 
