@@ -57,6 +57,10 @@ Two details worth knowing:
   default is 30 s; `hack/benchmark/patch_harness.sh` (fix 13) makes it 10 s,
   so a scenario that sets no interval — the P/D one — scrapes at 10 s too.
   `make lint-deploy-scripts` checks every interval this repo ships says so.
+  The controller's own `PROMETHEUS_METRICS_CACHE_TTL` (30 s) is not on this
+  path: the per-cycle replica collector queries Prometheus each cycle and
+  memoises within the cycle only, so at 10 s every 15 s cycle reads a fresh
+  row — visible on a run as a `requestRate` that changes every cycle.
 
 > **Check your Prometheus actually selects it.** The operator only reads
 > PodMonitors matching its `podMonitorSelector`. A stack installed with a

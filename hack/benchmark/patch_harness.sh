@@ -947,13 +947,18 @@ fi
 #   config/templates/jinja/17_standalone-podmonitor.yaml.j2
 #   config/templates/jinja/18_podmonitor.yaml.j2   {{ monitoring.scrapeInterval | default('30s') }}
 #
-# Measured on the shape-swap P/D trace, two cold passes on the same code: the
-# KV crossing that orders the second decode replica was seen at +53 s on one
-# and +70 s on the other, and the replica served from +143 s against +175 s;
-# the first-window p95 TTFT was 0.79 s against 3.25 s. The 15 s optimisation
-# cycle read the same 30 s row twice, and every saturated completion rate the
-# analyzer logged was an integer over 30. A scenario may still set either key
-# and win; the defaults just stop being the slow ones.
+# Measured on the shape-swap P/D trace, two cold passes on the same code at
+# 30 s: the KV crossing that orders the second decode replica was seen at
+# +53 s on one and +70 s on the other; the replica was Ready at +133 s and
+# +144 s, and the controller's rows showed it serving at +143 s and +175 s
+# (the row lag again). The 15 s optimisation cycle read the same row twice,
+# and every saturated completion rate the analyzer logged was an integer
+# over 30. At 10 s, on the same code: the crossing seen at +61 s, the
+# Deployment at 2 eleven seconds later, a fresh row every cycle (rates N/50);
+# the ramp's TTFT did not move, because that pass's second engine took 91 s
+# from container start to Ready against 57-58 s -- the scrape is the small
+# term. A scenario may still set either key and win; the defaults just stop
+# being the slow ones.
 # ---------------------------------------------------------------------------
 DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
 TPL17="$REPO_DIR/config/templates/jinja/17_standalone-podmonitor.yaml.j2"

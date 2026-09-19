@@ -16,6 +16,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PY=${PYTHON:-python3}
 FAILED=0
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
@@ -33,7 +34,7 @@ files="$(grep -rlE 'kind: (PodMonitor|ServiceMonitor)|scrapeInterval:|podmonitor
 slow="$(printf '%s\n' "$files" | xargs grep -nE '^[[:space:]]*-?[[:space:]]*(interval|scrapeInterval):[[:space:]]*"?[0-9]+[smh]"?' \
     | grep -vE ':[[:space:]]*"?10s"?([[:space:]]|$|#)')"
 if [ -z "$slow" ]; then
-    n="$(printf '%s\n' "$files" | xargs grep -cE '^[[:space:]]*-?[[:space:]]*(interval|scrapeInterval):[[:space:]]*"?10s' | awk -F: '{s+=$2} END {print s+0}')"
+    n="$(printf '%s\n' "$files" | xargs grep -HcE '^[[:space:]]*-?[[:space:]]*(interval|scrapeInterval):[[:space:]]*"?10s' | awk -F: '{s+=$NF} END {print s+0}')"
     [ "$n" -gt 0 ] && ok "every shipped scrape interval is 10s ($n sites in $(printf '%s\n' "$files" | wc -l | tr -d ' ') files)" \
                    || fail "no 10s scrape interval found at all -- the grep is broken"
 else
@@ -60,23 +61,23 @@ printf 'monitoring:\n  metricsPath: /metrics\n  scrapeInterval: "30s"\n  metrics
 printf 'spec:\n  podMetricsEndpoints:\n  - interval: {{ monitoring.scrapeInterval | default('"'"'30s'"'"') }}\n    path: /metrics\n  x:\n    interval: {{ monitoring.scrapeInterval | default('"'"'30s'"'"') }}\n' > "$T/18.j2"
 printf 'spec:\n  endpoints:\n  - interval: {{ monitoring.scrapeInterval | default('"'"'30s'"'"') }}\n' > "$T/17.j2"
 
-out="$(python3 "$T/fix13.py" "$T/defaults.yaml" "$T/17.j2" "$T/18.j2" 2>&1)"
+out="$("$PY" "$T/fix13.py" "$T/defaults.yaml" "$T/17.j2" "$T/18.j2" 2>&1)"
 case "$out" in *"applied"*) ok "fix 13: applies to the upstream anchors" ;; *) fail "fix 13 on the fixture: $out" ;; esac
 [ "$(grep -c '"10s"' "$T/defaults.yaml")" = 3 ] && ! grep -q '"30s"' "$T/defaults.yaml" \
     && ok "fix 13: defaults.yaml -- scrapeInterval and both podmonitor blocks at 10s, no 30s left" \
     || fail "fix 13: defaults.yaml still carries a 30s or is missing a 10s: $(grep -n '0s"' "$T/defaults.yaml" | tr '\n' ' ')"
 [ "$(grep -c "default('10s')" "$T/18.j2")" = 2 ] && [ "$(grep -c "default('10s')" "$T/17.j2")" = 1 ] && ! grep -q "30s" "$T/17.j2" "$T/18.j2" \
     && ok "fix 13: templates 17 and 18 default to 10s" || fail "fix 13: template defaults: $(grep -n 'default' "$T/17.j2" "$T/18.j2" | tr '\n' ' ')"
-out="$(python3 "$T/fix13.py" "$T/defaults.yaml" "$T/17.j2" "$T/18.j2" 2>&1)"
+out="$("$PY" "$T/fix13.py" "$T/defaults.yaml" "$T/17.j2" "$T/18.j2" 2>&1)"
 case "$out" in *"already applied"*) ok "fix 13: idempotent" ;; *) fail "fix 13 second run: $out" ;; esac
 # Without template 17 (older harness) the fix still applies the rest.
-cp "$T/defaults.yaml" "$T/d2.yaml"; sed -i 's/"10s"  # wva-patch.*/"30s"/; s/"10s"  # wva-patch/"30s"/' "$T/d2.yaml"
+cp "$T/defaults.yaml" "$T/d2.yaml"; sed -i 's/"10s"  # wva-patch.*/"30s"/' "$T/d2.yaml"
 printf 'spec:\n  podMetricsEndpoints:\n  - interval: {{ monitoring.scrapeInterval | default('"'"'30s'"'"') }}\n  x:\n    interval: {{ monitoring.scrapeInterval | default('"'"'30s'"'"') }}\n' > "$T/18b.j2"
-out="$(python3 "$T/fix13.py" "$T/d2.yaml" "$T/absent.j2" "$T/18b.j2" 2>&1)"
+out="$("$PY" "$T/fix13.py" "$T/d2.yaml" "$T/absent.j2" "$T/18b.j2" 2>&1)"
 case "$out" in *": applied"*) ok "fix 13: applies without template 17" ;; *) fail "fix 13 without template 17: $out" ;; esac
 # A moved anchor is refused, not half-applied.
 printf 'monitoring:\n  scrapeInterval: "30s"\n' > "$T/d3.yaml"
-out="$(python3 "$T/fix13.py" "$T/d3.yaml" "$T/absent.j2" "$T/18b.j2" 2>&1)"; rc=$?
+out="$("$PY" "$T/fix13.py" "$T/d3.yaml" "$T/absent.j2" "$T/18b.j2" 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"anchor missing"*) ok "fix 13: refuses a changed upstream shape" ;; *) fail "fix 13 on a changed shape: $out" ;; esac \
     || fail "fix 13 on a changed shape exited 0"
 
