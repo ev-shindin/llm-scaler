@@ -83,8 +83,17 @@ Properties, each with a spec in `throughput_floor_test.go`:
   *single* reading is the first cycle's under-read (3.67 against a true 7.13
   on the run), and an order on it over-provisions in a way that removes the
   saturation which would have recorded the second, corrected reading
-  (`MinThroughputSamplesToOrder`, 2). Neither changed the measured runs:
-  every order on them came from a window with several readings of its own.
+  (`MinThroughputSamplesToOrder`, 2). Two *distinct* readings: the
+  collector's rows are one-minute maxima re-read every cycle, so one
+  saturated moment shows up on four consecutive cycles with the same
+  completion rate to the digit, and counted four times it cleared the guard
+  on its own. Measured on the shape-swap trace's cold pass (2026-09-19): one
+  decode replica's single saturated sample -- 1 150 207 resident, queue 20,
+  3.43 req/s against a true ~5.4 -- recorded four times, and the floor
+  ordered and held a third decode replica for the remaining 35 minutes at
+  `lambda / mu` = 1.75. A rate the window already holds, exactly, is the
+  same sample and is not folded in again; two scrapes never agree to the
+  digit, a rate being a counter delta over the window.
 - **A backlog is throughput, not residency.** 350 queued requests at 6 req/s
   arriving are 58 s of arrivals; two replicas at 5.4 req/s each clear them in
   about two minutes and three in one. Charged as resident KV they were five

@@ -89,7 +89,9 @@ const (
 	// order on an under-read over-provisions in a way that removes the
 	// saturation which would have corrected it. Measured on the shape-swap
 	// trace: 3.67, then 5.23, then 7.13 req/s on three consecutive saturated
-	// cycles of one replica. Two readings is the second cycle.
+	// cycles of one replica. Two readings is the second cycle -- two DISTINCT
+	// readings: the same sample re-read on the next cycle is not one
+	// (recordSaturatedThroughput).
 	MinThroughputSamplesToOrder = 2
 
 	// VeryLongOutputThreshold is the upper bound (exclusive) for the "xxlong"

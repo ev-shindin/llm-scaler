@@ -45,6 +45,16 @@ func (r *rollingAverage) Average() float64 {
 }
 
 // Len returns the number of values currently stored.
+// Contains reports whether value is already in the window, exactly.
+func (r *rollingAverage) Contains(value float64) bool {
+	for _, v := range r.values {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *rollingAverage) Len() int {
 	return len(r.values)
 }

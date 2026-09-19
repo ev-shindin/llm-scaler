@@ -184,7 +184,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		// learned under decode's metering has, below the offered rate.
 		for i := 0; i < MinThroughputSamplesToOrder; i++ {
 			slow := prefill()
-			slow.RequestRate = 4
+			slow.RequestRate = 4 - 0.01*float64(i) // two readings, not one re-read
 			in := makeAnalyzerInput([]domain.ReplicaMetrics{
 				decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 0), slow}, states)
 			in.ArrivalRate = runLambda

@@ -240,6 +240,28 @@ var _ = Describe("the saturated-throughput window", func() {
 		Expect(mu).To(BeZero())
 	})
 
+	It("does not count the same sample twice", func() {
+		// The run's rows: one decode replica's saturated sample re-read on
+		// four consecutive cycles, 3.43 req/s each time. Four samples would
+		// clear MinThroughputSamplesToOrder and let the floor order at
+		// lambda / 3.43 = 1.75 replicas' worth on one under-read.
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		for i := 0; i < 4; i++ {
+			a.recordSaturatedThroughput("k", 3.433333333333333)
+		}
+		Expect(a.saturatedThroughput["k"].Len()).To(Equal(1), "one reading, however often the row repeats")
+		Expect(a.saturatedThroughputReading("k").samples).To(Equal(1))
+
+		By("counting a reading that differs, however slightly")
+		a.recordSaturatedThroughput("k", 3.4333333333333336)
+		Expect(a.saturatedThroughput["k"].Len()).To(Equal(2))
+		Expect(a.saturatedThroughput["k"].Max()).To(BeNumerically("~", 3.4333333333333336, 1e-12))
+
+		By("and one the window already holds from earlier is still the same sample")
+		a.recordSaturatedThroughput("k", 3.433333333333333)
+		Expect(a.saturatedThroughput["k"].Len()).To(Equal(2))
+	})
+
 	It("ignores a non-positive reading and is evicted with the k2 history", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
 		a.recordSaturatedThroughput("k", 0)
@@ -354,17 +376,20 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	// 1.15M resident, completing 5.4/s -- and the cycle after it, which is
 	// what makes the window one the floor may order on
 	// (MinThroughputSamplesToOrder).
-	saturateOnce := func() {
+	saturateOnce := func(rate float64) {
 		in := makeAnalyzerInput(
-			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 10, runMu), prefill("prefill-0", 66_183)},
+			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 10, rate), prefill("prefill-0", 66_183)},
 			states(1, 1))
 		in.ArrivalRate = runLambda
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 	}
+	// Each cycle a reading of its own: two scrapes never agree to the digit,
+	// and the window does not count one twice (recordSaturatedThroughput).
+	// The first is the under-read, the last is runMu, which the max keeps.
 	saturate := func() {
-		for i := 0; i < MinThroughputSamplesToOrder; i++ {
-			saturateOnce()
+		for i := MinThroughputSamplesToOrder - 1; i >= 0; i-- {
+			saturateOnce(runMu - 0.01*float64(i))
 		}
 		clock = clock.Add(DecodeSaturationMemory + time.Second)
 	}
@@ -412,8 +437,8 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	It("orders the second replica from lambda / mu on a fleet of one", func() {
 		// After ONE saturated cycle the window holds a single reading and the
 		// floor holds the fleet where it is (RC = 0 exactly); after the second
-		// it orders.
-		saturateOnce()
+		// -- a reading of its own, not the first re-read -- it orders.
+		saturateOnce(runMu - 0.01)
 		in0 := makeAnalyzerInput(
 			[]domain.ReplicaMetrics{decode("decode-0", 200_000, 0, runLambda), prefill("prefill-0", 0)},
 			states(1, 1))
@@ -429,7 +454,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(held.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 0.85*heldP, 1),
 			"one reading: capped at scaleUp x the one replica, so nothing is ordered")
 
-		saturateOnce()
+		saturateOnce(runMu)
 		// One decode replica at a fifth of its KV, no queue, mu on record:
 		// occupancy says nothing; the load says 1.11 replicas. RC through the
 		// engine's headroom is D / 0.85 - P > 0, so the second replica is
@@ -713,6 +738,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 
+		in.ReplicaMetrics[0].RequestRate = runMu - 0.01 // a second reading, not the first re-read
 		_, err = analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred(), "the second saturated cycle, so the window may order")
 

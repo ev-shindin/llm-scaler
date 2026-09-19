@@ -136,6 +136,19 @@ type throughputTerm struct {
 // accepts: a floor that is too LOW holds back, where occupancy still carries
 // a real shortfall.
 //
+// A reading the window already holds, to the digit, is the same Prometheus
+// sample seen again and is not folded in a second time. The collector's rows
+// are one-minute maxima re-read every cycle, so one saturated moment shows
+// up on four consecutive cycles with the same completion rate; counted four
+// times it clears MinThroughputSamplesToOrder on its own, and the floor
+// orders on the one reading that guard exists to hold on. Measured on the
+// shape-swap trace's cold pass (2026-09-19): one decode replica's single
+// saturated sample (1 150 207 resident, queue 20, 3.43 req/s against a true
+// ~5.4) recorded four times, and the floor held a third decode replica for
+// the remaining 35 minutes at lambda / mu = 1.75. Two rates from two
+// scrapes are never equal to the digit -- a rate is a counter delta over
+// the window -- so equality is the test.
+//
 // Same window size and staleness rule as k2 history, and pruned beside it in
 // EvictStaleHistory.
 func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64) {
@@ -148,6 +161,9 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 	if !ok || ra.Stale(HistoryEvictionTimeout) {
 		ra = newRollingAverage(RollingAverageWindowSize)
 		a.saturatedThroughput[key] = ra
+	}
+	if ra.Contains(rate) {
+		return
 	}
 	ra.Add(rate)
 }
