@@ -68,12 +68,13 @@ import (
 // reading is the first window's under-read -- an order on it
 // over-provisions, and the over-provisioned fleet never saturates again to
 // record the second reading that would have corrected it
-// (MinThroughputSamplesToOrder) -- and is capped at one replica beyond the
-// anticipated supply: the second reading is a rate window away
-// (ThroughputSampleSpacing), and a fleet held at its size for that minute,
-// its queues priced nowhere, landed the cold ramp's next replica 15-75 s
-// later than occupancy alone would have. One replica bounds the
-// under-read's damage and keeps the early order.
+// (MinThroughputSamplesToOrder) -- the cap stays, a hold and no more. The
+// second reading is a rate window away (ThroughputSampleSpacing), and a
+// fleet held at its size for that minute, its queues priced nowhere, lands
+// the cold ramp's next replica 15-45 s after the old dead guard would have
+// (occupancy orders in the meantime, or the second reading does); letting
+// the one reading order one replica was tried and dropped, see
+// estimateThroughputDemand.
 //
 // The same model prices a BACKLOG. Occupancy charged every queued request at
 // its full KV footprint, as if all of them had to be resident at once, and
@@ -118,10 +119,9 @@ type throughputTerm struct {
 	Backlog float64
 	// Replicas is (lambda + Backlog / DrainSeconds) / Mu.
 	Replicas float64
-	// Held reports that the floor was capped because its mu is not one the
-	// floor may order the full figure on -- HeldWhy says which: "borrowed"
-	// (a neighbouring bucket's reading; capped at the fleet's own size) or
-	// "single-sample" (one reading; capped at one replica beyond it).
+	// Held reports that the floor was capped at the fleet's anticipated size
+	// because its mu is not one the floor may order on -- HeldWhy says
+	// which: "borrowed" (a neighbouring bucket's reading) or "single-sample".
 	Held    bool
 	HeldWhy string
 }
@@ -166,8 +166,8 @@ type throughputTerm struct {
 // replicas saturating in one cycle read as one moment at the higher of
 // the two, whichever row the collector's map yields first.
 //
-// What the max is worth is another matter. The file header says a
-// saturated rate only under-reads; that holds while the replica is full,
+// What the max is worth is another matter. A saturated rate under-reads
+// while the replica is full (file header),
 // and fails in the last minute of an episode that ends by a replica
 // landing: the queue gate is a one-minute max and stays up while the rate
 // is fresh, and the fresh rate is the batch draining -- sequences admitted
@@ -380,15 +380,6 @@ func estimateThroughputDemand(
 	// readings).
 	costs := make(map[string][]float64)
 	mus := make(map[string][]float64)
-	// ownP is the per-replica capacity of each replica whose reading is the
-	// role's own: what "one replica" is worth when a single reading may
-	// order one. Not cost x mu -- two medians taken apart are not a
-	// replica's P once replicas differ in mu (P = 100 at mu 2 and mu 10:
-	// median cost 30 x median mu 6 = 180) -- and not a borrowed reading's.
-	// The SMALLEST of them: the optimizer turns the tokens it is short into
-	// replicas of whichever variant it picks, ceil(RC / P_v), and one
-	// replica of the largest is two of the smallest.
-	ownP := make(map[string][]float64)
 	mayOrder := make(map[string]bool)
 	borrowedOnly := make(map[string]bool)
 	for _, rc := range replicas {
@@ -407,7 +398,6 @@ func estimateThroughputDemand(
 		}
 		if !rc.SaturatedThroughputBorrowed {
 			borrowedOnly[role] = false
-			ownP[role] = append(ownP[role], p)
 			if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder {
 				mayOrder[role] = true
 			}
@@ -431,26 +421,20 @@ func estimateThroughputDemand(
 		floor := rate * cost
 		term := throughputTerm{Mu: mu, PerReplica: cost * mu, Backlog: b, Replicas: rate / mu}
 		if !mayOrder[role] && scaleUp > 0 {
-			// A borrowed reading may hold and no more. A single reading of the
-			// role's own may bring the fleet to ONE replica beyond what is
-			// RUNNING: with the spacing, the second reading is a minute away,
-			// and a fleet held at its size for that minute with its queues
-			// priced nowhere (the floor takes the residency charge out for a
-			// role with a mu) landed the cold ramp's third replica 15-75 s
-			// later than occupancy alone would have. One replica bounds what
-			// the first window's under-read can over-order, and the saturation
-			// the second reading needs outlives a start. Counted from the
-			// running fleet, not the anticipated one: a replica already on
-			// its way is the one. Measured on the cold pass of 2026-09-19
-			// (second), the phase switch's first reading (2.25 against a true
-			// ~2.75) met an anticipated supply of three with the third still
-			// starting, and "anticipated plus one" ordered a fourth the run
-			// never needed; against the two running it is held at three.
-			hold := scaleUp * anticipated[role].TotalAnticipatedSupply
-			if own := ownP[role]; len(own) > 0 {
-				hold = scaleUp * max(anticipated[role].TotalAnticipatedSupply, anticipated[role].TotalSupply+slices.Min(own))
-			}
-			if floor > hold {
+			// A hold, not an order, on either. Letting a single reading order
+			// one replica was tried, twice: measured against the anticipated
+			// supply it ordered a fourth replica at a phase switch whose
+			// third was still starting; measured against the running supply
+			// it was a ratchet -- nothing remembered that the reading had
+			// already ordered, so once the ordered replica reported, the same
+			// reading ordered the next, up to the full figure one start at a
+			// time. Across four passes the one replica bought a single cycle
+			// over the plain hold (a third replica 30 s ahead of occupancy,
+			// on the under-read that then ran unneeded for 35 minutes), and
+			// the hold's own cost, replayed, is 15-45 s on the cold ramp's
+			// next replica: the second counted reading lands a window after
+			// the first, and occupancy orders in the meantime.
+			if hold := scaleUp * anticipated[role].TotalAnticipatedSupply; floor > hold {
 				floor = hold
 				term.Held = true
 				term.HeldWhy = "single-sample"

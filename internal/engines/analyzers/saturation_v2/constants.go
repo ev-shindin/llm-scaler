@@ -82,8 +82,8 @@ const (
 	BacklogDrainSeconds = 60.0
 
 	// MinThroughputSamplesToOrder is how many saturated readings a role's own
-	// output-length bucket must hold before the throughput floor may ORDER
-	// the full figure from it; with one it may order one replica. The first
+	// output-length bucket must hold before the throughput floor may ORDER a
+	// replica from it; with fewer it holds the fleet and no more. The first
 	// reading at a saturation under-reads (a 1m rate on a replica that has
 	// been full for 20 s counts a third of a minute's completions), and an
 	// order on an under-read over-provisions in a way that removes the

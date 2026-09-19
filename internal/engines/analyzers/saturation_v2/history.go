@@ -75,8 +75,9 @@ func (r *rollingAverage) Len() int {
 
 // Max returns the largest stored value, or 0 if empty. The saturated
 // throughput window reads this rather than Average: see
-// recordSaturatedThroughput for why a completion rate under saturation can
-// only under-read.
+// recordSaturatedThroughput for why a completion rate under saturation
+// under-reads while the replica is full -- and for the drain at an
+// episode's end, which it does not.
 func (r *rollingAverage) Max() float64 {
 	if len(r.values) == 0 {
 		return 0
