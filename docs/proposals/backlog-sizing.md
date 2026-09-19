@@ -635,8 +635,9 @@ prefill again at one and the hold again on the cycles decode was full and
 queued. Its decode GPU-minutes are the highest of the cold passes (103.4)
 for a reason outside this change: the decode target chattered 3, 2, 3, 2
 from +272 s to +1023 s and the HPA's window kept the third replica until
-+1202 s, the descent that PR #73's sticky scale-down exists for, which is
-not in this image.
++1202 s, the descent the sticky scale-down (`WVA_STICKY_SCALE_DOWN`, on by
+default since it merged) exists for; it had not merged when this image
+was built. A run on the merged tree is below.
 
 The re-run did not get the signals that separate held blocks from bursts
 (prefill's `num_requests_running`, its KV at the queue peak, the EPP
