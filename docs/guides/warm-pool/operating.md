@@ -53,8 +53,10 @@ Two details worth knowing:
   (`config/modelserver-metrics/`) use 10 s; set the same on model servers you
   deploy from your own values (`monitoring.podmonitor.interval` in a
   modelservice values file, as the `two-variant-wva` and
-  `workload-autoscaling` benchmark scenarios do — the P/D scenario takes the
-  harness's own PodMonitor and its interval).
+  `workload-autoscaling` benchmark scenarios do). The benchmark harness's own
+  default is 30 s; `hack/benchmark/patch_harness.sh` (fix 13) makes it 10 s,
+  so a scenario that sets no interval — the P/D one — scrapes at 10 s too.
+  `make lint-deploy-scripts` checks every interval this repo ships says so.
 
 > **Check your Prometheus actually selects it.** The operator only reads
 > PodMonitors matching its `podMonitorSelector`. A stack installed with a

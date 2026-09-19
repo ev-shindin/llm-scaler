@@ -18,7 +18,10 @@ spec:
         operator: Exists
   podMetricsEndpoints:
     - path: /metrics
-      interval: 30s
+      # 10s, like every other engine scrape this repo sets up: the scale-up
+      # signal is a queue at the engine and moves only when Prometheus holds
+      # a sample showing it, so the interval is jitter on every decision.
+      interval: 10s
       relabelings:
         # A launcher pod runs two containers; only the one hosting vLLM serves
         # engine metrics.
