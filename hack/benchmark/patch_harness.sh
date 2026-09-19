@@ -1033,14 +1033,17 @@ fi
 # cluster's NVMe nodes with two near-empty volumes mounted, so 1-2 s of a 58 s
 # cold start; `ldconfig -p` answers the same question from the loader cache
 # in 2 ms, and it is where the NVIDIA runtime registers the driver's libcuda.
-# The image's own forward-compat copy (/usr/local/cuda-*/compat, a glob, no
-# walk, symlinked names resolved to one) is appended as before, so the
-# exported paths are the ones the walk
-# produced, in the same order; the walk itself is kept only as the fallback
-# for an image with neither, restricted to /usr and /opt on the root
-# filesystem. Measured in the engine image, the exported paths identical:
-# 1.9 s -> 6 ms in the serving pod, 0.6 s -> 6 ms in a GPU-less pod where
-# only the compat copy exists.
+# Its entries come first, in the cache's own order (the loader's search
+# order), deduplicated; the image's forward-compat copy
+# (/usr/local/cuda-*/compat, a glob, no walk, symlinked names resolved to
+# one) is appended after them; the walk is kept only as the fallback for an
+# image with neither, restricted to /usr and /opt on the root filesystem.
+# Measured in the engine image, the exported paths identical to the walk's:
+# 1.9 s -> 6 ms in the serving pod (driver, then compat), 0.6 s -> 6 ms in
+# a GPU-less pod (compat only). One difference, deliberate: with nothing
+# found the walk exported a leading empty component (":$LD_LIBRARY_PATH",
+# which the loader reads as the working directory); this leaves the
+# variables as they were.
 # ---------------------------------------------------------------------------
 DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
 if [ ! -f "$DEFAULTS" ]; then
@@ -1058,9 +1061,9 @@ OLD = '''  runtimePreamble: |
 '''
 NEW = '''  # wva-patch: the loader cache answers in ms; `find /` walked every mounted volume, twice.
   runtimePreamble: |
-    cuda_dirs=$(ldconfig -p 2>/dev/null | awk '/libcuda\\.so\\.1 /{print $NF}' | xargs -rn1 dirname 2>/dev/null | sort -u | paste -sd:)
+    cuda_dirs=$(ldconfig -p 2>/dev/null | awk '/libcuda\\.so\\.1 /{print $NF}' | xargs -rn1 dirname 2>/dev/null | awk '!seen[$0]++' | paste -sd:)
     for d in /usr/local/cuda*/compat; do [ -e "$d/libcuda.so.1" ] || continue; d=$(readlink -f "$d"); case ":$cuda_dirs:" in *":$d:"*) ;; *) cuda_dirs=${cuda_dirs:+$cuda_dirs:}$d ;; esac; done
-    [ -n "$cuda_dirs" ] || cuda_dirs=$(find /usr /opt -xdev -name libcuda.so.1 -printf '%h\\n' 2>/dev/null | sort -u | paste -sd:)
+    [ -n "$cuda_dirs" ] || cuda_dirs=$(find /usr /opt -xdev -name libcuda.so.1 -printf '%h\\n' 2>/dev/null | awk '!seen[$0]++' | paste -sd:)
     export LD_LIBRARY_PATH=${cuda_dirs:+$cuda_dirs:}${LD_LIBRARY_PATH}
     export LIBRARY_PATH=${cuda_dirs%%:*}${cuda_dirs:+:}${LIBRARY_PATH}
 '''
