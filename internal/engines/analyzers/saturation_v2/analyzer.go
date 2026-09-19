@@ -64,6 +64,12 @@ type SaturationAnalyzer struct {
 	// saturated replica HOLDS, this says how fast it COMPLETES, and only the
 	// latter tells how many replicas a given arrival rate needs.
 	saturatedThroughput map[string]*rollingAverage
+	// throughputSampledAt is, per saturatedThroughput key, when the window
+	// last took a reading as a sample of its own, and throughputLastRead the
+	// last reading it was given, sample or not (recordSaturatedThroughput);
+	// both swept with the window.
+	throughputSampledAt map[string]time.Time
+	throughputLastRead  map[string]float64
 	capacityStore       *CapacityKnowledgeStore
 
 	// decodeSaturatedAt is, per namespace|model, the last cycle a decode
@@ -91,6 +97,8 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore) *SaturationAnalyzer {
 		computeCapacityHistory: make(map[string]*rollingAverage),
 		lastAccelerator:        make(map[string]acceleratorMemo),
 		saturatedThroughput:    make(map[string]*rollingAverage),
+		throughputSampledAt:    make(map[string]time.Time),
+		throughputLastRead:     make(map[string]float64),
 		capacityStore:          store,
 		decodeSaturatedAt:      make(map[string]time.Time),
 		now:                    time.Now,
@@ -136,6 +144,8 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	for key, ra := range a.saturatedThroughput {
 		if time.Since(ra.lastUpdated) > timeout {
 			delete(a.saturatedThroughput, key)
+			delete(a.throughputSampledAt, key)
+			delete(a.throughputLastRead, key)
 		}
 	}
 	for key, at := range a.decodeSaturatedAt {
@@ -428,6 +438,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		"effectiveCapacity", effectiveCapacity, "boundBy", bound,
 		"tokensInUse", rm.TokensInUse, "localQueueDemand", localQueueDemand, "replicaDemand", replicaDemand,
 		"queueLength", rm.QueueLength, "queueThreshold", config.QueueLengthThreshold,
+		"requestRate", rm.RequestRate,
 		"saturatedThroughput", saturatedThroughput, "saturatedThroughputBucket", throughputBucket)
 
 	// Update capacity store with live data, preserving EngineParams from any

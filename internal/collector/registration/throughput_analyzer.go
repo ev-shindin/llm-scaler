@@ -28,6 +28,14 @@ import (
 //	Λ_req   (model-level arrival)     → AnalyzerInput.ArrivalRate (QueryModelArrivalRate   / RegisterThroughputAnalyzerQueries, this file)
 //	         λ_dec = Λ_req × avgOL, combined with the queue-drain term (model level, see Commit 2)
 const (
+	// RequestRateWindow is the range the per-pod completion rate is taken
+	// over (rate(...[RequestRateWindow])). The saturation analyzer spaces
+	// the readings it counts as samples of that rate by the same interval
+	// (saturation_v2.ThroughputSampleSpacing): two readings this far apart
+	// share no scrape, closer ones share most of them. Change the two
+	// together; a test in saturation_v2 holds them equal.
+	RequestRateWindow = "1m"
+
 	// QueryGenerationTokenRate is the query name for the observed generation
 	// (decode) token rate per pod (tokens/sec).
 	// This is the direct observable proxy for μ_dec^obs — how many tokens each
@@ -168,7 +176,7 @@ func RegisterArrivalRateQueries(sourceRegistry *source.SourceRegistry) {
 	registry.MustRegister(source.QueryTemplate{
 		Name:        QueryRequestRate,
 		Type:        source.QueryTypePromQL,
-		Template:    `sum by (model_name, instance, pod) (rate(vllm:request_generation_tokens_count{namespace="{{.namespace}}"}[1m]))`,
+		Template:    `sum by (model_name, instance, pod) (rate(vllm:request_generation_tokens_count{namespace="{{.namespace}}"}[` + RequestRateWindow + `]))`,
 		Params:      []string{source.ParamNamespace},
 		Description: "vLLM request completion rate per pod (req/s); fallback for λ when EPP metrics are unavailable",
 	})
@@ -198,7 +206,7 @@ func registerSGLangArrivalRateQueries(registry *source.QueryList) {
 	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{
 		Name:        QueryRequestRate,
 		Type:        source.QueryTypePromQL,
-		Template:    `sum by (model_name, instance, pod) (rate(sglang:generation_tokens_histogram_count{namespace="{{.namespace}}"}[1m]))`,
+		Template:    `sum by (model_name, instance, pod) (rate(sglang:generation_tokens_histogram_count{namespace="{{.namespace}}"}[` + RequestRateWindow + `]))`,
 		Params:      []string{source.ParamNamespace},
 		Description: "SGLang request completion rate per pod (req/s); fallback for λ when EPP metrics are unavailable",
 	})

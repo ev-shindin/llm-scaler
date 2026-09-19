@@ -31,6 +31,20 @@ var _ = Describe("Rolling Average", func() {
 			Expect(ra.Average()).To(Equal(4.0)) // (3+4+5)/3
 			Expect(ra.Len()).To(Equal(3))
 		})
+
+		It("raises the last value, never a lower one, and reports it", func() {
+			ra := newRollingAverage(3)
+			Expect(ra.Last()).To(Equal(0.0), "empty")
+			ra.Add(1.5)
+			ra.RaiseLast(1.2)
+			Expect(ra.Last()).To(Equal(1.5), "a lower reading leaves it")
+			ra.RaiseLast(1.8)
+			Expect(ra.Last()).To(Equal(1.8))
+			Expect(ra.Len()).To(Equal(1), "raising adds nothing")
+			ra.Add(2)
+			Expect(ra.Last()).To(Equal(2.0))
+			Expect(ra.Max()).To(Equal(2.0))
+		})
 	})
 
 	Describe("Empty average", func() {

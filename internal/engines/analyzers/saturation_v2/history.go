@@ -44,6 +44,30 @@ func (r *rollingAverage) Average() float64 {
 	return sum / float64(len(r.values))
 }
 
+// Touch marks the window as used now without adding to it: a reading seen
+// again is still the window being observed, and Stale asks about that.
+func (r *rollingAverage) Touch() {
+	r.lastUpdated = time.Now()
+}
+
+// RaiseLast lifts the most recent value to v when v is higher, and touches
+// the window either way. A reading that belongs to the last sample's window
+// is folded into that sample this way rather than counted or dropped.
+func (r *rollingAverage) RaiseLast(v float64) {
+	if n := len(r.values); n > 0 && v > r.values[n-1] {
+		r.values[n-1] = v
+	}
+	r.lastUpdated = time.Now()
+}
+
+// Last returns the most recent value, or 0 if empty.
+func (r *rollingAverage) Last() float64 {
+	if n := len(r.values); n > 0 {
+		return r.values[n-1]
+	}
+	return 0
+}
+
 // Len returns the number of values currently stored.
 func (r *rollingAverage) Len() int {
 	return len(r.values)
@@ -51,8 +75,9 @@ func (r *rollingAverage) Len() int {
 
 // Max returns the largest stored value, or 0 if empty. The saturated
 // throughput window reads this rather than Average: see
-// recordSaturatedThroughput for why a completion rate under saturation can
-// only under-read.
+// recordSaturatedThroughput for why a completion rate under saturation
+// under-reads while the replica is full -- and for the drain at an
+// episode's end, which it does not.
 func (r *rollingAverage) Max() float64 {
 	if len(r.values) == 0 {
 		return 0

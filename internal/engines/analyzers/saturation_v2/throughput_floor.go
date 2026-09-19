@@ -61,14 +61,20 @@ import (
 // saturation and never drifts down); what a late order cost was five to
 // seven replicas at the first ramp of every run.
 //
-// Two readings are not trusted with an order, only with a hold, and for
-// those the old cap at scaleUp x anticipated supply stays: a mu BORROWED from
-// a neighbouring bucket (nearestSaturatedThroughput), which is wrong in a
-// known direction and, from a longer shape, over-orders; and a window with a
-// SINGLE reading, which is the first cycle's under-read -- an order on it
+// Two readings are not trusted with an order, only with a hold. A mu BORROWED from a
+// neighbouring bucket (nearestSaturatedThroughput) is wrong in a known
+// direction and, from a longer shape, over-orders: the old cap at scaleUp x
+// anticipated supply stays, a hold and no more. A window with a SINGLE
+// reading is the first window's under-read -- an order on it
 // over-provisions, and the over-provisioned fleet never saturates again to
 // record the second reading that would have corrected it
-// (MinThroughputSamplesToOrder).
+// (MinThroughputSamplesToOrder) -- the cap stays, a hold and no more. The
+// second reading is a rate window away (ThroughputSampleSpacing), and a
+// fleet held at its size for that minute, its queues priced nowhere, lands
+// the cold ramp's next replica 15-45 s after the old dead guard would have
+// (occupancy orders in the meantime, or the second reading does); letting
+// the one reading order one replica was tried and dropped, see
+// estimateThroughputDemand.
 //
 // The same model prices a BACKLOG. Occupancy charged every queued request at
 // its full KV footprint, as if all of them had to be resident at once, and
@@ -113,9 +119,9 @@ type throughputTerm struct {
 	Backlog float64
 	// Replicas is (lambda + Backlog / DrainSeconds) / Mu.
 	Replicas float64
-	// Held reports that the floor was capped at the fleet's own size because
-	// its mu is not one the floor may order on -- HeldWhy says which:
-	// "borrowed" (a neighbouring bucket's reading) or "single-sample".
+	// Held reports that the floor was capped at the fleet's anticipated size
+	// because its mu is not one the floor may order on -- HeldWhy says
+	// which: "borrowed" (a neighbouring bucket's reading) or "single-sample".
 	Held    bool
 	HeldWhy string
 }
@@ -124,17 +130,71 @@ type throughputTerm struct {
 // the window for key. A non-positive rate is not a reading.
 //
 // The window keeps a MAX, not a mean, and the asymmetry is the point. A
-// replica's completion rate while saturated can only under-read its capacity:
-// in the first minute after it fills, the requests completing are the few that
-// were admitted first (a 1m rate on a replica that has been full for 20s
-// counts a third of a minute's completions); under KV pressure preemption and
-// recompute drop it further. It cannot over-read -- nothing completes faster
-// than the engine runs. A mean of under-reads is an under-read, and the floor
-// divides by it, so an under-read mu orders replicas that are not needed. The
-// max of the window is the best estimate of what the replica actually
-// sustains, and an outlier high reading errs the way this file already
-// accepts: a floor that is too LOW holds back, where occupancy still carries
-// a real shortfall.
+// replica's completion rate while saturated under-reads its capacity while
+// the replica is full: in the first minute after it fills, the requests
+// completing are the few that were admitted first (a 1m rate on a replica
+// that has been full for 20s counts a third of a minute's completions);
+// under KV pressure preemption and recompute drop it further. A mean of
+// under-reads is an under-read, and the floor divides by it, so an
+// under-read mu orders replicas that are not needed. The max of the window
+// is the best estimate of what the replica sustains, and a high reading
+// errs the way this file already accepts: a floor that is too LOW holds
+// back, where occupancy still carries a real shortfall. The exception, and
+// it is open, is the drain at the end of an episode -- see below.
+//
+// A reading counts as a SAMPLE of its own only when it lands
+// ThroughputSampleSpacing after the last one that counted and differs from
+// it. The rate is rate(...[RequestRateWindow]) evaluated afresh every 15 s
+// cycle, so the next cycle reads mostly the same window -- at 30 s scrapes,
+// exactly the same two samples, and the same value to the digit -- and one
+// saturated moment shows up on several consecutive cycles. Counted each
+// time, two cycles cleared MinThroughputSamplesToOrder on the first
+// window's under-read: the guard was dead at that scrape interval. Value
+// equality alone is not the test either: the rate is an integer count of
+// completions over the scrape interval, so two different windows agree to
+// the digit a few percent of the time, and two replicas saturating in one
+// cycle read two values from the same moment. A minute apart, two readings
+// share no samples.
+//
+// A reading inside the spacing belongs to the last sample's window, and is
+// folded into it: the sample becomes the max of what that window read
+// (RaiseLast) -- the max the window kept when every cycle was added, no
+// more. Dropping in-spacing readings instead lost the highest reading of
+// an episode exactly when no next window would come, and on two replayed
+// passes left mu 10-12 % low for the rest of the pass, on one of them
+// ordering a fourth replica the run never needed. Folding also makes two
+// replicas saturating in one cycle read as one moment at the higher of
+// the two, whichever row the collector's map yields first.
+//
+// What the max is worth is another matter. A saturated rate under-reads
+// while the replica is full (file header),
+// and fails in the last minute of an episode that ends by a replica
+// landing: the queue gate is a one-minute max and stays up while the rate
+// is fresh, and the fresh rate is the batch draining -- sequences admitted
+// together finish together, and no new ones come. Measured on the cold
+// pass of 2026-09-19 (second): 6.67 req/s on the last saturated cycle,
+// 200 completions in 30 s, with token throughput below the plateau the
+// replica held while full (~5.0 req/s sustained), and the window carried
+// 6.67 for the rest of the phase. The max window has always taken these;
+// nothing in it lowers a reading once taken. The fix is upstream of this
+// function -- a reading gated on an instantaneous queue, or a mu priced
+// from the generation-token rate over the bucket's output length, which
+// does not burst on a drain -- and is open.
+//
+// A reading equal to the last one given, at or past the spacing, is the
+// same scrape pair read again across the boundary (a re-read of the
+// previous pair when the next scrape has not landed), or a genuine repeat,
+// and only touches; that costs a cycle or two. Compared to the last
+// READING, not to the sample, which the fold may have raised above it.
+//
+// Measured on the shape-swap trace: every saturated rate logged over four
+// passes is N/30 (103/30 = 3.43, 110/30 = 3.67, 165/30 = 5.5 ...) but a
+// fresh replica's first, extrapolated window, and on the first cold pass
+// of 2026-09-19 one decode replica's 3.43 stood on four consecutive cycles
+// -- two scrape pairs -- and let the floor order on it. The 35 minutes of
+// a third replica that followed were the under-read itself, which
+// occupancy would have ordered 30 s later and the floor then held either
+// way; the sample count is what this fixes, not that.
 //
 // Same window size and staleness rule as k2 history, and pruned beside it in
 // EvictStaleHistory.
@@ -142,14 +202,30 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 	if !(rate > 0) {
 		return
 	}
+	now := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ra, ok := a.saturatedThroughput[key]
 	if !ok || ra.Stale(HistoryEvictionTimeout) {
 		ra = newRollingAverage(RollingAverageWindowSize)
 		a.saturatedThroughput[key] = ra
+		delete(a.throughputSampledAt, key)
+		delete(a.throughputLastRead, key)
+	}
+	lastRead, read := a.throughputLastRead[key]
+	a.throughputLastRead[key] = rate
+	if last, sampled := a.throughputSampledAt[key]; sampled {
+		if now.Sub(last) < ThroughputSampleSpacing {
+			ra.RaiseLast(rate) // the last sample's window, still being read
+			return
+		}
+		if read && rate == lastRead {
+			ra.Touch() // the same pair across the boundary, or a repeat
+			return
+		}
 	}
 	ra.Add(rate)
+	a.throughputSampledAt[key] = now
 }
 
 // saturatedThroughputFor returns the saturated completion rate on record for
@@ -344,6 +420,19 @@ func estimateThroughputDemand(
 		floor := rate * cost
 		term := throughputTerm{Mu: mu, PerReplica: cost * mu, Backlog: b, Replicas: rate / mu}
 		if !mayOrder[role] && scaleUp > 0 {
+			// A hold, not an order, on either. Letting a single reading order
+			// one replica was tried, twice: measured against the anticipated
+			// supply it ordered a fourth replica at a phase switch whose
+			// third was still starting; measured against the running supply
+			// it was a ratchet -- nothing remembered that the reading had
+			// already ordered, so once the ordered replica reported, the same
+			// reading ordered the next, up to the full figure one start at a
+			// time. Across four passes the one replica bought a single cycle
+			// over the plain hold (a third replica 30 s ahead of occupancy,
+			// on the under-read that then ran unneeded for 35 minutes), and
+			// the hold's own cost, replayed, is 15-45 s on the cold ramp's
+			// next replica: the second counted reading lands a window after
+			// the first, and occupancy orders in the meantime.
 			if hold := scaleUp * anticipated[role].TotalAnticipatedSupply; floor > hold {
 				floor = hold
 				term.Held = true
