@@ -430,8 +430,10 @@ var _ = Describe("holdPrefillDemand", func() {
 		Expect(held).To(BeFalse())
 	})
 	It("lets the cap win when the band is empty", func() {
-		// An in-flight scale-down: 3 running, target 2 -- anticipated below
-		// supply, so 0.7 x 300 = 210 is above 0.85 x 200 = 170.
+		// Anticipated supply below supply, so 0.7 x 300 = 210 is above
+		// 0.85 x 200 = 170. The analyzer never emits this (pending is never
+		// negative) and the config refuses a boundary at or above the
+		// threshold; the guard is for the helper's own contract.
 		down := []domain.VariantCapacity{{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 3, PendingReplicas: -1, PerReplicaCapacity: 100}}
 		rd := map[string]float64{domain.RolePrefill: 900}
 		h, held := holdPrefillDemand(rd, down, 0.85, 0.7)
