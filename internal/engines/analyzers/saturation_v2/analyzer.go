@@ -65,9 +65,11 @@ type SaturationAnalyzer struct {
 	// latter tells how many replicas a given arrival rate needs.
 	saturatedThroughput map[string]*rollingAverage
 	// throughputSampledAt is, per saturatedThroughput key, when the window
-	// last took a reading as a sample of its own (recordSaturatedThroughput);
-	// swept with the window.
+	// last took a reading as a sample of its own, and throughputLastRead the
+	// last reading it was given, sample or not (recordSaturatedThroughput);
+	// both swept with the window.
 	throughputSampledAt map[string]time.Time
+	throughputLastRead  map[string]float64
 	capacityStore       *CapacityKnowledgeStore
 
 	// decodeSaturatedAt is, per namespace|model, the last cycle a decode
@@ -96,6 +98,7 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore) *SaturationAnalyzer {
 		lastAccelerator:        make(map[string]acceleratorMemo),
 		saturatedThroughput:    make(map[string]*rollingAverage),
 		throughputSampledAt:    make(map[string]time.Time),
+		throughputLastRead:     make(map[string]float64),
 		capacityStore:          store,
 		decodeSaturatedAt:      make(map[string]time.Time),
 		now:                    time.Now,
@@ -142,6 +145,7 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 		if time.Since(ra.lastUpdated) > timeout {
 			delete(a.saturatedThroughput, key)
 			delete(a.throughputSampledAt, key)
+			delete(a.throughputLastRead, key)
 		}
 	}
 	for key, at := range a.decodeSaturatedAt {

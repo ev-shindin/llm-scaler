@@ -32,18 +32,18 @@ var _ = Describe("Rolling Average", func() {
 			Expect(ra.Len()).To(Equal(3))
 		})
 
-		It("holds a value exactly, and forgets it once it is evicted", func() {
+		It("raises the last value, never a lower one, and reports it", func() {
 			ra := newRollingAverage(3)
+			Expect(ra.Last()).To(Equal(0.0), "empty")
 			ra.Add(1.5)
-			Expect(ra.Contains(1.5)).To(BeTrue())
-			Expect(ra.Contains(1.5000001)).To(BeFalse(), "to the digit")
+			ra.RaiseLast(1.2)
+			Expect(ra.Last()).To(Equal(1.5), "a lower reading leaves it")
+			ra.RaiseLast(1.8)
+			Expect(ra.Last()).To(Equal(1.8))
+			Expect(ra.Len()).To(Equal(1), "raising adds nothing")
 			ra.Add(2)
-			ra.Add(3)
-			ra.Add(4) // evicts 1.5
-			Expect(ra.Contains(1.5)).To(BeFalse(), "an evicted value is not held against a new reading")
-			ra.Add(1.5)
-			Expect(ra.Len()).To(Equal(3))
-			Expect(ra.Contains(1.5)).To(BeTrue())
+			Expect(ra.Last()).To(Equal(2.0))
+			Expect(ra.Max()).To(Equal(2.0))
 		})
 	})
 

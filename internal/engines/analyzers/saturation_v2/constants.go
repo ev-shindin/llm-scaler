@@ -96,7 +96,7 @@ const (
 
 	// ThroughputSampleSpacing is how far apart two saturated completion-rate
 	// readings must be for the second to count as a sample of its own toward
-	// MinThroughputSamplesToOrder. The rate is rate(...[1m]) evaluated afresh
+	// MinThroughputSamplesToOrder. The rate is rate(...[RequestRateWindow]) evaluated afresh
 	// every cycle, so a cycle 15 s after the last reads mostly the same
 	// window -- at 30 s scrapes, exactly the same two samples -- and a
 	// reading a minute later is from a window that shares none of them.

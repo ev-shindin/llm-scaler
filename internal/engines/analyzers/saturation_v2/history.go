@@ -44,11 +44,6 @@ func (r *rollingAverage) Average() float64 {
 	return sum / float64(len(r.values))
 }
 
-// Contains reports whether value is already in the window, exactly.
-func (r *rollingAverage) Contains(value float64) bool {
-	return slices.Contains(r.values, value)
-}
-
 // Touch marks the window as used now without adding to it: a reading seen
 // again is still the window being observed, and Stale asks about that.
 func (r *rollingAverage) Touch() {

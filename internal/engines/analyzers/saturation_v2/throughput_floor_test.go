@@ -116,6 +116,51 @@ var _ = Describe("estimateThroughputDemand", func() {
 			"2.22 replicas' worth capped at scaleUp x (the one running + one): RC is exactly one replica")
 		Expect(f.Terms[domain.RoleDecode].HeldWhy).To(Equal("single-sample"))
 
+		By("pricing the one replica at a replica's own P, not at cost x mu across replicas")
+		// Two replicas at P = k1 reading mu 2 and mu 10 (a fresh pod's first
+		// window beside a mature one): median cost x median mu is 1.8 P.
+		// One replica is one replica's P.
+		fleetOfTwo := variants(domain.RoleDecode, 2)
+		uneven := []ReplicaCapacity{
+			{VariantName: "v", SaturatedThroughput: 2, SaturatedThroughputSamples: 1},
+			{VariantName: "v", SaturatedThroughput: 10, SaturatedThroughputSamples: 1},
+		}
+		u := estimateThroughputDemand(runLambda*10, uneven, fleetOfTwo, nil, BacklogDrainSeconds, 0.85)
+		Expect(u.Terms[domain.RoleDecode].Held).To(BeTrue())
+		Expect(u.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*3*float64(runK1), 1e-6),
+			"anticipated two plus one replica's P")
+
+		By("pricing it at the smallest own P when the role's variants differ in size")
+		twoSizes := []domain.VariantCapacity{
+			{VariantName: "big", Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: 200},
+			{VariantName: "small", Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: 100},
+		}
+		sized := []ReplicaCapacity{
+			{VariantName: "big", SaturatedThroughput: 2, SaturatedThroughputSamples: 1},
+			{VariantName: "small", SaturatedThroughput: 2, SaturatedThroughputSamples: 1},
+		}
+		z2 := estimateThroughputDemand(100, sized, twoSizes, nil, BacklogDrainSeconds, 0.85)
+		Expect(z2.Terms[domain.RoleDecode].Held).To(BeTrue())
+		Expect(z2.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*(300+100), 1e-6),
+			"anticipated 300 plus one replica of the smallest, 100: one of the largest is two of the smallest")
+
+		By("counting the one replica from what is running: a replica already on its way is the one")
+		pending := []domain.VariantCapacity{{VariantName: "v", Role: domain.RoleDecode, ReplicaCount: 2, PendingReplicas: 1, PerReplicaCapacity: 100}}
+		pend := estimateThroughputDemand(100, []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: 2, SaturatedThroughputSamples: 1}}, pending, nil, BacklogDrainSeconds, 0.85)
+		Expect(pend.Terms[domain.RoleDecode].Held).To(BeTrue())
+		Expect(pend.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*300, 1e-6),
+			"two running plus one pending is already the one: no fourth on one reading")
+
+		By("not widening the one replica by a borrowed reading beside an own one")
+		mixed := []ReplicaCapacity{
+			{VariantName: "v", SaturatedThroughput: 5, SaturatedThroughputSamples: 1},
+			{VariantName: "v", SaturatedThroughput: 2, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true},
+		}
+		x := estimateThroughputDemand(runLambda*10, mixed, fleetOfTwo, nil, BacklogDrainSeconds, 0.85)
+		Expect(x.Terms[domain.RoleDecode].Held).To(BeTrue())
+		Expect(x.Terms[domain.RoleDecode].HeldWhy).To(Equal("single-sample"), "the role has a reading of its own")
+		Expect(x.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*3*float64(runK1), 1e-6))
+
 		By("not capping a single reading that asks for one replica or less")
 		mild := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu, SaturatedThroughputSamples: 1}}
 		m := estimateThroughputDemand(runLambda, mild, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
@@ -281,9 +326,10 @@ var _ = Describe("the saturated-throughput window", func() {
 		a.recordSaturatedThroughput("k", 3.5)
 		Expect(a.saturatedThroughput["k"].Max()).To(Equal(3.6), "and a lower one leaves it")
 
-		By("not counting the same value at the boundary: the same pair straddling it, or a repeat")
+		By("not counting the last reading again at the boundary: the same pair straddling it, or a repeat")
+		// The last READING was 3.5, not the folded 3.6 the sample now holds.
 		now = t0.Add(ThroughputSampleSpacing)
-		a.recordSaturatedThroughput("k", 3.6)
+		a.recordSaturatedThroughput("k", 3.5)
 		Expect(a.saturatedThroughput["k"].Len()).To(Equal(1))
 
 		By("counting a reading that differs and lands a rate window after the last counted one")
