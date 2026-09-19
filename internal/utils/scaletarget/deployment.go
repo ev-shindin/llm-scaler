@@ -4,6 +4,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/resources"
 )
@@ -51,6 +52,10 @@ func (r *deploymentAccessor) GetTotalGPUsPerReplica() int {
 func (r *deploymentAccessor) GetDeletionTimestamp() *v1.Time {
 	// r.deployment is always not nil
 	return r.deployment.DeletionTimestamp
+}
+
+func (r *deploymentAccessor) GetUID() types.UID {
+	return r.deployment.UID
 }
 
 func (r *deploymentAccessor) GetLeaderPodTemplateSpec() *corev1.PodTemplateSpec {
