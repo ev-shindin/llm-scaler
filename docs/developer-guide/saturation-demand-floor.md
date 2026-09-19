@@ -79,39 +79,56 @@ Properties, each with a spec in `throughput_floor_test.go`:
   in the window: ten counted readings, a rate window apart, is ten minutes
   of one saturated replica, after which the earliest is evicted, and on one
   run the max fell 3.67 to 3.47 that way before the spacing existed.
-- **Two readings may hold but not order**, and for those the cap at
-  `scaleUp x anticipated supply` stays (`heldAtFleet`, `heldWhy` on the log
-  line). A `mu` *borrowed* from a neighbouring bucket is wrong in a known
-  direction and, from a longer shape, would over-order. A window with a
-  *single* reading is the first cycle's under-read (3.67 against a true 7.13
-  on the run), and an order on it over-provisions in a way that removes the
+- **A borrowed reading may hold but not order; a single reading of the
+  role's own may order one replica**, and the cap says which (`heldAtFleet`,
+  `heldWhy` on the log line). A `mu` *borrowed* from a neighbouring bucket is
+  wrong in a known direction and, from a longer shape, would over-order, so
+  it is capped at `scaleUp x anticipated supply`. A window with a *single*
+  reading is the first window's under-read (3.67 against a true 7.13 on the
+  run), and an order on it over-provisions in a way that removes the
   saturation which would have recorded the second, corrected reading
-  (`MinThroughputSamplesToOrder`, 2). Two readings from two *rate windows*:
-  the completion rate is `rate(...[1m])` evaluated afresh every 15 s cycle,
-  so the next cycle reads mostly the same window -- at 30 s scrapes exactly
-  the same two samples, the same value to the digit -- and a reading counts
-  as a sample of its own only when it is a new value that lands a rate
-  window (`ThroughputSampleSpacing`, one minute) after the last one that
-  counted; readings inside the spacing keep the window observed and add
-  nothing. Counted per cycle, the guard was dead at that scrape interval:
-  the second cycle always re-read the first pair, and every saturation
-  ordered on the first window's under-read. Value equality alone would not
-  do either -- the rate is an integer count of completions over the scrape
-  interval (every saturated rate logged on four passes is N/30: 103/30 =
-  3.43, 110/30 = 3.67, 165/30 = 5.5), so two windows agree to the digit a
-  few percent of the time, and two replicas saturating in one cycle read two
-  values from one moment. Measured on the shape-swap trace's cold pass
+  (`MinThroughputSamplesToOrder`, 2) -- so it is capped at `scaleUp x
+  (anticipated supply + one replica)`: one replica bounds what the
+  under-read can over-order, and the early order the floor exists for
+  stands. It has to: two readings are two *rate windows*. The completion
+  rate is `rate(...[1m])` evaluated afresh every 15 s cycle, so the next
+  cycle reads mostly the same window -- at 30 s scrapes exactly the same
+  two samples, the same value to the digit -- and a reading counts as a
+  sample of its own only when it lands a rate window
+  (`ThroughputSampleSpacing`, one minute, held equal to the collector's
+  `RequestRateWindow` by a test) after the last one that counted and
+  differs from it. Counted per cycle, the guard was dead at that scrape
+  interval: the second cycle always re-read the first pair, and every
+  saturation ordered on the first window's under-read, unbounded. With the
+  spacing, the second reading is a minute away, and a fleet held at its
+  size for that minute with its queues priced nowhere (the floor takes the
+  residency charge out for a role with a `mu`) would have landed the cold
+  ramp's next replica 15-75 s later than occupancy alone did on the three
+  measured cold passes -- hence the one replica. A reading inside the
+  spacing is *folded* into the last sample, which becomes the max of its
+  window: a saturated rate only under-reads, and the peak of an episode
+  tends to be its last reading, the fill matured just before the ordered
+  replica lands and ends the saturation; dropping in-spacing readings lost
+  that peak on two logged passes (`mu` 10-12 % low for the rest of the
+  pass, and on one of them a fourth replica the run never needed). Folding
+  also makes two replicas saturating in one cycle one moment at the higher
+  of the two, whichever row the collector's map yields first. Value
+  equality is not the test -- the rate is an integer count of completions
+  over the scrape interval (every saturated rate logged on four passes is
+  N/30 -- 103/30 = 3.43, 110/30 = 3.67, 165/30 = 5.5 -- but one, a freshly
+  started replica's first window, where the counter's zero point makes the
+  rate an extrapolation), so two windows agree to the digit a few percent
+  of the time; a reading equal to the last counted one at the boundary is
+  the same pair straddling it, or a repeat, and only touches the window,
+  which costs a cycle or two. Measured on the shape-swap trace's cold pass
   (2026-09-19): one decode replica's 3.43 stood on four consecutive cycles,
   two scrape pairs, and let the floor order on it. What followed -- a third
   decode replica held for the remaining 35 minutes at `lambda / mu` = 1.75
   against a true ~5.4 -- was the under-read itself: occupancy would have
   ordered the third replica 30 s later, and the floor, uncapped at three
   once it exists, held it either way. The spacing fixes what the guard
-  counts; an under-read that no later saturation corrects is still open.
-  The price of the spacing is the order moving from the second cycle to the
-  next window, 45 s, on the step the floor orders and occupancy would have
-  ordered within 30 s anyway; a genuine repeat costs one more window, a
-  few percent of the time.
+  counts and the cap bounds the first order; an under-read that no later
+  saturation corrects is still open.
 - **A backlog is throughput, not residency.** 350 queued requests at 6 req/s
   arriving are 58 s of arrivals; two replicas at 5.4 req/s each clear them in
   about two minutes and three in one. Charged as resident KV they were five
@@ -276,5 +293,5 @@ is a property of the load.
 | The persisted prefill `mu` alone ordered a second prefill replica at +51 s on the warm pass that followed, at zero resident KV | Measured, run `guidellm-1789746634-pov4xp_1`: `throughput-demand-floor` for prefill at 15:51:35, `arrivalRate` 5.5, `saturatedThroughput` 5.57, `residentDemand` 0, `replicasImplied` 0.99 |
 | Left unrecorded, the same cycle prices prefill at k1 with no order | Replayed from the run's rows in `downstream_saturation_test.go` |
 | With the gate, the hold and the memory, prefill stays at one replica on every pass; the hold engages only while decode is full and queued, and on the first cold pass it is what kept prefill at one | Measured, runs `guidellm-1789760128-zphd9d_1` (cold: 11 `prefill-demand-held` cycles at +130..+340 s, four of them capping 830 300 resident tokens -- 90 % of k1, no queue -- at 0.85 x k1; 0 `P1-obs-downstream`; all-pod 137.9 GPU-min against 167.8), `guidellm-1789768002-eb450o_1` (cold again: 9 and 0, 142.1, p95 241 ms) and `guidellm-1789763936-mr6h9x_1` (warm: 9 and 0, 132.9 against 168.0, p95 194 ms) |
-| Every saturated completion rate logged is N/30, and one reading stood on four consecutive cycles (two scrape pairs) and cleared the two-readings guard | Measured, runs `guidellm-1789760128-zphd9d_1`, `guidellm-1789768002-eb450o_1`, `guidellm-1789763936-mr6h9x_1` and the 2026-09-19 cold pass on the merged tree (`replica-capacity-decision`, `saturatedThroughput`; 30 s scrapes): 3.43 = 103/30 at 07:44:41-07:45:26 |
+| Every saturated completion rate logged is N/30 but a fresh replica's first, extrapolated window, and one reading stood on four consecutive cycles (two scrape pairs) and cleared the two-readings guard | Measured, runs `guidellm-1789760128-zphd9d_1` (the one exception, 4.715 on a replica 75 s old), `guidellm-1789768002-eb450o_1`, `guidellm-1789763936-mr6h9x_1` and `guidellm-1789803750-vl4r9g_1` (2026-09-19, the merged tree) (`replica-capacity-decision`, `saturatedThroughput`; 30 s scrapes): 3.43 = 103/30 at 07:44:41-07:45:26 |
 | With a minute's spacing between counted readings the floor may not order on that one reading; the 35 minutes at three replicas that followed it are the under-read, not the count | Replayed from the run's rows in `throughput_floor_test.go` ("does not order on one saturated sample"); the fleet outcome is predicted, not re-run |

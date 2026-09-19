@@ -303,10 +303,11 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey))
 		Expect(analyzer.saturatedThroughput).To(HaveKey(prefillKey))
-		// Priced by its own reading: k2 = 357 800, the queue as a backlog
-		// against its mu, the resident KV standing -- 100 % of the replica,
-		// above the band's cap of 85 %, so an order, and not held.
-		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 357_800, 1), "not held")
+		// Priced by its own reading: k2 = 357 800 and a mu of 4.77 against
+		// the two decode replicas' 9.5 req/s of completions (no scheduler
+		// rate on this input), two replicas' worth -- capped at the one a
+		// single reading may order, and an order; not the hold band.
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 0.85*2*prefillP(result), 1), "not held")
 		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically(">", 0.85*prefillP(result)))
 	})
 

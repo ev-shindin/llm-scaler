@@ -43,6 +43,7 @@ var logContract = map[string][]string{
 		"modelID", "namespace", "variant", // join keys
 		"k1MemoryBound", "k2ComputeBound", "boundBy", // k1/k2/Bound columns
 		"tokensInUse", "localQueueDemand", "replicaDemand", // demand columns
+		"requestRate", "saturatedThroughput", // the cycle's own completion rate beside the window's max: one sample or two is read off these
 	},
 	"scheduler-queue-demand": {
 		"modelID",         // joins the queue line to the variant's model

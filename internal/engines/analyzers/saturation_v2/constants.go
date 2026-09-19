@@ -83,13 +83,13 @@ const (
 
 	// MinThroughputSamplesToOrder is how many saturated readings a role's own
 	// output-length bucket must hold before the throughput floor may ORDER a
-	// replica from it; with fewer it holds the fleet and no more. The first
+	// the full figure from it; with one it may order one replica. The first
 	// reading at a saturation under-reads (a 1m rate on a replica that has
 	// been full for 20 s counts a third of a minute's completions), and an
 	// order on an under-read over-provisions in a way that removes the
 	// saturation which would have corrected it. Measured on the shape-swap
 	// trace: 3.67, then 5.23, then 7.13 req/s on three consecutive saturated
-	// scrape pairs of one replica, a minute apart. Two readings from two rate windows -- not
+	// scrape pairs, 60-90 s apart. Two readings from two rate windows -- not
 	// the same window read twice (recordSaturatedThroughput,
 	// ThroughputSampleSpacing).
 	MinThroughputSamplesToOrder = 2
@@ -100,8 +100,10 @@ const (
 	// every cycle, so a cycle 15 s after the last reads mostly the same
 	// window -- at 30 s scrapes, exactly the same two samples -- and a
 	// reading a minute later is from a window that shares none of them.
-	// Readings inside the spacing still count as the window being observed,
-	// not as a second measurement of it. See recordSaturatedThroughput.
+	// Readings inside the spacing are folded into the last sample (its
+	// window is still being read; the sample is the max of it). Equal to the
+	// collector's rate window, registration.RequestRateWindow; a test holds
+	// the two together. See recordSaturatedThroughput.
 	ThroughputSampleSpacing = time.Minute
 
 	// VeryLongOutputThreshold is the upper bound (exclusive) for the "xxlong"

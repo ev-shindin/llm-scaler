@@ -61,14 +61,19 @@ import (
 // saturation and never drifts down); what a late order cost was five to
 // seven replicas at the first ramp of every run.
 //
-// Two readings are not trusted with an order, only with a hold, and for
-// those the old cap at scaleUp x anticipated supply stays: a mu BORROWED from
-// a neighbouring bucket (nearestSaturatedThroughput), which is wrong in a
-// known direction and, from a longer shape, over-orders; and a window with a
-// SINGLE reading, which is the first cycle's under-read -- an order on it
+// Two readings are not trusted with the full order. A mu BORROWED from a
+// neighbouring bucket (nearestSaturatedThroughput) is wrong in a known
+// direction and, from a longer shape, over-orders: the old cap at scaleUp x
+// anticipated supply stays, a hold and no more. A window with a SINGLE
+// reading is the first window's under-read -- an order on it
 // over-provisions, and the over-provisioned fleet never saturates again to
 // record the second reading that would have corrected it
-// (MinThroughputSamplesToOrder).
+// (MinThroughputSamplesToOrder) -- and is capped at one replica beyond the
+// anticipated supply: the second reading is a rate window away
+// (ThroughputSampleSpacing), and a fleet held at its size for that minute,
+// its queues priced nowhere, landed the cold ramp's next replica 15-75 s
+// later than occupancy alone would have. One replica bounds the
+// under-read's damage and keeps the early order.
 //
 // The same model prices a BACKLOG. Occupancy charged every queued request at
 // its full KV footprint, as if all of them had to be resident at once, and
@@ -113,9 +118,10 @@ type throughputTerm struct {
 	Backlog float64
 	// Replicas is (lambda + Backlog / DrainSeconds) / Mu.
 	Replicas float64
-	// Held reports that the floor was capped at the fleet's own size because
-	// its mu is not one the floor may order on -- HeldWhy says which:
-	// "borrowed" (a neighbouring bucket's reading) or "single-sample".
+	// Held reports that the floor was capped because its mu is not one the
+	// floor may order the full figure on -- HeldWhy says which: "borrowed"
+	// (a neighbouring bucket's reading; capped at the fleet's own size) or
+	// "single-sample" (one reading; capped at one replica beyond it).
 	Held    bool
 	HeldWhy string
 }
@@ -136,28 +142,45 @@ type throughputTerm struct {
 // accepts: a floor that is too LOW holds back, where occupancy still carries
 // a real shortfall.
 //
-// A reading counts as a SAMPLE of its own only when it is a new value AND
-// lands ThroughputSampleSpacing after the last one that counted. The rate is
-// rate(...[1m]) evaluated afresh every 15 s cycle, so the next cycle reads
-// mostly the same window -- at 30 s scrapes, exactly the same two samples,
-// and the same value to the digit -- and one saturated moment shows up on
-// several consecutive cycles. Counted each time, two cycles cleared
-// MinThroughputSamplesToOrder on the first window's under-read: the guard
-// was dead at that scrape interval. Value equality alone is not the test
-// either: the rate is an integer count of completions over the scrape
-// interval, so two different windows agree to the digit a few percent of
-// the time, and two replicas saturating in one cycle read two values from
-// the same moment. A minute apart, two readings share no samples. Readings
-// inside the spacing keep the window observed (Touch) and enter nothing:
-// what the next window says, the next counted reading will.
+// A reading counts as a SAMPLE of its own only when it lands
+// ThroughputSampleSpacing after the last one that counted and differs from
+// it. The rate is rate(...[RequestRateWindow]) evaluated afresh every 15 s
+// cycle, so the next cycle reads mostly the same window -- at 30 s scrapes,
+// exactly the same two samples, and the same value to the digit -- and one
+// saturated moment shows up on several consecutive cycles. Counted each
+// time, two cycles cleared MinThroughputSamplesToOrder on the first
+// window's under-read: the guard was dead at that scrape interval. Value
+// equality alone is not the test either: the rate is an integer count of
+// completions over the scrape interval, so two different windows agree to
+// the digit a few percent of the time, and two replicas saturating in one
+// cycle read two values from the same moment. A minute apart, two readings
+// share no samples.
+//
+// A reading inside the spacing belongs to the last sample's window, and is
+// folded into it: the sample becomes the max of what that window read
+// (RaiseLast). The window keeps a max because a saturated rate only
+// under-reads, and the peak of an episode tends to be its last reading --
+// the fill matured just before the ordered replica lands and ends the
+// saturation -- so dropping in-spacing readings lost the peak exactly when
+// no next window would come: on two logged passes it left mu 10-12 % low
+// for the rest of the pass, and on one of them that ordered a fourth
+// replica the run never needed. Folding also makes two replicas saturating
+// in one cycle read as one moment at the higher of the two, whichever row
+// the collector's map yields first. A reading equal to the last counted
+// value at or past the spacing is the same scrape pair straddling the
+// boundary (four cycles at 30 s scrapes is a minute to the second), or a
+// genuine repeat, and only touches; that costs a cycle or two.
 //
 // Measured on the shape-swap trace: every saturated rate logged over four
-// passes is N/30 (103/30 = 3.43, 110/30 = 3.67, 165/30 = 5.5 ...), and on
+// passes is N/30 (103/30 = 3.43, 110/30 = 3.67, 165/30 = 5.5 ...) but a
+// fresh replica's first, extrapolated window, and on
 // the cold pass of 2026-09-19 one decode replica's 3.43 stood on four
 // consecutive cycles -- two scrape pairs -- and let the floor order on it.
 // The 35 minutes of a third replica that followed were the under-read
-// itself, which occupancy would have ordered 30 s later and the floor then
-// held either way; the sample count is what this fixes, not that.
+// itself, which occupancy would have ordered 15-75 s later and the floor
+// then held either way; the sample count is what this fixes, not that. A
+// repeat inside the spacing is not a counted sample, so a genuine repeat
+// costs a cycle or two, not a window.
 //
 // Same window size and staleness rule as k2 history, and pruned beside it in
 // EvictStaleHistory.
@@ -174,9 +197,15 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 		a.saturatedThroughput[key] = ra
 		delete(a.throughputSampledAt, key)
 	}
-	if last, sampled := a.throughputSampledAt[key]; ra.Contains(rate) || (sampled && now.Sub(last) < ThroughputSampleSpacing) {
-		ra.Touch() // observed, not a second measurement: the window is not going stale
-		return
+	if last, sampled := a.throughputSampledAt[key]; sampled {
+		if now.Sub(last) < ThroughputSampleSpacing {
+			ra.RaiseLast(rate) // the last sample's window, still being read
+			return
+		}
+		if rate == ra.Last() {
+			ra.Touch() // the same pair across the boundary, or a repeat
+			return
+		}
 	}
 	ra.Add(rate)
 	a.throughputSampledAt[key] = now
@@ -374,7 +403,20 @@ func estimateThroughputDemand(
 		floor := rate * cost
 		term := throughputTerm{Mu: mu, PerReplica: cost * mu, Backlog: b, Replicas: rate / mu}
 		if !mayOrder[role] && scaleUp > 0 {
-			if hold := scaleUp * anticipated[role].TotalAnticipatedSupply; floor > hold {
+			// A borrowed reading may hold and no more. A single reading of the
+			// role's own may order ONE replica: with the spacing, the second
+			// reading is a minute away, and a fleet held at its size for that
+			// minute with its queues priced nowhere (the floor takes the
+			// residency charge out for a role with a mu) landed the cold
+			// ramp's third replica 15-75 s later than occupancy alone would
+			// have. One replica bounds what the first window's under-read can
+			// over-order, and the saturation the second reading needs outlives
+			// a start.
+			hold := scaleUp * anticipated[role].TotalAnticipatedSupply
+			if !borrowedOnly[role] {
+				hold += scaleUp * cost * mu
+			}
+			if floor > hold {
 				floor = hold
 				term.Held = true
 				term.HeldWhy = "single-sample"

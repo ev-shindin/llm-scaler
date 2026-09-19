@@ -55,6 +55,24 @@ func (r *rollingAverage) Touch() {
 	r.lastUpdated = time.Now()
 }
 
+// RaiseLast lifts the most recent value to v when v is higher, and touches
+// the window either way. A reading that belongs to the last sample's window
+// is folded into that sample this way rather than counted or dropped.
+func (r *rollingAverage) RaiseLast(v float64) {
+	if n := len(r.values); n > 0 && v > r.values[n-1] {
+		r.values[n-1] = v
+	}
+	r.lastUpdated = time.Now()
+}
+
+// Last returns the most recent value, or 0 if empty.
+func (r *rollingAverage) Last() float64 {
+	if n := len(r.values); n > 0 {
+		return r.values[n-1]
+	}
+	return 0
+}
+
 // Len returns the number of values currently stored.
 func (r *rollingAverage) Len() int {
 	return len(r.values)
