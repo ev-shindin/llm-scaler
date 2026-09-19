@@ -491,18 +491,25 @@ var _ = Describe("SaturationAnalyzer", func() {
 			// prefill variant (permanently ~0 avgOutput in real traffic) and a
 			// decode variant that happens to be at "short" too (e.g. a cold
 			// replica before it's served real traffic).
-			input := makeAnalyzerInput(
+			//
+			// Saturated on separate cycles: a prefill saturation is recorded
+			// only while decode is not saturated (computeK2), so one cycle with
+			// both over the threshold would seed decode's history alone.
+			states := []domain.VariantReplicaState{
+				{VariantName: "variant-p", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1, Role: domain.RolePrefill},
+				{VariantName: "variant-d", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1, Role: domain.RoleDecode},
+			}
+			_, err := analyzer.Analyze(ctx, makeAnalyzerInput(
 				[]domain.ReplicaMetrics{
 					makeReplicaMetrics("pod-p", "variant-p", 8000, 16000, 6, 100, 50),
+					makeReplicaMetrics("pod-d", "variant-d", 3000, 16000, 0, 100, 50),
+				}, states))
+			Expect(err).NotTo(HaveOccurred())
+			_, err = analyzer.Analyze(ctx, makeAnalyzerInput(
+				[]domain.ReplicaMetrics{
+					makeReplicaMetrics("pod-p", "variant-p", 8000, 16000, 0, 100, 50),
 					makeReplicaMetrics("pod-d", "variant-d", 3000, 16000, 6, 100, 50),
-				},
-				[]domain.VariantReplicaState{
-					{VariantName: "variant-p", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1, Role: domain.RolePrefill},
-					{VariantName: "variant-d", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1, Role: domain.RoleDecode},
-				},
-			)
-
-			_, err := analyzer.Analyze(ctx, input)
+				}, states))
 			Expect(err).NotTo(HaveOccurred())
 
 			prefillHist, ok := analyzer.computeCapacityHistory["test-model|H100|1|prefill|short|q5"]

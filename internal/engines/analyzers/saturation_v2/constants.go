@@ -18,6 +18,18 @@ const (
 	// zero replicas over a weekend and scale back up Monday).
 	CapacityEvictionTimeout = 7 * 24 * time.Hour
 
+	// DecodeSaturationMemory is how long after the last cycle a decode
+	// replica was seen full and queued the analyzer keeps treating decode as
+	// saturated for prefill's sake (Analyze, roleSaturated). It is the
+	// collector's row window: every row is a max_over_time[1m], so a prefill
+	// row can carry a reading taken up to a minute before the cycle, and
+	// decode's rows can have moved on -- measured on the shape-swap P/D
+	// benchmark, decode's occupancy had dropped under k1 on the fourth
+	// cycle of an episode while prefill's row still repeated the saturated
+	// reading to the token. Without the memory that row would have
+	// recorded.
+	DecodeSaturationMemory = time.Minute
+
 	// HistoryEvictionTimeout is the duration after which unused k2 history
 	// entries are eligible for removal. Shorter than capacity eviction
 	// because workload patterns shift and stale k2 observations from a

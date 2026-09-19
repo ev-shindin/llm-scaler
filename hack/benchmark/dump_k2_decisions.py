@@ -5,7 +5,7 @@ markdown report of which fallback tier fired, when, and why.
 
 Reads the following log lines:
   - k2-decision                    (saturation_v2) per replica, per cycle:
-                                    which of the four k2 priority tiers fired
+                                    which of the four k2 priority tiers fired (or which observation was declined)
                                     (observed / historical / derived /
                                     fallback-to-k1)
   - replica-capacity-decision      (saturation_v2) per replica, per cycle:
@@ -28,6 +28,15 @@ Reads the following log lines:
                                     it binds: demand held at lambda / mu
                                     replicas' worth, mu being the saturated
                                     completion rate recorded beside k2
+  - scheduler-queue-prefill-share-dropped
+                                    (saturation_v2) per model, per cycle the
+                                    scheduler queue's prompts were not
+                                    charged to a prefill that has no mu
+  - prefill-demand-held            (saturation_v2) per model, per cycle a
+                                    decode replica is full and queued: the
+                                    prefill demand found and the figure it
+                                    was held at, neither ordering nor
+                                    releasing prefill on decode's backlog
   - Applied saturation decision via shared cache
                                     (steadystate) the actual, post-enforcement
                                     target replica count for the variant this
@@ -101,6 +110,8 @@ MESSAGES = {
     RC_MSG,
     SQ_MSG,
     TFLOOR_MSG,
+    "scheduler-queue-prefill-share-dropped",
+    "prefill-demand-held",
     "replica-capacity-skipped",
     "replica-capacity-store-fallback",
     "variant-capacity-source",
@@ -307,7 +318,10 @@ def build_cycle_row(cycle, variant):
     return {
         "ts": ts,
         "time_short": ts.split("T")[1].split("+")[0] if "T" in ts else ts,
-        "n": max(len(rcs), len(k2s)),
+        # One replica-capacity-decision per replica; k2-decision can be two
+        # for one replica (a declined observation, then the tier it fell
+        # through to), so it only counts when there are no capacity lines.
+        "n": len(rcs) if rcs else len(k2s),
         "priority_label": ",".join(sorted(set(priorities))) if priorities else "?",
         "k1": k1_common[0][0] if k1_common else "?",
         "k2": k2_common[0][0] if k2_common else "?",
@@ -532,7 +546,10 @@ def render_report(events, start, stop, cycle_gap, workload_line=None):
                      "variant that cycle (N). KVinUse/LocalQ/EPPq/TotalDemand are all in tokens; "
                      "Priority lists every k2 tier that fired across N replicas this cycle "
                      "(P1-obs=observed, P2-hist=historical average, P3-k2=derived from deployment "
-                     "args, P4-k1=no signal, memory-bound only). Time is HH:MM:SS on the run date "
+                     "args, P4-k1=no signal, memory-bound only; P1-obs-invalid and "
+                     "P1-obs-downstream mark an observation that was NOT recorded -- above the "
+                     "KV ceiling, or a prefill saturation while decode was saturated -- and are "
+                     "followed by the tier it fell through to). Time is HH:MM:SS on the run date "
                      "above.")
         lines.append("")
         lines.append(f"Legend — Bound: {BOUND_LEGEND}.  Decision: {DECISION_LEGEND}.")

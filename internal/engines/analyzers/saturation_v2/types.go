@@ -31,6 +31,14 @@ var k2Labels = map[k2Source]string{
 // k2-decision log line.
 const k2ReasonObsImplausible = "P1-obs-invalid"
 
+// k2ReasonObsDownstream labels the diagnostic emitted when a prefill
+// replica's saturated queue is left unrecorded because the decode role is
+// saturated in the same cycle: a prefill request completes only when decode
+// admits it, so what prefill shows then is decode's saturation, not its own
+// (computeK2). Like k2ReasonObsImplausible it is not a k2Source -- the
+// analyzer falls through to the next priority.
+const k2ReasonObsDownstream = "P1-obs-downstream"
+
 const (
 	satReasonP0Store = "P0-store" // capacity from store or compatible-variant record; no live replicas
 	// satReasonNoData marks a variant with no live replicas and no store record.

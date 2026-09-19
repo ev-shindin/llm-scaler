@@ -65,6 +65,15 @@ type SaturationAnalyzer struct {
 	// latter tells how many replicas a given arrival rate needs.
 	saturatedThroughput map[string]*rollingAverage
 	capacityStore       *CapacityKnowledgeStore
+
+	// decodeSaturatedAt is, per namespace|model, the last cycle a decode
+	// replica was seen full and queued (roleSaturated). Prefill's readings
+	// are treated as decode's for DecodeSaturationMemory after it
+	// (rememberDecodeSaturation); swept by EvictStaleHistory beside the
+	// history, one time.Time per model that ever saturated.
+	decodeSaturatedAt map[string]time.Time
+	// now is the clock the memory reads; tests set it.
+	now func() time.Time
 }
 
 // acceleratorMemo is the last accelerator that resolved for a variant, with the
@@ -83,6 +92,8 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore) *SaturationAnalyzer {
 		lastAccelerator:        make(map[string]acceleratorMemo),
 		saturatedThroughput:    make(map[string]*rollingAverage),
 		capacityStore:          store,
+		decodeSaturatedAt:      make(map[string]time.Time),
+		now:                    time.Now,
 	}
 }
 
@@ -100,7 +111,10 @@ func (a *SaturationAnalyzer) Name() string {
 // It prunes the accelerator memo on the same timeout, and here rather than in a
 // second sweep so the two cannot drift: both are per-variant state that exists
 // only to key or stabilise capacity, and a variant that has gone quiet for the
-// timeout has no use for either. The returned count remains the number of
+// timeout has no use for either. The saturated-throughput windows and the
+// decode-saturation memory go the same way -- the latter is per
+// namespace|model rather than per variant, but a model quiet for the timeout
+// has no use for it either. The returned count remains the number of
 // HISTORY entries evicted, which is what its callers report.
 func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	a.mu.Lock()
@@ -124,7 +138,28 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 			delete(a.saturatedThroughput, key)
 		}
 	}
+	for key, at := range a.decodeSaturatedAt {
+		if time.Since(at) > timeout {
+			delete(a.decodeSaturatedAt, key)
+		}
+	}
 	return evicted
+}
+
+// rememberDecodeSaturation records that decode was seen full and queued this
+// cycle when it was, and reports whether decode counts as saturated for
+// prefill's sake: now, or within DecodeSaturationMemory of the last time.
+func (a *SaturationAnalyzer) rememberDecodeSaturation(namespace, modelID string, saturatedNow bool) bool {
+	key := namespace + "|" + modelID
+	now := a.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if saturatedNow {
+		a.decodeSaturatedAt[key] = now
+		return true
+	}
+	last, ok := a.decodeSaturatedAt[key]
+	return ok && now.Sub(last) < DecodeSaturationMemory
 }
 
 // Analyze computes capacity signals for a model across all its variants.
@@ -150,6 +185,19 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		accelByVariant[vs.VariantName] = vs.AcceleratorName
 	}
 
+	// Whether the decode role is saturated this cycle decides what a
+	// saturated PREFILL replica is evidence of (computeK2): a prefill request
+	// completes only when decode admits it, so while decode is full and
+	// queued, prefill's queue and its held KV are decode's backlog seen from
+	// upstream, and neither its occupancy nor its completion rate is a
+	// reading of prefill. Decided once, over every decode row, before any
+	// replica is priced -- the order the rows arrive in must not matter --
+	// and remembered for the collector's row window, because prefill's row
+	// is a one-minute max that can outlive decode's
+	// (rememberDecodeSaturation).
+	decodeSaturated := a.rememberDecodeSaturation(input.Namespace, input.ModelID,
+		roleSaturated(input.ReplicaMetrics, rolesByVariant, domain.RoleDecode, satConfig.QueueLengthThreshold, satConfig.KvCacheThreshold))
+
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]ReplicaCapacity, 0, len(input.ReplicaMetrics))
 	for _, rm := range input.ReplicaMetrics {
@@ -159,8 +207,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		default:
 		}
 		gpuCount := gpusByVariant[rm.VariantName]
+		role := rolesByVariant[rm.VariantName]
+		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			rolesByVariant[rm.VariantName], accelByVariant[rm.VariantName], logger)
+			role, accelByVariant[rm.VariantName], downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -229,6 +279,42 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
 		totalDemand, roleDemand, queueDemand.byRole, eppQueued, logger)
 
+	// While decode is saturated, prefill's DEMAND is not a reading of prefill
+	// either: the KV it holds and the queue behind it are decode's backlog
+	// (computeK2 explains the mechanism), and the gate above only keeps them
+	// out of what is LEARNED. Left in the demand they still act on the
+	// decision -- against a k2 prefill learned on some earlier, genuine
+	// saturation (small, as a compute bound is) the held KV alone reads as
+	// several replicas, and against k1 on a fleet of two or more it reads as
+	// a release: 537 800 on a supply of 1 839 718 is 29 %, one replica
+	// removed while decode is saturated and re-ordered when it recovers. So
+	// the role's demand is clamped into the band where the engine neither
+	// orders nor releases (RC = 0 and SC = 0 under applyUniversalThreshold):
+	// prefill keeps what it has until decode's numbers are its own again:
+	// for as long as any decode replica's one-minute peak reads full and
+	// queued, plus the memory -- 195 s and two decode starts replayed on
+	// the measured cold pass, 135 s and one on the warm; unbounded while
+	// decode is capped and cannot grow. The cycle decode recovers, prefill's
+	// own occupancy and floor
+	// stand. What the floor of the band buys is not a re-order avoided --
+	// a released prefill replica would stay released, prefill reads near
+	// zero after an episode -- but the burst that ends one: the scheduler's
+	// flow control releases what it held in one go (124 requests, 744k
+	// prompt tokens on a 919k k1, on the measured run), and it lands on
+	// prefill first. Only the disaggregated case has a prefill
+	// entry to hold; the model-level total moves by the same amount so
+	// RoleDemand and TotalDemand keep moving together.
+	if decodeSaturated && roleDemand != nil {
+		scaleUp, scaleDown := satConfig.AnalyzerThresholds(domain.SaturationAnalyzerName)
+		if h, held := holdPrefillDemand(roleDemand, variantCapacities, scaleUp, scaleDown); held {
+			totalDemand += h.after - h.before
+			logger.Info("prefill-demand-held",
+				"modelID", input.ModelID, "namespace", input.Namespace,
+				"demandBefore", h.before, "demandHeld", h.after, "holdFloor", h.lo, "holdCap", h.hi,
+				"reason", "decode saturated: the KV prefill holds and the queue behind it are decode's backlog; prefill is neither ordered nor released on them")
+		}
+	}
+
 	result := &domain.AnalyzerResult{
 		AnalyzerName:      a.Name(),
 		ModelID:           input.ModelID,
@@ -245,7 +331,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 // computeReplicaCapacity computes the capacity breakdown for a single replica.
 // The role argument is the replica's P/D role, which determines how requests
 // waiting in the local engine queue are charged (see waitingQueueDemand).
-// An empty role is treated as domain.RoleBoth.
+// An empty role is treated as domain.RoleBoth. downstreamSaturated says the
+// role this replica hands its requests to is saturated this cycle, which
+// makes the replica's own saturation not a reading of it (computeK2); it is
+// only ever true for prefill.
 // Returns nil if the replica has no V2 capacity data (TotalKvCapacityTokens == 0).
 func (a *SaturationAnalyzer) computeReplicaCapacity(
 	rm domain.ReplicaMetrics,
@@ -254,6 +343,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	gpuCount int,
 	role string,
 	accelerator string,
+	downstreamSaturated bool,
 	logger logr.Logger,
 ) *ReplicaCapacity {
 	if rm.TotalKvCapacityTokens <= 0 {
@@ -271,7 +361,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	replicaDemand := rm.TokensInUse + localQueueDemand
 
 	// k1: memory-bound capacity
-	k1 := int64(float64(rm.TotalKvCapacityTokens) * config.KvCacheThreshold)
+	k1 := memoryBound(rm.TotalKvCapacityTokens, config.KvCacheThreshold)
 
 	// k2: compute-bound capacity
 	var engineParams *EngineParams
@@ -290,6 +380,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		k1,
 		rm.TotalKvCapacityTokens,
 		role,
+		downstreamSaturated,
 		logger,
 	)
 	// The same saturated moment that yields a k2 observation yields the
@@ -516,6 +607,7 @@ func (a *SaturationAnalyzer) computeK2(
 	k1 int64,
 	kvCeiling int64,
 	role string,
+	downstreamSaturated bool,
 	logger logr.Logger,
 ) (int64, k2Source) {
 	// Priority 1: Observed (queue saturated)
@@ -565,7 +657,56 @@ func (a *SaturationAnalyzer) computeK2(
 	// genuine observation diluted to 1/N against samples describing behaviour
 	// from before the gap -- an exposure this smoothing creates and the raw
 	// return did not have.
-	if queueLen >= int(queueThreshold) && tokensInUse > 0 {
+	//
+	// A saturated PREFILL replica is a reading of prefill only while decode
+	// is not saturated. A prefill request is done when decode admits it and
+	// pulls its KV, so with decode over its queue threshold what prefill
+	// shows is metered by decode: the KV of finished prompts it holds until
+	// the pull, the arrivals the scheduler's flow control releases to it in
+	// bursts, and a completion rate that is decode's admission rate. That is
+	// decode's saturation seen from upstream. Recorded as prefill's, it
+	// persists: measured on the shape-swap P/D benchmark (2026-09-18, cold
+	// pass), a single prefill replica showed queue 30 and 357 800 resident
+	// tokens for four cycles at +220..+265 s -- the cycles both decode
+	// replicas were over the threshold at ~1.0M resident -- and was priced
+	// at k2 = 357 800 (k1 was 919 859) and mu = 5.57 req/s. Its own
+	// occupancy then read 100 % of that k2 and ordered a second prefill
+	// replica; the mu, below the 6 req/s offered, held both for the rest
+	// of the run (lambda / mu = 1.08 replicas at the median) while their
+	// resident KV read near zero -- 33 GPU-minutes, and no later cycle could
+	// correct either figure, because a prefill fleet of two never saturates
+	// again. The correlation is what was measured; which path carried it
+	// (held blocks, flow-control bursts) is not settled -- prefill's KV was
+	// at 31 % of its cache on the gated rows, so it was not block-starved.
+	// The reading is left unrecorded: k2 falls through to history or k1,
+	// and the throughput floor records no mu (computeReplicaCapacity keys
+	// that on k2SrcObserved). A prefill bottleneck reduces decode's
+	// arrivals, so the two saturate at once only when decode is short at
+	// prefill's completion rate; prefill's reading then waits for decode to
+	// recover.
+	//
+	// The decode test is a replica full AND queued (roleSaturated), not the
+	// queue alone: vLLM counts a decode request waiting for its remote KV in
+	// num_requests_waiting, so a fleet whose transfer keeps as many in
+	// flight as the threshold would read decode saturated every cycle on
+	// the queue alone, and prefill would never record and -- with the hold
+	// on its demand (Analyze) -- never be ordered. Full is decode unable to
+	// allocate the blocks a pull needs, which the transfer pipeline does not
+	// produce. The test is remembered for the collector's row window
+	// (rememberDecodeSaturation): on the measured episode decode's
+	// occupancy dropped under k1 on the fourth cycle while its queue and
+	// prefill's stale row had not moved, and that row would otherwise have
+	// recorded. A decode bound by its sequence ceiling before its KV does
+	// not gate; that is a prefill mislearned low, which costs money, where
+	// a prefill that cannot be ordered costs latency.
+	if queueLen >= int(queueThreshold) && tokensInUse > 0 && downstreamSaturated {
+		logger.V(logging.DEFAULT).Info("k2-decision",
+			"modelID", modelID, "namespace", namespace, "variant", variantName,
+			"priority", k2ReasonObsDownstream, "historyKey", historyKey,
+			"queueLength", queueLen, "queueThreshold", queueThreshold,
+			"reason", "queue saturated while the decode role is; a prefill completes only when decode admits it, so this is decode's saturation seen from prefill; not recorded",
+			"tokensInUse", tokensInUse, "k1", k1)
+	} else if queueLen >= int(queueThreshold) && tokensInUse > 0 {
 		k2Observed := tokensInUse
 		if kvCeiling > 0 && k2Observed > kvCeiling {
 			logger.V(logging.DEFAULT).Info("k2-decision",
@@ -1134,6 +1275,104 @@ func canonicalRole(role string) string {
 		return domain.RoleBoth
 	}
 	return role
+}
+
+// roleSaturated reports whether any replica of the given role is full and
+// queued this cycle: its local queue at or over the threshold, as computeK2
+// admits a P1-obs reading on, AND its resident KV at or over its k1 (the
+// cache times kvCacheThreshold) and within the cache's physical ceiling (a
+// reading above it is a scrape artifact there, and no more a saturation
+// here). The queue alone would not do: a decode request waiting for its
+// remote KV sits in vLLM's waiting count, so a slow transfer keeps a queue
+// on a decode that is admitting fine. A row with no cache size cannot be
+// judged and does not count. Every row counts, bridges included: a
+// warm-pool Pod lent to decode that is full and queued is decode saturated
+// as much as one of its own replicas is.
+func roleSaturated(metrics []domain.ReplicaMetrics, rolesByVariant map[string]string, role string, queueThreshold, kvCacheThreshold float64) bool {
+	for _, rm := range metrics {
+		if canonicalRole(rolesByVariant[rm.VariantName]) != role {
+			continue
+		}
+		if rm.QueueLength < int(queueThreshold) || rm.TokensInUse <= 0 || rm.TotalKvCapacityTokens <= 0 {
+			continue
+		}
+		if rm.TokensInUse > rm.TotalKvCapacityTokens {
+			continue
+		}
+		if rm.TokensInUse >= memoryBound(rm.TotalKvCapacityTokens, kvCacheThreshold) {
+			return true
+		}
+	}
+	return false
+}
+
+// memoryBound is k1: the KV cache times kvCacheThreshold, truncated -- the
+// one formula for it, so the gate's "full" is the capacity the replica is
+// priced at.
+func memoryBound(totalKvCapacityTokens int64, kvCacheThreshold float64) int64 {
+	return int64(float64(totalKvCapacityTokens) * kvCacheThreshold)
+}
+
+// roleHold is what holdPrefillDemand did to prefill's demand: the figure it
+// found, the figure it left, and the band it clamped into.
+type roleHold struct {
+	before, after, lo, hi float64
+}
+
+// holdPrefillDemand clamps roleDemand[prefill] into the band where the
+// engine neither orders nor releases -- [scaleDown x supply, scaleUp x
+// anticipated supply], the demands at which applyUniversalThreshold's RC
+// and SC are both zero -- and reports whether it moved. No prefill demand
+// entry, no prefill supply anticipated, or a demand already inside the band
+// leaves it alone. When the band is empty the cap wins -- a hold that
+// cannot avoid both errors must not order -- though with the config
+// refusing a scale-down boundary at or above the scale-up threshold and
+// pending replicas never negative (aggregateByVariant), anticipated supply
+// is never below supply and the band is never empty in practice. The
+// variants' own demand and utilization are moved with the role figure.
+func holdPrefillDemand(roleDemand map[string]float64, variants []domain.VariantCapacity, scaleUp, scaleDown float64) (roleHold, bool) {
+	const role = domain.RolePrefill
+	before, ok := roleDemand[role]
+	if !ok || scaleUp <= 0 || scaleDown <= 0 {
+		return roleHold{}, false
+	}
+	rc, ok := aggregation.AggregateByRole(variants)[role]
+	if !ok || rc.TotalAnticipatedSupply <= 0 {
+		return roleHold{}, false
+	}
+	h := roleHold{before: before, lo: scaleDown * rc.TotalSupply, hi: scaleUp * rc.TotalAnticipatedSupply}
+	h.after = min(before, h.hi)
+	if h.lo <= h.hi {
+		h.after = max(h.after, h.lo)
+	}
+	if h.after == before {
+		return h, false
+	}
+	roleDemand[role] = h.after
+	// The per-variant figures follow, or the hold does not survive the split:
+	// the optimizer prices each variant of a role by its share of the ROLE
+	// demand (allocation.variantDemandShare), taken from the variants' own
+	// TotalDemand, and the sticky scale-down tests a variant's release
+	// against that priced figure. Left raw, the variant whose replica showed
+	// decode's backlog would carry nearly the whole held total, and a sibling
+	// idling on a genuine reading nearly none. Shared out by anticipated
+	// supply instead -- the hold's point is that prefill's measurement is
+	// nobody's this cycle, so every variant reads the band's figure at its
+	// own size. Utilization moves with it, so what reads it (the warm pool's
+	// pressure) sees the held figure too.
+	for i := range variants {
+		vc := &variants[i]
+		if canonicalRole(vc.Role) != role {
+			continue
+		}
+		anticipated := float64(vc.ReplicaCount+vc.PendingReplicas) * vc.PerReplicaCapacity
+		vc.TotalDemand = h.after * anticipated / rc.TotalAnticipatedSupply
+		vc.Utilization = 0
+		if supply := float64(vc.ReplicaCount) * vc.PerReplicaCapacity; supply > 0 {
+			vc.Utilization = vc.TotalDemand / supply
+		}
+	}
+	return h, true
 }
 
 // waitingQueueDemand estimates the KV-token demand of the requests waiting in a

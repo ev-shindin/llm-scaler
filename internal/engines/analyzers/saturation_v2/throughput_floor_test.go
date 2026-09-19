@@ -318,9 +318,16 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	var (
 		analyzer *SaturationAnalyzer
 		ctx      context.Context
+		clock    time.Time
 	)
 	BeforeEach(func() {
 		analyzer = NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		// The saturating cycles below are decode full and queued, which
+		// the analyzer remembers for DecodeSaturationMemory and holds
+		// prefill's demand through (holdPrefillDemand); the specs here are
+		// about the floor, so each saturation moves the clock past it.
+		clock = time.Date(2026, 9, 17, 10, 48, 9, 0, time.UTC)
+		analyzer.now = func() time.Time { return clock }
 		ctx = context.Background()
 	})
 
@@ -359,6 +366,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		for i := 0; i < MinThroughputSamplesToOrder; i++ {
 			saturateOnce()
 		}
+		clock = clock.Add(DecodeSaturationMemory + time.Second)
 	}
 
 	It("holds the decode role at lambda / mu once the fleet has caught up", func() {
@@ -515,8 +523,11 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		// prefill replicas that had nothing to prefill. A prefill replica holds
 		// a prompt for its prefill time plus the hand-off; the queue is decode's
 		// to drain.
+		// Decode is not over its queue threshold here: with decode saturated,
+		// prefill's whole demand is held in the no-order/no-release band
+		// (holdPrefillDemand), which would mask what this spec is about.
 		in := makeAnalyzerInput(
-			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 180, runMu), prefill("prefill-0", 66_183)},
+			[]domain.ReplicaMetrics{decode("decode-0", 900_000, 0, runMu), prefill("prefill-0", 66_183)},
 			states(1, 1))
 		in.ArrivalRate = runLambda
 		in.SchedulerQueue = &domain.SchedulerQueueMetrics{QueueSize: 200, QueueBytes: 200 * 6000 * 4}
@@ -526,10 +537,13 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			"prefill keeps only its own resident KV")
 
 		By("pricing it as a backlog once prefill has a saturated throughput of its own")
+		// Learned on a cycle decode is NOT saturated in: a prefill saturation
+		// under a saturated decode is decode's, and is not recorded
+		// (computeK2).
 		satP := prefill("prefill-0", 900_000)
 		satP.QueueLength = 10
 		satP.RequestRate = 30
-		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 180, runMu), satP}, states(1, 1))
+		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 300_000, 0, runMu), satP}, states(1, 1))
 		in2.ArrivalRate = runLambda
 		_, err = analyzer.Analyze(ctx, in2)
 		Expect(err).NotTo(HaveOccurred())

@@ -142,11 +142,11 @@ graphs and tables are the ones `post_run_analyze.sh` writes.
 | decode replicas ordered | 1 → 3 (first ramp) → 2 → 3 → 4, held | 1 → 3 → 2 → 3 → 4, held |
 | second decode replica ordered | +62 s after load start | +81 s |
 | prefill replicas | 1 throughout | 1 throughout |
-| replicas, both roles, mean / max | 2.59 / 4 | 2.73 / 4 |
+| decode replicas, mean / max | 2.59 / 4 | 2.73 / 4 |
 | TTFT p50 / p95 / p99 | 100 ms / **213 ms** / 11.7 s | 99 ms / 7.0 s / 24.7 s |
 | ITL p50 / p95 | 5.4 / 21.7 ms | 4.1 / 23.0 ms |
 | request latency p50 / p95 | 14.6 / 79.2 s | 14.2 / 84.5 s |
-| GPU-minutes | 100.0 | 105.3 |
+| decode GPU-minutes | 100.0 | 105.3 |
 | requests / errors | 13,288 / 0 | 13,288 / 0 |
 
 Where the tail is, by five-minute window (p95 TTFT from the engines' own
@@ -170,7 +170,15 @@ the last minute of the wait and is priced as work to drain within 60 s
 (`backlogRequests` on the `throughput-demand-floor` line), which is one more
 replica, not five: the target peaks at 3, the queue is gone in a minute, and
 the third replica is released at +6 min. Prefill is never ordered: prompts
-waiting at the scheduler are no longer charged to it as resident KV.
+waiting at the scheduler are no longer charged to it as resident KV. (A
+later cold pass ordered one by a second path -- a prefill saturation
+recorded while decode was saturated -- which the analyzer now declines, and
+it holds prefill's demand where it neither orders nor releases while decode
+is full and queued, which is what kept prefill at one on the passes since:
+see "A prefill saturation records only while decode is not saturated" in
+the [floor guide](../../developer-guide/saturation-demand-floor.md). The
+replica and GPU-minute rows above count decode only, as the harness's
+report does; prefill's one replica is on top.)
 
 **The first phase, steady** (minutes 5-18). Occupancy is a fraction of one
 replica (5-15% KV) -- the reading that, taken alone, would size the fleet to
@@ -187,7 +195,9 @@ The fourth, at minute 31, is one noisy arrival-rate sample (6.7 req/s for a
 cycle against a steady 5.4-6.0) tipping 2.5 replicas' worth over the
 three-replica boundary; the analyzer asked for three again 90 s later and the
 HPA's 180 s window kept the fourth to the end. One spare replica for six
-minutes is the cost of that jitter today.
+minutes was the cost of that jitter before the sticky scale-down
+(`WVA_STICKY_SCALE_DOWN`, on by default), which holds the published three
+against the creep unless demand at three reaches the scale-up threshold.
 
 What still moves: a controller that has never seen a shape saturated has no
 throughput for it and sizes that first ramp from occupancy and the backlog,
