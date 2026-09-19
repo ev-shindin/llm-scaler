@@ -1,0 +1,31 @@
+metadata:
+  labels:
+    name: shape-swap-1k4000-6k1000-rps6
+    description: |
+      The two-stage shape swap with its phases exchanged, replayed from a
+      pre-generated trace (hack/benchmark/gen_shape_trace.py): 1000/4000
+      tokens for 1100s, then 6000/1000 tokens for 1100s, both RPS=6 via
+      Poisson arrivals, fixed lengths. Rate never changes. The mirror of
+      shape_swap_replay_6k1000_1k4000_rps6_20m: the fleet is asked to
+      descend from the decode-heavy shape's need to the prefill-heavy one's
+      at the swap, where the other order asks it to climb.
+spec:
+  backend:
+    kind: openai_http
+    target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+    model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+    request_format: /v1/completions
+  profile:
+    kind: replay
+    time_scale: 1.0
+  # See shape_swap_replay.yaml.in for why this must be a local file bundled
+  # via the guidellm-profiles ConfigMap at the harness-name-parameterized
+  # mount path /workspace/profiles/guidellm/. The trace is ~910KB against
+  # the ConfigMap's 1MiB ceiling; its timestamps are rounded to the
+  # millisecond for that reason.
+  data:
+    - kind: trace_synthetic
+      path: /workspace/profiles/guidellm/shape_1k4000_6k1000_rps6_20m.jsonl
+  constraints:
+    - kind: max_duration
+      seconds: 2400

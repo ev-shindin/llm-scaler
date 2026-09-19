@@ -1,0 +1,31 @@
+# The shape-swap experiment with its phases exchanged: same RPS throughout
+# (6 req/s), request shape flips from decode-heavy (1000/4000) to
+# prefill-heavy (6000/1000) halfway through. The mirror of
+# shape_6k1000_1k4000_rps6_20m, so a controller that has learned the fleet
+# the decode-heavy shape needs (three decode replicas at this rate) is then
+# handed the prefill-heavy one, whose decode need is two -- the descent
+# case, where the other order only ever showed the climb. Same seed, same
+# per-phase durations, same rate; only the order of the two phases differs.
+
+seed: 42
+arrival_distribution: poisson
+length_distribution: constant   # min=max per phase -- fixed lengths, no spread
+
+output:
+  path: shape_1k4000_6k1000_rps6_20m.jsonl
+  timestamp_column: timestamp
+  prompt_tokens_column: input_length
+  output_tokens_column: output_length
+
+phases:
+  - name: 1k4000-rps6
+    duration_s: 1100
+    rate_rps: 6
+    input_tokens:  { mean: 1000 }
+    output_tokens: { mean: 4000 }
+
+  - name: 6k1000-rps6
+    duration_s: 1100
+    rate_rps: 6
+    input_tokens:  { mean: 6000 }
+    output_tokens: { mean: 1000 }
