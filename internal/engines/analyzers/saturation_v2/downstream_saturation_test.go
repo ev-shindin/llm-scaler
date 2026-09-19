@@ -309,6 +309,32 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically(">", 0.85*prefillP(result)))
 	})
 
+	It("shares the held figure out across a role's variants by their size", func() {
+		// Two prefill variants: the one whose replica shows decode's backlog
+		// (357 800 held, 30 queued) and one idling on a genuine reading. The
+		// optimizer prices each variant by its share of the role demand,
+		// read off the variants' own TotalDemand, and the sticky scale-down
+		// tests a release against that -- so the held figure has to reach
+		// the variants, and by size, not by who happened to show the backlog.
+		idle := makeReplicaMetrics("prefill-1", "prefill-w", 20_000, prefillKv, 0, 6000, 1)
+		idle.Ready = true
+		two := []domain.VariantReplicaState{states[0], states[1],
+			{VariantName: "prefill-w", Role: domain.RolePrefill, AcceleratorName: "H200", CurrentReplicas: 1, GPUsPerReplica: 1}}
+		result, err := analyzer.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{
+			decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill(), idle}, two))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", 0.7*2*prefillK1, 1), "the role, at the band floor")
+		var byName = map[string]domain.VariantCapacity{}
+		for _, vc := range result.VariantCapacities {
+			byName[vc.VariantName] = vc
+		}
+		Expect(byName[prefillVariant].TotalDemand).To(BeNumerically("~", 0.7*prefillK1, 1), "half each: same size")
+		Expect(byName["prefill-w"].TotalDemand).To(BeNumerically("~", 0.7*prefillK1, 1))
+		Expect(byName[prefillVariant].Utilization).To(BeNumerically("~", 0.7, 0.001))
+		Expect(byName["prefill-w"].Utilization).To(BeNumerically("~", 0.7, 0.001))
+		Expect(byName[decodeVariant].TotalDemand).To(BeNumerically(">", 2_000_000), "decode's own figures untouched")
+	})
+
 	It("falls through to prefill's own history once it has one, not to k1", func() {
 		// A history seeded on a cycle decode was keeping up in. The gate only
 		// declines the fresh reading; the priorities below it still apply,

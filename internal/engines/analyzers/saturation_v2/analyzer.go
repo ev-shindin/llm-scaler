@@ -1324,9 +1324,12 @@ type roleHold struct {
 // anticipated supply], the demands at which applyUniversalThreshold's RC
 // and SC are both zero -- and reports whether it moved. No prefill demand
 // entry, no prefill supply anticipated, or a demand already inside the band
-// leaves it alone. When the band is empty (an in-flight scale-down can
-// leave supply above anticipated supply) the cap wins: a hold that cannot
-// avoid both errors must not order.
+// leaves it alone. When the band is empty the cap wins -- a hold that
+// cannot avoid both errors must not order -- though with the config
+// refusing a scale-down boundary at or above the scale-up threshold and
+// pending replicas never negative (aggregateByVariant), anticipated supply
+// is never below supply and the band is never empty in practice. The
+// variants' own demand and utilization are moved with the role figure.
 func holdPrefillDemand(roleDemand map[string]float64, variants []domain.VariantCapacity, scaleUp, scaleDown float64) (roleHold, bool) {
 	const role = domain.RolePrefill
 	before, ok := roleDemand[role]
@@ -1346,6 +1349,29 @@ func holdPrefillDemand(roleDemand map[string]float64, variants []domain.VariantC
 		return h, false
 	}
 	roleDemand[role] = h.after
+	// The per-variant figures follow, or the hold does not survive the split:
+	// the optimizer prices each variant of a role by its share of the ROLE
+	// demand (allocation.variantDemandShare), taken from the variants' own
+	// TotalDemand, and the sticky scale-down tests a variant's release
+	// against that priced figure. Left raw, the variant whose replica showed
+	// decode's backlog would carry nearly the whole held total, and a sibling
+	// idling on a genuine reading nearly none. Shared out by anticipated
+	// supply instead -- the hold's point is that prefill's measurement is
+	// nobody's this cycle, so every variant reads the band's figure at its
+	// own size. Utilization moves with it, so what reads it (the warm pool's
+	// pressure) sees the held figure too.
+	for i := range variants {
+		vc := &variants[i]
+		if canonicalRole(vc.Role) != role {
+			continue
+		}
+		anticipated := float64(vc.ReplicaCount+vc.PendingReplicas) * vc.PerReplicaCapacity
+		vc.TotalDemand = h.after * anticipated / rc.TotalAnticipatedSupply
+		vc.Utilization = 0
+		if supply := float64(vc.ReplicaCount) * vc.PerReplicaCapacity; supply > 0 {
+			vc.Utilization = vc.TotalDemand / supply
+		}
+	}
 	return h, true
 }
 

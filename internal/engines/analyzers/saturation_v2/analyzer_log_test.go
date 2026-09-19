@@ -2,6 +2,9 @@ package saturation_v2
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +69,22 @@ var logContract = map[string][]string{
 	"replica-capacity-store-fallback": {"modelID", "namespace", "variant", "reason"},
 	"variant-capacity-source":         {"modelID", "namespace", "variant", "reason"},
 	"zero-replica-capacity-estimate":  {"modelID", "namespace", "variant", "source"},
+}
+
+// The report tool keeps its own list of the messages it collects
+// (MESSAGES in hack/benchmark/dump_k2_decisions.py) and drops every other
+// line before it reaches k2_decisions.json. A message added to the contract
+// here and not there is emitted, pinned, and never seen in a report -- which
+// is how prefill-demand-held shipped invisible for a round. The script is
+// Python, so the pin is textual: every message the contract names must
+// appear in the script as a string literal.
+func TestLogContract_ReportToolCollectsEveryMessage(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "hack", "benchmark", "dump_k2_decisions.py"))
+	require.NoError(t, err, "hack/benchmark/dump_k2_decisions.py must be readable from the package directory")
+	for msg := range logContract {
+		assert.True(t, strings.Contains(string(script), `"`+msg+`"`),
+			"%q is in the log contract but dump_k2_decisions.py never names it; add it to MESSAGES", msg)
+	}
 }
 
 // k2PriorityLabels is the vocabulary a k2 SOURCE is labelled with; the

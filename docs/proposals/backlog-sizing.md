@@ -610,36 +610,49 @@ P1-obs-downstream lines   --              0               0                --   
 prefill-demand-held       --              11 (+130..+340) 9 (+137..+257)   --              9
 ```
 
-Prefill never left one replica on either pass: 30-35 GPU-minutes per pass
+Prefill never left one replica on any pass: 30-35 GPU-minutes per pass
 against run 8, and the warm pass's p95 the lowest of the series. The gate
-was never needed -- prefill showed no saturated row on either pass -- and
-the hold engaged on the cycles decode was full and queued (11 on the cold
-pass, at +130..+340 s; 9 on the warm), clamping a prefill demand of
-6k-36k to the band floor: no order, no release.
+was never needed -- prefill showed no saturated row on any pass -- and the
+hold was: decode was full and queued for 15 cycles of the first cold pass
+(+130..+340 s), and on four of them (+175..+220 s) prefill's resident KV
+read 830 300 with NO queue -- 72 % of its cache, sixty-odd finished prompts
+awaiting a pull -- which is 90 % of k1, above the scale-up threshold. The
+hold capped it at 0.85 x k1; without it a second prefill replica would
+have been ordered at +175 s, as run 8's was at +220 s, and for the same
+reason. The other seven logged cycles lifted 6k-349k to the band floor
+(the four in between, at 710k, sat inside the band and needed nothing).
+On the warm pass and the second cold pass every held figure was below the
+floor (0-463k). Note what the 830k-with-no-queue rows say about the
+mechanism question above: the held blocks are real on their own, queue or
+no queue; whether the queue of 30 on run 8 was theirs or a burst's is
+still the open part.
 
 The cold pass's first ramp is the pod-start variance on record
 ([the workload preparation reference](../reference/workload-preparation.md), "The rest of the start path"), not the analyzer: the second
-decode replica was ordered at +70 s, as on every run (+62..+85), and took
-129 s to become Ready (created 19:36:58, containers started 14 s later,
-Ready 19:39:07) against 81-83 s on runs 7 and 8 -- same image on the node,
-same volume. The lone replica tipped at its usual ~+90 s, the backlog ran
+decode replica was ordered at +70 s, as on every cold pass (+70..+85), and
+took 129 s from creation to Ready (created 19:36:58, containers started
+14 s later, Ready 19:39:07) against 66 s for run 8's -- same image on the
+node, same volume. The lone replica tipped at its usual ~+90 s, the backlog ran
 two minutes instead of one, and the throughput floor priced it as a fourth
 replica at +265 s and released it at +355 s. Nothing here touches decode's
 demand or a pod's start; the phase switch at +1200 s, where the same
-paths run without a start, is 4.4 s against 4.1 and 3.5 s. The second
+paths run without a start, is 4.4 s against 4.1 and 3.3-3.5 s (the P/D
+well-lit path's 3.3 and the 3.5 here are the same run 7 window anchored at
+the harness start and at the first scrape). The second
 cold pass (run `guidellm-1789768002-eb450o_1`, controller restarted, 0
 history lines before the load) drew a 67 s start for its second decode
 replica, Ready at +165 s, and its first window is 2.9 s at p95 -- the
-lowest cold ramp of the series (7.3, 5.0 and 21.5 s before it) -- with
+lowest cold ramp of the series (7.0-7.3, 5.0 and 21.5 s before it) -- with
 prefill again at one and the hold again on the cycles decode was full and
 queued. Its decode GPU-minutes are the highest of the cold passes (103.4)
 for a reason outside this change: the decode target chattered 3, 2, 3, 2
 from +272 s to +1023 s and the HPA's window kept the third replica until
 +1202 s, the descent the sticky scale-down (`WVA_STICKY_SCALE_DOWN`, on by
-default since it merged) exists for; it had not merged when this image
-was built. A run on the merged tree is below.
+default since it merged) exists for; the branch this image was built from
+does not include it. A run on the merged tree is in progress and will be
+added here.
 
 The re-run did not get the signals that separate held blocks from bursts
-(prefill's `num_requests_running`, its KV at the queue peak, the EPP
-flow-control queue); prefill never saturated, so there was no peak to
-read. Still open.
+at a prefill QUEUE peak (prefill's `num_requests_running`, its KV at the
+peak, the EPP flow-control queue): prefill never queued, so there was no
+peak to read. What it did show is the held-block half on its own, above.

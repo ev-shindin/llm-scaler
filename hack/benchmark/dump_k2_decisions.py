@@ -28,6 +28,15 @@ Reads the following log lines:
                                     it binds: demand held at lambda / mu
                                     replicas' worth, mu being the saturated
                                     completion rate recorded beside k2
+  - scheduler-queue-prefill-share-dropped
+                                    (saturation_v2) per model, per cycle the
+                                    scheduler queue's prompts were not
+                                    charged to a prefill that has no mu
+  - prefill-demand-held            (saturation_v2) per model, per cycle a
+                                    decode replica is full and queued: the
+                                    prefill demand found and the figure it
+                                    was held at, neither ordering nor
+                                    releasing prefill on decode's backlog
   - Applied saturation decision via shared cache
                                     (steadystate) the actual, post-enforcement
                                     target replica count for the variant this
@@ -101,6 +110,8 @@ MESSAGES = {
     RC_MSG,
     SQ_MSG,
     TFLOOR_MSG,
+    "scheduler-queue-prefill-share-dropped",
+    "prefill-demand-held",
     "replica-capacity-skipped",
     "replica-capacity-store-fallback",
     "variant-capacity-source",
