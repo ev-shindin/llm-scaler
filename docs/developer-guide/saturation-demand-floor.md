@@ -56,13 +56,39 @@ Properties, each with a spec in `throughput_floor_test.go`:
 
 - **Invariant to fleet size.** `mu` is a per-replica constant, so the floor is
   the same at one replica and at six.
-- **A max over the window, not a mean.** A saturated completion rate can only
-  under-read its capacity -- in the first minute after a replica fills, the
-  requests completing are the few admitted first; under KV pressure preemption
-  drops it further -- and it cannot over-read, since nothing completes faster
-  than the engine runs. One run's readings for one replica were 5.4, 3.3 and
-  3.5 req/s while it was demonstrably completing 5.4. The floor divides by
-  `mu`, so a mean of under-reads would order replicas that are not needed.
+- **A max over the window, not a mean.** A saturated completion rate
+  under-reads its capacity while the replica is full -- in the first minute
+  after it fills, the requests completing are the few admitted first; under
+  KV pressure preemption drops it further. One run's readings for one
+  replica were 5.4, 3.3 and 3.5 req/s while it was demonstrably completing
+  5.4. The floor divides by `mu`, so a mean of under-reads would order
+  replicas that are not needed. It does NOT only under-read: in the last
+  minute of an episode that ends by a replica landing, the queue gate (a
+  one-minute max) stays up while the rate is fresh, and the fresh rate is
+  the batch draining -- sequences admitted together finish together, and no
+  new ones come. Measured on the second cold pass of 2026-09-19
+  (`guidellm-1789812977-xzf9ay_1`), from the pod's own counters: the replica
+  sustained ~5.0 req/s full (token throughput on a plateau), read 6.67 --
+  200 completions in 30 s, token throughput below the plateau -- on the
+  last saturated cycle as the second replica took the arrivals, and the
+  window carried 6.67 for the rest of the phase. The fleet holds `n`
+  replicas while `lambda > 0.7 x (n - 1) x mu`, so a figure too high
+  releases where the true one holds, in the band between the two: for
+  6.67 against 5.0, 3.5-4.7 req/s from two to one, and this trace's
+  phase-1 rate (5.4-6.2) sits where both hold two. The same pass's phase
+  switch shows it biting: the `xxlong` window's max, 3.27, was a 30 s burst
+  on a still-full replica (token throughput under the plateau; the
+  sustained figure is ~2.75), and at 5.8-6.9 req/s -- where phase 2 ran --
+  3.27 releases the fourth replica the true figure holds; the fourth left
+  at +1584 s on it, two minutes before the true figure would have let it
+  go. The max window has always taken these readings and nothing in it
+  lowers one. A `mu` priced from the generation-token rate over the
+  bucket's output length, which does not burst on a drain, is the
+  follow-up; a reading gated on an instantaneous queue would catch the
+  first case and not the second, where the burst was read with the queue
+  up. The k2 history beside it is a mean over the same rows and
+  takes a re-read row as many times as it repeats; that errs toward a lower
+  k2, the safe direction, and is left as it is.
 - **An order as well as a hold, and the order comes first.** The first
   version was capped at the fleet's own size, so that scale-up stayed with
   occupancy and the queues. Measured on three runs of the shape-swap trace,
@@ -75,16 +101,68 @@ Properties, each with a spec in `throughput_floor_test.go`:
   that replica in the first cycle `lambda` is measured. There is no cap; the
   bound is the formula, which does not move as replicas are added. What a
   `mu` that under-read costs is bounded by the under-read, and the window's
-  max corrects it upward at the next saturation.
+  max corrects it upward at the next saturation -- while the reading stays
+  in the window: ten counted readings, a rate window apart, is ten minutes
+  of one saturated replica, after which the earliest is evicted, and on one
+  run the max fell 3.67 to 3.47 that way before the spacing existed.
 - **Two readings may hold but not order**, and for those the cap at
   `scaleUp x anticipated supply` stays (`heldAtFleet`, `heldWhy` on the log
   line). A `mu` *borrowed* from a neighbouring bucket is wrong in a known
   direction and, from a longer shape, would over-order. A window with a
-  *single* reading is the first cycle's under-read (3.67 against a true 7.13
-  on the run), and an order on it over-provisions in a way that removes the
-  saturation which would have recorded the second, corrected reading
-  (`MinThroughputSamplesToOrder`, 2). Neither changed the measured runs:
-  every order on them came from a window with several readings of its own.
+  *single* reading is the first window's under-read (3.67 against a true
+  7.13 on the run), and an order on it over-provisions in a way that
+  removes the saturation which would have recorded the second, corrected
+  reading (`MinThroughputSamplesToOrder`, 2). Letting a single reading
+  order one replica was tried, twice, and dropped: measured against the
+  anticipated supply it ordered a fourth replica at a phase switch whose
+  third was still starting; measured against the running supply it was a
+  ratchet -- nothing remembered that the reading had already ordered, so
+  once the ordered replica reported, the same reading ordered the next,
+  one start at a time, up to the full figure. Across four passes the one
+  replica bought a single cycle over the plain hold (a third replica 30 s
+  ahead of occupancy, on the under-read that then ran unneeded for 35
+  minutes). Two
+  readings are two *rate windows*. The completion
+  rate is `rate(...[1m])` evaluated afresh every 15 s cycle, so the next
+  cycle reads mostly the same window -- at 30 s scrapes exactly the same
+  two samples, the same value to the digit -- and a reading counts as a
+  sample of its own only when it lands a rate window
+  (`ThroughputSampleSpacing`, one minute, held equal to the collector's
+  `RequestRateWindow` by a test) after the last one that counted and
+  differs from it. Counted per cycle, the guard was dead at that scrape
+  interval: the second cycle always re-read the first pair, and every
+  saturation ordered on the first window's under-read, unbounded. With the
+  spacing, the second reading is a minute away, and a fleet held at its
+  size for that minute with its queues priced nowhere (the floor takes the
+  residency charge out for a role with a `mu`) lands the cold ramp's next
+  replica 15-45 s after the dead guard would have on the three measured
+  cold passes -- occupancy orders it in the meantime, or the second
+  counted reading does. A reading inside the
+  spacing is *folded* into the last sample, which becomes the max of its
+  window -- the max the window kept when every cycle was added, no more;
+  dropping in-spacing readings instead lost the highest reading of an
+  episode exactly when no next window would come, and on two replayed
+  passes left `mu` 10-12 % low for the rest of the pass, on one of them
+  ordering a fourth replica the run never needed. (What that highest
+  reading is worth is the drain question above; the fold neither creates
+  nor cures it.) Folding also makes two replicas saturating in one cycle
+  one moment at the higher of the two, whichever row the collector's map
+  yields first. Value
+  equality is not the test -- the rate is an integer count of completions
+  over the scrape interval (every saturated rate logged on four passes is
+  N/30 -- 103/30 = 3.43, 110/30 = 3.67, 165/30 = 5.5 -- but one, a freshly
+  started replica's first window, where the counter's zero point makes the
+  rate an extrapolation), so two windows agree to the digit a few percent
+  of the time; a reading equal to the last one *given* at the boundary is
+  the same pair read again across it, or a repeat, and only touches the
+  window, which costs a cycle or two. Measured on the shape-swap trace's first cold pass
+  of 2026-09-19 (`guidellm-1789803750-vl4r9g_1`): one decode replica's 3.43 stood on four consecutive cycles,
+  two scrape pairs, and let the floor order on it. What followed -- a third
+  decode replica held for the remaining 35 minutes at `lambda / mu` = 1.75
+  against a true ~5.4 -- was the under-read itself: occupancy would have
+  ordered the third replica 30 s later, and the floor, uncapped at three
+  once it exists, held it either way. The spacing fixes what the guard
+  counts; an under-read that no later saturation corrects is still open.
 - **A backlog is throughput, not residency.** 350 queued requests at 6 req/s
   arriving are 58 s of arrivals; two replicas at 5.4 req/s each clear them in
   about two minutes and three in one. Charged as resident KV they were five
@@ -151,6 +229,15 @@ Properties, each with a spec in `throughput_floor_test.go`:
   (`vllm:num_requests_waiting_by_reason`, `reason="capacity"` for the
   scheduler's own queue); reading that for both this test and P1 itself is
   the follow-up, once the vLLM the stack ships is known to carry it.
+- **Priced per row, and the rows may sit in different buckets.** The floor
+  takes medians over the replicas' rows, and a fresh replica sits in the
+  bucket of its own few completions for a cycle or two; on one pass a
+  landing replica's `long` reading (the previous phase's 6.67) was
+  medianed with two `xxlong` rows at 3.27 for a cycle. And `mayOrder` is
+  set by any own row with two samples, so a row in an old bucket unlocks
+  the full order for a role whose current bucket has one. Neither changed
+  a decision on the measured passes; both are open, pre-existing: pricing
+  a variant from one bucket per cycle is the fix.
 - **Keyed by output length**, in factor-of-two buckets above 500 tokens
   (`classifyOutputLength`). `mu` falls roughly with output length, and two
   shapes sharing a bucket share a window whose max is the shorter shape's --
@@ -249,3 +336,7 @@ is a property of the load.
 | The persisted prefill `mu` alone ordered a second prefill replica at +51 s on the warm pass that followed, at zero resident KV | Measured, run `guidellm-1789746634-pov4xp_1`: `throughput-demand-floor` for prefill at 15:51:35, `arrivalRate` 5.5, `saturatedThroughput` 5.57, `residentDemand` 0, `replicasImplied` 0.99 |
 | Left unrecorded, the same cycle prices prefill at k1 with no order | Replayed from the run's rows in `downstream_saturation_test.go` |
 | With the gate, the hold and the memory, prefill stays at one replica on every pass; the hold engages only while decode is full and queued, and on the first cold pass it is what kept prefill at one | Measured, runs `guidellm-1789760128-zphd9d_1` (cold: 11 `prefill-demand-held` cycles at +130..+340 s, four of them capping 830 300 resident tokens -- 90 % of k1, no queue -- at 0.85 x k1; 0 `P1-obs-downstream`; all-pod 137.9 GPU-min against 167.8), `guidellm-1789768002-eb450o_1` (cold again: 9 and 0, 142.1, p95 241 ms) and `guidellm-1789763936-mr6h9x_1` (warm: 9 and 0, 132.9 against 168.0, p95 194 ms) |
+| Every saturated completion rate logged is N/30 but a fresh replica's first, extrapolated window, and one reading stood on four consecutive cycles (two scrape pairs) and cleared the two-readings guard | Measured, runs `guidellm-1789760128-zphd9d_1` (the one exception, 4.715 on a replica 75 s old), `guidellm-1789768002-eb450o_1`, `guidellm-1789763936-mr6h9x_1` and `guidellm-1789803750-vl4r9g_1` (2026-09-19, the merged tree) (`replica-capacity-decision`, `saturatedThroughput`; 30 s scrapes): 3.43 = 103/30 at 07:44:41-07:45:26 |
+| With a minute's spacing between counted readings one reading holds and does not order; the 35 minutes at three replicas that followed it are the under-read, not the count | Replayed from the run's rows in `throughput_floor_test.go` ("does not order on one saturated sample") |
+| With the spacing, the cold ramp's second sample came a minute after the first (4.37, then 6.67 -- the drain, see above -- and the fresh second replica's extrapolated 2.81 in the same cycle, one moment at the higher), and phase 1 settled at two decode replicas from +412 s -- a third, ordered on occupancy under the queue at +143 s, came down then -- instead of three held for the rest of the pass on 3.43. The ramp's orders (+53 s, +143 s) were occupancy's, as on every pass, and its first-window p95 TTFT of 0.79 s is the start-time lottery, not this change's | Measured, run `guidellm-1789812977-xzf9ay_1` (2026-09-19, the branch head at `faa3d17a`, cold): `requestRate` 4.37 at +113 s, 3.33, then 6.67 at +173 s; `saturatedThroughput` 6.67 on every decode floor line from +173 s to the phase switch; decode 97.2 GPU-minutes against 109.7 on the pass whose reading stuck at 3.43; prefill at one throughout. On that head the phase switch's one reading (2.25) met an anticipated supply of three with the third still starting and ordered a fourth at +1434 s, released at +1584 s -- a single reading holds now, at the anticipated three; the phase-switch cycle is replayed in `throughput_floor_test.go`, not re-run |
+| On the final rule -- spacing, fold, hold -- one reading holds where it used to order, and the cost is one cycle: at the cold ramp the floor's single reading implied 1.98 replicas' worth on a fleet of two with the second still starting, held at 0.85 x 2, and occupancy ordered the third 15 s later; at the phase switch two cycles of one reading implied 2.77 and 2.71 on an anticipated three, held at 0.85 x 3, and no fourth was ordered (2.77 / 0.85 rounds to four). Phase 1 ran at two decode replicas, phase 2 at three, prefill at one throughout; the sticky scale-down held a published two against a fresh three for three cycles in phase 1 (its first engagement on this trace); the lowest GPU-minutes of the series | Measured, run `guidellm-1789841919-vtvrsk_1` (2026-09-19, the branch's code at `505098e2`, cold): `throughput-demand-floor` `heldAtFleet` true, `heldWhy` `single-sample` at +160 s (`replicasImplied` 1.98, `saturatedThroughput` 3.63) and at +1452/+1467 s (2.77/2.71 on 2.23/2.4); `requestRate` 3.63 at +130 s, 3.1 and 3.73 folded, 4.47 a window later at +221 s; decode orders at +70 s, +175 s (both occupancy), +1391 s; 92.8 decode / 131.7 all-pod GPU-minutes over the harness window against 97.2 / 136.3 on the pass before and 109.7 / 148.2 on the pass whose reading stuck at 3.43. The p95 TTFT of the first five minutes, 3.25 s, is the ramp -- the second replica was ordered at +70 s on occupancy (959 k resident tokens; +53 s on the pass before) and served from +175 s (a 105 s start; +143 s before), so the lone replica queued 113 for 45 s where the pass before queued 30 -- and 15 s of it is the hold. Overall p95 4.88 s (the ramp and the phase switch at two, 5.05 s in minutes 20-25; 4.2 s there on the pass before), p50 104 ms |
