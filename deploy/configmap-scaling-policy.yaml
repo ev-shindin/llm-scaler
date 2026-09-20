@@ -107,3 +107,16 @@ data:
   #       name: cluster-h100
   #       scope: cluster
   #       quotas: { H100: 32 }
+  #
+  #   # (c) quota limiter bounded by Kueue: per namespace and accelerator type
+  #   #     the SMALLER of the Kueue nominal quota and the static cap applies.
+  #   #     Kueue flavors without a product label (the usual install) grant no
+  #   #     named type, so name the types here and -1 lets Kueue set the figure.
+  #   limiters:
+  #     - type: quota
+  #       name: namespace-quota
+  #       scope: namespace
+  #       kueue: { enabled: true }
+  #       namespaceQuotas:
+  #         team-a: { H100: 8 }
+  #         default: { H100: -1 }

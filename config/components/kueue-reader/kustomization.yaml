@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Grants the controller the cluster-scoped Kueue reads that a quota entry with
+# `kueue.enabled` requires, and nothing else.
+#
+# ClusterQueues carry the nominal quotas and ResourceFlavors name the
+# accelerator behind each flavor; both are cluster-scoped, so no Role can reach
+# them. LocalQueues are namespaced and come with the tenant Role instead. The
+# reader gets and lists on demand — no watch, no write.
+#
+# Part of the namespace-scoped overlays and, like node-reader, created by the
+# PREREQS phase: it is cluster-scoped RBAC, an admin's to grant. Harmless on a
+# cluster without Kueue: a rule naming an unserved API group grants nothing,
+# and the reader reports "not served" rather than an empty quota if enabled
+# there. A cluster-scoped install does not need it: its manager ClusterRole
+# already carries these rules.
+resources:
+- kueue-reader-clusterrole.yaml
+- kueue-reader-clusterrolebinding.yaml

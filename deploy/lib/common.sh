@@ -224,6 +224,8 @@ WVA_SHARED_CLUSTER_ROLE_BINDINGS=(
     # second apply replaced its subject list, so the first controller lost node
     # access and its readiness gate turned that into a NotReady pod.
     wva-node-reader-rolebinding
+    # Same story for the Kueue reads a kueue-enabled quota entry needs.
+    wva-kueue-reader-rolebinding
 )
 
 # WVA_OWNED_CLUSTER_ROLES are the ClusterRoles this project defines, mapped to the
@@ -251,6 +253,7 @@ WVA_OWNED_CLUSTER_ROLES=(
     # not, and getting that wrong leaves the role unrenamed and the binding
     # pointing at a name nothing creates.
     "wva-node-reader-role:wva-node-reader-rolebinding"
+    "wva-kueue-reader-role:wva-kueue-reader-rolebinding"
 )
 
 # wva_ns_suffix echoes the per-namespace suffix appended to those names.

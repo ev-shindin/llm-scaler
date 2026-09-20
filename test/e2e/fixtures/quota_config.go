@@ -25,6 +25,17 @@ const (
 	wvaConfigMapLabelValue = "workload-variant-autoscaler"
 )
 
+// QuotaOption adjusts the quota entry SetNamespaceQuota writes.
+type QuotaOption func(entry map[string]any)
+
+// WithKueue bounds the entry by Kueue, re-read every refreshInterval. A short
+// interval keeps a spec that flips Kueue objects from waiting on the default.
+func WithKueue(refreshInterval string) QuotaOption {
+	return func(entry map[string]any) {
+		entry["kueue"] = map[string]any{"enabled": true, "refreshInterval": refreshInterval}
+	}
+}
+
 // SetNamespaceQuota declares a namespace-scoped GPU quota and returns a restore
 // func.
 //
@@ -48,6 +59,7 @@ func SetNamespaceQuota(
 	clientset *kubernetes.Clientset,
 	configNamespace, configName, targetNamespace, accelerator string,
 	gpus int,
+	opts ...QuotaOption,
 ) (func(context.Context) error, error) {
 	cms := clientset.CoreV1().ConfigMaps(configNamespace)
 
@@ -77,16 +89,18 @@ func SetNamespaceQuota(
 			return nil, fmt.Errorf("parse existing %s entry: %w", defaultEntryKey, err)
 		}
 	}
-	doc["limiters"] = []any{
-		map[string]any{
-			"name":  "e2e-warm-pool-quota",
-			"type":  "quota",
-			"scope": "namespace",
-			"namespaceQuotas": map[string]any{
-				targetNamespace: map[string]any{accelerator: gpus},
-			},
+	entry := map[string]any{
+		"name":  "e2e-warm-pool-quota",
+		"type":  "quota",
+		"scope": "namespace",
+		"namespaceQuotas": map[string]any{
+			targetNamespace: map[string]any{accelerator: gpus},
 		},
 	}
+	for _, opt := range opts {
+		opt(entry)
+	}
+	doc["limiters"] = []any{entry}
 	merged, err := yaml.Marshal(doc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal %s entry: %w", defaultEntryKey, err)

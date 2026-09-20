@@ -43,6 +43,9 @@ WVA_SCOPE           ?=
 # `quota` additionally REQUIRES WVA_QUOTAS, the per-accelerator budget
 # (WVA_QUOTAS='H200=8 A100=4'); there is no default, and an empty quota entry is
 # a budget of zero rather than unlimited. WVA_QUOTA_SCOPE is namespace|cluster.
+# WVA_QUOTA_KUEUE=true also reads Kueue: per namespace and accelerator type the
+# smaller of the Kueue nominal quota and WVA_QUOTAS applies (name the types with
+# -1 to let Kueue set the figure) -- docs/well-lit-paths/kueue-bounded-quotas/.
 WVA_LIMITER         ?= none
 # A ScaledObject is how a workload registers with WVA. WVA_DEFAULT_SO=true has the
 # installer create one per llm-d model server; WVA_DEFAULT_SO_NS picks the
@@ -418,7 +421,7 @@ WVA_LIMITER_TARGETS ?=
 enable-physical-limiter: ## CLUSTER ADMIN: bound every WVA by real GPUs. Publishes cluster policy and grants each controller the node read it then requires. WVA_LIMITER_TYPE=gpu-inventory|quota (quota also needs WVA_QUOTAS), WVA_POLICY_NS, WVA_LIMITER_TARGETS.
 	@WVA_POLICY_NS=$(WVA_POLICY_NS) WVA_LIMITER_TYPE=$(WVA_LIMITER_TYPE) \
 		WVA_LIMITER_TARGETS="$(WVA_LIMITER_TARGETS)" \
-		WVA_QUOTAS='$(WVA_QUOTAS)' WVA_QUOTA_SCOPE=$(WVA_QUOTA_SCOPE) \
+		WVA_QUOTAS='$(WVA_QUOTAS)' WVA_QUOTA_SCOPE=$(WVA_QUOTA_SCOPE) WVA_QUOTA_KUEUE=$(WVA_QUOTA_KUEUE) \
 		bash -c 'source deploy/lib/common.sh; source deploy/lib/limiter_policy.sh; source deploy/lib/physical_limiter.sh; enable_physical_limiter'
 
 .PHONY: disable-physical-limiter
@@ -463,7 +466,7 @@ SCOPE ?= $(if $(WVA_SCOPE),$(WVA_SCOPE),namespace)
 define wva_phase
 	@echo "Phase '$(if $(1),$(1),auto)', $(SCOPE)-scoped$(if $(2), on $(2),)"
 	$(if $(filter prereqs,$(1)),,@echo "Image: $(IMG)")
-	$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) IMG=$(IMG) WVA_SCOPE=$(SCOPE) WVA_LIMITER=$(WVA_LIMITER) $(if $(WVA_QUOTAS),WVA_QUOTAS='$(WVA_QUOTAS)',) $(if $(WVA_QUOTA_SCOPE),WVA_QUOTA_SCOPE=$(WVA_QUOTA_SCOPE),) $(if $(1),INSTALL_PHASE=$(1),) $(if $(2),ENVIRONMENT=$(2),) WVA_DEFAULT_SO=$(WVA_DEFAULT_SO) $(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) $(if $(PROMETHEUS_URL),PROMETHEUS_URL=$(PROMETHEUS_URL),) ./deploy/install.sh
+	$(if $(filter command line environment,$(origin WVA_NS)),WVA_NS=$(WVA_NS),) $(if $(filter command line environment,$(origin NAMESPACE)),NAMESPACE=$(NAMESPACE),) IMG=$(IMG) WVA_SCOPE=$(SCOPE) WVA_LIMITER=$(WVA_LIMITER) $(if $(WVA_QUOTAS),WVA_QUOTAS='$(WVA_QUOTAS)',) $(if $(WVA_QUOTA_SCOPE),WVA_QUOTA_SCOPE=$(WVA_QUOTA_SCOPE),) $(if $(WVA_QUOTA_KUEUE),WVA_QUOTA_KUEUE=$(WVA_QUOTA_KUEUE),) $(if $(1),INSTALL_PHASE=$(1),) $(if $(2),ENVIRONMENT=$(2),) WVA_DEFAULT_SO=$(WVA_DEFAULT_SO) $(if $(WVA_DEFAULT_SO_NS),WVA_DEFAULT_SO_NS=$(WVA_DEFAULT_SO_NS),) $(if $(PROMETHEUS_URL),PROMETHEUS_URL=$(PROMETHEUS_URL),) ./deploy/install.sh
 endef
 
 # wva_check: $(1)=ENVIRONMENT
@@ -1097,6 +1100,10 @@ test-e2e-multi-controller-with-setup: deploy-e2e-infra test-e2e-multi-controller
 .PHONY: test-e2e-full-with-setup
 test-e2e-full-with-setup:
 	DEPLOY_LWS=true SCALER_BACKEND=keda $(MAKE) deploy-e2e-infra
+	@# The Kueue-bounded quota spec (kueue_quota_test.go) lists Kueue objects, so
+	@# the three CRDs it reads must exist. kind only: the script refuses a cluster
+	@# that already has them, and a shared cluster is not ours to add CRDs to.
+	@if [ "$(ENVIRONMENT)" = "kind-emulator" ]; then deploy/ci-pr-checks/install-kueue-crds.sh; fi
 	$(MAKE) test-e2e-full
 
 

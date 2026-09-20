@@ -213,6 +213,8 @@ default: |
   (Composition of physical + quota caps is tracked separately in #1003.)
 - `type: quota` uses the **same schema** as `QuotaLimiterConfig`, so `scope`, `quotas`,
   `namespaceQuotas`, and `exclude` all apply; multiple quota entries are composed.
+  A quota entry may also set `kueue: { enabled: true }` to be bounded by the quotas
+  Kueue declares — see [Kueue as a quota source](quota-limiter.md#kueue-as-a-quota-source).
 - **Cluster-default only.** The list is read only from the global (system-namespace)
   `default` entry — a budget-scope setting, like `enableRescale` — so a tenant cannot
   widen a cap via a per-model or namespace-local entry. A `limiters:` block placed on any

@@ -52,7 +52,7 @@ BLUE=''; GREEN=''; YELLOW=''; RED=''; NC=''
 # exported, and with `WVA_QUOTA_SCOPE=cluster` in the environment this check
 # produced six FAILs all blaming the code. A check that depends on the caller's
 # shell reports on the shell.
-unset WVA_QUOTAS WVA_QUOTA_SCOPE WVA_SCOPE WVA_WATCH_NS WVA_LIMITER WVA_LIMITER_TYPE
+unset WVA_QUOTAS WVA_QUOTA_SCOPE WVA_QUOTA_KUEUE WVA_SCOPE WVA_WATCH_NS WVA_LIMITER WVA_LIMITER_TYPE
 WVA_NS="wva-system"
 # shellcheck disable=SC1090
 . "$WORK/limiter_policy.sh"
@@ -228,18 +228,61 @@ else
 fi
 
 # The physical limiter must carry NO quota fields: validateLimiters rejects
-# scope/quotas/namespaceQuotas/exclude on a gpu-inventory entry. This shape ships
-# today and works; the case pins it so the quota fix cannot bleed into it.
-WVA_QUOTAS='H200=8' emit gpu-inventory
+# scope/quotas/namespaceQuotas/exclude/kueue on a gpu-inventory entry. This shape
+# ships today and works; the case pins it so the quota fix cannot bleed into it.
+# WVA_QUOTA_KUEUE=true is set deliberately: it too must be dropped, not emitted.
+WVA_QUOTAS='H200=8' WVA_QUOTA_KUEUE=true emit gpu-inventory
 if [ "$RC" -ne 0 ]; then
     fail "gpu-inventory refused: $ERR"
 else
     got="$(printf '%s\n' "$OUT" | yq -o=json '.' 2>/dev/null)"
     [ "$(printf '%s' "$got" | jq -r '.[0].type')" = "gpu-inventory" ] \
         || fail "gpu-inventory: type is wrong: $got"
-    [ "$(printf '%s' "$got" | jq -r '[.[0] | has("scope"), has("quotas"), has("namespaceQuotas"), has("exclude")] | any')" = "false" ] \
+    [ "$(printf '%s' "$got" | jq -r '[.[0] | has("scope"), has("quotas"), has("namespaceQuotas"), has("exclude"), has("kueue")] | any')" = "false" ] \
         || fail "gpu-inventory: carries quota fields, which validateLimiters rejects: $got"
     ok "gpu-inventory emits a bare entry, with none of the quota fields it forbids"
+fi
+
+# ---------------------------------------------------------------------------
+# The Kueue reader, on the quota entry only
+# ---------------------------------------------------------------------------
+
+# WVA_QUOTA_KUEUE=true adds the `kueue: {enabled: true}` block the controller
+# reads (config.KueueQuotaSource); the budget stays, as the types Kueue's
+# untyped grant is applied to. Its shape is what internal/config parses, so an
+# entry that drifted here would be rejected on read and cost the whole policy.
+WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a WVA_QUOTAS='H100=-1' WVA_QUOTA_KUEUE=true emit quota
+if [ "$RC" -ne 0 ]; then
+    fail "quota with WVA_QUOTA_KUEUE=true refused a valid budget: $ERR"
+else
+    got="$(printf '%s\n' "$OUT" | yq -o=json '.' 2>/dev/null)"
+    [ "$(printf '%s' "$got" | jq -r '.[0].kueue.enabled // "absent"')" = "true" ] \
+        || fail "WVA_QUOTA_KUEUE=true did not emit kueue.enabled: $got"
+    [ "$(printf '%s' "$got" | jq -r '.[0].namespaceQuotas["tenant-a"].H100 // "absent"')" = "-1" ] \
+        || fail "the budget must still be emitted beside the kueue block (it names the types): $got"
+    ok "WVA_QUOTA_KUEUE=true emits kueue.enabled beside the budget"
+fi
+
+# Unset means absent, not `enabled: false`: an entry without the block is the
+# shape every install before the reader existed wrote, and it must stay so.
+WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a WVA_QUOTAS='H100=8' emit quota
+if [ "$RC" -ne 0 ]; then
+    fail "quota without WVA_QUOTA_KUEUE refused: $ERR"
+else
+    got="$(printf '%s\n' "$OUT" | yq -o=json '.' 2>/dev/null)"
+    [ "$(printf '%s' "$got" | jq -r '.[0] | has("kueue")')" = "false" ] \
+        || fail "an unset WVA_QUOTA_KUEUE emitted a kueue block: $got"
+    ok "an unset WVA_QUOTA_KUEUE emits no kueue block"
+fi
+
+# A value that is neither true nor false is refused before anything is printed.
+WVA_SCOPE=namespace WVA_WATCH_NS=tenant-a WVA_QUOTAS='H100=8' WVA_QUOTA_KUEUE=yes emit quota
+if [ "$RC" -eq 0 ]; then
+    fail "WVA_QUOTA_KUEUE=yes was accepted; emitted: $OUT"
+elif [ -n "$OUT" ]; then
+    fail "WVA_QUOTA_KUEUE=yes was refused but a partial entry was printed first: $OUT"
+else
+    ok "WVA_QUOTA_KUEUE takes only true or false"
 fi
 
 # ---------------------------------------------------------------------------
@@ -969,7 +1012,7 @@ fi
 # and the check still prints OK -- and the ok() suppression means the count of
 # ok lines is not comparable against a known-good run either.
 case_begin
-CASES_EXPECTED=51
+CASES_EXPECTED=54
 if [ "$CASES" -ne "$CASES_EXPECTED" ]; then
     fail "$CASES cases ran, not $CASES_EXPECTED. A case was added or removed; update CASES_EXPECTED deliberately rather than letting coverage drift out."
 else

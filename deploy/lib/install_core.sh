@@ -46,6 +46,16 @@ wva_missing_prereqs() {
             echo "UNVERIFIABLE $kind/$name"
             continue
         fi
+        # The Kueue read is needed only by a quota entry that enables it, and it
+        # arrived after installs already existed. Refusing every upgrade until an
+        # admin re-runs prereqs, for a feature the tenant may never turn on,
+        # would send them back to the admin for nothing; the controller runs
+        # fine without it and the reader logs Forbidden if it is ever enabled.
+        case "$name" in
+            wva-kueue-reader-*)
+                echo "OPTIONAL $kind/$name"
+                continue ;;
+        esac
         case "$kind" in
             Namespace|ClusterRole|ClusterRoleBinding|CustomResourceDefinition)
                 echo "$kind/$name" ;;
@@ -95,16 +105,22 @@ wva_resolve_install_phase() {
 # create them, so the useful output is the list to hand to an admin — not a
 # Forbidden on one object with the rest unknown.
 require_prereqs_present() {
-    local line missing=() unverifiable=()
+    local line missing=() unverifiable=() optional=()
     while read -r line; do
         [ -n "$line" ] || continue
         case "$line" in
             UNRENDERABLE)
                 log_error "Could not render the install overlay, so whether the cluster-admin prerequisites exist could not be checked. Fix the overlay (try 'kubectl kustomize $(wva_overlay_dir)') and re-run; nothing has been applied." ;;
             "UNVERIFIABLE "*) unverifiable+=("${line#UNVERIFIABLE }") ;;
+            "OPTIONAL "*) optional+=("${line#OPTIONAL }") ;;
             *) missing+=("$line") ;;
         esac
     done <<< "$(wva_missing_prereqs)"
+
+    if [ ${#optional[@]} -ne 0 ]; then
+        log_info "Optional cluster-admin prerequisites are absent: ${optional[*]}"
+        log_info "  Needed only by a quota limiter entry with kueue.enabled. To add them, ask an admin to re-run 'NAMESPACE=$WVA_NS make setup-prereqs'."
+    fi
 
     if [ ${#missing[@]} -ne 0 ]; then
         log_error "The cluster-admin prerequisites for $WVA_NS are not in place. Missing:

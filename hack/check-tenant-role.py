@@ -45,6 +45,11 @@ CLUSTER_SCOPED = {
     ("", "nodes"),
     ("", "nodes/status"),
     ("", "namespaces"),
+    # Kueue ClusterQueues and ResourceFlavors: read only by a quota entry with
+    # kueue.enabled, granted by components/kueue-reader (prereqs phase). The
+    # namespaced half, localqueues, is in the tenant Role and is checked.
+    ("kueue.x-k8s.io", "clusterqueues"),
+    ("kueue.x-k8s.io", "resourceflavors"),
 }
 
 

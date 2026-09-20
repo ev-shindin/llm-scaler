@@ -135,3 +135,7 @@ Every field, the namespace lookup rules, validation and the reload lifecycle:
 [the quota limiter reference](../../reference/quota-limiter.md). What the two
 usage bases mean and why they are counted differently:
 [GPU capacity accounting](../../concepts/gpu-capacity-accounting.md).
+
+If the numbers already live in Kueue, the entry can be bounded by them instead
+of repeating them: [Bound tenants by the quotas Kueue already
+holds](../kueue-bounded-quotas/) (experimental).

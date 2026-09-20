@@ -31,3 +31,5 @@ components:
 # See the Kubernetes overlay: nodes are cluster-scoped, so the gpu-inventory
 # limiter needs this and the prereqs phase applies it.
 - ../../../components/node-reader/
+# Likewise for the Kueue objects a kueue-enabled quota entry reads.
+- ../../../components/kueue-reader/

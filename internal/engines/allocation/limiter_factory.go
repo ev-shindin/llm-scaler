@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/gpunodes"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/kueue"
 )
 
 // NewLimiterFromConfig constructs the GPU limiter selected via
@@ -26,13 +28,15 @@ import (
 //   - LimiterTypeQuota: builds one DefaultLimiter per Config.EffectiveQuotaEntries
 //     entry, each wrapping a QuotaInventory. Multiple entries are grouped in a
 //     CompositeLimiter, and the engine computes constraints from each. Pure
-//     operator-declared caps — physical capacity is NOT consulted.
+//     operator-declared caps — physical capacity is NOT consulted. An entry with
+//     `kueue.enabled` is additionally bounded by the quotas a kueue.Reader reads
+//     from Kueue (min per namespace and accelerator type).
 //
-// The kubeClient is only used by the inventory path (for GPU operator
-// discovery); the quota and none paths ignore it. Inline limiter entries are
-// validated at ConfigMap parse time (ScalingPolicy.validateLimiters),
-// so unknown limiter types reaching the default branch represent a programming
-// error.
+// The kubeClient serves the inventory path (GPU operator discovery) and the
+// Kueue reader; the none path and a Kueue-less quota entry ignore it. Inline
+// limiter entries are validated at ConfigMap parse time
+// (ScalingPolicy.validateLimiters), so unknown limiter types reaching the
+// default branch represent a programming error.
 func NewLimiterFromConfig(cfg *config.Config, kubeClient client.Client) (Limiter, error) {
 	switch t := cfg.EffectiveLimiterMode(); t {
 	case config.LimiterTypeNone:
@@ -40,11 +44,47 @@ func NewLimiterFromConfig(cfg *config.Config, kubeClient client.Client) (Limiter
 	case config.LimiterTypeInventory:
 		return newInventoryLimiter(kubeClient), nil
 	case config.LimiterTypeQuota:
-		return newQuotaLimiter(cfg)
+		return newQuotaLimiter(cfg, kubeClient)
 	default:
 		return nil, fmt.Errorf("limiter factory: unknown limiter type %q (valid: %q, %q, %q)",
 			t, config.LimiterTypeNone, config.LimiterTypeInventory, config.LimiterTypeQuota)
 	}
+}
+
+// kueueReaders holds one kueue.Reader per quota entry name, shared by every
+// limiter built for that entry. Both engines build their own limiter from the
+// same config (cmd/main.go), and a Reader each would mean two full reads of
+// Kueue per refresh interval and two snapshots that can disagree for up to one
+// interval. A rebuild with different reader options (resources, interval,
+// namespace) replaces the entry's Reader; the old one is simply dropped.
+var kueueReaders = struct {
+	sync.Mutex
+	byEntry map[string]*sharedReader
+}{byEntry: map[string]*sharedReader{}}
+
+type sharedReader struct {
+	key    string
+	reader *kueue.Reader
+}
+
+// sharedKueueReader returns the Reader for entry, creating or replacing it when
+// none exists yet with the same options. One process has one client, so the
+// client is not part of the key.
+func sharedKueueReader(entry config.QuotaLimiterConfig, kubeClient client.Client, namespace string) *kueue.Reader {
+	opts := kueue.Options{
+		Resources:       entry.Kueue.Resources,
+		RefreshInterval: entry.KueueRefreshInterval(),
+		Namespace:       namespace,
+	}
+	key, _ := json.Marshal(opts)
+	kueueReaders.Lock()
+	defer kueueReaders.Unlock()
+	if s, ok := kueueReaders.byEntry[entry.Name]; ok && s.key == string(key) {
+		return s.reader
+	}
+	r := kueue.NewReader(kubeClient, opts)
+	kueueReaders.byEntry[entry.Name] = &sharedReader{key: string(key), reader: r}
+	return r
 }
 
 // LimiterSignature is a deterministic fingerprint of the config inputs that
@@ -74,7 +114,12 @@ func newInventoryLimiter(kubeClient client.Client) Limiter {
 // newQuotaLimiter builds one DefaultLimiter per QuotaLimiterConfig entry, each
 // wrapping a QuotaInventory. When more than one entry is configured, the result
 // is grouped in a CompositeLimiter so every entry's constraints are consulted.
-func newQuotaLimiter(cfg *config.Config) (Limiter, error) {
+//
+// An entry that enables Kueue gets a kueue.Reader as its QuotaSource. The reader
+// lists LocalQueues only in the watched namespace when the controller is
+// namespace-scoped: that is where its RBAC reaches, and a cluster-wide list from
+// there is Forbidden — which must surface as the error it is, not as "no quota".
+func newQuotaLimiter(cfg *config.Config, kubeClient client.Client) (Limiter, error) {
 	entries := cfg.EffectiveQuotaEntries()
 	if len(entries) == 0 {
 		return nil, errors.New("limiter factory: quota mode requires at least one inline " +
@@ -82,7 +127,14 @@ func newQuotaLimiter(cfg *config.Config) (Limiter, error) {
 	}
 	constituents := make([]Limiter, 0, len(entries))
 	for _, entry := range entries {
-		constituents = append(constituents, NewDefaultLimiter(entry.Name, NewQuotaInventory(entry)))
+		var source QuotaSource
+		if entry.KueueEnabled() {
+			if kubeClient == nil {
+				return nil, fmt.Errorf("limiter factory: quota entry %q enables kueue but no Kubernetes client is available", entry.Name)
+			}
+			source = sharedKueueReader(entry, kubeClient, cfg.WatchNamespace())
+		}
+		constituents = append(constituents, NewDefaultLimiter(entry.Name, NewQuotaInventoryWithSource(entry, source)))
 	}
 	if len(constituents) == 1 {
 		return constituents[0], nil

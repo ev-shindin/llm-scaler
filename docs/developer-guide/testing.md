@@ -204,6 +204,19 @@ This deploys:
 
 When `ENABLE_SCALE_TO_ZERO=true` (set by `make deploy-e2e-infra` when `SCALE_TO_ZERO_ENABLED=true`), **`install-epp.sh`** enables the **flowControl feature gate** on the EPP so it exposes `inference_extension_flow_control_queue_size`. The **InferenceObjective** `e2e-default` is created by the scale-from-zero tests (`test/e2e/fixtures`), not by the install scripts.
 
+**Kueue CRDs (full suite on kind).** `kueue_quota_test.go` (label `kueue-quota`)
+proves a quota entry bounded by Kueue against a real API server. It needs only
+the three Kueue **CRDs** (ClusterQueue, LocalQueue, ResourceFlavor), not Kueue's
+controller — the reader lists objects and never talks to Kueue.
+`make test-e2e-full-with-setup` installs them on kind through
+`deploy/ci-pr-checks/install-kueue-crds.sh` (pinned `KUEUE_VERSION`). On kind
+the spec **fails rather than skips** when the kinds are absent, so a missing
+setup step is never read as coverage; run the script by hand before a bare
+`make test-e2e-full` on kind. On any other cluster (the OpenShift CI included)
+nothing installs them, and the spec runs when the cluster serves the kinds and
+skips — saying so in the `-v` output — when it does not. The script leaves a
+cluster that already has the CRDs untouched and exits 0.
+
 **Install script tuning (optional, same variables as `deploy/install.sh`):**
 
 - **`SKIP_HELM_REPO_UPDATE`**: When set to **`true`**, `helm repo update` is skipped during installs (faster, less network churn). Default runs `helm repo update` to refresh repo indexes.

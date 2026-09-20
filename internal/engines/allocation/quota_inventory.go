@@ -2,8 +2,12 @@ package allocation
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
 	"sync"
+	"time"
+
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 )
@@ -14,8 +18,10 @@ import (
 // scope — a deployment that needs both cluster and namespace caps composes two
 // QuotaInventory instances via the limiter chain (sub-issue #1003).
 //
-// Quota values are static; QuotaInventory.Refresh is a no-op because there's
-// no external source to discover. Usage is tracked the same way as
+// Quota values come from the entry's static maps and, when the entry names one,
+// an external QuotaSource (Kueue): Refresh reads the source and installs the
+// static entry bounded by it (config.QuotaLimiterConfig.BoundBy) as the effective
+// config. Without a source Refresh is a no-op. Usage is tracked the same way as
 // TypeInventory: callers invoke SetUsed (or SetUsedByNamespace) before each
 // cycle, then read the pools.
 //
@@ -24,17 +30,33 @@ import (
 // min(physical, quota); used standalone, no physical bound is enforced.
 type QuotaInventory struct {
 	name string
-	// cfg is a value copy taken at construction and is immutable thereafter, so
-	// it is safe to read (incl. cfg.IsExcluded / cfg.QuotaForNamespace) without
-	// holding mu. Only usedByType / usedByNS are mutable and mu-protected.
-	cfg config.QuotaLimiterConfig
+	// static is the entry as configured, immutable after construction.
+	static config.QuotaLimiterConfig
+	// source, when non-nil, supplies the external caps static is bounded by.
+	source QuotaSource
 
 	mu sync.RWMutex
+	// cfg is the EFFECTIVE entry: static bounded by the last external snapshot,
+	// or static itself when there is no source. Replaced by Refresh under mu and
+	// read under mu everywhere else, because a swap between two reads within one
+	// ComputeConstraints would let usage be reconciled onto one key set and pools
+	// be built from another.
+	cfg config.QuotaLimiterConfig
+	// lastExternal fingerprints the external snapshot cfg was built from, so a
+	// change is logged once rather than every cycle.
+	lastExternal string
 	// usedByType is the cluster-scoped usage map (Scope == QuotaScopeCluster).
 	usedByType map[string]int
 	// usedByNS is the per-namespace usage map (Scope == QuotaScopeNamespace).
 	// Outer key: namespace; inner key: accelerator type.
 	usedByNS map[string]map[string]int
+}
+
+// QuotaSource supplies caps owned by an external authority that a quota entry
+// is bounded by. Quotas returns the current snapshot; on failure it returns the
+// last good snapshot with the error, and a zero ObservedAt when it never had one.
+type QuotaSource interface {
+	Quotas(ctx context.Context) (config.ExternalQuotas, error)
 }
 
 // NewQuotaInventory constructs an inventory from a validated config entry.
@@ -43,10 +65,20 @@ type QuotaInventory struct {
 func NewQuotaInventory(cfg config.QuotaLimiterConfig) *QuotaInventory {
 	return &QuotaInventory{
 		name:       cfg.Name,
+		static:     cfg,
 		cfg:        cfg,
 		usedByType: make(map[string]int),
 		usedByNS:   make(map[string]map[string]int),
 	}
+}
+
+// NewQuotaInventoryWithSource constructs an inventory whose entry is bounded by
+// an external source on every Refresh. A nil source is the same as
+// NewQuotaInventory.
+func NewQuotaInventoryWithSource(cfg config.QuotaLimiterConfig, source QuotaSource) *QuotaInventory {
+	q := NewQuotaInventory(cfg)
+	q.source = source
+	return q
 }
 
 // Compile-time interface assertions.
@@ -76,12 +108,81 @@ func (q *QuotaInventory) Name() string {
 	return q.name
 }
 
-// Refresh is a no-op for QuotaInventory: quotas are operator-declared via
-// ConfigMap and don't have an external source to refresh from. The method
-// satisfies the Inventory interface and returns nil to allow uniform
-// pipeline orchestration.
-func (q *QuotaInventory) Refresh(_ context.Context) error {
+// Refresh re-reads the external source, if any, and installs the static entry
+// bounded by its snapshot as the effective config. Without a source it is a
+// no-op: the static caps have nothing to refresh from.
+//
+// It never returns an error, deliberately. Both engines treat a failed
+// ComputeConstraints as "no constraint" and fall back to their unlimited path,
+// so surfacing a Kueue outage as an error would LIFT the cap the operator
+// declared — the opposite of what a quota is for. Instead:
+//   - with a previous snapshot, it stays in force (the source keeps it) and the
+//     error is logged with the snapshot's age;
+//   - with none, the static entry alone applies, which is at least as tight as
+//     no limiter and at most as loose as the operator typed, and the error is
+//     logged every cycle until a read succeeds.
+func (q *QuotaInventory) Refresh(ctx context.Context) error {
+	if q.source == nil {
+		return nil
+	}
+	logger := ctrl.LoggerFrom(ctx).WithValues("limiter", q.name)
+	ext, err := q.source.Quotas(ctx)
+	if err != nil {
+		if ext.ObservedAt.IsZero() {
+			logger.Error(err, "external quota source unreadable and never read; applying the static quota entry alone")
+		} else {
+			logger.Error(err, "external quota source unreadable; keeping its last snapshot",
+				"snapshotAge", time.Since(ext.ObservedAt).Round(time.Second).String())
+		}
+	}
+	effective := q.static
+	if !ext.ObservedAt.IsZero() {
+		effective = q.static.BoundBy(ext)
+	}
+	// Maps marshal with sorted keys, so equal snapshots fingerprint equal.
+	fp, _ := json.Marshal(struct {
+		Read bool // never-read and read-but-empty must not fingerprint alike
+		N    map[string]config.ExternalCaps
+		C    config.ExternalCaps
+	}{!ext.ObservedAt.IsZero(), ext.Namespace, ext.Cluster})
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if string(fp) != q.lastExternal {
+		q.lastExternal = string(fp)
+		if ext.ObservedAt.IsZero() {
+			logger.Info("quota entry effective without external caps")
+		} else {
+			msg := "quota entry bounded by external caps"
+			if len(ext.Namespace) == 0 && ext.Cluster.IsZero() {
+				msg = "external quota source grants no GPUs; the static quota entry applies as written"
+			}
+			logger.Info(msg,
+				"externalNamespaceQuotas", ext.Namespace, "externalClusterQuotas", ext.Cluster,
+				"effectiveNamespaceQuotas", effective.NamespaceQuotas, "effectiveClusterQuotas", effective.ClusterQuotas)
+			if unapplied := q.static.UnappliedUntyped(ext); len(unapplied) > 0 {
+				// A real grant the limiter cannot budget under: the source could
+				// not name the accelerator (a Kueue flavor with no product
+				// label) and the static entry names none for these subjects
+				// either. Saying so is the difference between "Kueue grants 16
+				// and nothing scales" reading as a bug and as a config gap.
+				logger.Info("external quota source grants GPUs of no named accelerator type; "+
+					"the quota entry names no type to apply them to, so they do not bound anything. "+
+					"Name the accelerator types in the entry (with -1 to let the source supply the figure)",
+					"subjects", unapplied)
+			}
+		}
+	}
+	q.cfg = effective
 	return nil
+}
+
+// EffectiveConfig returns the entry currently enforced: the static entry bounded
+// by the last external snapshot, or the static entry itself.
+func (q *QuotaInventory) EffectiveConfig() config.QuotaLimiterConfig {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.cfg
 }
 
 // SetUsed updates the cluster-scoped usage map for cluster-scoped inventories.
@@ -99,7 +200,7 @@ func (q *QuotaInventory) Refresh(_ context.Context) error {
 // reports its full allowance free however much is running — so the cap never
 // binds, which is the one thing a quota exists to do.
 func (q *QuotaInventory) SetUsed(usedByType map[string]int) {
-	if q.cfg.Scope != config.QuotaScopeCluster {
+	if q.static.Scope != config.QuotaScopeCluster {
 		return
 	}
 	q.mu.Lock()
@@ -130,7 +231,7 @@ func reconcileUsageKeys(known map[string]int, declared map[string]int) map[strin
 // Each namespace's usage is reconciled onto that namespace's configured quota
 // keys, for the reason given on SetUsed.
 func (q *QuotaInventory) SetUsedByNamespace(usedByNS map[string]map[string]int) {
-	if q.cfg.Scope != config.QuotaScopeNamespace {
+	if q.static.Scope != config.QuotaScopeNamespace {
 		return
 	}
 	q.mu.Lock()
