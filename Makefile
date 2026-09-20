@@ -2392,6 +2392,10 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash hack/check-prepull-manifests.sh
 	@echo "Checking what weights.sh and model_hostpath.sh actually emit..."
 	@bash hack/check-weights-manifests.sh
+	@echo "Checking every scrape interval is 10s, the harness default included..."
+	@# 30s on the engine PodMonitor is 0..30s of jitter on every scaling
+	@# decision; the P/D scenario took the harness default and paid it.
+	@bash hack/check-scrape-interval.sh
 	@echo "Checking the accelerator label keys agree..."
 	@# The controller (Go), the planning tools (Python) and the create path
 	@# (shell) each carry their own copy of the node label keys that name a GPU

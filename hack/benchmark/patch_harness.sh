@@ -929,3 +929,93 @@ else:
     print("  fix 12 (hostPath PV owned by its namespace): applied")
 PYEOF
 fi
+
+# ---------------------------------------------------------------------------
+# Fix 13 -- the harness scrapes the engines every 30 s by default; make it 10.
+#
+# PR #64 moved every PodMonitor this repo ships to 10 s (deploy/warmpool.sh,
+# config/modelserver-metrics/, the two-variant-wva and workload-autoscaling
+# scenarios via the chart's podmonitor, two-model-warm-pool via
+# monitoring.scrapeInterval) and said why: the scale-up signal is a queue at
+# the engine, it moves only when Prometheus holds a sample that shows it, and
+# the interval is 0..30 s of jitter on every decision. The P/D scenario was
+# left out because it sets neither key and so takes the harness's OWN default
+# -- 30 s, in three places:
+#
+#   config/templates/values/defaults.yaml:522   monitoring.scrapeInterval: "30s"
+#   config/templates/values/defaults.yaml       decode/prefill.monitoring.podmonitor.interval: "30s"
+#   config/templates/jinja/17_standalone-podmonitor.yaml.j2
+#   config/templates/jinja/18_podmonitor.yaml.j2   {{ monitoring.scrapeInterval | default('30s') }}
+#
+# Measured on the shape-swap P/D trace, two cold passes on the same code at
+# 30 s: the KV crossing that orders the second decode replica was seen at
+# +53 s on one and +70 s on the other; the replica was Ready at +133 s and
+# +144 s, and the controller's rows showed it serving at +143 s and +175 s
+# (the row lag again). The 15 s optimisation cycle read the same row twice,
+# and every saturated completion rate the analyzer logged was an integer
+# over 30. At 10 s, on the same code: the crossing seen at +61 s, the
+# Deployment at 2 eleven seconds later, a fresh row every cycle (rates N/50);
+# the ramp's TTFT did not move, because that pass's second engine took 91 s
+# from container start to Ready against 57-58 s -- the scrape is the small
+# term. A scenario may still set either key and win; the defaults just stop
+# being the slow ones.
+# ---------------------------------------------------------------------------
+DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
+TPL17="$REPO_DIR/config/templates/jinja/17_standalone-podmonitor.yaml.j2"
+TPL18="$REPO_DIR/config/templates/jinja/18_podmonitor.yaml.j2"
+if [ ! -f "$DEFAULTS" ] || [ ! -f "$TPL18" ]; then
+    note "fix 13 (scrape interval 10s): no defaults.yaml or 18_podmonitor.yaml.j2, skipped"
+else
+    "$PY" - "$DEFAULTS" "$TPL17" "$TPL18" <<'PYEOF' || fail "fix 13 (scrape interval 10s) failed"
+import io, os, sys
+
+defaults, tpl17, tpl18 = sys.argv[1:4]
+
+
+def load(p):
+    return io.open(p, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+
+def save(p, s):
+    io.open(p, "w", encoding="utf-8", newline="\n").write(s)
+
+
+# (path, old, new, how many sites the anchor must have)
+edits = [
+    (defaults, '''  metricsPath: /metrics
+  scrapeInterval: "30s"
+''', '''  metricsPath: /metrics
+  scrapeInterval: "10s"  # wva-patch: 30s is 0..30s of jitter on every scaling decision
+''', 1),
+    (defaults, '''    podmonitor:
+      enabled: false
+      portName: "metrics"
+      path: "/metrics"
+      interval: "30s"
+''', '''    podmonitor:
+      enabled: false
+      portName: "metrics"
+      path: "/metrics"
+      interval: "10s"  # wva-patch
+''', 2),
+    (tpl18, "{{ monitoring.scrapeInterval | default('30s') }}", "{{ monitoring.scrapeInterval | default('10s') }}", 2),
+]
+if os.path.isfile(tpl17):
+    edits.append((tpl17, "{{ monitoring.scrapeInterval | default('30s') }}", "{{ monitoring.scrapeInterval | default('10s') }}", 1))
+
+done = 0
+for path, old, new, sites in edits:
+    src = load(path)
+    if src.count(new) == sites and old not in src:
+        done += 1
+        continue
+    if src.count(old) != sites:
+        sys.exit("anchor missing or ambiguous (upstream shape changed): %s, expected %d sites, found %d in %s"
+                 % (old.strip().splitlines()[-1].strip(), sites, src.count(old), os.path.basename(path)))
+    save(path, src.replace(old, new))
+if done == len(edits):
+    print("  fix 13 (scrape interval 10s): already applied")
+else:
+    print("  fix 13 (scrape interval 10s): applied")
+PYEOF
+fi
