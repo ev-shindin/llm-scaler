@@ -1019,3 +1019,63 @@ else:
     print("  fix 13 (scrape interval 10s): applied")
 PYEOF
 fi
+
+# ---------------------------------------------------------------------------
+# Fix 14 -- defaults.yaml: find the driver's libcuda in the loader cache, not
+# by walking the whole filesystem twice.
+#
+# accelerator.runtimePreamble -- the first thing every engine command runs on
+# an NVIDIA node -- is two `find / -name libcuda.so.1` walks, one for
+# LD_LIBRARY_PATH and one for LIBRARY_PATH. Each crosses every mount in the
+# pod: the image's 14 GB of site-packages and the model and engine-cache
+# volumes. Measured inside the engine image: 0.6-1.0 s per walk on this
+# cluster's NVMe nodes with two near-empty volumes mounted, so 1-2 s of a 58 s
+# cold start (on a shared model cache holding many models it would be a
+# directory walk over the network, twice -- not measured here); `ldconfig -p`
+# answers the same question from the loader cache
+# in 2 ms, and it is where the NVIDIA runtime registers the driver's libcuda.
+# Its entries come first, in the cache's own order (the loader's search
+# order), deduplicated; the image's forward-compat copy
+# (/usr/local/cuda-*/compat, a glob, no walk, symlinked names resolved to
+# one) is appended after them; the walk is kept only as the fallback for an
+# image with neither, restricted to /usr and /opt on the root filesystem.
+# Measured in the engine image, both texts verbatim, the exported paths
+# compared with cmp and identical: 1.9 s -> 10 ms in the serving pod
+# (driver, then compat), 0.6 s -> 6 ms in a GPU-less pod (compat only).
+# One difference, deliberate: with nothing
+# found the walk exported a leading empty component (":$LD_LIBRARY_PATH",
+# which the loader reads as the working directory); this leaves the
+# variables as they were.
+# ---------------------------------------------------------------------------
+DEFAULTS="$REPO_DIR/config/templates/values/defaults.yaml"
+if [ ! -f "$DEFAULTS" ]; then
+    note "fix 14 (libcuda from the loader cache): no defaults.yaml, skipped"
+else
+    "$PY" - "$DEFAULTS" <<'PYEOF' || fail "fix 14 (libcuda from the loader cache) failed"
+import io, sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+OLD = '''  runtimePreamble: |
+    export LD_LIBRARY_PATH=$(find / -name libcuda.so.1 -printf '%h\\n' 2>/dev/null | sed ':a; N; $!ba; s/\\n/:/g'):${LD_LIBRARY_PATH}
+    export LIBRARY_PATH=$(find / -name libcuda.so.1 -printf '%h\\n' 2>/dev/null | head -1):${LIBRARY_PATH}
+'''
+NEW = '''  # wva-patch: the loader cache answers in ms; `find /` walked every mounted volume, twice.
+  runtimePreamble: |
+    cuda_dirs=$(ldconfig -p 2>/dev/null | awk '/libcuda\\.so\\.1 /{print $NF}' | xargs -rn1 dirname 2>/dev/null | awk '!seen[$0]++' | paste -sd:)
+    for d in /usr/local/cuda*/compat; do [ -e "$d/libcuda.so.1" ] || continue; d=$(readlink -f "$d"); case ":$cuda_dirs:" in *":$d:"*) ;; *) cuda_dirs=${cuda_dirs:+$cuda_dirs:}$d ;; esac; done
+    [ -n "$cuda_dirs" ] || cuda_dirs=$(find /usr /opt -xdev -name libcuda.so.1 -printf '%h\\n' 2>/dev/null | awk '!seen[$0]++' | paste -sd:)
+    export LD_LIBRARY_PATH=${cuda_dirs:+$cuda_dirs:}${LD_LIBRARY_PATH}
+    export LIBRARY_PATH=${cuda_dirs%%:*}${cuda_dirs:+:}${LIBRARY_PATH}
+'''
+if NEW in src:
+    print("  fix 14 (libcuda from the loader cache): already applied")
+    sys.exit(0)
+if src.count(OLD) != 1:
+    sys.exit("anchor missing or ambiguous (upstream shape changed): runtimePreamble: |")
+src = src.replace(OLD, NEW, 1)
+io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+print("  fix 14 (libcuda from the loader cache): applied")
+PYEOF
+fi

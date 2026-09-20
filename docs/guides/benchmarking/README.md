@@ -275,9 +275,12 @@ Every ramp a benchmark records is sized by how long a new replica takes to
 become Ready ([why](../../reference/workload-preparation.md#the-rest-of-the-start-path)).
 llm-d-benchmark adds steps of its own to that path, and a benchmark that keeps
 them measures the harness, not the autoscaler. The scenarios under
-`hack/benchmark/scenarios/guides/` handle three of them; a scenario of your own
-should copy the same three blocks. A fourth is the cluster's, not the
-harness's, and comes first:
+`hack/benchmark/scenarios/guides/` handle three of them (package installs,
+the startup probe, engine caches); a scenario of your own should copy the
+same three blocks. A fourth (the `libcuda` walk) is a harness default that
+`patch_harness.sh` changes, so every scenario gets it. Two more are the
+cluster's, not the harness's -- the image and, for large models, the
+weights on the node -- and the image comes first:
 
 **The image is on every accelerator node before the harness deploys it.** A
 replica scheduled to a node without the engine image pulls 10-20 GB before
@@ -384,6 +387,21 @@ the API server drops a zero and the harness's config validator then fails the
 standup on `None`), and the scenarios that spell out their own `probes:` block
 carry the same numbers.
 
+**The `libcuda` walk.** The harness's `accelerator.runtimePreamble` -- the
+first thing every engine command runs on an NVIDIA node -- is two
+`find / -name libcuda.so.1` walks, one per variable it exports, and each
+crosses every mount in the pod: the image's 14 GB of site-packages, the model
+volume and the engine-cache volume. Measured inside the engine image on this
+cluster's NVMe nodes with two near-empty volumes mounted, 0.6-1.0 s per walk;
+on a shared model cache holding many models it would be a directory walk over
+the network, twice (not measured here). `patch_harness.sh` fix 14 makes the
+preamble ask the loader
+cache instead (`ldconfig -p`, 2 ms -- it is where the NVIDIA runtime
+registers the driver's `libcuda`), and fall back to a walk of `/usr` and
+`/opt` on the root filesystem only, for an image whose only copy is a
+forward-compat one. A scenario that writes its own preamble instead of
+`${accelerator.runtimePreamble}` keeps whatever it wrote.
+
 **Engine caches.** The chart mounts the model PVC read-only at `/model-cache`,
 and a second mount of the same claim inherits that (the CSI driver publishes a
 claim once per pod), so the scenarios mount the harness's own `workload-pvc`
@@ -412,6 +430,8 @@ kubectl exec -n $BENCHMARK_NAMESPACE $D -c vllm -- grep -c apt-get /shared-confi
 # the second replica should report a compile-cache hit, not a compile; a
 # "not writable" line here means the guard fell back to the engine default
 kubectl logs -n $BENCHMARK_NAMESPACE $D -c vllm | grep -E 'torch.compile took|Using cache directory|not writable'
+# 0: the preamble asks the loader cache (fix 14); a count here is the walk of /
+kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{.spec.containers[?(@.name=="vllm")].args}' | grep -c 'find / -name libcuda'
 # the image was on the node: container started within seconds of scheduling
 kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].lastTransitionTime}{" scheduled, container up "}{.status.containerStatuses[?(@.name=="vllm")].state.running.startedAt}{"\n"}'
 ```
