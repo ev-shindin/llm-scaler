@@ -1097,6 +1097,10 @@ test-e2e-multi-controller-with-setup: deploy-e2e-infra test-e2e-multi-controller
 .PHONY: test-e2e-full-with-setup
 test-e2e-full-with-setup:
 	DEPLOY_LWS=true SCALER_BACKEND=keda $(MAKE) deploy-e2e-infra
+	@# The Kueue-bounded quota spec (kueue_quota_test.go) lists Kueue objects, so
+	@# the three CRDs it reads must exist. kind only: the script refuses a cluster
+	@# that already has them, and a shared cluster is not ours to add CRDs to.
+	@if [ "$(ENVIRONMENT)" = "kind-emulator" ]; then deploy/ci-pr-checks/install-kueue-crds.sh; fi
 	$(MAKE) test-e2e-full
 
 
