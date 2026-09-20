@@ -852,7 +852,7 @@ so_workload_patch_index() {
 #
 # $1 the live object JSON, $2 the volume name, $3 the mount path, $4 the claim.
 so_workload_weights_safe() {
-    local live="$1" volname="$2" mountpath="$3" claim="$4" ns="$5" reason
+    local live="$1" volname="$2" mountpath="$3" claim="$4" ns="$5" reason pvc
     reason="$(printf '%s' "$live" | jq -r --arg v "$volname" --arg m "$mountpath" '
         (.spec.template.spec // {}) as $t
         | [ ($t.volumes[]? | select(.name == $v) | "a volume named \($v) already exists"),
@@ -863,9 +863,26 @@ so_workload_weights_safe() {
         return 1
     fi
     # The claim has to exist, or every pod the rollout creates stays Pending on a
-    # volume that cannot be attached -- an outage in place of a warning.
-    if ! kubectl get pvc "$claim" -n "$ns" >/dev/null 2>&1; then
+    # volume that cannot be attached -- an outage in place of a warning. And it
+    # has to be the right kind: a claim that is not Bound strands the pods the
+    # same way, and a ReadWriteOnce one binds to ONE node, so the second replica
+    # cannot schedule at all -- a slow scale-up turned into a failed one. Both
+    # halves write to their volume, so ReadOnlyMany is not enough either.
+    if ! pvc="$(kubectl get pvc "$claim" -n "$ns" -o json 2>/dev/null)" || [ -z "$pvc" ]; then
         printf '%s' "PersistentVolumeClaim $claim does not exist (or cannot be read)"
+        return 1
+    fi
+    if ! reason="$(printf '%s' "$pvc" | jq -r --arg c "$claim" '
+            if (.status.phase // "") != "Bound" then
+                "PersistentVolumeClaim \($c) is not Bound (\(.status.phase // "no phase"))"
+            elif ((.spec.accessModes // []) | any(. == "ReadWriteMany") | not) then
+                "PersistentVolumeClaim \($c) is \((.spec.accessModes // []) | join(",")), not ReadWriteMany: it binds to one node, and the second replica could not schedule"
+            else "" end' 2>/dev/null)"; then
+        printf '%s' "PersistentVolumeClaim $claim could not be parsed"
+        return 1
+    fi
+    if [ -n "$reason" ]; then
+        printf '%s' "$reason"
         return 1
     fi
     return 0
@@ -901,9 +918,25 @@ so_workload_weights_can_apply() {
 # makes that cost a compile rather than the replica lives in the container
 # command, which belongs to the chart and is not patched here. So applying it
 # live is applying it without the guard, and that is said at the time.
+#
+# One more refusal, for the claim `make engine-cache` makes: its preparer
+# DaemonSet says per node whether the directory is there and writable, and a
+# node it has not reached is exactly the node where an unguarded engine dies.
+# So the half is refused while any selected node is unprepared -- the number
+# is printed, and `make engine-cache-status` names them. A claim the operator
+# named themselves has no preparer, and gets no such check.
 so_workload_enginecache_can_apply() {
-    so_workload_volume_can_apply "$1" "$2" "$3" "${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}" engine-cache WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE || return 1
-    log_warning "  $1/$2: the engine-cache guard is NOT applied with it -- the command belongs to the chart. A node where the cache is not writable then loses the replica, not a compile; the emitted file has the guard."
+    local ns="$1" name="$2" doc="$3" claim ds ready want
+    so_workload_volume_can_apply "$ns" "$name" "$doc" "${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}" engine-cache WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE || return 1
+    claim="${WVA_ENGINE_CACHE_CLAIM:-engine-cache}"; claim="${claim%%:*}"
+    if ds="$(kubectl get daemonset "$claim" -n "$ns" -o json 2>/dev/null)" && [ -n "$ds" ]; then
+        read -r ready want <<< "$(printf '%s' "$ds" | jq -r '"\(.status.numberReady // 0) \(.status.desiredNumberScheduled // 0)"' 2>/dev/null)"
+        if [ "${ready:-0}" -lt "${want:-0}" ]; then
+            log_warning "  $ns/$name: the engine-cache volume is emitted, NOT applied -- $((want - ready)) of $want accelerator node(s) are not prepared (make engine-cache-status NAMESPACE=$ns), and without the guard a replica on one of them loses the engine, not a compile."
+            return 1
+        fi
+    fi
+    log_warning "  $ns/$name: the engine-cache guard is NOT applied with it -- the command belongs to the chart. A node where the cache stops being writable then loses the replica, not a compile; the emitted file has the guard."
     return 0
 }
 
@@ -1084,6 +1117,22 @@ wva_workload_patch() {
         fi
     done
 
+    # The names go into yq programs and YAML by interpolation, so they are
+    # checked once here rather than escaped in four places: a quote in one made
+    # the trim program invalid, and the whole document -- drain hook included --
+    # was then deferred as "needs only a volume". DNS-1123 labels, as the API
+    # server itself requires of a volume or claim name; the subPath may not
+    # leave the claim.
+    for tool in WVA_MODEL_VOLUME_NAME WVA_ENGINE_CACHE_VOLUME_NAME; do
+        case "${!tool:-x}" in
+            ""|*[!a-z0-9-]*|-*|*-) log_warning "$tool must be a DNS-1123 label (lower-case letters, digits, -), not '${!tool}'."; return 1 ;;
+        esac
+    done
+    case "${WVA_ENGINE_CACHE_CLAIM:-x}" in
+        ""|*[!a-z0-9.:/_-]*|-*|:*|*..*|*:/*|*:)
+            log_warning "WVA_ENGINE_CACHE_CLAIM must be <claim>[:<subPath>] -- a DNS-1123 claim name, and a relative subPath without '..' -- not '${WVA_ENGINE_CACHE_CLAIM}'."; return 1 ;;
+    esac
+
     tmp="$(mktemp)" || return 1
     # Cleared before the success path returns, so it only fires on the error
     # paths. It does NOT cover Ctrl-C -- a RETURN trap does not run on a signal --
@@ -1155,7 +1204,7 @@ wva_workload_patch() {
             log_warning "Nothing was written: all $scanned workload(s) were skipped (see above)."
             return 0
         fi
-        log_success "$((scanned - skipped)) model server(s) already drain on scale-down and keep their weights and compile caches on a volume."
+        log_success "$((scanned - skipped)) model server(s) already drain on scale-down and keep their weights on a volume; no vLLM among them compiles from nothing."
         [ "$skipped" -gt 0 ] && log_warning "  $skipped other workload(s) were skipped and were not checked."
         so_workload_patch_clear_stale "$out"
         return 0
@@ -1198,7 +1247,7 @@ wva_workload_patch() {
             log_info "  The weights half is emitted only -- see $out. Add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true to apply it."
         fi
         if [ "${WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE:-false}" = "true" ]; then
-            log_info "  The engine-cache half is applied too, where it cannot break the workload -- see $out."
+            log_info "  The engine-cache half is applied too, where nothing collides, the claim is Bound ReadWriteMany and every node is prepared -- WITHOUT the guard, which is the chart's (see $out)."
         else
             log_info "  The engine-cache half is emitted only -- see $out. Add WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true to apply it."
         fi
@@ -1323,19 +1372,29 @@ so_workload_gaps() {
         # dies with the pod, so a cache under it is a cache for one replica,
         # which is none. SGLang has no such variable, so the field is empty
         # for it: no opinion, not a clean bill.
-        | ([ $t.spec.volumes[]? | select(.persistentVolumeClaim != null or .hostPath != null) | .name ]) as $durable
+        | ([ $t.spec.volumes[]? | select(.persistentVolumeClaim != null or .hostPath != null or .nfs != null) | .name ]) as $durable
         | ([ $e.volumeMounts[]? | select(.name as $n | $durable | any(. == $n)) | .mountPath ]) as $dmounts
+        # A value that comes from a ConfigMap or a Secret (valueFrom) is set to
+        # something this cannot read. That is no opinion, not "unset": calling
+        # it unset emitted the half, and a strategic merge of `value` into an
+        # env entry that has `valueFrom` is rejected by the API server -- the
+        # whole document, drain hook included.
+        | ( [ $e.env[]? | select(.name == "VLLM_CACHE_ROOT") ] | last ) as $cacheent
         # `last`, not `first`: a name listed twice in env is resolved by the
-        # kubelet to its LAST value, and the benchmark harness lists this one
-        # twice (its default /tmp/vllm, then the mount). Reading the first
-        # reported every harness engine as compiling from nothing.
-        | ( [ $e.env[]? | select(.name == "VLLM_CACHE_ROOT") | .value ] | last ) as $cacheroot
+        # kubelet to its LAST value, and the engines on the benchmark stand
+        # list this one twice (a default under /tmp, then the harness mount).
+        # Reading the first reported every one of them as compiling from
+        # nothing.
+        | ( $cacheent.value // "" ) as $cacheroot
         | ( ((($e.image // "") | ascii_downcase | test("vllm"))
              or ($argv | ascii_downcase | test("vllm serve"))) ) as $isvllm
+        # Path COMPONENTS, not a string prefix: /engine-cache2/vllm is not
+        # under a mount at /engine-cache.
         | ( if ($e | not) or ($isvllm | not) then ""
-            elif ($cacheroot | not) then "unset"
+            elif ($cacheent != null) and ($cacheent.valueFrom != null) then ""
+            elif ($cacheroot == "") then "unset"
             elif ([ $dmounts[] | select(. != null)
-                    | select(. as $m | $cacheroot | startswith($m)) ] | length) > 0 then "volume:" + $cacheroot
+                    | select(. as $m | $cacheroot | (. == $m) or ($m == "/") or startswith($m + "/")) ] | length) > 0 then "volume:" + $cacheroot
             else "ephemeral:" + $cacheroot end ) as $cachevol
         | [ ($e.name // ""),
             (if ($e | not) then 0 elif ($e.lifecycle.preStop != null) then 1 else 0 end),
@@ -1355,7 +1414,7 @@ so_workload_gaps() {
             # the image layer) read as solved.
             (if ($dldir | not) then 0
              elif ([ $mounts[] | select(. != null)
-                     | select(. as $m | $dldir | startswith($m)) ] | length) > 0 then 1
+                     | select(. as $m | $dldir | (. == $m) or ($m == "/") or startswith($m + "/")) ] | length) > 0 then 1
              else 0 end),
             $argv,
             # cacheOnVolume, LAST and after argv on purpose: the readers are
@@ -1857,6 +1916,20 @@ CACHENEED
 #   to create. If \`make engine-cache\` made it, \`make engine-cache-status
 #   NAMESPACE=${ns}\` says which nodes are prepared.
 ENGINEHAVE
+        elif [ "$eclaim" != "engine-cache" ]; then
+            # The operator named this claim, so the remedy is theirs to pick:
+            # `make engine-cache` creates a claim called engine-cache, never
+            # this one, and telling them to run it would leave every pod
+            # Pending on the name the patch above actually mounts.
+            cat <<ENGINENAMED
+#
+#   ${eclaim} (WVA_ENGINE_CACHE_CLAIM) does NOT exist in ${ns}. Name a Bound
+#   ReadWriteMany claim this namespace has, or drop WVA_ENGINE_CACHE_CLAIM to
+#   mount the one \`make engine-cache\` creates (engine-cache, on the nodes'
+#   own disks). Whoever can write the claim you name runs code in every
+#   engine that mounts it, on every node at once -- trust it as you would the
+#   engine image.
+ENGINENAMED
         else
             cat <<ENGINENEED
 #
@@ -1865,28 +1938,35 @@ ENGINEHAVE
 #
 #     make engine-cache NAMESPACE=${ns} ENGINE_CACHE_PATH=<node dir> ENGINE_CACHE_IMAGE=<engine image>
 #
-#   <node dir> is a directory on every accelerator node (WEIGHTS_NODE_SELECTOR=<key=value>
-#   narrows which nodes; the model servers must select the same ones). The
-#   caches land under <node dir>/engine-cache, and the directory must be:
-#     - absolute, at least two components (/mnt/local/weights/${ns}), no '..';
+#   <node dir> is one path that must hold on every accelerator node
+#   (WEIGHTS_NODE_SELECTOR=<key=value> narrows which nodes; the model servers
+#   must select the same ones). The caches land under <node dir>/engine-cache,
+#   and the directory must be:
+#     - absolute, at least two components (/mnt/local/weights/${ns}), no '..',
+#       no trailing slash;
 #     - on a disk that is not the node's own, never a network mount, never a
-#       system path (/etc, /var/lib, /tmp, /home, /opt/bin and their kind are
-#       refused); on RHCOS under /var (/var/mnt/weights/${ns}) with the disk
-#       mounted there first;
+#       system path (/etc, /usr, /var/lib, /var/log, /tmp, /home, /opt/bin and
+#       their kind are refused, and /var/mnt and /var/srv themselves); on RHCOS
+#       under /var (/var/mnt/weights/${ns}) with the disk mounted there first --
+#       the script cannot tell a mountpoint from a directory;
 #     - one directory per trust domain: what lands there is CODE every engine
 #       on the node loads, world-writable (1777), charged to no quota;
-#     - writable by the preparer: root on Kubernetes; on OpenShift prepared on
-#       each node first (chgrp 0, chmod 2775, chcon -t container_file_t).
+#     - creatable by the preparer: root on Kubernetes; on OpenShift (by
+#       analysis, not yet run there) <node dir>/engine-cache prepared on each
+#       node first (chgrp 0, chmod 2775, chcon -t container_file_t).
 #   And leave to create PersistentVolumes (cluster-scoped; a namespace tenant
 #   has none, storage-admin on OpenShift). docs/reference/workload-preparation.md
-#   has the whole list under "Engine caches on the node's disk".
+#   has the same list under "Engine caches on the node's disk".
 #
 #   Without a node directory: name a ReadWriteMany claim this namespace already
 #   has, WVA_ENGINE_CACHE_CLAIM=<claim>[:<subPath>], and the volume above points
 #   at it instead. The first start anywhere then compiles once and every later
 #   one finds it -- until the claim is published read-only on some node (a CSI
 #   driver can; measured, it cost every start on those nodes 25 s), which is
-#   what the guard below is for.
+#   what the guard below is for. And what is on that claim is code every
+#   engine loads: whoever can write it -- for a benchmark's workload claim,
+#   the load generator too -- runs code in every engine, on every node at
+#   once. Trust it as you would the engine image.
 ENGINENEED
         fi
         cat <<'ENGINEGUARD'
@@ -2051,7 +2131,7 @@ so_existing_name() {
 # then the whole truth about what was found, and turning a "no" into a "yes" is a
 # deliberate act rather than an undiscoverable one.
 so_discover() {
-    local ns name args envs labels objlabels model model_ref pool kind apply note drain weights
+    local ns name args envs labels objlabels model model_ref pool kind apply note drain weights caches
     local existing existing_name existing_min existing_max existing_cost existing_policy existing_is_wva
     local min max cost policy
     so_plan_preamble

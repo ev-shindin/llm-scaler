@@ -68,7 +68,10 @@
 #                               writes that -- at the cost this script exists
 #                               to remove: a CSI driver can publish that claim
 #                               read-only on a node, and every start there
-#                               then compiles.
+#                               then compiles. And what is on that claim is
+#                               code every engine loads: whoever can write it
+#                               runs code in every engine, on every node at
+#                               once -- trust it as you would the engine image.
 #   --image IMG                 image to prepare with: any image carrying /bin/sh
 #                               -- the engine image itself is the natural
 #                               choice, and it is then held on the node as a

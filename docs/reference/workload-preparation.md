@@ -313,8 +313,8 @@ has to hold on every node the preparer selects -- by default every node
 carrying a known GPU product label, or `WEIGHTS_NODE_SELECTOR=<key=value>`
 narrows it to the nodes your model servers select on (the model servers
 must then select the same ones: a replica on a node the preparer did not
-reach finds no cache there, and with the guard below costs a compile rather
-than the replica). The directory must be:
+reach finds no cache there, and with the guard from the start-path table
+costs a compile rather than the replica). The directory must be:
 
 - **absolute, at least two components, no `..`**, no trailing slash
   (`/mnt/local/weights/<ns>`; the whole of a top-level directory is refused);
@@ -332,8 +332,9 @@ than the replica). The directory must be:
 - **one directory per trust domain**, because what lands there is code every
   engine on the node loads (the paragraph below); on OpenShift one per
   project is the only thing that works;
-- **creatable by the preparer**: root on Kubernetes; on OpenShift prepared
-  on each node before `make engine-cache` (`chgrp 0`, `chmod 2775`,
+- **creatable by the preparer**: root on Kubernetes; on OpenShift -- by
+  analysis, not yet run there -- `<dir>/engine-cache` prepared on each node
+  before `make engine-cache` (`chgrp 0`, `chmod 2775`,
   `chcon -t container_file_t`, below).
 
 And the one thing that is not about the directory: leave to create
@@ -350,9 +351,14 @@ this way, on its workload claim under `engine-cache/`, before the node-local
 cache existed). The first start anywhere then compiles once and every later
 replica finds it, on any node -- at the cost this section opened with: a
 CSI driver can publish the claim read-only on a node, and every start there
-compiles. So that layout needs the guard from the table above in the
+compiles. So that layout needs the guard from the start-path table in the
 engine's command, without exception; the emitted patch carries it as a
-comment, because the command belongs to the chart. A node selector does not
+comment, because the command belongs to the chart. And it widens who is
+trusted: what is on that claim is code every engine loads, so whoever can
+write it -- for a benchmark's workload claim, the load generator and the
+results pods too, not only the engines -- runs code in every engine, on
+every node at once, where a write to a node directory reaches that node.
+Trust the claim as you would the engine image. A node selector does not
 remove the need for a directory -- it only decides which nodes get one --
 and a `local`/`local-path` StorageClass does not either: such a claim binds
 to one node, and a per-node cache shared by every pod on that node is what
@@ -619,8 +625,9 @@ named per workload on the console rather than left in the file:
 On a cluster with no egress it is not a cost but a failure, and the first time
 anyone sees it is the first scale-up.
 
-The engine cache is reported the same way, per workload and in the summary --
-`COMPILES FROM NOTHING on every start` -- because it has the same property: it
+The engine cache is reported the same way, per workload (`COMPILES FROM
+NOTHING on every start`) and in the summary (`N model server(s) COMPILE FROM
+NOTHING every time a replica is added`), because it has the same property: it
 costs nothing while the replica count holds and tens of seconds at every
 scale-up (measured, 14 s of `torch.compile` against 3 s from a warm cache, and
 8 s more before the API server answered). The emitted document names the claim
@@ -645,11 +652,15 @@ at the time, and both are worth reading before you type it:
   adding a hook: it can be refused by the API server outright, and it changes
   where an engine reads its weights from, or writes code it will load. With the
   opt-in a half is applied only where it cannot break the workload — no volume
-  of that name, nothing already mounted at that path, and the claim exists. Any
-  of those three refuses it, says which, and still applies the rest. The
-  engine-cache half applied live is applied **without the guard** (the command
-  belongs to the chart), and says so: until the guard is in the chart, a node
-  where the cache path is not writable loses the replica rather than a compile.
+  of that name, nothing already mounted at that path, and the claim exists, is
+  `Bound` and is `ReadWriteMany` (a `ReadWriteOnce` claim binds to one node,
+  and the second replica could not schedule). Any of those refuses it, says
+  which, and still applies the rest. The engine-cache half has one more: when
+  the claim is the one `make engine-cache` makes, every accelerator node its
+  preparer selects must be prepared (`make engine-cache-status` names the
+  others), because it is applied **without the guard** (the command belongs
+  to the chart), and says so: until the guard is in the chart, a node where
+  the cache path is not writable loses the replica rather than a compile.
 
   The first check is the one that matters: `volumes` merges with `retainKeys`,
   and only `kubectl apply` generates that directive, so
@@ -667,7 +678,7 @@ at the time, and both are worth reading before you type it:
 | `WVA_MODEL_VOLUME_NAME` | `model-storage` | the volume name in the emitted patch |
 | `WVA_MODEL_CACHE_PATH` | `/model-cache` | where that volume is mounted, and the parent of the emitted `HF_HOME` |
 | `WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE` | `false` | `true` also applies the engine-cache half where it cannot break the workload |
-| `WVA_ENGINE_CACHE_CLAIM` | `engine-cache` | the claim the emitted engine-cache volume names, `<claim>[:<subPath>]` — the one `make engine-cache` makes, or a shared RWX claim you already have |
+| `WVA_ENGINE_CACHE_CLAIM` | `engine-cache` | the claim the emitted engine-cache volume names, `<claim>[:<subPath>]` — the one `make engine-cache` makes, or a shared RWX claim you already have (whoever can write it runs code in every engine; see above) |
 | `WVA_ENGINE_CACHE_VOLUME_NAME` | `engine-cache` | the volume name in the emitted patch |
 | `WVA_ENGINE_CACHE_PATH` | `/engine-cache` | where that volume is mounted, and the parent of the emitted `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` |
 
