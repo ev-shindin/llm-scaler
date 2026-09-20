@@ -378,9 +378,11 @@ var _ = Describe("estimateThroughputDemand with mixed readings", func() {
 		g := estimateThroughputDemand(1.68, []ReplicaCapacity{fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
 		Expect(g.Terms[domain.RoleDecode].Mu).To(Equal(4.38))
 		Expect(g.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/4.38, 1e-6))
-		// (not held: two replicas' worth is under the fleet's cap, so the cap
-		// has nothing to do -- the borrowed figure under-holds, which is the
-		// direction the header accepts)
+		// Not held: two replicas' worth is under the fleet's cap (0.85 x 3 x
+		// 930k), so the cap has nothing to do -- the borrowed figure
+		// under-holds, which is the direction the header accepts.
+		Expect(g.Terms[domain.RoleDecode].Held).To(BeFalse())
+		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("<", 0.85*3*930_000))
 
 		By("keeping the own readings' median when they disagree among themselves")
 		own2 := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.26, SaturatedThroughputSamples: 1}
