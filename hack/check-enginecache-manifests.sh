@@ -6,8 +6,10 @@
 # namespace root write on the node, a claim without a claimRef is taken by the
 # first claim that asks for its class, and a preparer that requests a GPU or
 # carries a `$(` in its command parses fine and ships wrong. `bash -n` sees
-# none of it; this renders the manifests and looks, runs the scenario edit
-# against a stub kubectl, and reads the Makefile's argv. It needs no cluster.
+# none of it; this renders the manifests and looks, drives status, delete and
+# apply through a stub kubectl with fake nodes, pods and volumes, runs the
+# scenario edit against the same stub, and reads the Makefile's argv. It
+# needs no cluster.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,10 +22,14 @@ trap 'rm -rf "$T"' EXIT
 ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }
 
+# A missing tool is a failure, not a pass: a check that skips leaves every
+# assertion unmade and the run green.
 for tool in yq jq "$PY"; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "  SKIP $tool is not installed; this check needs yq, jq and python3 with PyYAML" >&2; exit 0; }
+    command -v "$tool" >/dev/null 2>&1 || { printf 'FATAL: %s is required (this check needs yq, jq and python3 with PyYAML)
+' "$tool" >&2; exit 1; }
 done
-"$PY" -c "import yaml" 2>/dev/null || { echo "  SKIP python3 has no PyYAML" >&2; exit 0; }
+"$PY" -c "import yaml" 2>/dev/null || { printf 'FATAL: python3 has no PyYAML (pip install pyyaml)
+' >&2; exit 1; }
 
 IMG=docker.io/vllm/vllm-openai:v0.26.0
 
@@ -226,14 +232,17 @@ printf 'scenario:\n  - name: x\n    decode: {}\n' > "$T/s5.yaml"
 if PATH="$STUB_PATH" bash hack/benchmark/engine_cache_claim.sh "$T/s5.yaml" check-ns >/dev/null 2>&1; then fail "engine_cache_claim must fail on a scenario with no engine-cache volume"; else ok "engine_cache_claim: a scenario with no engine-cache volume is refused, not silently left shared"; fi
 cp "$T/scenario.yaml" "$T/s6.yaml"
 if PATH="$STUB_PATH" bash hack/benchmark/engine_cache_claim.sh "$T/s6.yaml" check-ns 'Bad_Name' >/dev/null 2>&1; then fail "engine_cache_claim accepted a claim name that is not a label"; else ok "engine_cache_claim: a claim name that is not a DNS label is refused"; fi
-# the shipped scenarios carry the volume the edit looks for
-for sc in hack/benchmark/scenarios/guides/pd-disaggregation.yaml; do
+# every shipped scenario that carries the volume is repointed (two roles in
+# the P/D one, one in the others), and the one without it is refused
+for sc in hack/benchmark/scenarios/guides/*.yaml; do
     cp "$sc" "$T/real.yaml"
+    have="$(yq -r '[.. | select(type == "!!map" and has("additionalVolumes")) | .additionalVolumes[] | select(.name == "engine-cache")] | length' "$sc")"
     if PATH="$STUB_PATH" bash hack/benchmark/engine_cache_claim.sh "$T/real.yaml" check-ns > "$T/real.out" 2>&1; then
         n="$(yq -r '[.. | select(type == "!!map" and has("additionalVolumes")) | .additionalVolumes[] | select(.name == "engine-cache") | .persistentVolumeClaim.claimName] | map(select(. == "engine-cache")) | length' "$T/real.yaml")"
-        [ "$n" -ge 2 ] && ok "engine_cache_claim: $(basename "$sc") -- $n engine-cache volumes repointed" || fail "engine_cache_claim on $(basename "$sc"): $n repointed"
+        sub="$(yq -r '[.. | select(type == "!!map" and has("additionalVolumeMounts")) | .additionalVolumeMounts[] | select(.name == "engine-cache") | has("subPath")] | map(select(.)) | length' "$T/real.yaml")"
+        [ "$have" -gt 0 ] && [ "$n" = "$have" ] && [ "$sub" = 0 ] && ok "engine_cache_claim: $(basename "$sc") -- $n engine-cache volume(s) repointed, no subPath left" || fail "engine_cache_claim on $(basename "$sc"): had $have, repointed $n, subPaths left $sub"
     else
-        fail "engine_cache_claim on $(basename "$sc"): $(cat "$T/real.out")"
+        [ "$have" = 0 ] && grep -q 'declares no engine cache to move' "$T/real.out" && ok "engine_cache_claim: $(basename "$sc") -- carries no engine-cache volume and is refused" || fail "engine_cache_claim on $(basename "$sc"): $(cat "$T/real.out")"
     fi
 done
 

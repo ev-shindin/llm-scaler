@@ -436,7 +436,9 @@ volume in the scenario copy at that claim, without the `subPath`. The env
 vars and the guard stay as they are. The edit refuses a namespace without a
 Bound `engine-cache` claim and fails the standup: engines whose cache
 volume never mounts sit in `ContainerCreating` for good. A hostPath is a
-bind mount, which nothing publishes read-only; the first start on a node
+bind mount with no storage driver in its path, so no driver publishes it
+read-only (the filesystem under it can still go read-only, which is what the
+preparer's readiness and the guard are for); the first start on a node
 compiles once and every start after it on that node hits. `make
 engine-cache-status NAMESPACE=$BENCHMARK_NAMESPACE` lists the nodes.
 
