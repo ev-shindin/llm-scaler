@@ -85,9 +85,9 @@ mount = c["volumeMounts"][0]
 check(mount["name"] == vols[0]["name"] and mount["mountPath"] == "/engine-cache" and "subPath" not in mount, "the claim is mounted at /engine-cache, whole")
 script = c["args"][0]
 check("$(" not in script and "$$" not in script, "the command carries no $( or $$ (Kubernetes rewrites both)")
-for sub in ("vllm", "flashinfer", "triton"):
-    check('mkdir -p "/engine-cache/$d"' in script, "one mkdir loop")
-check("for d in vllm flashinfer triton" in script and "chmod 1777" in script, "the three cache directories, world-writable and sticky")
+loop = re.search(r"^for d in (.*); do$", script, re.M)
+check(loop is not None and set(loop.group(1).split()) == {"vllm", "flashinfer", "triton"}, "one mkdir loop over the three cache directories: %s" % (loop.group(1) if loop else None))
+check('mkdir -p "/engine-cache/$d"' in script and 'chmod 1777 "/engine-cache/$d"' in script, "each made, then world-writable and sticky")
 check('touch "/engine-cache/$MARKER"' in script and env["MARKER"]["value"] == ".prepared", "the marker is written after the directories, its name from the environment")
 check("trap 'exit 0' TERM" in script and "sleep 3600" in script, "then the pod stays, so numberReady counts prepared nodes")
 check(c["command"] == ["/bin/sh", "-c"], "sh -c with the script as args")
@@ -205,7 +205,18 @@ else
 fi
 cp "$T/scenario.yaml" "$T/s2.yaml"
 if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash hack/benchmark/engine_cache_claim.sh "$T/s2.yaml" check-ns > "$T/s2.out" 2>&1; then fail "engine_cache_claim must refuse a claim that is not Bound"; else
-    grep -q "no Bound claim named engine-cache" "$T/s2.out" && cmp -s "$T/scenario.yaml" "$T/s2.yaml" && ok "engine_cache_claim: a claim that is not Bound is refused, scenario untouched" || fail "engine_cache_claim Pending: $(tail -1 "$T/s2.out")"; fi
+    grep -q "no Bound claim named engine-cache after 30 s" "$T/s2.out" && cmp -s "$T/scenario.yaml" "$T/s2.yaml" && ok "engine_cache_claim: a claim that stays Pending is refused after the wait, scenario untouched" || fail "engine_cache_claim Pending: $(tail -1 "$T/s2.out")"; fi
+# the claim binds a moment after the apply: the first reads see Pending, then Bound
+cat > "$T/bin/kubectl-late" <<EOF
+#!/usr/bin/env bash
+n=\$(cat "$T/late.n" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "$T/late.n"
+case "\$*" in *"jsonpath={.status.phase}"*) [ "\$n" -ge 3 ] && printf Bound || printf Pending ;; *"jsonpath={.spec.storageClassName}"*) printf node-local-engine-cache ;; *) exit 2 ;; esac
+EOF
+chmod +x "$T/bin/kubectl-late"; mkdir -p "$T/late"; cp "$T/bin/kubectl-late" "$T/late/kubectl"; rm -f "$T/late.n"
+cp "$T/scenario.yaml" "$T/s2b.yaml"
+if PATH="$T/late:$PATH" bash hack/benchmark/engine_cache_claim.sh "$T/s2b.yaml" check-ns > "$T/s2b.out" 2>&1; then
+    [ "$(cat "$T/late.n")" -ge 3 ] && grep -q '2 engine-cache volume(s)' "$T/s2b.out" && ok "engine_cache_claim: a claim Bound on the third read is waited for, then the edit is made" || fail "engine_cache_claim late bind: reads=$(cat "$T/late.n"); $(tail -1 "$T/s2b.out")"
+else fail "engine_cache_claim must wait for a claim that binds a moment later: $(tail -1 "$T/s2b.out")"; fi
 cp "$T/scenario.yaml" "$T/s3.yaml"
 if STUB_PVC_PHASE= PATH="$STUB_PATH" bash hack/benchmark/engine_cache_claim.sh "$T/s3.yaml" check-ns >/dev/null 2>&1; then fail "engine_cache_claim must refuse a missing claim"; else ok "engine_cache_claim: a missing claim is refused"; fi
 cp "$T/scenario.yaml" "$T/s4.yaml"
@@ -287,6 +298,7 @@ case "\$1 \$2" in
       case "\$ARGV" in
         *"jsonpath={.status.phase}"*) printf '%s' "\${STUB_PVC_PHASE-Bound}" ;;
         *"jsonpath={.metadata.name}/{.spec.storageClassName}"*) [ -z "\${STUB_PVC_PHASE-Bound}" ] || printf 'engine-cache/%s' "\${STUB_PVC_CLASS-}" ;;
+        *"jsonpath={.spec.volumeName}"*) [ -z "\${STUB_PVC_PHASE-Bound}" ] || printf '%s' "\${STUB_PVC_VOLUME-$PVNAME}" ;;
         *"jsonpath={.spec.storageClassName}"*) printf '%s' "\${STUB_PVC_CLASS-}" ;;
         *) echo "stub kubectl: unexpected pvc read:\$ARGV" >&2; exit 2 ;;
       esac ;;
@@ -296,7 +308,11 @@ case "\$1 \$2" in
   "api-resources --api-group=security.openshift.io") [ -n "\${STUB_OPENSHIFT:-}" ] && echo "securitycontextconstraints scc security.openshift.io/v1 false SecurityContextConstraints"; : ;;
   "apply -f")    cat >/dev/null; echo applied ;;
   "delete daemonset"|"delete pvc"|"delete serviceaccount") want -n check-ns; echo deleted ;;
-  "get pv")      want -l "$LBL"; want -o json; refuse -n; cat "$T/pvs.json" ;;
+  "get pv")      refuse -n
+                 case "\$ARGV" in
+                   *"jsonpath={.spec.hostPath.path}"*) case "\$ARGV" in *" $PVNAME "*) printf '%s' "\${STUB_PV_PATH-/mnt/local/weights/check-ns/engine-cache}" ;; *) echo "stub kubectl: pv read for a volume that is not the claim's:\$ARGV" >&2; exit 2 ;; esac ;;
+                   *) want -l "$LBL"; want -o json; cat "$T/pvs.json" ;;
+                 esac ;;
   "delete pv")   refuse -n; echo deleted ;;
   *) echo "stub kubectl: unexpected \$*" >&2; exit 2 ;;
 esac
@@ -344,10 +360,12 @@ if STUB_PVC_CLASS=shared-vast PATH="$STUB_PATH" bash deploy/enginecache.sh apply
 STUB_PVC_CLASS=node-local-engine-cache PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" > "$T/apply.out" 2>&1 || true
 grep -q '^apply -f' "$T/calls" && grep -q 'preparing /mnt/local/weights/check-ns/engine-cache on' "$T/apply.out" && grep -q '^  node-ready ' "$T/apply.out" && ok "apply: applies, says what it prepared where, and reports per node" || fail "apply: $(head -3 "$T/apply.out" | tr '\n' ';')"
 grep -q 'OpenShift:' "$T/apply.out" && fail "apply: the OpenShift notice printed on a cluster without SCCs" || ok "apply: no OpenShift notice on a cluster without SecurityContextConstraints"
-# a re-apply with another directory is refused: the claim's volume cannot change
+# a re-apply with another directory is refused: the claim's volume cannot
+# change -- read off the volume the claim is bound to, so a DaemonSet deleted
+# by hand does not make the claim look free
 : > "$T/calls"
-if STUB_PVC_CLASS=node-local-engine-cache PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/other --image "$IMG" > "$T/moved.out" 2>&1; then fail "apply must refuse a second directory for a namespace that has one"; else
-    grep -q 'already has its engine cache at /mnt/local/weights/check-ns/engine-cache' "$T/moved.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: a re-apply with another --path is refused before anything lands (the claim's volume is immutable)" || fail "apply moved: $(tail -1 "$T/moved.out")"; fi
+if STUB_DS_PATH="" STUB_PVC_CLASS=node-local-engine-cache PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/other --image "$IMG" > "$T/moved.out" 2>&1; then fail "apply must refuse a second directory for a namespace that has one"; else
+    grep -q "already has its engine cache at /mnt/local/weights/check-ns/engine-cache (volume ${PVNAME})" "$T/moved.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: a re-apply with another --path is refused before anything lands, off the claim's bound volume, DaemonSet or no DaemonSet" || fail "apply moved: $(tail -1 "$T/moved.out")"; fi
 # a claim of the name with no class at all is not ours either
 if STUB_DS_PATH="" STUB_PVC_CLASS="" PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" > "$T/noclass.out" 2>&1; then fail "apply must refuse an existing claim with no storage class"; else
     grep -q "already has a claim named engine-cache on storage class ''" "$T/noclass.out" && ok "apply: an existing claim on no class is refused too" || fail "apply no-class claim: $(tail -1 "$T/noclass.out")"; fi

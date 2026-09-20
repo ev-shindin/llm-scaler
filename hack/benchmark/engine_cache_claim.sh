@@ -33,8 +33,15 @@ case "$CLAIM" in
     *[!a-z0-9-]*|"") log_error "not a claim name: '${CLAIM}' (a DNS-1123 label)" ;;
 esac
 
-phase="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-[ "$phase" = Bound ] || log_error "namespace ${NAMESPACE} has no Bound claim named ${CLAIM} (found: '${phase:-none}'); run deploy/enginecache.sh apply first (make engine-cache), and check make engine-cache-status"
+# A static volume with a claimRef binds within moments of the apply, but not
+# in the same instant: wait a little for Bound before refusing.
+phase=""
+for _ in $(seq 1 15); do
+    phase="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [ "$phase" = Bound ] && break
+    sleep 2
+done
+[ "$phase" = Bound ] || log_error "namespace ${NAMESPACE} has no Bound claim named ${CLAIM} after 30 s (found: '${phase:-none}'); run deploy/enginecache.sh apply first (make engine-cache), and check make engine-cache-status"
 class="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
 [ "$class" = "$STORAGE_CLASS" ] || log_error "claim ${CLAIM} in ${NAMESPACE} is on storage class '${class}', not ${STORAGE_CLASS}: it is not the node-local cache deploy/enginecache.sh makes"
 

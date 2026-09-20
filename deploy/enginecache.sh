@@ -337,10 +337,14 @@ cmd_apply() {
     if [ -n "$existing" ] && [ "${existing#*/}" != "$STORAGE_CLASS" ]; then
         log_error "namespace ${NAMESPACE} already has a claim named ${CLAIM} on storage class '${existing#*/}', which this script did not make; delete it or use a namespace without one"
     fi
-    local applied
-    applied="$(kubectl get daemonset -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.metadata.annotations.wva\.llmd\.ai/engine-cache-path}' 2>/dev/null || true)"
+    # The directory the claim is really on is its volume's, not the
+    # DaemonSet's annotation (the DaemonSet may be gone; the claim stays bound).
+    local volume applied
+    volume="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    applied=""
+    [ -z "$volume" ] || applied="$(kubectl get pv "$volume" -o jsonpath='{.spec.hostPath.path}' 2>/dev/null || true)"
     if [ -n "$applied" ] && [ "$applied" != "${NODE_PATH}/${SUBDIR}" ]; then
-        log_error "namespace ${NAMESPACE} already has its engine cache at ${applied}; the claim's volume cannot change. enginecache.sh delete -n ${NAMESPACE} first (the caches on the nodes stay), then apply with the new --path"
+        log_error "namespace ${NAMESPACE} already has its engine cache at ${applied} (volume ${volume}); the claim's volume cannot change. enginecache.sh delete -n ${NAMESPACE} first (the caches on the nodes stay), then apply with the new --path"
     fi
     render | kubectl apply -f - >/dev/null
     log_info "preparing ${NODE_PATH}/${SUBDIR} on $(accelerator_selector_text "$NODE_SELECTOR"); claim ${CLAIM} -- mount it read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR and TRITON_CACHE_DIR under it"
