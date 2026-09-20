@@ -393,8 +393,9 @@ first thing every engine command runs on an NVIDIA node -- is two
 crosses every mount in the pod: the image's 14 GB of site-packages, the model
 volume and the engine-cache volume. Measured inside the engine image on this
 cluster's NVMe nodes with two near-empty volumes mounted, 0.6-1.0 s per walk;
-on a shared model cache holding many models it is a directory walk over the
-network, twice. `patch_harness.sh` fix 14 makes the preamble ask the loader
+on a shared model cache holding many models it would be a directory walk over
+the network, twice (not measured here). `patch_harness.sh` fix 14 makes the
+preamble ask the loader
 cache instead (`ldconfig -p`, 2 ms -- it is where the NVIDIA runtime
 registers the driver's `libcuda`), and fall back to a walk of `/usr` and
 `/opt` on the root filesystem only, for an image whose only copy is a

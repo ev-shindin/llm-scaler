@@ -1028,10 +1028,11 @@ fi
 # an NVIDIA node -- is two `find / -name libcuda.so.1` walks, one for
 # LD_LIBRARY_PATH and one for LIBRARY_PATH. Each crosses every mount in the
 # pod: the image's 14 GB of site-packages and the model and engine-cache
-# volumes, which on a shared NFS model cache is a directory walk over the
-# network. Measured inside the engine image: 0.6-1.0 s per walk on this
+# volumes. Measured inside the engine image: 0.6-1.0 s per walk on this
 # cluster's NVMe nodes with two near-empty volumes mounted, so 1-2 s of a 58 s
-# cold start; `ldconfig -p` answers the same question from the loader cache
+# cold start (on a shared model cache holding many models it would be a
+# directory walk over the network, twice -- not measured here); `ldconfig -p`
+# answers the same question from the loader cache
 # in 2 ms, and it is where the NVIDIA runtime registers the driver's libcuda.
 # Its entries come first, in the cache's own order (the loader's search
 # order), deduplicated; the image's forward-compat copy
@@ -1039,8 +1040,9 @@ fi
 # one) is appended after them; the walk is kept only as the fallback for an
 # image with neither, restricted to /usr and /opt on the root filesystem.
 # Measured in the engine image, both texts verbatim, the exported paths
-# compared byte for byte and identical: 1.9 s -> 10 ms in the serving pod
-# (driver, then compat), 0.6 s -> 6 ms in a GPU-less pod (compat only). One difference, deliberate: with nothing
+# compared with cmp and identical: 1.9 s -> 10 ms in the serving pod
+# (driver, then compat), 0.6 s -> 6 ms in a GPU-less pod (compat only).
+# One difference, deliberate: with nothing
 # found the walk exported a leading empty component (":$LD_LIBRARY_PATH",
 # which the loader reads as the working directory); this leaves the
 # variables as they were.

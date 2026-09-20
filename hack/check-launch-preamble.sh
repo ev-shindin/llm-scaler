@@ -9,12 +9,20 @@
 # fast one, and the patched text is shell inside YAML inside Python: this runs
 # the fix on a fixture with the upstream anchor, then runs the preamble it
 # produced under stubbed `ldconfig`/`find` and reads the two variables it must
-# export. It needs no cluster and no GPU.
+# export. It needs no cluster and no GPU. The preamble is written for the
+# engine image (GNU coreutils and findutils: readlink -f, find -printf,
+# xargs -r), and running it here needs the same: on macOS, brew install
+# coreutils findutils and put their gnubin directories first on PATH, or
+# this check skips.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY=${PYTHON:-python3}
 FAILED=0
+if ! readlink -f / >/dev/null 2>&1 || ! find / -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    echo "  SKIP GNU coreutils/findutils not on PATH (readlink -f, find -printf): the preamble is the engine image's; brew install coreutils findutils on macOS" >&2
+    exit 0
+fi
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 
