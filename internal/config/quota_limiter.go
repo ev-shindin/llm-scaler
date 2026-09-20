@@ -6,6 +6,9 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/accelerator"
 )
 
 // QuotaLimiterReservedNamespaceKey is the reserved key in the namespace-scoped
@@ -79,6 +82,249 @@ type QuotaLimiterConfig struct {
 	// constraint applied). Only meaningful when Scope == QuotaScopeNamespace.
 	// Useful for system namespaces or privileged tenants.
 	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
+
+	// Kueue, when enabled, reads GPU quotas from Kueue (ClusterQueue nominal
+	// quotas, attributed to namespaces through their LocalQueues) and bounds
+	// this entry by them: per namespace (or cluster) and accelerator type the
+	// SMALLER of the Kueue cap and the static cap above wins. See BoundBy for
+	// the exact rules. Nil or disabled means the static maps are the only source.
+	Kueue *KueueQuotaSource `yaml:"kueue,omitempty" json:"kueue,omitempty"`
+}
+
+// KueueQuotaSource configures reading quotas from Kueue for one quota entry.
+//
+// Kueue is the cluster's admission-time quota authority; this makes WVA respect
+// the same figures before it asks KEDA for a replica that Kueue would then hold
+// pending. The mapping is: a ClusterQueue's nominalQuota for a GPU extended
+// resource, per flavor, becomes a per-accelerator-type cap; a namespace is
+// granted the caps of every ClusterQueue one of its LocalQueues points at; the
+// cluster figure is the sum over all ClusterQueues. Borrowing limits and cohorts
+// are deliberately NOT counted — the bound wants the guaranteed figure.
+type KueueQuotaSource struct {
+	// Enabled turns the reader on. A `kueue:` block with enabled false is the
+	// same as no block at all.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// Resources lists the extended-resource names that count as GPUs in a
+	// ClusterQueue (e.g. "nvidia.com/gpu"). Empty means every vendor resource
+	// WVA already knows (constants.VendorResources).
+	Resources []string `yaml:"resources,omitempty" json:"resources,omitempty"`
+
+	// RefreshInterval caps how often Kueue is re-read; a Go duration string.
+	// Empty means DefaultKueueRefreshInterval. Between reads the last snapshot is
+	// served, so a quota edit in Kueue takes up to this long to bind here.
+	RefreshInterval string `yaml:"refreshInterval,omitempty" json:"refreshInterval,omitempty"`
+}
+
+// DefaultKueueRefreshInterval is how often Kueue quotas are re-read when the
+// entry does not say. The saturation cycle is of the same order, so a shorter
+// value would only add API calls the next decision cannot use.
+const DefaultKueueRefreshInterval = 30 * time.Second
+
+// KueueEnabled reports whether this entry reads quotas from Kueue.
+func (q QuotaLimiterConfig) KueueEnabled() bool {
+	return q.Kueue != nil && q.Kueue.Enabled
+}
+
+// KueueRefreshInterval returns the configured Kueue refresh interval, or the
+// default when unset. Callers must have run Validate, which rejects a value that
+// does not parse; an unparseable value here falls back to the default rather than
+// panicking.
+func (q QuotaLimiterConfig) KueueRefreshInterval() time.Duration {
+	if q.Kueue == nil || q.Kueue.RefreshInterval == "" {
+		return DefaultKueueRefreshInterval
+	}
+	d, err := time.ParseDuration(q.Kueue.RefreshInterval)
+	if err != nil || d <= 0 {
+		return DefaultKueueRefreshInterval
+	}
+	return d
+}
+
+// validate checks the Kueue block of one entry. Only the fields an operator can
+// get wrong are checked: a resource name must be non-empty and the refresh
+// interval must be a positive duration.
+func (k *KueueQuotaSource) validate(location string) error {
+	if k == nil {
+		return nil
+	}
+	var errs []error
+	for i, r := range k.Resources {
+		if strings.TrimSpace(r) == "" {
+			errs = append(errs, fmt.Errorf("%s.kueue.resources[%d]: resource name must not be empty", location, i))
+		}
+	}
+	if k.RefreshInterval != "" {
+		d, err := time.ParseDuration(k.RefreshInterval)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s.kueue.refreshInterval: %q is not a duration: %w", location, k.RefreshInterval, err))
+		case d <= 0:
+			errs = append(errs, fmt.Errorf("%s.kueue.refreshInterval: %q must be positive", location, k.RefreshInterval))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// clone returns a copy of k that shares no mutable state with the original.
+func (k *KueueQuotaSource) clone() *KueueQuotaSource {
+	if k == nil {
+		return nil
+	}
+	out := *k
+	if k.Resources != nil {
+		out.Resources = slices.Clone(k.Resources)
+	}
+	return &out
+}
+
+// ExternalQuotas is a snapshot of GPU caps read from an external authority
+// (today Kueue) in the shape the quota entry maps use: per namespace and per
+// accelerator type for the namespace scope, per accelerator type for the
+// cluster scope. Values are finite caps; the source never emits QuotaUnlimited.
+//
+// Absence carries meaning, and it differs between the two levels:
+//   - A namespace missing from Namespace is NOT governed by the source (no
+//     LocalQueue of its reaches a ClusterQueue that declares a GPU resource), so
+//     the static entry alone decides for it.
+//   - A type missing from a PRESENT namespace's map is a cap of 0: the source
+//     knows the namespace and grants it nothing of that type.
+//   - An empty Cluster map means the source declares no GPU budget at all, so
+//     it contributes nothing at cluster scope.
+type ExternalQuotas struct {
+	Namespace map[string]map[string]int
+	Cluster   map[string]int
+	// ObservedAt is when the source was last read successfully; zero when it
+	// never was, in which case the maps are empty and mean nothing.
+	ObservedAt time.Time
+}
+
+// BoundBy returns this entry bounded by an external snapshot: the static maps and
+// the external ones are combined per key so that the SMALLER cap wins, which is
+// what an operator declaring both means — neither source may raise what the other
+// granted. Exclude is untouched; excluded namespaces bypass both sources.
+//
+// Rules for the namespace scope, per namespace N present in ext.Namespace:
+//   - N excluded: skipped.
+//   - N is the reserved "default" key: skipped. Writing it would turn one
+//     namespace's Kueue grant into the fall-through for every unlisted namespace;
+//     the K8s "default" namespace is already unconfigurable here (see
+//     QuotaLimiterReservedNamespaceKey).
+//   - N listed in NamespaceQuotas: its map becomes min(static map, ext map).
+//   - N unlisted but a static "default" exists: min(default map, ext map). The
+//     namespace becomes explicitly listed, at that per-namespace budget.
+//   - N unlisted and NamespaceQuotas is empty: the external map is taken as is
+//     — an entry with no static map has asked for the source to be the whole
+//     answer.
+//   - N unlisted in a non-empty static allowlist without "default": left out.
+//     The static list denies N and the source cannot open it.
+//
+// Namespaces the snapshot does not mention keep their static treatment.
+//
+// min over two maps is taken over the UNION of their type keys, with a type
+// absent from one side counting as 0 — both maps are closed allowlists, so
+// "not listed" already means "denied" on each. Type keys are matched across the
+// two maps by accelerator identity (exact, or equal short names; see
+// sameAccelerator) and the static spelling is kept, so a Kueue flavor labelled
+// "NVIDIA-H100-80GB-HBM3" bounds a static "H100". QuotaUnlimited (-1) on either
+// side yields the other side's value.
+//
+// Cluster scope: an empty ext.Cluster changes nothing; an empty static quotas map
+// takes ext.Cluster as is; otherwise min over the union, as above.
+func (q QuotaLimiterConfig) BoundBy(ext ExternalQuotas) QuotaLimiterConfig {
+	out := q.clone()
+	switch q.Scope {
+	case QuotaScopeCluster:
+		switch {
+		case len(ext.Cluster) == 0:
+		case len(q.ClusterQuotas) == 0:
+			out.ClusterQuotas = maps.Clone(ext.Cluster)
+		default:
+			out.ClusterQuotas = minTypeQuotas(q.ClusterQuotas, ext.Cluster)
+		}
+	case QuotaScopeNamespace:
+		if len(ext.Namespace) == 0 {
+			return out
+		}
+		if out.NamespaceQuotas == nil {
+			out.NamespaceQuotas = make(map[string]map[string]int, len(ext.Namespace))
+		}
+		staticDefault, hasDefault := q.NamespaceQuotas[QuotaLimiterReservedNamespaceKey]
+		staticEmpty := len(q.NamespaceQuotas) == 0
+		for ns, extQuotas := range ext.Namespace {
+			if ns == QuotaLimiterReservedNamespaceKey || q.IsExcluded(ns) {
+				continue
+			}
+			switch base, listed := q.NamespaceQuotas[ns]; {
+			case listed:
+				out.NamespaceQuotas[ns] = minTypeQuotas(base, extQuotas)
+			case hasDefault:
+				out.NamespaceQuotas[ns] = minTypeQuotas(staticDefault, extQuotas)
+			case staticEmpty:
+				out.NamespaceQuotas[ns] = maps.Clone(extQuotas)
+			}
+		}
+	}
+	return out
+}
+
+// minTypeQuotas combines two per-type maps by taking the smaller cap over the
+// union of their keys; a key one side lacks counts as 0 there. Keys are matched
+// by accelerator identity and the result keeps base's spelling for matched keys,
+// other's for the rest.
+func minTypeQuotas(base, other map[string]int) map[string]int {
+	out := make(map[string]int, len(base)+len(other))
+	for accType, baseCap := range base {
+		otherCap := 0
+		if key, ok := lookupAccelerator(other, accType); ok {
+			otherCap = other[key]
+		}
+		out[accType] = minQuota(baseCap, otherCap)
+	}
+	for accType, otherCap := range other {
+		if _, ok := lookupAccelerator(base, accType); ok {
+			continue // already combined under base's spelling
+		}
+		out[accType] = minQuota(0, otherCap)
+	}
+	return out
+}
+
+// minQuota returns the tighter of two caps, treating QuotaUnlimited as no bound.
+func minQuota(a, b int) int {
+	switch {
+	case a == QuotaUnlimited:
+		return b
+	case b == QuotaUnlimited:
+		return a
+	}
+	return min(a, b)
+}
+
+// lookupAccelerator finds the key in quotas that names the same accelerator as
+// name: an exact match first, then one whose short name matches. Two keys of the
+// same map can normalize alike ("H100" and "NVIDIA-H100-PCIE-80GB"); the exact
+// match wins and otherwise the first found is used.
+func lookupAccelerator(quotas map[string]int, name string) (string, bool) {
+	if _, ok := quotas[name]; ok {
+		return name, true
+	}
+	for key := range quotas {
+		if sameAccelerator(key, name) {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+// sameAccelerator reports whether two type keys name the same accelerator:
+// identical, or the same short name ignoring case, so an operator's "H100", a
+// node label's "NVIDIA-H100-80GB-HBM3" and a Kueue flavor named "h100" all meet.
+func sameAccelerator(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return strings.EqualFold(accelerator.NormalizeAcceleratorName(a), accelerator.NormalizeAcceleratorName(b))
 }
 
 // IsExcluded reports whether the given namespace bypasses this limiter.
@@ -127,8 +373,8 @@ func (q QuotaLimiterConfig) QuotaForNamespace(namespace string) (map[string]int,
 }
 
 // clone returns a deep copy of q: the ClusterQuotas / NamespaceQuotas maps and
-// the Exclude slice are duplicated so the result shares no mutable state with
-// the original. Used by Config.EffectiveQuotaEntries to hand out entries that callers
+// the Exclude slice and the Kueue block are duplicated so the result shares no
+// mutable state with the original. Used by Config.EffectiveQuotaEntries to hand out entries that callers
 // cannot use to mutate the config-owned snapshot.
 func (q QuotaLimiterConfig) clone() QuotaLimiterConfig {
 	out := q // copies scalar fields and (to be replaced) map/slice headers
@@ -144,6 +390,7 @@ func (q QuotaLimiterConfig) clone() QuotaLimiterConfig {
 	if q.Exclude != nil {
 		out.Exclude = slices.Clone(q.Exclude)
 	}
+	out.Kueue = q.Kueue.clone()
 	return out
 }
 
@@ -197,6 +444,9 @@ func (e *QuotaLimiterEntries) Validate() (warnings []string, err error) {
 		if entry.Type != "quota" {
 			errs = append(errs, fmt.Errorf("entry[%d] (%q): type must be \"quota\", got %q", i, entry.Name, entry.Type))
 			// Keep going: scope/quotas validation is still useful diagnostically.
+		}
+		if kErr := entry.Kueue.validate(fmt.Sprintf("entry[%d] (%q)", i, entry.Name)); kErr != nil {
+			errs = append(errs, kErr)
 		}
 
 		switch entry.Scope {

@@ -13,6 +13,10 @@
 #                         reading a policy annotation. Both are best-effort: a
 #                         single-namespace controller never lists, and the policy
 #                         read tolerates being denied.
+#   clusterqueues,        Kueue quotas. Needed ONLY by a quota entry with
+#   resourceflavors       `kueue.enabled`; components/kueue-reader grants them,
+#                         applied by the prereqs phase like node-reader. The
+#                         namespaced half, localqueues, is below.
 #
 # Everything else — pods, services, configmaps, deployments, replicasets,
 # statefulsets, deployments/scale, inferencepools, scaledobjects,
@@ -98,6 +102,13 @@ rules:
   - scaledobjects
   verbs:
   - get
+- apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - localqueues
+  verbs:
+  - get
+  - list
 - apiGroups:
   - leaderworkerset.x-k8s.io
   resources:

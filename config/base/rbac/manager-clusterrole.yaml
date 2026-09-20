@@ -70,6 +70,15 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - clusterqueues
+  - localqueues
+  - resourceflavors
+  verbs:
+  - get
+  - list
+- apiGroups:
   - leaderworkerset.x-k8s.io
   resources:
   - leaderworkersets

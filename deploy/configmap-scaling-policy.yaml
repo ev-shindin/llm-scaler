@@ -107,3 +107,14 @@ data:
   #       name: cluster-h100
   #       scope: cluster
   #       quotas: { H100: 32 }
+  #
+  #   # (c) quota limiter bounded by Kueue: per namespace and accelerator type
+  #   #     the SMALLER of the Kueue nominal quota and the static cap applies.
+  #   #     Leave namespaceQuotas out to take Kueue's figures alone.
+  #   limiters:
+  #     - type: quota
+  #       name: namespace-quota
+  #       scope: namespace
+  #       kueue: { enabled: true }
+  #       namespaceQuotas:
+  #         team-a: { H100: 8 }

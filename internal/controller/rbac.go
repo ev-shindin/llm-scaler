@@ -61,6 +61,18 @@ package controller
 // these objects.
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get
 
+// Kueue quotas, read by the quota limiter when a quota entry sets
+// `kueue.enabled` (internal/kueue.Reader): ClusterQueues carry the nominal
+// quotas, ResourceFlavors name the accelerator behind each flavor, LocalQueues
+// tie a namespace to its ClusterQueues.
+//
+// get and list only. The reader lists on demand, unstructured, through the
+// direct client path — no informer, so no watch — and never writes: Kueue owns
+// these objects. Kueue itself is optional; a rule naming an API group the
+// cluster does not serve is inert, and the reader reports "not served" rather
+// than an empty quota when it is missing.
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues;localqueues;resourceflavors,verbs=get;list
+
 // InferencePool discovery and controller-owned ServiceMonitor observation.
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch
 // +kubebuilder:rbac:groups=inference.networking.x-k8s.io;inference.networking.k8s.io,resources=inferencepools,verbs=get;list;watch

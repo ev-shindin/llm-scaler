@@ -557,8 +557,8 @@ func (c *ScalingPolicy) validateLimiters() error {
 	for i, l := range c.Limiters {
 		switch l.Type {
 		case limiterTypeGPUInventory, string(LimiterTypeInventory):
-			if l.Scope != "" || len(l.ClusterQuotas) > 0 || len(l.NamespaceQuotas) > 0 || len(l.Exclude) > 0 {
-				return fmt.Errorf("limiters[%d] (type %q): must not set quota fields (scope/quotas/namespaceQuotas/exclude)", i, l.Type)
+			if l.Scope != "" || len(l.ClusterQuotas) > 0 || len(l.NamespaceQuotas) > 0 || len(l.Exclude) > 0 || l.Kueue != nil {
+				return fmt.Errorf("limiters[%d] (type %q): must not set quota fields (scope/quotas/namespaceQuotas/exclude/kueue)", i, l.Type)
 			}
 		case string(LimiterTypeQuota):
 			quotaOnes = append(quotaOnes, l)

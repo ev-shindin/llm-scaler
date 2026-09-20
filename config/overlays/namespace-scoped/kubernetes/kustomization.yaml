@@ -29,3 +29,6 @@ components:
 # controller cannot resolve accelerators without this. Applied by the prereqs
 # phase along with the rest of the cluster-scoped RBAC.
 - ../../../components/node-reader/
+# Kueue ClusterQueues and ResourceFlavors are cluster-scoped too; a quota entry
+# with kueue.enabled reads them. Inert on a cluster without Kueue.
+- ../../../components/kueue-reader/
