@@ -340,11 +340,28 @@ preparer's readiness and the guard are for), and each node's cache is warm
 from the second start on that node -- the first start on a node compiles once (measured: 76 s and
 81 s on two nodes whose cache was empty, then 55 s and 55 s; 50 s on a
 third whose cache a previous pod had already filled), as on the shared
-claim the first start anywhere did. The caches are keyed by a hash of the
+claim the first start anywhere did. That is the node-local cache's own
+edge: the scheduler spreads replicas across the accelerator nodes, so
+until every node has started an engine once, a scale-up can land on a
+cold one (measured on a benchmark pass: the second replica on a node no
+engine had used since the switch, Ready 96 s after it was wanted). So
+**seed it**: `ENGINE_CACHE_SEED_CLAIM=<claim>[:<subPath>]` names a claim
+in the namespace -- the shared RWX claim the caches lived on before is
+the natural one -- and the preparer mounts it read-only and copies its
+caches onto each node as it prepares it, once (a marker), keeping
+whatever the node already has. The caches are portable across nodes of
+one accelerator model, driver and engine version, keyed by a hash of the
 engine config, so one claim per namespace serves every model and flag set
-in it, and a changed engine misses rather than hits stale. Keep the guard
-from the table: a node the preparer has not reached (`engine-cache-status`
-lists it) costs a compile, not the replica.
+in it, a changed engine misses rather than hits stale, and a seeded node
+starts warm on its first engine. Keep the guard from the table: a node the
+preparer has not reached (`engine-cache-status` lists it, with the seed)
+costs a compile, not the replica.
+
+```bash
+# the caches this namespace already has on its shared claim, onto every node
+make engine-cache ENGINE_CACHE_PATH=/mnt/local/weights/<ns> ENGINE_CACHE_IMAGE=<engine image> \
+     ENGINE_CACHE_SEED_CLAIM=<shared claim>[:<subPath>] NAMESPACE=<ns>
+```
 
 What it costs, and what it needs, is the weights section's list with two
 things changed. The size: a few gigabytes per engine config per node rather

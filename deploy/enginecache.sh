@@ -16,10 +16,13 @@
 # selected node and then reports Ready. The model servers mount the claim
 # exactly as they mount any other; a hostPath is a bind mount with no
 # storage driver in its path, and each node's cache is warm from the second
-# start on that node. (The filesystem under it can still go read-only --
-# that is what the preparer's readiness and the engines' guard are for.)
+# start on that node -- or from the first, with --seed-claim, which copies a
+# shared claim's caches onto each node as it is prepared. (The filesystem
+# under it can still go read-only -- that is what the preparer's readiness
+# and the engines' guard are for.)
 #
-#   enginecache.sh apply  -n NS --path DIR --image IMG [--dry-run]   prepare DIR/engine-cache on every accelerator node
+#   enginecache.sh apply  -n NS --path DIR --image IMG [--seed-claim PVC[:SUBPATH]] [--dry-run]
+#                                                                     prepare DIR/engine-cache on every accelerator node
 #   enginecache.sh status -n NS [--node-selector KEY=VALUE]           which nodes are prepared, which are not, and why
 #   enginecache.sh delete -n NS [--dry-run]                           drop the claim, volume and preparer (the caches stay)
 #
@@ -36,6 +39,18 @@
 #                               side effect
 #   --capacity SIZE             the volume's declared capacity (default 200Gi;
 #                               it is a declaration, hostPath has no quota)
+#   --seed-claim PVC[:SUBPATH]  a claim in the namespace holding caches to
+#                               copy onto each node before it is prepared --
+#                               the shared claim the caches lived on before,
+#                               or one filled once on purpose. Mounted
+#                               read-only; copied without overwriting what
+#                               the node already has; once per node (a
+#                               marker). The caches are portable across
+#                               nodes of one accelerator model, driver and
+#                               engine version: without a seed the first
+#                               start on EVERY node compiles (the scheduler
+#                               spreads replicas, so that is one cold start
+#                               per node), with one no node starts cold.
 #   --node-selector KEY=VALUE   which nodes count as accelerator nodes. The
 #                               default is any node carrying a known GPU
 #                               product label (deploy/lib/accelerator_nodes.sh);
@@ -113,6 +128,9 @@ STORAGE_CLASS="node-local-engine-cache"
 CLAIM="engine-cache"
 SUBDIR="engine-cache"
 MARKER=".prepared"
+SEED_MARKER=".seeded"
+SEED_CLAIM=""
+SEED_SUBPATH=""
 SA_NAME="engine-cache-preparer"
 
 usage() {
@@ -151,10 +169,49 @@ for d in vllm flashinfer triton; do
   mkdir -p "/engine-cache/$d" || exit 1
   chmod 1777 "/engine-cache/$d" 2>/dev/null || true
 done
+if [ -d /seed ] && [ ! -f "/engine-cache/$SEED_MARKER" ]; then
+  seeded=""
+  for d in vllm flashinfer triton; do
+    [ -d "/seed/$d" ] || continue
+    cp -a -n "/seed/$d/." "/engine-cache/$d/" 2>/dev/null || true
+    seeded="$seeded $d"
+  done
+  touch "/engine-cache/$SEED_MARKER" || exit 1
+  echo "engine cache: seeded$seeded on $HOSTNAME from the seed claim (what the node already had was kept)"
+fi
 touch "/engine-cache/$MARKER" || exit 1
 echo "engine cache: prepared on $HOSTNAME: /engine-cache/{vllm,flashinfer,triton}"
 trap 'exit 0' TERM; while :; do sleep 3600 & wait; done
 SCRIPT
+}
+
+# seed_volume_yaml and seed_mount_yaml print the seed claim's volume and its
+# read-only mount at /seed when --seed-claim was given, nothing otherwise.
+seed_volume_yaml() {
+    [ -n "$SEED_CLAIM" ] || return 0
+    printf '        - name: seed\n          persistentVolumeClaim:\n            claimName: %s\n            readOnly: true\n' "$SEED_CLAIM"
+}
+seed_mount_yaml() {
+    [ -n "$SEED_CLAIM" ] || return 0
+    printf '            - name: seed\n              mountPath: /seed\n              readOnly: true\n'
+    [ -z "$SEED_SUBPATH" ] || printf '              subPath: %s\n' "$SEED_SUBPATH"
+}
+
+# check_seed refuses a seed that is not a claim name with an optional subPath
+# under it: the claim is mounted as given, and a subPath with '..' would
+# reach outside it.
+check_seed() {
+    local claim="${1%%:*}" sub=""
+    [ "$claim" = "$1" ] || sub="${1#*:}"
+    case "$claim" in
+        ""|*[!a-z0-9.-]*) log_error "--seed-claim: not a claim name: '${claim}' (a DNS-1123 name, with an optional :subPath)" ;;
+    esac
+    [ "$claim" != "$CLAIM" ] || log_error "--seed-claim: the seed cannot be the engine-cache claim itself"
+    case "$sub" in
+        *..*|/*|*[!A-Za-z0-9._/-]*) log_error "--seed-claim: not a subPath: '${sub}' (relative, path characters, no '..')" ;;
+    esac
+    SEED_CLAIM="$claim"
+    SEED_SUBPATH="$sub"
 }
 
 # render prints the ServiceAccount, the volume, the claim and the preparer.
@@ -234,6 +291,7 @@ metadata:
   annotations:
     wva.llmd.ai/engine-cache-path: "${NODE_PATH}/${SUBDIR}"
     wva.llmd.ai/engine-cache-node-selector: "${NODE_SELECTOR}"
+    wva.llmd.ai/engine-cache-seed: "${SEED_CLAIM}${SEED_SUBPATH:+:$SEED_SUBPATH}"
 spec:
   selector:
     matchLabels:
@@ -264,6 +322,7 @@ $(for t in "${TOLERATIONS[@]}"; do printf '        - key: "%s"\n          operat
         - name: engine-cache
           persistentVolumeClaim:
             claimName: ${CLAIM}
+$(seed_volume_yaml)
       containers:
         - name: prepare
           image: "${IMAGE}"
@@ -284,6 +343,8 @@ $(preparer_script | sed 's/^/              /')
           env:
             - name: MARKER
               value: "${MARKER}"
+            - name: SEED_MARKER
+              value: "${SEED_MARKER}"
             # Engine images bake in NVIDIA_VISIBLE_DEVICES=all, and the NVIDIA
             # runtime honours it from a container that requested no GPU.
             - name: NVIDIA_VISIBLE_DEVICES
@@ -291,6 +352,7 @@ $(preparer_script | sed 's/^/              /')
           volumeMounts:
             - name: engine-cache
               mountPath: /engine-cache
+$(seed_mount_yaml)
           # Ready is "prepared, and writable by this UID": what the engines
           # will find, as the UID they run as.
           readinessProbe:
@@ -346,8 +408,13 @@ cmd_apply() {
     if [ -n "$applied" ] && [ "$applied" != "${NODE_PATH}/${SUBDIR}" ]; then
         log_error "namespace ${NAMESPACE} already has its engine cache at ${applied} (volume ${volume}); the claim's volume cannot change. enginecache.sh delete -n ${NAMESPACE} first (the caches on the nodes stay), then apply with the new --path"
     fi
+    if [ -n "$SEED_CLAIM" ]; then
+        local seed_phase
+        seed_phase="$(kubectl get pvc -n "$NAMESPACE" "$SEED_CLAIM" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        [ "$seed_phase" = Bound ] || log_error "--seed-claim ${SEED_CLAIM}: no Bound claim of that name in ${NAMESPACE} (found: '${seed_phase:-none}'); the preparer would mount it and never start"
+    fi
     render | kubectl apply -f - >/dev/null
-    log_info "preparing ${NODE_PATH}/${SUBDIR} on $(accelerator_selector_text "$NODE_SELECTOR"); claim ${CLAIM} -- mount it read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR and TRITON_CACHE_DIR under it"
+    log_info "preparing ${NODE_PATH}/${SUBDIR} on $(accelerator_selector_text "$NODE_SELECTOR"); claim ${CLAIM}${SEED_CLAIM:+, seeded from ${SEED_CLAIM}${SEED_SUBPATH:+:$SEED_SUBPATH}} -- mount it read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR and TRITON_CACHE_DIR under it"
     if kubectl api-resources --api-group=security.openshift.io 2>/dev/null | grep -q securitycontextconstraints; then
         log_warning "OpenShift: the preparer and the engines run as the project UID (GID 0) under restricted-v2 and the kubelet does not relabel a hostPath; on each node, before this takes: mkdir -p ${NODE_PATH}/${SUBDIR} && chgrp 0 ${NODE_PATH}/${SUBDIR} && chmod 2775 ${NODE_PATH}/${SUBDIR} && chcon -t container_file_t ${NODE_PATH}/${SUBDIR} (oc debug node/<n> -- chroot /host ...), or a MachineConfig mount with context=system_u:object_r:container_file_t:s0. Not yet run on OpenShift"
     fi
@@ -415,7 +482,9 @@ cmd_status() {
     pods_file="$(mktemp)"
     kubectl get pods -n "$NAMESPACE" -l "$LABEL_COMPONENT" -o json > "$pods_file"
     bound="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    echo "${path}  (claim ${CLAIM}: ${bound:-missing}; nodes: $(accelerator_selector_text "$selector"))"
+    local seed
+    seed="$(kubectl get daemonset -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.metadata.annotations.wva\.llmd\.ai/engine-cache-seed}' 2>/dev/null || true)"
+    echo "${path}  (claim ${CLAIM}: ${bound:-missing}; seed: ${seed:-none}; nodes: $(accelerator_selector_text "$selector"))"
     if [ "$bound" != Bound ]; then
         rc=1
         [ -z "$bound" ] || echo "  the claim is not bound: its volume is cluster-scoped and was not created -- apply needs leave to create PersistentVolumes (ask the cluster admin to run apply)"
@@ -514,7 +583,7 @@ esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        -n|--namespace|--path|--image|--capacity|--node-selector|--toleration)
+        -n|--namespace|--path|--image|--capacity|--seed-claim|--node-selector|--toleration)
             [ $# -ge 2 ] || log_error "$1 needs a value" ;;
     esac
     case "$1" in
@@ -522,6 +591,7 @@ while [ $# -gt 0 ]; do
         --path) NODE_PATH="$2"; shift 2 ;;
         --image) IMAGE="$2"; shift 2 ;;
         --capacity) CAPACITY="$2"; shift 2 ;;
+        --seed-claim) check_seed "$2"; shift 2 ;;
         --node-selector) NODE_SELECTOR="$2"; NODE_SELECTOR_GIVEN=true; shift 2 ;;
         --toleration) accelerator_check_toleration "$2"; TOLERATIONS+=("$2"); shift 2 ;;
         --dry-run) [ "$CMD" != status ] || log_error "--dry-run applies to apply and delete, not status"; DRY_RUN=true; shift ;;
