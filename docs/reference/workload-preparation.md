@@ -290,13 +290,13 @@ The caches in the table above -- torch.compile, FlashInfer autotune, Triton
 JIT -- are worth keeping only if the next replica finds them, and on a
 shared RWX claim that holds until the claim does not. Measured on one
 cluster: nine starts of one decode pod spec, three per node on three nodes,
-were repeatable within a second on a node and split by node into 51-56 s
-and 75-81 s. The 25 s was the cache. On the slow nodes the CSI driver had
+were repeatable within 2.5 s on a node and split by node into 51-56 s and
+75-81 s. The 25 s was the cache. On the slow nodes the CSI driver had
 published the shared claim read-only (`ro` in `/proc/mounts`; `touch` fails
 with "Read-only file system"), the guard in the engine's command fell back
 to the engine default under `/tmp`, and every start on those nodes compiled
 from nothing: 14.4 s of torch.compile against 2.9 s from the cache, and
-~10 s more in the API server before the engine came up. Which node a
+8 s more in the API server before the engine came up. Which node a
 replica landed on decided its start time, and nothing in the pod said so.
 
 ```bash
@@ -333,28 +333,51 @@ containers:
       - {name: TRITON_CACHE_DIR,         value: /engine-cache/triton}
 ```
 
-A hostPath is a bind mount: no storage driver publishes it, so nothing
-publishes it read-only, and each node's cache is warm from the second start
-on that node -- the first start on a node compiles once, as on the shared
+A hostPath is a bind mount with no storage driver in its path, so no
+driver publishes it read-only (the filesystem under it can still go
+read-only -- an NVMe error, an admin's remount -- which is what the
+preparer's readiness and the guard are for), and each node's cache is warm
+from the second start on that node -- the first start on a node compiles once (measured: 76 s and
+81 s on two nodes whose cache was empty, then 55 s and 55 s; 50 s on a
+third whose cache a previous pod had already filled), as on the shared
 claim the first start anywhere did. The caches are keyed by a hash of the
 engine config, so one claim per namespace serves every model and flag set
 in it, and a changed engine misses rather than hits stale. Keep the guard
 from the table: a node the preparer has not reached (`engine-cache-status`
 lists it) costs a compile, not the replica.
 
-What it costs, and what it needs, is the weights section's list with the
-numbers changed: a few gigabytes per engine config per node rather than a
-model; the same cluster-shared, root-writable directory rules (one
-directory per trust domain, a disk that is not the node's own, never a
-system path -- the script refuses the same paths); leave to create
-PersistentVolumes (the claim's `ENGINE_CACHE_CAPACITY`, 200Gi unless set,
-is what a storage quota charges); Pod Security `baseline` (the preparer
-mounts the claim, not a hostPath). On OpenShift -- by analysis, not yet
-run there -- `restricted-v2` runs the preparer and the engines as the
-project's range UID, and the kubelet does not relabel a hostPath: prepare
+What it costs, and what it needs, is the weights section's list with two
+things changed. The size: a few gigabytes per engine config per node rather
+than a model. And what the directory holds: **code**. The caches are
+torch.compile artefacts, FlashInfer and Triton kernels that every engine
+on the node loads and runs, and the three directories are world-writable
+(1777: any UID the engines run as can write; sticky, so one UID's files are
+not another's to remove). Whoever can write the directory runs code in
+every engine on that node. On Kubernetes that is anyone with `pods/create`
+in a namespace that can mount the claim -- no more than `pods/create`
+already grants, since such a pod runs as root and could overwrite the
+weights too -- and across namespaces it is everyone pointed at the same
+directory. So the weights section's rules hold harder here: one directory
+per trust domain, on a disk that is not the node's own, never a system
+path (the script refuses the same paths); and wipe `<dir>/engine-cache` on
+the nodes when a namespace or a directory changes hands -- `delete` keeps
+the caches, and a new tenant of the same namespace name and directory
+would load the old one's. 1777 is a trade-off, taken so the engines need no
+`fsGroup`; a namespace that runs its engines under one UID and wants the
+separation can `chown` the three directories to it and `chmod 1770` them
+on each node. The rest is the same: leave to create PersistentVolumes (the
+claim's `ENGINE_CACHE_CAPACITY`, 200Gi unless set, is what a storage quota
+charges); Pod Security `baseline` (the preparer mounts the claim, not a
+hostPath). On OpenShift -- by analysis, not yet run there --
+`restricted-v2` runs the preparer and the engines as the project's range
+UID, and the kubelet does not relabel a hostPath: prepare
 `<dir>/engine-cache` on each node as the weights section says (`chgrp 0`,
-`chmod 2775`, `chcon -t container_file_t`, or a `context=` mount), and
-the preparer's own `chmod` becomes a no-op it does not need.
+`chmod 2775`, `chcon -t container_file_t`, or a `context=` mount). The
+preparer then creates the three directories inside it as that UID, owns
+them, and its `chmod 1777` takes; the files carry the project's SELinux
+level, so another project's pods cannot read them unless the disk is
+mounted with `context=`, in which case the directory split is the only
+separation.
 
 The benchmark standup has the same measure under
 `BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>`, which defaults to

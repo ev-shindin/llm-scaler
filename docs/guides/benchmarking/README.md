@@ -421,10 +421,10 @@ leaves its script without a trailing newline.)
 
 That fallback is silent and it is the start-time variance: nine bare starts
 of the decode pod spec, three per node on three nodes, were repeatable
-within a second on a node and split by node into 51-56 s and 75-81 s, and
+within 2.5 s on a node and split by node into 51-56 s and 75-81 s, and
 the slow nodes were the ones where `workload-pvc` had come up read-only --
 every start there compiled from nothing (14.4 s against 2.9 s from the
-cache, and ~10 s more before the engine). `BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>`
+cache, and 8 s more before the engine). `BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>`
 (defaulting to `BENCHMARK_MODEL_HOSTPATH`, so one directory turns both on)
 makes the standup put the caches on the node's disk instead: it runs
 `deploy/enginecache.sh apply` with the harness's engine image -- one

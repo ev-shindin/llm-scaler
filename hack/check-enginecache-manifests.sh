@@ -88,11 +88,12 @@ check("$(" not in script and "$$" not in script, "the command carries no $( or $
 for sub in ("vllm", "flashinfer", "triton"):
     check('mkdir -p "/engine-cache/$d"' in script, "one mkdir loop")
 check("for d in vllm flashinfer triton" in script and "chmod 1777" in script, "the three cache directories, world-writable and sticky")
-check("touch /engine-cache/.prepared" in script, "the marker is written after the directories")
+check('touch "/engine-cache/$MARKER"' in script and env["MARKER"]["value"] == ".prepared", "the marker is written after the directories, its name from the environment")
 check("trap 'exit 0' TERM" in script and "sleep 3600" in script, "then the pod stays, so numberReady counts prepared nodes")
 check(c["command"] == ["/bin/sh", "-c"], "sh -c with the script as args")
 probe = c["readinessProbe"]["exec"]["command"]
 check(probe == ["/bin/sh", "-c", "test -f /engine-cache/.prepared && test -w /engine-cache/vllm"], "Ready is the marker AND the directory writable by this UID: %s" % probe)
+check("$HOSTNAME" in script, "the command is rendered as written, not evaluated on the operator's machine")
 res = c.get("resources", {})
 for section in ("requests", "limits"):
     for k in res.get(section, {}):
@@ -115,6 +116,8 @@ for b in bad:
 sys.exit(1 if bad else 0)
 PYEOF
 [ "$FAILED" = 0 ] && ok "render: volume, claim and preparer have the shape the header promises"
+n="$(grep -c "cat <<'SCRIPT'" deploy/enginecache.sh)"
+[ "$n" = 1 ] && grep -q '^\$(preparer_script | sed' deploy/enginecache.sh && ok "render: the preparer's command comes from a quoted heredoc, so nothing in it is evaluated at apply time" || fail "render: the preparer's command is not in a quoted heredoc ($n)"
 
 # ---------------------------------------------------------------------------
 # 2. What apply refuses, before any kubectl.
@@ -223,6 +226,147 @@ for sc in hack/benchmark/scenarios/guides/pd-disaggregation.yaml; do
     fi
 done
 
+
+# ---------------------------------------------------------------------------
+# 3b. status and delete, offline, against a stub kubectl with fake objects.
+# ---------------------------------------------------------------------------
+LBL='app.kubernetes.io/component=node-local-engine-cache,app.kubernetes.io/managed-by=wva-enginecache'
+PVNAME="$(yq -r 'select(.kind == "PersistentVolume") | .metadata.name' "$T/render-default.yaml")"
+[ -n "$PVNAME" ] || fail "no volume name in the rendered manifests"
+cat > "$T/nodes.json" <<EOF
+{"items":[
+ {"metadata":{"name":"node-ready",   "labels":{"nvidia.com/gpu.product":"H200"}}},
+ {"metadata":{"name":"node-notready","labels":{"gpu.nvidia.com/model":"H200"}}},
+ {"metadata":{"name":"node-failing", "labels":{"nvidia.com/gpu.product":"H200"}}},
+ {"metadata":{"name":"node-nopod",   "labels":{"nvidia.com/gpu.product":"H200"}}},
+ {"metadata":{"name":"node-cpu",     "labels":{"gpu.nvidia.com/model":""}}},
+ {"metadata":{"name":"node-evicted", "labels":{"nvidia.com/gpu.product":"H200"}}}
+]}
+EOF
+cat > "$T/pods.json" <<EOF
+{"items":[
+ {"metadata":{"name":"ec-ready","labels":{"wva.llmd.ai/engine-cache":"engine-cache"}},"spec":{"nodeName":"node-ready"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
+ {"metadata":{"name":"ec-notready","labels":{"wva.llmd.ai/engine-cache":"engine-cache"}},"spec":{"nodeName":"node-notready"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"running":{}}}]}},
+ {"metadata":{"name":"ec-failing","labels":{"wva.llmd.ai/engine-cache":"engine-cache"}},"spec":{"nodeName":"node-failing"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}},"lastState":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+ {"metadata":{"name":"other","labels":{"wva.llmd.ai/engine-cache":"other"}},"spec":{"nodeName":"node-nopod"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"state":{"running":{}}}]}},
+ {"metadata":{"name":"ec-evicted","labels":{"wva.llmd.ai/engine-cache":"engine-cache"}},"spec":{"nodeName":"node-evicted"},"status":{"phase":"Failed","reason":"Evicted","message":"The node had condition: [DiskPressure]."}}
+]}
+EOF
+# the volumes carrying our labels: ours, the same claim in another namespace,
+# and one whose claimRef is a weights claim that somehow carries our labels
+cat > "$T/pvs.json" <<EOF
+{"items":[
+ {"metadata":{"name":"${PVNAME}"},                   "spec":{"claimRef":{"namespace":"check-ns","name":"engine-cache"}}},
+ {"metadata":{"name":"engine-cache-othernamespace"}, "spec":{"claimRef":{"namespace":"other-ns","name":"engine-cache"}}},
+ {"metadata":{"name":"engine-cache-not-this-claim"}, "spec":{"claimRef":{"namespace":"check-ns","name":"weights-x"}}}
+]}
+EOF
+cat > "$T/bin/kubectl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$T/calls"
+ARGV=" \$* "
+want() { case "\$ARGV" in *" \$1 \$2 "*) ;; *) echo "stub kubectl: \$1 \$2 missing from:\$ARGV" >&2; exit 2 ;; esac; }
+refuse() { case "\$ARGV" in *" \$1 "*) echo "stub kubectl: unexpected \$1 in:\$ARGV" >&2; exit 2 ;; esac; }
+case "\$1 \$2" in
+  "get nodes")   if [ -n "\${STUB_SELECTOR:-}" ]; then want -l "\$STUB_SELECTOR"; else refuse -l; fi
+                 [ -n "\${STUB_NODES_ERROR:-}" ] && { echo "\$STUB_NODES_ERROR" >&2; exit 1; }
+                 cat "$T/nodes.json" ;;
+  "get pods")    want -n check-ns; want -l "$LBL"; cat "$T/pods.json" ;;
+  "get daemonset")
+      want -n check-ns
+      case "\$ARGV" in *" engine-cache "*) ;; *) echo "stub kubectl: get daemonset for a name that is not the DaemonSet:\$ARGV" >&2; exit 2 ;; esac
+      case "\$ARGV" in
+        *"engine-cache-path}"*) printf '%s' "\${STUB_DS_PATH-/mnt/local/weights/check-ns/engine-cache}" ;;
+        *"jsonpath={.spec.template.spec.nodeSelector}"*)
+           if [ -n "\${STUB_DS_SELECTOR:-}" ]; then jq -cn --arg k "\${STUB_DS_SELECTOR%%=*}" --arg v "\${STUB_DS_SELECTOR#*=}" '{(\$k): \$v}'; else printf '{}'; fi ;;
+        *) echo "stub kubectl: unexpected daemonset read:\$ARGV" >&2; exit 2 ;;
+      esac ;;
+  "get pvc")
+      want -n check-ns
+      case "\$ARGV" in *" engine-cache "*) ;; *) echo "stub kubectl: the claim read names no claim:\$ARGV" >&2; exit 2 ;; esac
+      case "\$ARGV" in
+        *"jsonpath={.status.phase}"*) printf '%s' "\${STUB_PVC_PHASE-Bound}" ;;
+        *"jsonpath={.metadata.name}/{.spec.storageClassName}"*) [ -z "\${STUB_PVC_PHASE-Bound}" ] || printf 'engine-cache/%s' "\${STUB_PVC_CLASS-}" ;;
+        *"jsonpath={.spec.storageClassName}"*) printf '%s' "\${STUB_PVC_CLASS-}" ;;
+        *) echo "stub kubectl: unexpected pvc read:\$ARGV" >&2; exit 2 ;;
+      esac ;;
+  "get events")  want -n check-ns; printf '%s' "\${STUB_EVENT:-}" ;;
+  "logs -n")     want -n check-ns; printf '%s\n' "\${STUB_LOG:-}" ;;
+  "auth can-i")  case "\$ARGV" in *" create persistentvolumes -A -q "*) [ -z "\${STUB_NO_PV:-}" ] || exit 1; exit 0 ;; *) echo "stub kubectl: unexpected can-i:\$ARGV" >&2; exit 2 ;; esac ;;
+  "api-resources --api-group=security.openshift.io") [ -n "\${STUB_OPENSHIFT:-}" ] && echo "securitycontextconstraints scc security.openshift.io/v1 false SecurityContextConstraints"; : ;;
+  "apply -f")    cat >/dev/null; echo applied ;;
+  "delete daemonset"|"delete pvc"|"delete serviceaccount") want -n check-ns; echo deleted ;;
+  "get pv")      want -l "$LBL"; want -o json; refuse -n; cat "$T/pvs.json" ;;
+  "delete pv")   refuse -n; echo deleted ;;
+  *) echo "stub kubectl: unexpected \$*" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$T/bin/kubectl"
+: > "$T/calls"
+PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns > "$T/status.out" 2>&1; rc=$?
+expect_line() { if grep -qE "^  $1 +$2 " "$T/status.out"; then ok "status: $1 -> $2"; else fail "status: $1 expected $2; got: $(grep -E "^  $1 " "$T/status.out" || echo none)"; fi; }
+expect_line node-ready    prepared
+grep -qE '^  node-ready +prepared +Ready *$' "$T/status.out" && ok "status: a healthy row ends at its phase (an empty reason is not swallowed)" || fail "status: healthy row: $(grep '^  node-ready' "$T/status.out")"
+expect_line node-notready absent
+grep -qE '^  node-notready +absent +Running \(not ready\)' "$T/status.out" && ok "status: a preparer that is up but not Ready (the directory not writable by its UID) is not prepared" || fail "status: not-ready row: $(grep '^  node-notready' "$T/status.out")"
+expect_line node-failing  absent
+grep -q 'node-failing .*CrashLoopBackOff (last exit 1 Error)' "$T/status.out" && ok "status: a crash-looping preparer carries its reason and last exit" || fail "status: failing row: $(grep '^  node-failing' "$T/status.out")"
+expect_line node-nopod    absent
+grep -qE '^  node-nopod +absent +no pod' "$T/status.out" && ok "status: a node the DaemonSet did not reach is 'no pod' (another DaemonSet's pod there does not count)" || fail "status: nopod row: $(grep '^  node-nopod' "$T/status.out")"
+expect_line node-evicted  absent
+grep -q 'node-evicted .*Evicted' "$T/status.out" && ok "status: an evicted preparer shows its reason" || fail "status: Evicted reason missing"
+grep -q '^  node-cpu ' "$T/status.out" && fail "status: a node with an empty product label was counted" || ok "status: the default placement leaves the empty-label node out"
+grep -q 'Permission denied\|Read-only' "$T/status.out" && fail "status: a permission diagnosis with no such error in the log" || ok "status: no permission diagnosis when the log shows none"
+grep -q '1/5 nodes prepared; 4 not' "$T/status.out" && ok "status: the tally counts only Ready as prepared" || fail "status: tally: $(grep 'nodes prepared' "$T/status.out")"
+grep -q "claim engine-cache: Bound" "$T/status.out" && grep -q '^/mnt/local/weights/check-ns/engine-cache  (claim' "$T/status.out" && ok "status: reports the directory (off the DaemonSet's annotation) and the claim Bound" || fail "status: header: $(head -1 "$T/status.out")"
+[ "$rc" -ne 0 ] && ok "status: exits non-zero while a node is not prepared" || fail "status: exit 0 with nodes not prepared"
+grep -q 'stub kubectl:' "$T/status.out" && fail "status: a kubectl call lacked its scope: $(grep 'stub kubectl:' "$T/status.out" | head -1)" || ok "status: every kubectl call carried -n / -l"
+STUB_LOG='mkdir: cannot create directory /engine-cache/vllm: Read-only file system' PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns > "$T/eacces.out" 2>&1 || true
+grep -q 'cannot write /mnt/local/weights/check-ns/engine-cache: Read-only file system in its log' "$T/eacces.out" && grep -q 'chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR' "$T/eacces.out" && ok "status: a preparer dying on a read-only or denied directory is named, with the node-directory steps" || fail "status EACCES diagnosis: $(grep -c 'cannot write' "$T/eacces.out") line(s)"
+grep -q '^logs -n check-ns ec-failing --tail=20$' "$T/calls" && ok "status: the log read names the failing pod, no other" || fail "status: log read: $(grep '^logs' "$T/calls" | head -2 | tr '\n' ';')"
+if STUB_DS_PATH="" PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns > "$T/none.out" 2>&1; then fail "status with no DaemonSet must fail"; else grep -q 'no engine-cache DaemonSet' "$T/none.out" && ok "status: no DaemonSet is refused with a reason" || fail "status: $(tail -1 "$T/none.out")"; fi
+: > "$T/calls"
+STUB_DS_SELECTOR=example.com/accelerator=h200 STUB_SELECTOR=example.com/accelerator=h200 PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns >/dev/null 2>&1 || true
+grep -q 'get nodes -l example.com/accelerator=h200' "$T/calls" && ok "status: lists the nodes the DaemonSet was applied for (its live nodeSelector)" || fail "status: live selector not used: $(grep 'get nodes' "$T/calls")"
+if STUB_DS_SELECTOR='a=b"c' PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns > "$T/edited.out" 2>&1; then fail "status must refuse a DaemonSet nodeSelector that is not label characters"; else
+    grep -q 'this script did not write' "$T/edited.out" && ok "status: a DaemonSet nodeSelector this script did not write is refused before kubectl" || fail "status on an edited DaemonSet: $(tail -1 "$T/edited.out")"; fi
+if STUB_NODES_ERROR='Error from server (Forbidden): nodes is forbidden: User cannot list' PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns > "$T/forb.out" 2>&1; then fail "status must fail when nodes cannot be listed"; else
+    grep -q 'cluster-reader' "$T/forb.out" && ok "status: a Forbidden node list names the permission (cluster-reader)" || fail "status Forbidden: $(tail -1 "$T/forb.out")"; fi
+if STUB_PVC_PHASE=Pending PATH="$STUB_PATH" bash deploy/enginecache.sh status -n check-ns > "$T/pending.out" 2>&1; then fail "status must fail while the claim is not Bound"; else grep -q 'the claim is not bound: its volume is cluster-scoped and was not created' "$T/pending.out" && ok "status: an unbound claim is reported with why, and fails" || fail "status: unbound claim: $(head -2 "$T/pending.out" | tr '\n' ';')"; fi
+# apply: refuses before anything lands without PV rights; refuses a foreign claim; the OpenShift notice
+: > "$T/calls"
+if STUB_NO_PV=1 STUB_PVC_PHASE="" PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" > "$T/nopv.out" 2>&1; then fail "apply must refuse without leave to create PersistentVolumes"; else
+    grep -q 'leave to create PersistentVolumes' "$T/nopv.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: without leave to create PersistentVolumes nothing is applied" || fail "apply without PV rights: $(tail -1 "$T/nopv.out"); calls: $(grep '^apply' "$T/calls")"; fi
+: > "$T/calls"
+if STUB_PVC_CLASS=shared-vast PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" > "$T/foreign.out" 2>&1; then fail "apply must refuse a same-named claim on another class"; else
+    grep -q "already has a claim named engine-cache on storage class 'shared-vast'" "$T/foreign.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: a claim named engine-cache on another class is refused, nothing applied" || fail "apply foreign claim: $(tail -1 "$T/foreign.out")"; fi
+: > "$T/calls"
+STUB_PVC_CLASS=node-local-engine-cache PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" > "$T/apply.out" 2>&1 || true
+grep -q '^apply -f' "$T/calls" && grep -q 'preparing /mnt/local/weights/check-ns/engine-cache on' "$T/apply.out" && grep -q '^  node-ready ' "$T/apply.out" && ok "apply: applies, says what it prepared where, and reports per node" || fail "apply: $(head -3 "$T/apply.out" | tr '\n' ';')"
+grep -q 'OpenShift:' "$T/apply.out" && fail "apply: the OpenShift notice printed on a cluster without SCCs" || ok "apply: no OpenShift notice on a cluster without SecurityContextConstraints"
+# a re-apply with another directory is refused: the claim's volume cannot change
+: > "$T/calls"
+if STUB_PVC_CLASS=node-local-engine-cache PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/other --image "$IMG" > "$T/moved.out" 2>&1; then fail "apply must refuse a second directory for a namespace that has one"; else
+    grep -q 'already has its engine cache at /mnt/local/weights/check-ns/engine-cache' "$T/moved.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: a re-apply with another --path is refused before anything lands (the claim's volume is immutable)" || fail "apply moved: $(tail -1 "$T/moved.out")"; fi
+# a claim of the name with no class at all is not ours either
+if STUB_DS_PATH="" STUB_PVC_CLASS="" PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" > "$T/noclass.out" 2>&1; then fail "apply must refuse an existing claim with no storage class"; else
+    grep -q "already has a claim named engine-cache on storage class ''" "$T/noclass.out" && ok "apply: an existing claim on no class is refused too" || fail "apply no-class claim: $(tail -1 "$T/noclass.out")"; fi
+STUB_DS_PATH="" STUB_PVC_PHASE="" STUB_OPENSHIFT=1 PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /var/mnt/weights/p --image "$IMG" > "$T/ocp.out" 2>&1 || true
+grep -q 'OpenShift: the preparer and the engines run as the project UID' "$T/ocp.out" && grep -q 'chcon -t container_file_t /var/mnt/weights/p/engine-cache' "$T/ocp.out" && ok "apply: on a cluster with SecurityContextConstraints the node-directory steps are printed, with the cache directory" || fail "apply on OpenShift: $(grep -c OpenShift "$T/ocp.out") notice(s)"
+# delete: DaemonSet, claim and ServiceAccount in the namespace; the volume found
+# by OUR labels and its claimRef into this namespace and claim, no other
+: > "$T/calls"
+PATH="$STUB_PATH" bash deploy/enginecache.sh delete -n check-ns >/dev/null 2>&1
+grep -q "^delete daemonset -n check-ns engine-cache --ignore-not-found" "$T/calls" && grep -q "^delete pvc -n check-ns engine-cache --ignore-not-found" "$T/calls" \
+    && grep -q "^delete pv ${PVNAME} --ignore-not-found" "$T/calls" && grep -q "^delete serviceaccount -n check-ns engine-cache-preparer" "$T/calls" && ok "delete: DaemonSet, claim, ServiceAccount, and the volume whose claimRef is this namespace's engine-cache" || fail "delete issued: $(grep delete "$T/calls" | tr '\n' ';')"
+grep -q '^get pvc' "$T/calls" && fail "delete: a claim was read for its volume name (a tenant writes that field)" || ok "delete: no claim is read for a volume name"
+grep -q "^delete pv .*othernamespace" "$T/calls" && fail "delete: another namespace's volume was deleted" || ok "delete: another namespace's volume is left alone"
+grep -q "^delete pv .*not-this-claim" "$T/calls" && fail "delete: a volume bound to another claim in this namespace was deleted" || ok "delete: a volume with our labels but another claimRef is left alone"
+grep -q "^get pv -l ${LBL} -o json" "$T/calls" && ok "delete: the volumes are listed by our labels, cluster-scoped" || fail "delete: pv listing: $(grep '^get pv' "$T/calls")"
+: > "$T/calls"
+PATH="$STUB_PATH" bash deploy/enginecache.sh delete -n check-ns --dry-run > "$T/dry.out" 2>&1
+grep -q '^delete ' "$T/calls" && fail "delete --dry-run deleted something" || ok "delete --dry-run: prints what would go, deletes nothing ($(grep -c 'would run' "$T/dry.out") lines)"
+
 # ---------------------------------------------------------------------------
 # 4. The Makefile: the targets' argv and the standup's step.
 # ---------------------------------------------------------------------------
@@ -246,6 +390,10 @@ if [ $# -ge 4 ] && [ "$1" -lt "$2" ] && [ "$2" -lt "$3" ] && [ "$3" -lt "$4" ]; 
 # make -n prints the recipe's shell text; the step is guarded by an if on the
 # variable, so with neither set the condition it prints is an empty test
 if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -B1 'img="";' | grep -q 'if \[ -n "" \]'; then ok "benchmark-standup: neither variable, the cache step's condition is empty (the shared volume, as before)"; else fail "benchmark-standup: the cache step is not behind an empty test with neither variable set"; fi
-if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -q -- '--path "/mnt/local/c"'; then ok "benchmark-standup: BENCHMARK_ENGINE_CACHE_HOSTPATH on its own takes its own directory" ; else fail "benchmark-standup: the cache directory did not reach the apply"; fi
+# make -n prints the recipe with the variables substituted, not evaluated: the
+# assertion is on the guard LINE (the if on the cache directory, with the
+# preparer's image assignment right after it), not on a token anywhere in it
+if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -A1 'if \[ -n "/mnt/local/c" \]; then' | grep -q 'img='; then ok "benchmark-standup: the cache step is guarded by BENCHMARK_ENGINE_CACHE_HOSTPATH itself" ; else fail "benchmark-standup: the cache step's guard is not on BENCHMARK_ENGINE_CACHE_HOSTPATH"; fi
+if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -q -- 'enginecache.sh apply -n "ns" --path "/mnt/local/c"'; then ok "benchmark-standup: BENCHMARK_ENGINE_CACHE_HOSTPATH on its own takes its own directory" ; else fail "benchmark-standup: the cache directory did not reach the apply"; fi
 
 exit $FAILED

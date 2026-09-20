@@ -10,13 +10,14 @@
 # and 75-81 s, and the 25 s was the shared claim being published read-only on
 # some nodes by the CSI driver, the engine falling back to an empty cache
 # under /tmp, and every start there compiling from nothing (14 s of
-# torch.compile against 3 s from the cache, and 10 s more before the engine).
+# torch.compile against 3 s from the cache, and 8 s more before the engine).
 # This puts the caches on the node: one static hostPath PersistentVolume, one
 # claim bound to it, and one DaemonSet that prepares the directory on every
 # selected node and then reports Ready. The model servers mount the claim
-# exactly as they mount any other; a hostPath is a bind mount, which no
-# storage driver can publish read-only, and each node's cache is warm from
-# the second start on that node.
+# exactly as they mount any other; a hostPath is a bind mount with no
+# storage driver in its path, and each node's cache is warm from the second
+# start on that node. (The filesystem under it can still go read-only --
+# that is what the preparer's readiness and the engines' guard are for.)
 #
 #   enginecache.sh apply  -n NS --path DIR --image IMG [--dry-run]   prepare DIR/engine-cache on every accelerator node
 #   enginecache.sh status -n NS [--node-selector KEY=VALUE]           which nodes are prepared, which are not, and why
@@ -56,18 +57,33 @@
 # not have -- ask the cluster admin to run apply, or to create the volume.
 # Nothing here uses a hostPath volume in a Pod (the preparer mounts the
 # claim), so Pod Security "baseline" admits it and "restricted" does not. The
-# node directory is cluster-shared, root-writable state, and what is written
-# there is charged to no quota: the same rules as weights.sh, one DIR per
-# trust domain, on a disk that is not the node's own. The preparer runs as
+# node directory is cluster-shared, WORLD-writable state (1777 on the three
+# cache directories, so any UID the engines run as can write; sticky, so one
+# UID's files are not another's to remove), what is written there is charged
+# to no quota, and what is written there is CODE: torch.compile artefacts,
+# FlashInfer and Triton kernels that every engine on the node loads and
+# runs. Whoever can write the directory runs code in every engine on that
+# node -- on Kubernetes that is anyone with pods/create in a namespace that
+# can mount the claim, which is no more than pods/create already grants,
+# and across namespaces it is everyone pointed at the same DIR. So the
+# rules are weights.sh's, harder: one DIR per trust domain, on a disk that
+# is not the node's own, and wipe DIR/engine-cache on the nodes when a
+# namespace or a directory changes hands -- delete keeps the caches, and a
+# new tenant of the same name and DIR would load the old one's. 1777 is a
+# trade-off, taken so the engines need no fsGroup; a namespace that runs
+# its engines under one UID and wants the separation can chown the three
+# directories to it and chmod them 1770 on each node. The preparer runs as
 # its own ServiceAccount, engine-cache-preparer.
 #
 # On OpenShift -- NOT YET RUN THERE -- restricted-v2 runs the preparer and
 # the engines as the project's range UID with GID 0, and the kubelet does not
-# relabel a hostPath: prepare DIR on each node as weights.sh --help says
-# (chgrp 0, chmod 2775, chcon -t container_file_t, or a MachineConfig mount
-# with context=...:container_file_t:s0), and the preparer's chmod is then a
-# no-op it does not need. `status` says when the preparer died on a
-# permission error.
+# relabel a hostPath: prepare DIR/engine-cache on each node as weights.sh
+# --help says (chgrp 0, chmod 2775, chcon -t container_file_t, or a
+# MachineConfig mount with context=...:container_file_t:s0). The preparer
+# then creates the three directories inside it as that UID, owns them, and
+# its chmod 1777 takes (the setgid bit is not inherited by a mode set
+# outright; the files carry the project's SELinux level either way). `status`
+# says when the preparer died on a permission error.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,6 +137,24 @@ check_image() {
         "") log_error "--image must not be empty" ;;
         *[!A-Za-z0-9._:/@-]*) log_error "not an image reference: '$1' (registry/path[:tag|@sha256:digest], no spaces or quotes)" ;;
     esac
+}
+
+# preparer_script is the preparer's command. A quoted heredoc: nothing in it
+# is bash's to evaluate at render time -- it runs on the node, as written. A
+# `$(...)` here would otherwise run on the operator's machine at apply and
+# bake its output into every node's manifest. The marker's name reaches it
+# as an environment variable. No `$(` and no `$$` in it: Kubernetes rewrites
+# both in a container's command.
+preparer_script() {
+    cat <<'SCRIPT'
+for d in vllm flashinfer triton; do
+  mkdir -p "/engine-cache/$d" || exit 1
+  chmod 1777 "/engine-cache/$d" 2>/dev/null || true
+done
+touch "/engine-cache/$MARKER" || exit 1
+echo "engine cache: prepared on $HOSTNAME: /engine-cache/{vllm,flashinfer,triton}"
+trap 'exit 0' TERM; while :; do sleep 3600 & wait; done
+SCRIPT
 }
 
 # render prints the ServiceAccount, the volume, the claim and the preparer.
@@ -235,24 +269,21 @@ $(for t in "${TOLERATIONS[@]}"; do printf '        - key: "%s"\n          operat
           image: "${IMAGE}"
           imagePullPolicy: IfNotPresent
           # One directory per cache, writable by any UID the engines run as
-          # (1777: sticky, so one UID's files are not another's to remove),
-          # then a marker, then the pod stays, Ready, so the DaemonSet's
-          # numberReady is the count of prepared nodes. The chmod is best
-          # effort: on a directory the admin prepared (OpenShift) it is not
-          # the preparer's to change and need not be. No command
-          # substitution and no double dollar in the command: Kubernetes
-          # rewrites both.
+          # (1777: sticky, so one UID's files are not another's to remove --
+          # and world-writable, so whoever can write here writes what every
+          # engine on the node will load; see the header), then a marker,
+          # then the pod stays, Ready, so the DaemonSet's numberReady is the
+          # count of prepared nodes. The preparer creates the three
+          # directories itself, so it owns them and the chmod takes, on
+          # Kubernetes as root and on OpenShift as the project UID inside
+          # the directory the admin prepared.
           command: ["/bin/sh", "-c"]
           args:
             - |
-              for d in vllm flashinfer triton; do
-                mkdir -p "/engine-cache/\$d" || exit 1
-                chmod 1777 "/engine-cache/\$d" 2>/dev/null || true
-              done
-              touch /engine-cache/${MARKER} || exit 1
-              echo "engine cache: prepared on \$HOSTNAME: /engine-cache/{vllm,flashinfer,triton}"
-              trap 'exit 0' TERM; while :; do sleep 3600 & wait; done
+$(preparer_script | sed 's/^/              /')
           env:
+            - name: MARKER
+              value: "${MARKER}"
             # Engine images bake in NVIDIA_VISIBLE_DEVICES=all, and the NVIDIA
             # runtime honours it from a container that requested no GPU.
             - name: NVIDIA_VISIBLE_DEVICES
@@ -295,12 +326,21 @@ cmd_apply() {
     if ! kubectl auth can-i create persistentvolumes -A -q 2>/dev/null; then
         log_error "apply needs leave to create PersistentVolumes (cluster-scoped), which a namespace tenant does not have -- ask the cluster admin to run apply (storage-admin on OpenShift)"
     fi
-    # A claim of this name on another class is somebody else's: the volume
-    # here would never bind to it, and the engines would go on using it.
+    # A claim of this name on another class (or on none) is somebody else's:
+    # the volume here would never bind to it, and the engines would go on
+    # using it. And a claim's volume is immutable: a second apply with a new
+    # --path would create a second volume, land the DaemonSet with the new
+    # directory in its annotation, and leave the claim bound to the old one
+    # -- status would then report a directory the engines do not mount.
     local existing
-    existing="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
-    if [ -n "$existing" ] && [ "$existing" != "$STORAGE_CLASS" ]; then
-        log_error "namespace ${NAMESPACE} already has a claim named ${CLAIM} on storage class '${existing}', which this script did not make; delete it or use a namespace without one"
+    existing="$(kubectl get pvc -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.metadata.name}/{.spec.storageClassName}' 2>/dev/null || true)"
+    if [ -n "$existing" ] && [ "${existing#*/}" != "$STORAGE_CLASS" ]; then
+        log_error "namespace ${NAMESPACE} already has a claim named ${CLAIM} on storage class '${existing#*/}', which this script did not make; delete it or use a namespace without one"
+    fi
+    local applied
+    applied="$(kubectl get daemonset -n "$NAMESPACE" "$CLAIM" -o jsonpath='{.metadata.annotations.wva\.llmd\.ai/engine-cache-path}' 2>/dev/null || true)"
+    if [ -n "$applied" ] && [ "$applied" != "${NODE_PATH}/${SUBDIR}" ]; then
+        log_error "namespace ${NAMESPACE} already has its engine cache at ${applied}; the claim's volume cannot change. enginecache.sh delete -n ${NAMESPACE} first (the caches on the nodes stay), then apply with the new --path"
     fi
     render | kubectl apply -f - >/dev/null
     log_info "preparing ${NODE_PATH}/${SUBDIR} on $(accelerator_selector_text "$NODE_SELECTOR"); claim ${CLAIM} -- mount it read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR and TRITON_CACHE_DIR under it"
@@ -389,8 +429,9 @@ cmd_status() {
             rc=1
         fi
         printf '  %-28s %-12s %s %s\n' "$node" "$has" "$phase" "$reason"
+        # the reason carries the last exit after it ("CrashLoopBackOff (last exit 1 Error)")
         case "$reason" in
-            CrashLoopBackOff|Error)
+            CrashLoopBackOff*|Error*)
                 if kubectl logs -n "$NAMESPACE" "$podname" --tail=20 2>/dev/null | grep -q 'Permission denied\|Read-only file system'; then
                     echo "    the preparer cannot write ${path}: $(kubectl logs -n "$NAMESPACE" "$podname" --tail=20 2>/dev/null | grep -o 'Permission denied\|Read-only file system' | head -1) in its log"
                     eacces=$((eacces + 1))
@@ -415,7 +456,7 @@ cmd_status() {
            ] | join("")')
     rm -f "$pods_file"
     if [ "$eacces" -gt 0 ]; then
-        echo "  ${eacces} node(s): the node directory is not writable by the preparer. On Kubernetes the preparer is root and the kubelet creates the directory root-owned, so this is a mount that is read-only or not there; on OpenShift it runs as the project UID (GID 0) under restricted-v2 and the directory is not relabelled -- on each node: mkdir -p DIR && chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR, or a MachineConfig mount with context=...:container_file_t:s0 (enginecache.sh --help)"
+        echo "  ${eacces} node(s): the node directory is not writable by the preparer. On Kubernetes the preparer is root and the kubelet creates the directory root-owned, so this is a mount that is read-only or not there, or a directory that already existed with another owner (ls -ld on the node); on OpenShift it runs as the project UID (GID 0) under restricted-v2 and the directory is not relabelled -- on each node: mkdir -p DIR && chgrp 0 DIR && chmod 2775 DIR && chcon -t container_file_t DIR, or a MachineConfig mount with context=...:container_file_t:s0 (enginecache.sh --help)"
     fi
     echo "  ${ready}/${node_count} nodes prepared; $((node_count - ready)) not"
     [ -n "$selector" ] || printf '%s' "$nodes_json" | accelerator_vendor_warning
