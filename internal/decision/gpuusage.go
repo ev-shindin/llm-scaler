@@ -135,37 +135,83 @@ var DefaultManagedGPUUsage = NewGPUUsageStore()
 var (
 	warmPoolGPUsMu sync.RWMutex
 	warmPoolGPUs   = map[string]map[string]int{}
+	// warmPoolGPUsVersion counts CHANGES to the figure, across all namespaces.
+	// It is what lets a pool tell whether a headroom snapshot was built after
+	// its own Pods were charged: the engine stamps the version it read onto the
+	// snapshot, and a snapshot older than the pool's last change is one that
+	// still credits the namespace with the GPUs the pool has since taken.
+	warmPoolGPUsVersion uint64
+	// warmPoolGPUsChangedAt is, per namespace, the global version at which that
+	// namespace's figure last changed. It is what a pool asks a snapshot to have
+	// reached: its OWN last change, not the counter's latest value, so another
+	// namespace's flapping pool does not keep raising the bar for this one.
+	warmPoolGPUsChangedAt = map[string]uint64{}
 )
 
 // PublishWarmPoolGPUs records what the warm pools in one namespace hold, keyed by
 // accelerator. Replaces that namespace's previous figure wholesale, so a pool
-// that shrank or went away stops being charged for.
-func PublishWarmPoolGPUs(namespace string, byType map[string]int) {
+// that shrank or went away stops being charged for. Returns the version of this
+// namespace's last change: unchanged when the figure is the same as last time,
+// so a pool that republishes an unchanged figure every pass does not keep moving
+// the bar a headroom snapshot has to clear, and untouched by other namespaces'
+// changes, which are theirs to wait for.
+func PublishWarmPoolGPUs(namespace string, byType map[string]int) uint64 {
 	warmPoolGPUsMu.Lock()
 	defer warmPoolGPUsMu.Unlock()
-	if len(byType) == 0 {
+	prev, had := warmPoolGPUs[namespace]
+	switch {
+	case len(byType) == 0 && !had:
+		// Absent and staying absent: not a change.
+	case len(byType) == 0:
 		delete(warmPoolGPUs, namespace)
-		return
+		warmPoolGPUsVersion++
+		warmPoolGPUsChangedAt[namespace] = warmPoolGPUsVersion
+	case had && maps.Equal(prev, byType):
+		// Same figure: not a change.
+	default:
+		warmPoolGPUs[namespace] = maps.Clone(byType)
+		warmPoolGPUsVersion++
+		warmPoolGPUsChangedAt[namespace] = warmPoolGPUsVersion
 	}
-	warmPoolGPUs[namespace] = maps.Clone(byType)
+	return warmPoolGPUsChangedAt[namespace]
 }
 
 // WarmPoolGPUs returns a copy of what every namespace's pools hold.
 func WarmPoolGPUs() map[string]map[string]int {
+	out, _ := WarmPoolGPUsWithVersion()
+	return out
+}
+
+// WarmPoolGPUsWithVersion returns a copy of what every namespace's pools hold
+// and the version of that figure, read together under one lock so a reader can
+// say exactly which figure a snapshot it derives was built from.
+func WarmPoolGPUsWithVersion() (map[string]map[string]int, uint64) {
 	warmPoolGPUsMu.RLock()
 	defer warmPoolGPUsMu.RUnlock()
 	out := make(map[string]map[string]int, len(warmPoolGPUs))
 	for ns, byType := range warmPoolGPUs {
 		out[ns] = maps.Clone(byType)
 	}
-	return out
+	return out, warmPoolGPUsVersion
 }
 
-// ResetWarmPoolGPUs clears the record. For tests.
+// WarmPoolGPUsVersion returns the current version of the pool figure.
+func WarmPoolGPUsVersion() uint64 {
+	warmPoolGPUsMu.RLock()
+	defer warmPoolGPUsMu.RUnlock()
+	return warmPoolGPUsVersion
+}
+
+// ResetWarmPoolGPUs clears the record. For tests. The counter is not reset:
+// a test that published, reset and published again must still see a change.
 func ResetWarmPoolGPUs() {
 	warmPoolGPUsMu.Lock()
 	defer warmPoolGPUsMu.Unlock()
+	if len(warmPoolGPUs) > 0 {
+		warmPoolGPUsVersion++
+	}
 	warmPoolGPUs = map[string]map[string]int{}
+	warmPoolGPUsChangedAt = map[string]uint64{}
 }
 
 // PublishGPUUsage records a physical-usage snapshot in the default store.

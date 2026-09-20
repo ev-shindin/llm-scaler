@@ -308,14 +308,15 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 // appended in registration order.
 
 // addWarmPoolGPUs charges each namespace's warm pools into the managed usage
-// about to be published.
+// about to be published, and returns the version of the pool figure it charged.
 //
 // Namespaces are ADDED, not merely updated: a namespace whose only WVA
 // consumption is a pool has no scaling requests, so it would otherwise be absent
 // from the managed figure entirely and its quota would read as untouched while
 // the pool holds GPUs inside it.
-func addWarmPoolGPUs(byType map[string]int, byNamespace map[string]map[string]int) {
-	for namespace, pools := range decision.WarmPoolGPUs() {
+func addWarmPoolGPUs(byType map[string]int, byNamespace map[string]map[string]int) uint64 {
+	figure, version := decision.WarmPoolGPUsWithVersion()
+	for namespace, pools := range figure {
 		perType, ok := byNamespace[namespace]
 		if !ok {
 			perType = make(map[string]int)
@@ -329,6 +330,7 @@ func addWarmPoolGPUs(byType map[string]int, byNamespace map[string]map[string]in
 			byType[accelerator] += gpus
 		}
 	}
+	return version
 }
 
 func (e *Engine) RegisterAnalyzer(name string, a domain.Analyzer) error {
@@ -920,20 +922,35 @@ func (e *Engine) selectV2Optimizer(
 ) (allocation.ScalingOptimizer, []*allocation.ResourceConstraints) {
 	logger := ctrl.LoggerFrom(ctx)
 
-	// GreedyByScore is currently the only GPU-aware optimizer; any future
-	// constraint-consuming optimizer must be added to this guard.
-	optimizer := e.optimizer
-	if _, ok := optimizer.(*allocation.GreedyByScoreOptimizer); !ok {
-		return optimizer, nil
-	}
-
 	// Collect constraints from every provider backing the GPU limiter: a single
 	// DefaultLimiter, or each constituent of a CompositeLimiter (so multi-entry
 	// quota configs are all consulted, and namespace-scoped providers contribute
 	// per-namespace caps via NamespacePools).
+	//
+	// FIRST, before the optimizer guard below. With no limiter declared,
+	// optimize() installs the cost-aware optimizer and that guard returns, so a
+	// publish placed after it would never run for a limiter-less fleet that has
+	// something to optimize -- and the warm pool, which now waits for a
+	// snapshot before it grows, would be held at its size for as long as any
+	// model was registered.
 	providers := gpuConstraintProviders(e.currentGPULimiter())
 	if len(providers) == 0 {
+		// Nothing bounds anything -- said out loud, because the warm pool waits
+		// for a headroom snapshot before it grows and nothing else here would
+		// publish one on a cluster with no limiter.
+		allocation.PublishUnboundedHeadroom(decision.WarmPoolGPUsVersion(), time.Now())
 		return allocation.NewCostAwareOptimizer(), nil
+	}
+
+	// GreedyByScore is currently the only GPU-aware optimizer; any future
+	// constraint-consuming optimizer must be added to this guard.
+	optimizer := e.optimizer
+	if _, ok := optimizer.(*allocation.GreedyByScoreOptimizer); !ok {
+		// Providers exist but the optimizer is not GPU-aware: a limiter edit to
+		// none whose rebuild failed leaves the previous limiter in place under
+		// the cost-aware optimizer. The models scale unbounded; so may the pool.
+		allocation.PublishUnboundedHeadroom(decision.WarmPoolGPUsVersion(), time.Now())
+		return optimizer, nil
 	}
 
 	// Each provider is fed the measure of usage IT asked for: physical inventories
@@ -950,6 +967,9 @@ func (e *Engine) selectV2Optimizer(
 		// constraints.
 		logger.V(logging.DEBUG).Info("No GPU usage observation yet on a basis some provider needs; "+
 			"using the unlimited optimizer for this cycle", "basis", basis.String())
+		// The models scale unbounded this cycle; the pool follows the same
+		// posture rather than being held against a limit nobody could compute.
+		allocation.PublishUnboundedHeadroom(views.PoolsVersion, time.Now())
 		return allocation.NewCostAwareOptimizer(), nil
 	}
 
@@ -961,7 +981,7 @@ func (e *Engine) selectV2Optimizer(
 			logger.Error(err, "Failed to compute GPU constraints, skipping provider", "provider", cp.Name())
 			continue
 		}
-		constraints = append(constraints, constraint)
+		constraints = append(constraints, views.Stamp(constraint))
 
 		// What the limiter decided this cycle, as numbers.
 		//
@@ -990,8 +1010,20 @@ func (e *Engine) selectV2Optimizer(
 	// engine's unlimited path, so scale-up proceeds instead of being silently
 	// blocked.
 	if len(constraints) == 0 {
+		// Same posture as above: every provider failed (the usual cause is the
+		// Node API, for an inventory limiter without node read), the models
+		// scale unbounded, and so may the pool.
+		allocation.PublishUnboundedHeadroom(views.PoolsVersion, time.Now())
 		return allocation.NewCostAwareOptimizer(), nil
 	}
+	// What each namespace may still take, for the warm pool -- published HERE,
+	// once per cycle, from the constraints every provider agreed on. The
+	// optimizer publishes it too, but only from the attribution pass of a model
+	// that is scaling UP: a fleet of steady models never took that branch, the
+	// fleet was not idle either, and so a live cluster with one no-change variant
+	// never published headroom at all -- the pool read "unknown" forever and
+	// grew past a one-GPU quota unopposed.
+	allocation.PublishNamespaceHeadroom(constraints, time.Now())
 	return optimizer, constraints
 }
 
@@ -1100,6 +1132,14 @@ func (e *Engine) optimizeV2(
 	}
 
 	if len(requests) == 0 {
+		// Active variants, none of which produced a request: every model FAILED
+		// collection this cycle. Nothing is published for the warm pool here,
+		// deliberately, for the reason the managed figure is not published
+		// either (below): a view built without the models' usage would credit
+		// the namespace with every GPU they hold, and the pool would grow into
+		// it. The previous snapshot stands until it ages out, so a transient
+		// failure costs the pool nothing; a persistent one holds the pool, as
+		// it should, beside models that are not being optimized either.
 		return nil
 	}
 

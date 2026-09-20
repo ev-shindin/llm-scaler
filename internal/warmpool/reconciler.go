@@ -120,15 +120,29 @@ type Reconciler struct {
 	lastUndeclared string
 
 	// Headroom reports how many GPUs of this accelerator the namespace may still
-	// take, and whether that figure is usable at all. Optional; nil means the
-	// pool grows without a capacity check, which is what an install with no
-	// limiter declared should do.
+	// take, as one of three states (decision.HeadroomState), from a headroom
+	// snapshot built from a warm-pool figure at least as new as poolsVersion.
+	// Optional; nil means the pool grows without a capacity check, which is
+	// what a test that is not about capacity wants.
 	//
-	// FALSE means "no answer" -- no limiter bounds this namespace, or none has
-	// published yet -- and must not be read as zero. A pool held down because
-	// nobody has published a limit would never grow on a cluster that has no
-	// limiter at all.
-	Headroom func(namespace, accelerator string) (int, bool)
+	// The three states are all needed, and they are not interchangeable:
+	//   - Bounded: Free is what is left, and zero is a real zero -- the pool
+	//     asks for no more than it can pay for.
+	//   - Unbounded: no limiter constrains this namespace. Grow freely.
+	//   - Unknown: no answer yet, or one built before this pool's Pods were
+	//     charged. HOLD at the current size. Growing on an Unknown is how a
+	//     one-GPU quota ended up with a three-Pod pool: the pool charged its
+	//     first Pod and, on the same pass, sized itself against a snapshot that
+	//     still credited the namespace with that GPU. It is a hold for one
+	//     optimize cycle, not a freeze -- the engine publishes an Unbounded
+	//     snapshot when no limiter is declared, so a limiter-less cluster is
+	//     never left waiting.
+	Headroom func(namespace, accelerator string, poolsVersion uint64) (int, decision.HeadroomState)
+
+	// poolsVersion is the version decision.PublishWarmPoolGPUs returned for this
+	// pass's charge, the bar a headroom snapshot has to clear before the pool
+	// grows on it. Written by Once under passMu.
+	poolsVersion uint64
 
 	// Contended reports whether a model replica in this namespace is being
 	// denied GPUs of a given accelerator. Nil disables the arbitration, which
@@ -187,6 +201,10 @@ type Reconciler struct {
 	lastShort map[string]int
 	// lastCapped dedupes the capacity-capped line, keyed by pool.
 	lastCapped map[string]string
+	// lastAwaiting dedupes the "waiting for the allowance to see this pool" line,
+	// keyed by pool and holding the version waited for, so a new wait after a
+	// new charge is announced again while one wait is stated once.
+	lastAwaiting map[string]uint64
 	// lastSummary is the previous pass's one-line state PER POOL, so a steady
 	// pool logs once rather than every Interval. Guarded by passMu, which
 	// already serialises the whole pass.
@@ -329,7 +347,7 @@ func (r *Reconciler) Once(ctx context.Context) (policy.Plan, error) {
 	// Not published when observation FAILED -- that returns above -- because an
 	// empty reading there means "could not see", and zero would hand the quota
 	// its allowance back at the moment WVA cannot tell what it is holding.
-	decision.PublishWarmPoolGPUs(r.Namespace, warmPoolGPUsByAccelerator(memberships))
+	r.poolsVersion = decision.PublishWarmPoolGPUs(r.Namespace, warmPoolGPUsByAccelerator(memberships))
 	// Which Pods are LENT, and to which variant, so the collector can attribute
 	// their engine metrics. A bridge is owned by the pool's workload, so the
 	// ownerReference walk that attributes every other Pod reaches the pool's
@@ -582,9 +600,18 @@ func (r *Reconciler) publishSize(ctx context.Context, spec PoolSpec, memberships
 	}
 	want := SizeFor(spec.Config.SleepMinSize, lent)
 
+	// The pool's CURRENT size, for every hold and cap below. PoolSpec.Replicas
+	// is the ScaledObject floor -- the best reading when nothing else says --
+	// and a pool lending one Pod above a floor of one is at three, not one. A
+	// hold computed from the floor would tell KEDA to take the bridge away, and
+	// a cap from it would tell a pool holding exactly its quota to shrink and
+	// then grow back, on a fifteen-minute sawtooth. The Pods themselves are the
+	// reading; the floor is the lower bound KEDA keeps anyway.
+	current := max(heldPods(memberships), spec.Replicas)
+
 	// Yield to model replicas. While a variant of this pool's accelerator is
 	// being denied GPUs, the pool stops asking for more -- see HoldAt.
-	if hold := HoldAt(spec.Replicas); r.Contended != nil && want > hold {
+	if hold := HoldAt(current); r.Contended != nil && want > hold {
 		if accelerator := soleAccelerator(memberships); accelerator != "" &&
 			r.Contended(r.Namespace, accelerator) {
 			r.reportHeld(ctx, spec, accelerator, want, hold)
@@ -604,24 +631,105 @@ func (r *Reconciler) publishSize(ctx context.Context, spec PoolSpec, memberships
 	// Distinct from the contention hold above. That yields ground while a model
 	// replica is actively being denied; this refuses to ask when the allowance is
 	// spent. A namespace can be uncontended and still have nothing left.
-	if r.Headroom != nil && want > spec.Replicas {
-		if accelerator := soleAccelerator(memberships); accelerator != "" {
-			if free, known := r.Headroom(r.Namespace, accelerator); known {
-				// Headroom is in GPUs; the pool grows in Pods. A Pod costs the
-				// devices one warm unit holds, and a group of two 8-GPU Pods
-				// costs sixteen -- capacityOf already reports the unit's total.
-				perPod := gpusPerUnit(memberships)
+	//
+	// And DO NOT ASK before the allowance has seen what the pool already holds.
+	// The pool charges its Pods at the top of every pass; a headroom snapshot
+	// built from the figure before that charge still credits the namespace with
+	// those GPUs, and sizing against it grants the pool its own Pods twice. That
+	// is exactly what happened: a pool with a one-GPU quota saw its first Pod,
+	// asked for its reserve on the same pass against a snapshot that said one
+	// GPU was free, and KEDA created two more. So a snapshot older than this
+	// pass's charge is no answer, and the pool holds at its current size until
+	// the next optimize cycle -- which is one cycle, not a freeze: the engine
+	// publishes an Unbounded snapshot when no limiter is declared.
+	//
+	// A pool with no readable Pod yet, or Pods on nodes that name no single
+	// accelerator, has no accelerator to ask about. It asks anyway, for the
+	// namespace: a namespace no limiter bounds says so (Unbounded) and the pool
+	// grows; a bounded namespace answers for the empty accelerator, which is
+	// zero -- a type the allowlist does not name -- and the pool holds at what
+	// it has until it can ask properly. Growing here instead was the last
+	// overshoot: the first Pod is not readable for a pass or two, the pool
+	// asked for its reserve in that window with no check at all, and once the
+	// Pods were up it wanted no more than it held, so the cap never ran and
+	// the extra Pod stayed for good.
+	//
+	// A pass that does not end in a wait clears the wait record, whether the
+	// allowance answered or the pool simply stopped wanting more: a wait that
+	// recurs later at the same version -- a snapshot that aged out -- is a new
+	// wait and is said again.
+	awaiting := false
+	defer func() {
+		if !awaiting {
+			delete(r.lastAwaiting, r.metricName(spec))
+		}
+	}()
+	if r.Headroom != nil && want > current {
+		accelerator := soleAccelerator(memberships)
+		free, state := r.Headroom(r.Namespace, accelerator, r.poolsVersion)
+		switch state {
+		case decision.HeadroomBounded:
+			// Headroom is in GPUs; the pool grows in Pods. A Pod costs the
+			// devices one warm unit holds, and a group of two 8-GPU Pods costs
+			// sixteen -- capacityOf already reports the unit's total. A pool
+			// whose Pods declare no devices costs the allowance nothing and is
+			// not capped by it; a pool with NO Pods to read a cost from is held
+			// until there is one (it cannot have named an accelerator either).
+			perPod := gpusPerUnit(memberships)
+			if perPod > 0 || len(memberships) == 0 {
+				affordable := current
 				if perPod > 0 {
-					affordable := spec.Replicas + free/perPod
-					if want > affordable {
-						r.reportCapped(ctx, spec, accelerator, want, affordable, free)
-						want = affordable
-					}
+					affordable += free / perPod
+				}
+				if want > affordable {
+					r.reportCapped(ctx, spec, accelerator, want, affordable, free)
+					want = affordable
 				}
 			}
+		case decision.HeadroomUnknown:
+			hold := HoldAt(current)
+			if want > hold {
+				awaiting = true
+				r.reportAwaiting(ctx, spec, accelerator, want, hold)
+				want = hold
+			}
+		case decision.HeadroomUnbounded:
+			// No limiter bounds this namespace; the pool grows as it likes.
 		}
 	}
 	r.PublishSize(r.Namespace, spec.Deployment, int32(want)) //nolint:gosec // small counts
+}
+
+// heldPods counts the distinct Pods a pool holds, empty ones included: an empty
+// Pod contributes a placeholder membership so that idle Pods are visible as
+// reserve, which is exactly what makes this the pool's size in Pods.
+func heldPods(memberships []pool.Membership) int {
+	pods := map[types.NamespacedName]bool{}
+	for _, m := range memberships {
+		pods[m.Pod] = true
+	}
+	return len(pods)
+}
+
+// reportAwaiting says the pool wants to grow and is waiting for a headroom
+// snapshot that has charged what it already holds. Stated once per wait: the
+// key is the version waited for, so a fresh charge that starts a fresh wait is
+// announced, and the same wait is not repeated every pass while one optimize
+// cycle goes by.
+func (r *Reconciler) reportAwaiting(ctx context.Context, spec PoolSpec, accelerator string, want, held int) {
+	name := r.metricName(spec)
+	if r.lastAwaiting == nil {
+		r.lastAwaiting = map[string]uint64{}
+	}
+	if v, ok := r.lastAwaiting[name]; ok && v == r.poolsVersion {
+		return
+	}
+	r.lastAwaiting[name] = r.poolsVersion
+	log.FromContext(ctx).WithName("warmpool").Info(
+		"warm pool is holding its size until the namespace allowance has accounted for the Pods it holds; "+
+			"it grows, or is capped, on the next optimize cycle",
+		"pool", name, "accelerator", accelerator, "wanted", want, "holdingAt", held,
+		"poolsVersion", r.poolsVersion)
 }
 
 // gpusPerUnit is what one more Pod of this pool would cost in devices.

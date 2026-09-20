@@ -1099,8 +1099,8 @@ func runWarmPool(
 	// the pool would report itself short forever with nothing able to
 	// fill it. Published by the allocation layer, which is the only
 	// component that sees every constraint provider at once.
-	reconciler.Headroom = func(namespace, accelerator string) (int, bool) {
-		return decision.GPUHeadroom(namespace, accelerator, warmpool.ContentionMaxAge, time.Now())
+	reconciler.Headroom = func(namespace, accelerator string, poolsVersion uint64) (int, decision.HeadroomState) {
+		return decision.GPUHeadroomReading(namespace, accelerator, poolsVersion, warmpool.ContentionMaxAge, time.Now())
 	}
 	// Which model the optimizer says should be awake in a pool. Nothing
 	// publishes one yet -- the rule that decides is the open half of this

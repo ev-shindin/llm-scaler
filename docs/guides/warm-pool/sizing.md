@@ -143,6 +143,24 @@ Three things follow from scaling it this way, and they are the reason for it:
 - **`minReplicaCount` must exceed the reserve.** Otherwise the pool spends every
   quiet period in the one state where it can never warm anything.
 
+**Under a quota the pool asks only for what the namespace can pay for.** A
+pool that cannot yet name its accelerator — no readable Pod, or Pods on nodes
+without a product label — holds at its current size under a bounded namespace
+until it can; without a limiter it grows regardless. A pool already above its
+allowance (a quota lowered after the fact) is not shrunk by this; it simply
+does not grow. The pool's GPUs are charged against the same allowance
+as model replicas, and the size WVA publishes is capped at what it holds plus
+what that allowance leaves — the log line is
+`warm pool is not growing: the namespace has no GPU allowance left for it`,
+with the figures. The check is ordered, not merely present: after the pool
+charges a new Pod it holds its size for one optimize cycle, until the
+allowance has accounted for that Pod (`warm pool is holding its size until the
+namespace allowance has accounted for the Pods it holds`), and only then grows
+or is capped. Without that hold a pool that had just taken its first Pod sized
+itself against an allowance that still credited the namespace with it, and a
+one-GPU quota ended up with three Pods. Without a limiter nothing bounds the
+pool and it grows straight to `lent + reserve + 1`.
+
 ### Keeping the pool a fixed size
 
 Set them equal:

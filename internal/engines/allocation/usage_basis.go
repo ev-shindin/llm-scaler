@@ -103,6 +103,19 @@ type GPUUsageViews struct {
 	// ManagedByType / ManagedByNamespace: only what WVA's own variants hold.
 	ManagedByType      map[string]int
 	ManagedByNamespace map[string]map[string]int
+
+	// PoolsVersion is the version of the warm-pool figure folded into the
+	// managed views (decision.WarmPoolGPUsWithVersion), stamped onto every
+	// constraint computed from them. See ResourceConstraints.PoolsVersion.
+	PoolsVersion uint64
+}
+
+// Stamp records the views' pools version on constraints computed from them.
+func (v GPUUsageViews) Stamp(c *ResourceConstraints) *ResourceConstraints {
+	if c != nil {
+		c.PoolsVersion = v.PoolsVersion
+	}
+	return c
 }
 
 // For returns the usage pair the given provider must be fed.

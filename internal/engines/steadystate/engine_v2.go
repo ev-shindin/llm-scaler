@@ -622,8 +622,10 @@ func gpuUsageViews(requests []allocation.ModelScalingRequest) allocation.GPUUsag
 	// published. These views are what the constraint providers are given, so a
 	// quota built without them does not bind on the pool at all -- the published
 	// figure would say the pool costs something while the limiter enforcing it
-	// carried on as though it did not.
-	addWarmPoolGPUs(views.ManagedByType, views.ManagedByNamespace)
+	// carried on as though it did not. The version of the figure charged rides
+	// with the views, onto the constraints, into the headroom snapshot: it is
+	// how the pool knows the snapshot it grows on has seen its Pods.
+	views.PoolsVersion = addWarmPoolGPUs(views.ManagedByType, views.ManagedByNamespace)
 	if snap, ok := decision.LatestGPUUsage(); ok {
 		views.PhysicalByType = snap.ByType
 		views.PhysicalByNamespace = withActiveNamespaces(snap.ByNamespace, requests)
@@ -1261,18 +1263,30 @@ func unattributedGPUs(byType map[string]int) (total int, keys []string) {
 // allowance, so a pool at its quota must read as no headroom left rather than as
 // a namespace nobody bounds.
 //
-// Silent on every failure. Publishing a wrong figure here is worse than
-// publishing none: an absent namespace reads as unbounded, which is the
-// behaviour that existed before this function, while a fabricated one would cap
-// a pool for a reason nobody could find.
+// Where constraints cannot be had -- no limiter, no usage observation on a
+// basis a provider needs, every provider failed -- it publishes UNBOUNDED, the
+// same posture the optimizing path takes for the models in those states, rather
+// than a fabricated figure or nothing: a fabricated one would cap a pool for a
+// reason nobody could find, and nothing would now hold it, since a pool grows
+// only on a snapshot. It is NOT called when models exist but failed collection;
+// a view without their usage would over-state what is free (see the
+// len(requests)==0 branch in optimize).
 func (e *Engine) publishHeadroomForIdleFleet(ctx context.Context) {
 	providers := gpuConstraintProviders(e.currentGPULimiter())
 	if len(providers) == 0 {
-		return // nothing bounds anything; the pool grows freely, as it should
+		// Nothing bounds anything. Published, not merely implied by silence:
+		// the pool grows only on a snapshot, and this is the only place one
+		// would come from on a limiter-less cluster with nothing to optimize.
+		allocation.PublishUnboundedHeadroom(decision.WarmPoolGPUsVersion(), time.Now())
+		return
 	}
 	views := gpuUsageViews(nil)
 	if _, missing := views.MissingBasis(providers); missing {
-		return // no observation on a basis some provider needs
+		// No observation on a basis some provider needs. The optimizing path
+		// runs the models unbounded in this state; the pool is told the same,
+		// rather than held against a limit nobody could compute.
+		allocation.PublishUnboundedHeadroom(views.PoolsVersion, time.Now())
+		return
 	}
 	var constraints []*allocation.ResourceConstraints
 	for _, cp := range providers {
@@ -1281,9 +1295,10 @@ func (e *Engine) publishHeadroomForIdleFleet(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		constraints = append(constraints, constraint)
+		constraints = append(constraints, views.Stamp(constraint))
 	}
 	if len(constraints) == 0 {
+		allocation.PublishUnboundedHeadroom(views.PoolsVersion, time.Now()) // every provider failed: same posture
 		return
 	}
 	allocation.PublishNamespaceHeadroom(constraints, time.Now())
