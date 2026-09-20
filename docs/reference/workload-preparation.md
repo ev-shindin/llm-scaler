@@ -356,8 +356,10 @@ not another's to remove). Whoever can write the directory runs code in
 every engine on that node. On Kubernetes that is anyone with `pods/create`
 in a namespace that can mount the claim -- no more than `pods/create`
 already grants, since such a pod runs as root and could overwrite the
-weights too -- and across namespaces it is everyone pointed at the same
-directory. So the weights section's rules hold harder here: one directory
+weights too; in a namespace that separates its workloads by UID (Pod
+Security `restricted`, a `runAsUser` per Deployment) it is more, and the
+1770 variant below is for that -- and across namespaces it is everyone
+pointed at the same directory. So the weights section's rules hold harder here: one directory
 per trust domain, on a disk that is not the node's own, never a system
 path (the script refuses the same paths); and wipe `<dir>/engine-cache` on
 the nodes when a namespace or a directory changes hands -- `delete` keeps
