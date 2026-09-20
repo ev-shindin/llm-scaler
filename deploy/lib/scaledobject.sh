@@ -992,24 +992,25 @@ so_workload_patch_one() {
 # volume list for both. A list emptied by that goes too; an `env: []` left
 # behind is a field the patch would still write.
 so_workload_patch_trim() {
-    local doc="$1" keep_w="${2:-0}" keep_e="${3:-0}" stripped keep prog=""
+    local doc="$1" keep_w="${2:-0}" keep_e="${3:-0}" stripped keep prog
     local wvol="${WVA_MODEL_VOLUME_NAME:-model-storage}" evol="${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}"
+    local vols="false" envs="false"
     stripped="$(mktemp)" || return 1
-    if [ "$keep_w" -ne 1 ]; then
-        prog="del(.spec.template.spec.volumes[] | select(.name == \"$wvol\"))
-              | del(.spec.template.spec.containers[].volumeMounts[] | select(.name == \"$wvol\"))
-              | del(.spec.template.spec.containers[].env[] | select(.name == \"HF_HOME\"))"
-    fi
-    if [ "$keep_e" -ne 1 ]; then
-        prog="${prog:+$prog | }del(.spec.template.spec.volumes[] | select(.name == \"$evol\"))
-              | del(.spec.template.spec.containers[].volumeMounts[] | select(.name == \"$evol\"))
-              | del(.spec.template.spec.containers[].env[] | select(.name == \"VLLM_CACHE_ROOT\" or .name == \"FLASHINFER_WORKSPACE_DIR\" or .name == \"TRITON_CACHE_DIR\"))"
-    fi
+    # One `map(select(...))` per list, NOT one `del(.list[] | select(...))` per
+    # half: on the yq CI installs (v4.44) the second del on the same list
+    # deletes nothing -- the index moved under it -- so the half meant to go
+    # was sent. Filtered as a whole, each list is walked once. `select(. !=
+    # null)` on the left keeps a missing list missing rather than creating it.
+    [ "$keep_w" -eq 1 ] || { vols="$vols or .name == \"$wvol\""; envs="$envs or .name == \"HF_HOME\""; }
+    [ "$keep_e" -eq 1 ] || { vols="$vols or .name == \"$evol\""; envs="$envs or .name == \"VLLM_CACHE_ROOT\" or .name == \"FLASHINFER_WORKSPACE_DIR\" or .name == \"TRITON_CACHE_DIR\""; }
     # The comments go too. They are written for whoever reads the FILE, and a
     # removed half leaves its explanation behind as a comment on the document,
     # so the body sent to the API server still spoke of a volume it no longer
     # carried -- harmless to the server, misleading in a log of what was sent.
-    prog="${prog:+$prog | }del(.spec.template.spec.volumes | select(length == 0))
+    prog="(.spec.template.spec.volumes | select(. != null)) |= map(select(($vols) | not))
+          | (.spec.template.spec.containers[].volumeMounts | select(. != null)) |= map(select(($vols) | not))
+          | (.spec.template.spec.containers[].env | select(. != null)) |= map(select(($envs) | not))
+          | del(.spec.template.spec.volumes | select(length == 0))
           | del(.spec.template.spec.containers[].volumeMounts | select(length == 0))
           | del(.spec.template.spec.containers[].env | select(length == 0))
           | ... comments=\"\""
