@@ -1964,7 +1964,9 @@ CACHENEED
 #
 #   ${eclaim} already exists in ${ns}, so the engine caches go there. Nothing
 #   to create. If \`make engine-cache\` made it, \`make engine-cache-status
-#   NAMESPACE=${ns}\` says which nodes are prepared.
+#   NAMESPACE=${ns}\` says which nodes are prepared, and whether they were
+#   seeded (ENGINE_CACHE_SEED_CLAIM: without a seed the first start on each
+#   node compiles once).
 ENGINEHAVE
         elif [ "$eclaim" != "engine-cache" ]; then
             # The operator named this claim, so the remedy is theirs to pick:
@@ -1987,6 +1989,13 @@ ENGINENAMED
 #   every pod the rollout makes stays Pending. On the nodes' own disks:
 #
 #     make engine-cache NAMESPACE=${ns} ENGINE_CACHE_PATH=<node dir> ENGINE_CACHE_IMAGE=<engine image>
+#
+#   The cache is one per node, so without more the FIRST start on each node
+#   still compiles (the scheduler spreads replicas, so that is one cold start
+#   per node). If the caches lived on a shared claim before -- or a claim was
+#   filled once on purpose -- add ENGINE_CACHE_SEED_CLAIM=<claim>[:<subPath>]
+#   and every node is warm from its first start (trust it as the cache itself:
+#   one write to it reaches every node).
 #
 #   <node dir> is one path that must hold on every accelerator node
 #   (WEIGHTS_NODE_SELECTOR=<key=value> narrows which nodes; the model servers

@@ -1530,6 +1530,7 @@ before=$FAILED
 doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
 assert_contains "$doc" "engine-cache does NOT exist yet in ns"
 assert_contains "$doc" "make engine-cache NAMESPACE=ns ENGINE_CACHE_PATH=<node dir>"
+assert_contains "$doc" "ENGINE_CACHE_SEED_CLAIM"      # the seed is part of the same instruction
 assert_contains "$doc" "at least two components"
 assert_contains "$doc" "not the node's own"
 assert_contains "$doc" "one directory per trust domain"

@@ -565,8 +565,9 @@ make model-cache NAMESPACE=my-models \
 #    the nodes. The emitted file says what <node dir> must be (the list under
 #    "Engine caches on the node's disk" above), or set
 #    WVA_ENGINE_CACHE_CLAIM=<claim>[:<subPath>] on the next step to use a shared
-#    ReadWriteMany claim you already have instead, and skip this.
-make engine-cache NAMESPACE=my-models ENGINE_CACHE_PATH=<node dir> ENGINE_CACHE_IMAGE=<engine image>
+#    ReadWriteMany claim you already have instead, and skip this. The seed is
+#    optional and is what makes the FIRST start on each node warm too.
+make engine-cache NAMESPACE=my-models ENGINE_CACHE_PATH=<node dir> ENGINE_CACHE_IMAGE=<engine image>     ENGINE_CACHE_SEED_CLAIM=<a claim holding caches>[:<subPath>]
 
 # 4. Apply. The drain half needs nothing; each storage half needs its claim from
 #    step 2 or 3 and its own opt-in, because mounting storage is a bigger change
