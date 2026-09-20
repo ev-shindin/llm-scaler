@@ -354,6 +354,41 @@ var _ = Describe("the saturated-throughput window", func() {
 })
 
 var _ = Describe("estimateThroughputDemand with mixed readings", func() {
+	It("lets no borrowed reading outvote a replica's own", func() {
+		// Replayed from the 1000/6000 shape-swap trace (2026-09-20, cycle
+		// 11:46:37): the replica that had been saturated under the new shape
+		// reads its own xxlong bucket at 1.74 req/s, two fresh replicas read
+		// an output length of 0 (no completions yet, or the short ones that
+		// finish first), land in a bucket with no reading and borrow the
+		// previous shape's 4.38. The median of the three was 4.38 -- the
+		// backlog of 441 requests read as two replicas' worth instead of five,
+		// and the target went from 10 to 4 while the backlog grew.
+		variants := []domain.VariantCapacity{{VariantName: "v", Role: domain.RoleDecode, ReplicaCount: 3, PerReplicaCapacity: 930_000}}
+		own := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.74, SaturatedThroughputSamples: MinThroughputSamplesToOrder}
+		fresh := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 4.38, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true}
+		backlog := map[string]float64{domain.RoleDecode: 441}
+		f := estimateThroughputDemand(1.68, []ReplicaCapacity{fresh, own, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
+		term := f.Terms[domain.RoleDecode]
+		Expect(term.Mu).To(Equal(1.74), "the own reading, however many replicas borrow")
+		Expect(term.Replicas).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/1.74, 1e-6))
+		Expect(term.Held).To(BeFalse(), "an own reading with enough samples still orders")
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/1.74*930_000, 1e-6))
+
+		By("taking the borrowed readings when no replica reads its own")
+		g := estimateThroughputDemand(1.68, []ReplicaCapacity{fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
+		Expect(g.Terms[domain.RoleDecode].Mu).To(Equal(4.38))
+		Expect(g.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/4.38, 1e-6))
+		// (not held: two replicas' worth is under the fleet's cap, so the cap
+		// has nothing to do -- the borrowed figure under-holds, which is the
+		// direction the header accepts)
+
+		By("keeping the own readings' median when they disagree among themselves")
+		own2 := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.26, SaturatedThroughputSamples: 1}
+		h := estimateThroughputDemand(1.68, []ReplicaCapacity{fresh, own, own2, fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
+		Expect(h.Terms[domain.RoleDecode].Mu).To(BeNumerically("~", (1.74+1.26)/2, 1e-9), "the central pair of the two own readings, three borrowed ones ignored")
+		Expect(h.Terms[domain.RoleDecode].Held).To(BeFalse(), "one own window has enough samples")
+	})
+
 	It("takes the median cost across a role's replicas, not the mean or an extreme", func() {
 		// Two variants of one role priced differently: an H200 at 930k tokens
 		// completing 5.4/s and a slower card at 600k completing 2.0/s. Costs

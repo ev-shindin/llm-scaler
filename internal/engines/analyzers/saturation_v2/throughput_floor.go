@@ -350,6 +350,23 @@ func bucketOf(key string) string {
 // its floor is capped at scaleUp x the role's anticipated supply, the largest
 // demand the engine's RC = D / scaleUp - anticipated turns into nothing. The
 // term says so (Held, HeldWhy). scaleUp <= 0 disables the cap.
+//
+// A borrowed reading never outvotes a replica's own. The median is taken over
+// the role's replicas that read their OWN bucket when any does, and over the
+// borrowed ones only when none does -- the rule nearestSaturatedThroughput
+// states per key ("used only until the bucket has a reading of its own"),
+// applied to the role. Without it a shape switch flapped the fleet: a fresh
+// replica's first completions are the short requests (they finish first, and
+// a replica with none yet reads an output length of 0), so its key lands in
+// a short bucket that has no reading and borrows the previous shape's mu --
+// 4.38 req/s from 1000-token outputs -- while the replica that had been
+// saturated under the new 6000-token shape read 1.4-1.7 of its own. Two
+// fresh replicas out of three put the borrowed 4.38 at the median: the
+// backlog of 441 requests read as 2 replicas' worth instead of 5, the floor
+// fell from 10 M tokens to 3 M in one cycle, the target from 10 to 4, and
+// the backlog kept growing (256 -> 642) under the figure that said it would
+// not. Measured on the 1000/6000 shape-swap trace, 2026-09-20, cycles
+// 11:45:22-11:47:22; the target then swung 10 <-> 4 for ten minutes.
 func estimateThroughputDemand(
 	lambda float64,
 	replicas []ReplicaCapacity,
@@ -379,6 +396,10 @@ func estimateThroughputDemand(
 	// readings).
 	costs := make(map[string][]float64)
 	mus := make(map[string][]float64)
+	// The same, from the replicas whose reading is a neighbouring bucket's;
+	// taken only for a role none of whose replicas reads its own.
+	borrowedCosts := make(map[string][]float64)
+	borrowedMus := make(map[string][]float64)
 	mayOrder := make(map[string]bool)
 	borrowedOnly := make(map[string]bool)
 	for _, rc := range replicas {
@@ -390,16 +411,25 @@ func estimateThroughputDemand(
 			continue
 		}
 		role := roleOf[rc.VariantName]
-		costs[role] = append(costs[role], p/rc.SaturatedThroughput)
-		mus[role] = append(mus[role], rc.SaturatedThroughput)
 		if _, seen := borrowedOnly[role]; !seen {
 			borrowedOnly[role] = true
 		}
-		if !rc.SaturatedThroughputBorrowed {
-			borrowedOnly[role] = false
-			if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder {
-				mayOrder[role] = true
-			}
+		if rc.SaturatedThroughputBorrowed {
+			borrowedCosts[role] = append(borrowedCosts[role], p/rc.SaturatedThroughput)
+			borrowedMus[role] = append(borrowedMus[role], rc.SaturatedThroughput)
+			continue
+		}
+		costs[role] = append(costs[role], p/rc.SaturatedThroughput)
+		mus[role] = append(mus[role], rc.SaturatedThroughput)
+		borrowedOnly[role] = false
+		if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder {
+			mayOrder[role] = true
+		}
+	}
+	for role, c := range borrowedCosts {
+		if len(costs[role]) == 0 {
+			costs[role] = c
+			mus[role] = borrowedMus[role]
 		}
 	}
 	if len(costs) == 0 {
