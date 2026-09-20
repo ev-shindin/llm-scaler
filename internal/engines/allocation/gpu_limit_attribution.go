@@ -58,7 +58,7 @@ func applyGPULimitAttribution(
 	defer func() {
 		now := time.Now()
 		decision.PublishGPUContention(contended, now)
-		decision.PublishHeadroom(namespaceHeadroom(constraints), now)
+		decision.PublishHeadroom(namespaceHeadroom(constraints), poolsVersionOf(constraints), now)
 	}()
 
 	if len(limited) == 0 {
@@ -177,13 +177,46 @@ func bindingProvider(constraints []*ResourceConstraints, namespace, accType stri
 // Headroom is normally published as a side effect of attribution, which runs
 // only when there is something to optimize. A namespace whose ONLY WVA
 // consumption is a warm pool has no variants and therefore no optimization pass
-// -- so it never got an answer, and "no answer" means unbounded to the pool,
-// which is the one caller that reads it. Measured: a namespace with a one-GPU
-// quota and no models grew its pool to three Pods.
+// -- so it never got an answer, and "no answer" used to mean unbounded to the
+// pool, which is the one caller that reads it. Measured: a namespace with a
+// one-GPU quota and no models grew its pool to three Pods.
 //
 // Exported rather than exposing namespaceHeadroom itself, so the mapping from
 // constraints to headroom stays in one place and every publisher agrees about
 // what an absent namespace means.
 func PublishNamespaceHeadroom(constraints []*ResourceConstraints, now time.Time) {
-	decision.PublishHeadroom(namespaceHeadroom(constraints), now)
+	decision.PublishHeadroom(namespaceHeadroom(constraints), poolsVersionOf(constraints), now)
+}
+
+// PublishUnboundedHeadroom records that NO limiter bounds any namespace, as of
+// the given warm-pool figure version.
+//
+// This is a real answer and it has to be published: a warm pool holds until it
+// has a headroom snapshot at least as new as its own last charge, and on a
+// cluster with no limiter nothing else would ever publish one -- the pool would
+// wait forever for an allowance nobody is keeping. An empty snapshot says
+// "nothing bounds you", which is what the pool needs to hear to grow.
+func PublishUnboundedHeadroom(poolsVersion uint64, now time.Time) {
+	decision.PublishHeadroom(nil, poolsVersion, now)
+}
+
+// poolsVersionOf is the warm-pool figure version every constraint was computed
+// against: the smallest across them, so a snapshot never claims to have charged
+// a figure some constraint in it has not seen. Zero when no constraint is
+// stamped, which no pool that has ever published can match -- an unstamped
+// snapshot never lets a pool grow, and a publisher that forgets to stamp shows
+// up as a pool that stops growing rather than one that overshoots.
+func poolsVersionOf(constraints []*ResourceConstraints) uint64 {
+	var v uint64
+	first := true
+	for _, c := range constraints {
+		if c == nil {
+			continue
+		}
+		if first || c.PoolsVersion < v {
+			v = c.PoolsVersion
+			first = false
+		}
+	}
+	return v
 }

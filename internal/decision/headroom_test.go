@@ -20,7 +20,7 @@ func TestNoSnapshotIsNoAnswerRatherThanZero(t *testing.T) {
 
 func TestAnUnconstrainedNamespaceIsNoAnswer(t *testing.T) {
 	s := NewHeadroomStore()
-	s.Publish(map[string]map[string]int{"other": {"H100": 4}}, time.Now())
+	s.Publish(map[string]map[string]int{"other": {"H100": 4}}, 0, time.Now())
 
 	if _, known := s.Available("ns", "H100", time.Minute, time.Now()); known {
 		t.Error("a namespace no limiter bounds must answer 'unknown', not zero")
@@ -31,7 +31,7 @@ func TestAnUnconstrainedNamespaceIsNoAnswer(t *testing.T) {
 // name is denied outright. That IS an answer, and it is zero.
 func TestAnUnlistedAcceleratorInACappedNamespaceIsZero(t *testing.T) {
 	s := NewHeadroomStore()
-	s.Publish(map[string]map[string]int{"ns": {"H100": 4}}, time.Now())
+	s.Publish(map[string]map[string]int{"ns": {"H100": 4}}, 0, time.Now())
 
 	free, known := s.Available("ns", "A100", time.Minute, time.Now())
 	if !known {
@@ -44,7 +44,7 @@ func TestAnUnlistedAcceleratorInACappedNamespaceIsZero(t *testing.T) {
 
 func TestFreeGPUsAreReported(t *testing.T) {
 	s := NewHeadroomStore()
-	s.Publish(map[string]map[string]int{"ns": {"H100": 3}}, time.Now())
+	s.Publish(map[string]map[string]int{"ns": {"H100": 3}}, 0, time.Now())
 
 	free, known := s.Available("ns", "H100", time.Minute, time.Now())
 	if !known || free != 3 {
@@ -57,7 +57,7 @@ func TestFreeGPUsAreReported(t *testing.T) {
 func TestAStaleSnapshotIsNoAnswer(t *testing.T) {
 	s := NewHeadroomStore()
 	now := time.Now()
-	s.Publish(map[string]map[string]int{"ns": {"H100": 3}}, now.Add(-10*time.Minute))
+	s.Publish(map[string]map[string]int{"ns": {"H100": 3}}, 0, now.Add(-10*time.Minute))
 
 	if _, known := s.Available("ns", "H100", time.Minute, now); known {
 		t.Error("a snapshot older than maxAge must answer 'unknown'")
@@ -69,14 +69,14 @@ func TestAStaleSnapshotIsNoAnswer(t *testing.T) {
 func TestPublishingReplacesTheWholeSnapshot(t *testing.T) {
 	s := NewHeadroomStore()
 	now := time.Now()
-	s.Publish(map[string]map[string]int{"ns": {"H100": 8}}, now)
-	s.Publish(map[string]map[string]int{"ns": {"H100": 1}}, now)
+	s.Publish(map[string]map[string]int{"ns": {"H100": 8}}, 0, now)
+	s.Publish(map[string]map[string]int{"ns": {"H100": 1}}, 0, now)
 
 	if free, _ := s.Available("ns", "H100", time.Minute, now); free != 1 {
 		t.Errorf("after shrinking, got %d free, want 1", free)
 	}
 
-	s.Publish(map[string]map[string]int{}, now)
+	s.Publish(map[string]map[string]int{}, 0, now)
 	if _, known := s.Available("ns", "H100", time.Minute, now); known {
 		t.Error("a namespace no longer capped must answer 'unknown'")
 	}
@@ -87,7 +87,7 @@ func TestPublishingReplacesTheWholeSnapshot(t *testing.T) {
 func TestTheSnapshotDoesNotAliasTheCaller(t *testing.T) {
 	s := NewHeadroomStore()
 	live := map[string]map[string]int{"ns": {"H100": 4}}
-	s.Publish(live, time.Now())
+	s.Publish(live, 0, time.Now())
 
 	live["ns"]["H100"] = 0
 

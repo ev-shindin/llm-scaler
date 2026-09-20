@@ -68,10 +68,11 @@ func TestIdleFleetReportsAnExhaustedAllowance(t *testing.T) {
 	}
 }
 
-// No limiter is not an empty allowance: nothing is published, so the pool goes
-// on growing. Publishing zeros here would cap every pool on every cluster that
-// has not configured a quota at all.
-func TestIdleFleetWithNoLimiterPublishesNothing(t *testing.T) {
+// No limiter is not an empty allowance, and it is not silence either. The pool
+// grows only on a snapshot at least as new as its own charge, so a limiter-less
+// cluster has to be TOLD nothing bounds it, at the current pool-figure version;
+// silence would hold every pool forever, zeros would cap them all.
+func TestIdleFleetWithNoLimiterPublishesUnbounded(t *testing.T) {
 	decision.ResetWarmPoolGPUs()
 	decision.DefaultHeadroom.Reset()
 	t.Cleanup(func() {
@@ -79,14 +80,51 @@ func TestIdleFleetWithNoLimiterPublishesNothing(t *testing.T) {
 		decision.DefaultHeadroom.Reset()
 	})
 
-	decision.PublishWarmPoolGPUs("tenant", map[string]int{"H100": 2})
+	v := decision.PublishWarmPoolGPUs("tenant", map[string]int{"H100": 2})
 
 	e := &Engine{}
 
 	e.publishHeadroomForIdleFleet(context.Background())
 
 	if _, known := decision.GPUHeadroom("tenant", "H100", time.Minute, time.Now()); known {
-		t.Error("with no limiter configured the namespace must stay unbounded")
+		t.Error("with no limiter configured the namespace must not read as capped")
+	}
+	_, state := decision.GPUHeadroomReading("tenant", "H100", v, time.Minute, time.Now())
+	if state != decision.HeadroomUnbounded {
+		t.Errorf("with no limiter the pool must be told it is unbounded at its own charge version %d, read %v", v, state)
+	}
+}
+
+// The snapshot carries the version of the pool figure it charged, so a pool
+// whose Pods it has seen may grow on it and a pool that charged more since may
+// not. This is the whole of the race fix from the engine's side.
+func TestIdleFleetStampsThePoolFigureItCharged(t *testing.T) {
+	decision.ResetWarmPoolGPUs()
+	decision.DefaultHeadroom.Reset()
+	t.Cleanup(func() {
+		decision.ResetWarmPoolGPUs()
+		decision.DefaultHeadroom.Reset()
+	})
+
+	v := decision.PublishWarmPoolGPUs("tenant", map[string]int{"H100": 1})
+	e := &Engine{GPULimiter: quotaLimiterFor("tenant", "H100", 2)}
+	e.publishHeadroomForIdleFleet(context.Background())
+
+	free, state := decision.GPUHeadroomReading("tenant", "H100", v, time.Minute, time.Now())
+	if state != decision.HeadroomBounded || free != 1 {
+		t.Errorf("a pool whose charge the snapshot saw reads (%d, %v), want (1, bounded)", free, state)
+	}
+	// The pool takes a second Pod: the standing snapshot predates that charge
+	// and must not be grown on, however fresh its clock says it is.
+	v2 := decision.PublishWarmPoolGPUs("tenant", map[string]int{"H100": 2})
+	if _, state := decision.GPUHeadroomReading("tenant", "H100", v2, time.Minute, time.Now()); state != decision.HeadroomUnknown {
+		t.Errorf("a snapshot from before the second Pod reads %v, want unknown", state)
+	}
+	// And the next cycle clears it, at zero left.
+	e.publishHeadroomForIdleFleet(context.Background())
+	free, state = decision.GPUHeadroomReading("tenant", "H100", v2, time.Minute, time.Now())
+	if state != decision.HeadroomBounded || free != 0 {
+		t.Errorf("after the next cycle reads (%d, %v), want (0, bounded)", free, state)
 	}
 }
 

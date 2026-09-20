@@ -86,6 +86,13 @@ type ResourceConstraints struct {
 	TotalLimit     int
 	TotalUsed      int
 	TotalAvail     int
+	// PoolsVersion is the version of the warm-pool figure
+	// (decision.WarmPoolGPUsVersion) that the usage these constraints were
+	// computed against included. Set by the engine that built the usage views,
+	// not by the provider, which never sees where its usage came from. The
+	// headroom published from these constraints carries it on, so a warm pool
+	// can tell a snapshot that has charged its Pods from one that has not.
+	PoolsVersion uint64
 }
 
 // ConstraintProvider exposes hard constraints for the optimizer.

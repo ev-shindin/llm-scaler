@@ -77,7 +77,7 @@ func TestHeadroomDistinguishesUnboundedFromExhausted(t *testing.T) {
 	t.Cleanup(decision.DefaultHeadroom.Reset)
 
 	now := time.Now()
-	decision.PublishHeadroom(map[string]map[string]int{"capped": {"H100": 0}}, now)
+	decision.PublishHeadroom(map[string]map[string]int{"capped": {"H100": 0}}, 0, now)
 
 	if _, known := decision.GPUHeadroom("unbounded", "H100", time.Minute, now); known {
 		t.Error("a namespace no limiter bounds must read as unknown, not exhausted")
