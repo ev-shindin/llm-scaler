@@ -208,6 +208,11 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	decodeSaturated := a.rememberDecodeSaturation(input.Namespace, input.ModelID,
 		roleSaturated(input.ReplicaMetrics, rolesByVariant, domain.RoleDecode, satConfig.QueueLengthThreshold, satConfig.KvCacheThreshold))
 
+	// The output length the fleet is serving this cycle, once, for every
+	// replica's throughput key (computeReplicaCapacity says why the key is
+	// the fleet's shape and not the replica's).
+	fleetOutput := fleetOutputLength(input.ReplicaMetrics, rolesByVariant)
+
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]ReplicaCapacity, 0, len(input.ReplicaMetrics))
 	for _, rm := range input.ReplicaMetrics {
@@ -220,7 +225,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		role := rolesByVariant[rm.VariantName]
 		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			role, accelByVariant[rm.VariantName], downstreamSaturated, logger)
+			role, accelByVariant[rm.VariantName], fleetOutput, downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -353,6 +358,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	gpuCount int,
 	role string,
 	accelerator string,
+	fleetOutput float64,
 	downstreamSaturated bool,
 	logger logr.Logger,
 ) *ReplicaCapacity {
@@ -413,10 +419,31 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// one such reading would price the whole variant for the rest of the
 	// window; the read side already leaves bridges out
 	// (estimateThroughputDemand), and the write side has to match it.
+	//
+	// Recorded and read under the FLEET's output-length bucket, not this
+	// replica's. The k2 key above is the replica's own, and rightly: its
+	// occupancy is its own. Its throughput is priced per role, as the median
+	// over the role's replicas (estimateThroughputDemand), and a median over
+	// readings from different buckets is a reading of nothing. A replica's
+	// own average output length is a few minutes of its own completions,
+	// and at a shape switch that is noise: a fresh replica's first
+	// completions are the short requests (they finish first), so with the
+	// fleet on 6000-token outputs it classified as `long` and read the
+	// 1000-token shape's mu of its own -- 3.08 against the 1.42 the replicas
+	// classified `xxlong` read. Measured on the 1000/6000 shape-swap trace
+	// (2026-09-20, cycles 17:32-17:34): the median came out 2.94, the floor
+	// said two replicas as the switch's batch drained, the fleet released
+	// 10 -> 3 where 4-5 is what the shape needs at that arrival rate, and
+	// the queue that built from 34 min cost a p95 TTFT of 32 s at 36-38 min.
+	// One bucket per role per cycle -- the fleet's, weighted by request rate
+	// so a fresh replica barely moves it (fleetOutputLength) -- gives every
+	// replica of the role the same shape, and the median a meaning.
+	throughputKey := a.historyKey(modelID, namespace, rm.VariantName, accelerator, gpuCount, role,
+		fleetOutput, config.QueueLengthThreshold)
 	if k2Priority == k2SrcObserved && rm.Ready && !rm.FromWarmPool {
-		a.recordSaturatedThroughput(historyKey, rm.RequestRate)
+		a.recordSaturatedThroughput(throughputKey, rm.RequestRate)
 	}
-	reading := a.saturatedThroughputReading(historyKey)
+	reading := a.saturatedThroughputReading(throughputKey)
 	saturatedThroughput, throughputBucket := reading.rate, reading.bucket
 
 	effectiveCapacity := k1
@@ -1230,6 +1257,36 @@ func computeModelWorkloadAverages(replicaMetrics []domain.ReplicaMetrics, rolesB
 		avgOutput /= float64(outputCount)
 	}
 	return avgInput, avgOutput, avgHitRate
+}
+
+// fleetOutputLength is the output length the fleet is serving this cycle: the
+// generating replicas' average output tokens, weighted by their request rate.
+// A fresh replica whose first completions are the short requests (they finish
+// first) reports a short average at a low rate and barely moves it; a replica
+// with no completions yet reports nothing and does not move it at all. With
+// no rate reported anywhere it is the plain mean, as computeModelWorkloadAverages
+// takes it. Zero when no replica reports an output length.
+func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[string]string) float64 {
+	var weighted, weights, plain float64
+	var n int
+	for _, rm := range replicas {
+		if rm.AvgOutputTokens <= 0 || !generatesOutput(rm, rolesByVariant) {
+			continue
+		}
+		plain += rm.AvgOutputTokens
+		n++
+		if rm.RequestRate > 0 {
+			weighted += rm.AvgOutputTokens * rm.RequestRate
+			weights += rm.RequestRate
+		}
+	}
+	if weights > 0 {
+		return weighted / weights
+	}
+	if n > 0 {
+		return plain / float64(n)
+	}
+	return 0
 }
 
 // rolesFromStates builds the variant-name -> role lookup the per-role helpers

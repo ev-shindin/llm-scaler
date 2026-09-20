@@ -523,6 +523,69 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(bare.RoleDemand[domain.RoleDecode]).To(BeNumerically("<", want/5))
 	})
 
+	It("prices every replica of a role under the fleet's shape, not each replica's own", func() {
+		// Replayed from the 1000/6000 shape-swap trace (2026-09-20, cycles
+		// 17:32-17:34). Phase 1, 1000-token outputs: one decode replica
+		// saturates twice a window apart at 3.08 -- the `long` bucket's own
+		// reading. Phase 2, ~5500-token outputs: two replicas saturate at
+		// 1.40 under `xxlong`; three fresh ones have completed a handful of
+		// short stragglers each (average 900, `long` by their own reading,
+		// at 0.2 req/s). Then the switch's batch drains: no queue, little
+		// resident KV, 6 req/s arriving. The floor's mu must be the shape
+		// the fleet serves, 1.40 -- four-and-a-bit replicas' worth -- and
+		// not the median of three `long` readings and two `xxlong` ones,
+		// 3.08, which released the fleet to 3 on the run.
+		long := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
+			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 900)
+			rm.RequestRate = rate
+			rm.Ready = true
+			return rm
+		}
+		xxlong := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
+			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 5500)
+			rm.RequestRate = rate
+			rm.Ready = true
+			return rm
+		}
+		cycle := func(rms []domain.ReplicaMetrics, decodeN int) *domain.AnalyzerResult {
+			in := makeAnalyzerInput(append(rms, prefill("prefill-0", 66_183)), states(decodeN, 1))
+			in.ArrivalRate = runLambda
+			out, err := analyzer.Analyze(ctx, in)
+			Expect(err).NotTo(HaveOccurred())
+			return out
+		}
+		// phase 1: `long` learns 3.08 over two spaced samples
+		for _, rate := range []float64{3.07, 3.08} {
+			cycle([]domain.ReplicaMetrics{long("d0", 1_158_912, 10, rate)}, 1)
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		}
+		// phase 2: `xxlong` learns 1.40 over two spaced samples, with three
+		// fresh replicas beside the saturated pair
+		for _, rate := range []float64{1.39, 1.40} {
+			cycle([]domain.ReplicaMetrics{
+				xxlong("d0", 1_158_912, 10, rate), xxlong("d1", 1_158_912, 10, rate),
+				long("d2", 30_000, 0, 0.2), long("d3", 30_000, 0, 0.2), long("d4", 30_000, 0, 0.2),
+			}, 5)
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		}
+		// the drain: nothing queued, little resident, 6 req/s still arriving
+		result := cycle([]domain.ReplicaMetrics{
+			xxlong("d0", 30_000, 0, 1.2), xxlong("d1", 30_000, 0, 1.2),
+			long("d2", 30_000, 0, 0.2), long("d3", 30_000, 0, 0.2), long("d4", 30_000, 0, 0.2),
+		}, 5)
+		var decodeP float64
+		for _, vc := range result.VariantCapacities {
+			if vc.VariantName == decodeVariant {
+				decodeP = vc.PerReplicaCapacity
+			}
+		}
+		Expect(decodeP).To(BeNumerically(">", 0))
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/1.40, 0.05),
+			"the fleet serves ~5500-token outputs: the floor is lambda over the xxlong mu, whatever each replica's own recent completions average")
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).NotTo(BeNumerically("~", runLambda/3.08, 0.3),
+			"and not lambda over the 1000-token shape's mu")
+	})
+
 	It("does not order on one saturated sample, however many cycles the row shows it", func() {
 		// The measured failure: one decode replica's saturated sample --
 		// 1 150 207 resident, queue 20, 3.43 req/s against a true ~5.4 --
