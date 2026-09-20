@@ -214,8 +214,8 @@ the spec **fails rather than skips** when the kinds are absent, so a missing
 setup step is never read as coverage; run the script by hand before a bare
 `make test-e2e-full` on kind. On any other cluster (the OpenShift CI included)
 nothing installs them, and the spec runs when the cluster serves the kinds and
-skips — saying so in the `-v` output — when it does not. The script refuses a
-cluster that already has the CRDs.
+skips — saying so in the `-v` output — when it does not. The script leaves a
+cluster that already has the CRDs untouched and exits 0.
 
 **Install script tuning (optional, same variables as `deploy/install.sh`):**
 

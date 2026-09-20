@@ -146,6 +146,9 @@ per `(namespace, type)`: it applies only when `N` is wholly unlisted.
 
 ### Kueue as a quota source
 
+The decision above these fields — when to take this, what it costs, the
+evidence — is [the Kueue-bounded quotas path](../well-lit-paths/kueue-bounded-quotas/).
+
 A quota entry can be **bounded by Kueue**. Kueue is the cluster's admission-time
 quota authority; reading its figures makes WVA respect the same caps before it
 asks KEDA for a replica that Kueue would then hold pending. Set `kueue.enabled`
@@ -168,19 +171,31 @@ limiters:
 
 **Both sources present → the smaller cap wins**, per namespace and accelerator
 type. Neither source can raise what the other granted. With no static map at all
-(`namespaceQuotas` / `quotas` omitted), Kueue's figures are the whole answer.
+(`namespaceQuotas` / `quotas` omitted), Kueue's **typed** grants are the whole
+answer; an untyped grant alone opens nothing, and the entry — an empty static
+map — denies every type (see *Merge rules*, row 3).
 
 #### What is read
 
 | Kueue object | Scope | Used for |
 |---|---|---|
-| `ResourceFlavor` | cluster | `spec.nodeLabels` names the accelerator behind a flavor — the vendor product label (`nvidia.com/gpu.product`, `amd.com/gpu.product-name`, …, or the GKE alias), kept **as written**: a flavor exists to tell one product from another (a 40GB PCIe A100 from an 80GB SXM one), so the grant is keyed by the full product and meets a static key at bound time (see below). A ClusterQueue that names a flavor **not present** on the cluster, or whose `stopPolicy` is `Hold`/`HoldAndDrain`, is inactive in Kueue and admits nothing — here it stays a *governing* queue that grants **nothing** (an untyped grant of 0), so its namespaces are denied rather than left to the static entry. `namespaceSelector` is not evaluated (it would need namespace labels a tenant install cannot read). A flavor **without** a product label — Kueue's quickstart `default-flavor`, or any single-GPU-type cluster — is an **untyped grant**: it is *not* named after the flavor (a flavor called `default-flavor` or `h100-sxm` is not an accelerator type, and treating it as one would compete with every static key and zero them all). |
+| `ResourceFlavor` | cluster | `spec.nodeLabels` names the accelerator behind a flavor — the vendor product label (`nvidia.com/gpu.product`, `amd.com/gpu.product-name`, …, or the GKE alias), kept **as written**: a flavor exists to tell one product from another (a 40GB PCIe A100 from an 80GB SXM one), so the grant is keyed by the full product and meets a static key at bound time (see below). A flavor **without** a product label is an **untyped grant** — see the list below the table. |
 | `ClusterQueue` | cluster | `spec.resourceGroups[].flavors[].resources[].nominalQuota` for each GPU resource, per flavor, summed per product (typed flavors) or into the untyped grant (unlabelled flavors). Two grants of the **same** product add up; two products of one family (SXM and PCIe H100) stay apart until the static key says they are one. **`borrowingLimit`, `lendingLimit` and cohorts are not counted** — the bound wants the guaranteed figure. |
 | `LocalQueue` | namespaced | `spec.clusterQueue` links a namespace to a ClusterQueue. A namespace is granted the caps of every ClusterQueue one of its LocalQueues points at; two LocalQueues on one ClusterQueue count it once. |
 
-The cluster-scope figure is the sum over **all** ClusterQueues. Two things this
-attribution does *not* do, deliberately:
+The cluster-scope figure is the sum over **all** ClusterQueues. Five rules of
+the attribution that a first reading of the table would not give:
 
+- **A flavor without a product label is an untyped grant.** Kueue's quickstart
+  `default-flavor`, or any single-GPU-type cluster. It is *not* named after the
+  flavor: `default-flavor` or `h100-sxm` is not an accelerator type, and treating
+  it as one would compete with every static key and zero them all.
+- **An inactive ClusterQueue governs, and grants nothing.** A queue that names a
+  flavor **not present** on the cluster, or whose `stopPolicy` is `Hold` or
+  `HoldAndDrain`, admits nothing in Kueue; here it becomes an untyped grant of
+  0, so its namespaces are denied rather than left to the static entry.
+  `namespaceSelector` is not evaluated (it would need namespace labels a tenant
+  install cannot read).
 - **A shared ClusterQueue is a per-namespace ceiling, not a partition.** Every
   namespace with a LocalQueue on it is bounded at the queue's full nominal
   quota, so several such namespaces may in sum still ask for more than the
@@ -274,7 +289,7 @@ answerable from the controller log.
 
 The manager ClusterRole carries `get`/`list` on `clusterqueues`, `localqueues`
 and `resourceflavors` in `kueue.x-k8s.io`. A namespace-scoped install lists
-LocalQueues only in its own namespace (the tenant Role grants that) and gets the
+LocalQueues only in the namespace it manages (the tenant Role grants that) and gets the
 two cluster-scoped kinds from `components/kueue-reader`, applied by the prereqs
 phase like `node-reader`. A rule naming an API group the cluster does not serve
 is inert, so the grant is harmless without Kueue.

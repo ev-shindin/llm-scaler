@@ -60,6 +60,10 @@ Environment Variables:
                                type. There is no default: a quota limiter with no budget is not
                                unlimited, it is zero for every accelerator, and the fleet freezes.
                                The TYPE is the name WVA resolves, which it logs per variant.
+  WVA_QUOTA_KUEUE              true | false (default). With WVA_LIMITER=quota, also read Kueue: per
+                               namespace and accelerator type the SMALLER of the Kueue nominal
+                               quota and WVA_QUOTAS applies. Name the types in WVA_QUOTAS with -1
+                               to let Kueue set the figure: WVA_QUOTAS='H100=-1' WVA_QUOTA_KUEUE=true.
   WVA_QUOTA_SCOPE              namespace (default) | cluster. namespace caps each managed namespace
                                separately; cluster caps the sum across all of them -- but only
                                within ONE controller's policy. Published to several controllers

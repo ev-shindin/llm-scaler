@@ -12,7 +12,7 @@
 #
 # Requires funcs: log_error.
 # Requires vars: none unconditionally; the quota path reads WVA_QUOTAS,
-# WVA_QUOTA_SCOPE, WVA_SCOPE, WVA_WATCH_NS and WVA_NS. The namespace a
+# WVA_QUOTA_SCOPE, WVA_QUOTA_KUEUE, WVA_SCOPE, WVA_WATCH_NS and WVA_NS. The namespace a
 # namespace-scoped budget is keyed on is an ARGUMENT, never an environment
 # variable -- it is the highest-precedence input to the document, and one that
 # could arrive from an operator's exported shell would be unvalidatable.
@@ -47,6 +47,11 @@ limiter_entry_yaml() {
         if [ -n "${WVA_QUOTAS:-}" ]; then
             log_warning "WVA_QUOTAS is set, but the ${ltype} limiter takes no budget -- it bounds by the GPUs that physically exist. The caps you passed ('${WVA_QUOTAS}') are being IGNORED. Pass WVA_LIMITER=quota to declare them instead."
         fi
+        # Same for the Kueue reader: it is a property of a quota entry, and
+        # validateLimiters rejects it on this type, so it is not emitted here.
+        if [ "${WVA_QUOTA_KUEUE:-false}" = "true" ]; then
+            log_warning "WVA_QUOTA_KUEUE=true is set, but the ${ltype} limiter reads no quotas, from Kueue or anywhere -- it is being IGNORED. Pass WVA_LIMITER=quota to bound by Kueue."
+        fi
         # Physical capacity comes from the GPU operator, so there is nothing to
         # declare. A name is allowed but unused — NewLimiterFromConfig names the
         # inventory limiter itself — and quota fields are REJECTED on this type.
@@ -58,6 +63,17 @@ limiter_entry_yaml() {
     fi
 
     local scope="${WVA_QUOTA_SCOPE:-namespace}"
+    # Kueue bounds the entry when asked: per namespace and accelerator type the
+    # SMALLER of the Kueue nominal quota and the budget in WVA_QUOTAS applies.
+    # The budget is still required. Kueue's usual flavors carry no product
+    # label, so its grant names no accelerator type; WVA_QUOTAS names the types
+    # and -1 lets Kueue set the figure: WVA_QUOTAS='H100=-1' WVA_QUOTA_KUEUE=true.
+    # Validated before the first line is printed, like everything else here.
+    local kueue="${WVA_QUOTA_KUEUE:-false}"
+    case "$kueue" in
+        true|false) ;;
+        *) log_error "WVA_QUOTA_KUEUE must be 'true' or 'false', got '$kueue'" ;;
+    esac
     case "$scope" in
         namespace|cluster) ;;
         *) log_error "WVA_QUOTA_SCOPE must be 'namespace' or 'cluster', got '$scope'" ;;
@@ -245,6 +261,9 @@ $types" in
     # lint-deploy-scripts looks for, because that is the shape a collapsed line
     # continuation leaves behind.
     printf '%s\n' '- name: install-quota' '  type: quota' "  scope: ${scope}"
+    if [ "$kueue" = "true" ]; then
+        printf '%s\n' '  kueue:' '    enabled: true'
+    fi
     if [ "$scope" = "cluster" ]; then
         # Cluster scope caps the SUM across every namespace, so it is keyed by
         # accelerator type alone. Indented one level less than the namespace form.

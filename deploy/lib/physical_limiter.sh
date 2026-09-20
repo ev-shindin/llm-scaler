@@ -176,6 +176,48 @@ subjects:
 EOF
 }
 
+# pl_grant_kueue_read grants one controller the cluster-scoped Kueue read a quota
+# entry with kueue.enabled needs: ClusterQueues and ResourceFlavors. LocalQueues
+# are namespaced and come with the controller's own Role.
+#
+# Same object names as components/kueue-reader, for the same reason as
+# pl_grant_node_read. Without this, a cluster policy carrying the kueue block
+# reached every controller, and one installed before the kueue-reader
+# prerequisite existed read it, logged "external quota source unreadable and
+# never read" each cycle, and ran on the static entry alone -- which for the
+# recommended `-1` budget is no cap at all.
+pl_grant_kueue_read() {
+    local ns="$1" sa="$2" suffix
+    suffix="$(wva_ns_suffix "$ns")"
+    kubectl apply -f - >/dev/null <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wva-kueue-reader-role-${suffix}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+rules:
+- apiGroups: ["kueue.x-k8s.io"]
+  resources: ["clusterqueues", "resourceflavors"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wva-kueue-reader-rolebinding-${suffix}
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wva-kueue-reader-role-${suffix}
+subjects:
+- kind: ServiceAccount
+  name: ${sa}
+  namespace: ${ns}
+EOF
+}
+
 # pl_grant_policy_read lets one controller READ the policy ConfigMap. Read only,
 # never write: the point of putting policy in an admin-owned namespace is that its
 # subject cannot change it.
@@ -395,13 +437,16 @@ enable_physical_limiter() {
         if [ "$limiter" = "gpu-inventory" ]; then
             pl_grant_node_read "$ns" "$sa"
         fi
+        if [ "$limiter" = "quota" ] && [ "${WVA_QUOTA_KUEUE:-false}" = "true" ]; then
+            pl_grant_kueue_read "$ns" "$sa"
+        fi
         cm_ns="$(pl_policy_cm_ns "$ns")"
         if [ "$cm_ns" = "$policy_ns" ]; then
             pl_grant_policy_read "$ns" "$sa" "$policy_ns"
             pl_needs_restart "$ns" && restart_list="$restart_list $ns"
         fi
         case " $targets " in *" $cm_ns "*) : ;; *) targets="$targets $cm_ns" ;; esac
-        log_success "  $ns/$sa — reads policy from ${cm_ns}$([ "$limiter" = "gpu-inventory" ] && echo ', and may list nodes')"
+        log_success "  $ns/$sa — reads policy from ${cm_ns}$([ "$limiter" = "gpu-inventory" ] && echo ', and may list nodes')$([ "$limiter" = "quota" ] && [ "${WVA_QUOTA_KUEUE:-false}" = "true" ] && echo ', and may read Kueue')"
         granted=$((granted + 1))
     done
 
