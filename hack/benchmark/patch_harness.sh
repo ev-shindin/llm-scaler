@@ -1038,9 +1038,9 @@ fi
 # (/usr/local/cuda-*/compat, a glob, no walk, symlinked names resolved to
 # one) is appended after them; the walk is kept only as the fallback for an
 # image with neither, restricted to /usr and /opt on the root filesystem.
-# Measured in the engine image, the exported paths identical to the walk's:
-# 1.9 s -> 6 ms in the serving pod (driver, then compat), 0.6 s -> 6 ms in
-# a GPU-less pod (compat only). One difference, deliberate: with nothing
+# Measured in the engine image, both texts verbatim, the exported paths
+# compared byte for byte and identical: 1.9 s -> 10 ms in the serving pod
+# (driver, then compat), 0.6 s -> 6 ms in a GPU-less pod (compat only). One difference, deliberate: with nothing
 # found the walk exported a leading empty component (":$LD_LIBRARY_PATH",
 # which the loader reads as the working directory); this leaves the
 # variables as they were.

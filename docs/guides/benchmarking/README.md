@@ -275,10 +275,12 @@ Every ramp a benchmark records is sized by how long a new replica takes to
 become Ready ([why](../../reference/workload-preparation.md#the-rest-of-the-start-path)).
 llm-d-benchmark adds steps of its own to that path, and a benchmark that keeps
 them measures the harness, not the autoscaler. The scenarios under
-`hack/benchmark/scenarios/guides/` handle three of them; a scenario of your own
-should copy the same three blocks. A fourth is a harness default that
-`patch_harness.sh` changes, so every scenario gets it. A fifth is the
-cluster's, not the harness's, and comes first:
+`hack/benchmark/scenarios/guides/` handle three of them (package installs,
+the startup probe, engine caches); a scenario of your own should copy the
+same three blocks. A fourth (the `libcuda` walk) is a harness default that
+`patch_harness.sh` changes, so every scenario gets it. Two more are the
+cluster's, not the harness's -- the image and, for large models, the
+weights on the node -- and the image comes first:
 
 **The image is on every accelerator node before the harness deploys it.** A
 replica scheduled to a node without the engine image pulls 10-20 GB before

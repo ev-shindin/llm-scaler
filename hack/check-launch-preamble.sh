@@ -51,16 +51,24 @@ out="$("$PY" "$T/fix14.py" "$T/d2.yaml" 2>&1)"; rc=$?
 #    machine, and the harness's own `${dotted.path}` substitution (a dot inside
 #    the braces) must not see any of the shell expansions the preamble uses.
 # ---------------------------------------------------------------------------
-"$PY" - "$T/defaults.yaml" "$T/preamble.sh" <<'PYEOF'
-import re, sys
+"$PY" - "$T/defaults.yaml" "$T/preamble.sh" "$T/fix14.py" <<'PYEOF'
+import ast, re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 m = re.search(r"  runtimePreamble: \|\n((?:    .*\n)+)", src)
 body = "".join(line[4:] + "\n" for line in m.group(1).splitlines())
+# The block scalar must be the whole of what fix 14 writes: a line the regex
+# stops at (a blank, a different indent) would leave a prefix under test and
+# the rest of the preamble untested.
+# (the literal is evaluated: the patcher's source spells a backslash as two)
+new = ast.literal_eval(re.search(r"NEW = (TQ.*?TQ)".replace("TQ", chr(39) * 3), open(sys.argv[3], encoding="utf-8").read(), re.S).group(1))
+want = "".join(l[4:] + "\n" for l in new.splitlines() if l.startswith("    "))
+if body != want:
+    sys.exit("the extracted preamble (%d lines) is not fix 14's whole block (%d lines)" % (body.count("\n"), want.count("\n")))
 open(sys.argv[2], "w", encoding="utf-8", newline="\n").write(body)
 if re.search(r"\$\{([\w]+(?:\.[\w]+)+)\}", body):
     sys.exit("the preamble contains a ${dotted.path} the harness would try to substitute")
 PYEOF
-[ $? -eq 0 ] && ok "preamble: no \${dotted.path} for the harness's substitution to catch" || fail "preamble: harness substitution would fire on it"
+[ $? -eq 0 ] && ok "preamble: the whole of fix 14's block, and no \${dotted.path} for the harness's substitution to catch" || fail "preamble: extraction or harness substitution"
 bash -n "$T/preamble.sh" && ok "preamble: parses" || fail "preamble: does not parse"
 
 mkdir -p "$T/bin"
@@ -84,6 +92,23 @@ got="$(run "$T/lc2" "$T/empty")"
     && ok "preamble: both cache entries on LD_LIBRARY_PATH, the first on LIBRARY_PATH, the old values kept" \
     || fail "preamble with two cache entries: $got"
 [ -f "$T/find.calls" ] && fail "preamble: walked the filesystem although the cache answered" || ok "preamble: no walk when the cache answers"
+# a'. the cache lists them in an order that is not alphabetical: that order is
+#     the loader's search order and must be kept (sort -u would swap these)
+printf '\tlibcuda.so.1 (libc6,x86-64) => /usr/local/nvidia/lib64/libcuda.so.1\n\tlibcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1\n\tlibcuda.so.1 (libc6,x86-64) => /usr/local/nvidia/lib64/libcuda.so.1\n' > "$T/lc3"
+got="$(run "$T/lc3" "$T/empty")"
+[ "$got" = "/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu$compat:/pre/ld|/usr/local/nvidia/lib64:/pre/lib" ] \
+    && ok "preamble: the cache's own order is kept and a repeated entry dropped" || fail "preamble with a non-alphabetical cache: $got"
+# a''. the image's compat copy, on a fake root: the glob finds it, a symlinked
+#      alias of the same directory counts once, and it comes after the cache
+mkdir -p "$T/root/usr/local/cuda-13.0/compat"; : > "$T/root/usr/local/cuda-13.0/compat/libcuda.so.1"
+ln -s cuda-13.0 "$T/root/usr/local/cuda-13"; ln -s cuda-13.0 "$T/root/usr/local/cuda"
+sed "s|/usr/local/cuda\*/compat|$T/root/usr/local/cuda*/compat|" "$T/preamble.sh" > "$T/preamble-root.sh"
+grep -q "$T/root/usr/local/cuda\*/compat" "$T/preamble-root.sh" || fail "preamble: the compat glob is not where this check expects it"
+cp "$T/lc2" "$T/ldconfig.out"; cp "$T/empty" "$T/find.out"; rm -f "$T/find.calls"
+got="$(PATH="$T/bin:$PATH" LD_LIBRARY_PATH=/pre/ld LIBRARY_PATH=/pre/lib bash -c '. "$1"; printf "%s|%s" "$LD_LIBRARY_PATH" "$LIBRARY_PATH"' _ "$T/preamble-root.sh")"
+[ "$got" = "/usr/lib/x86_64-linux-gnu:/usr/local/cuda-13.0/compat:$T/root/usr/local/cuda-13.0/compat:/pre/ld|/usr/lib/x86_64-linux-gnu:/pre/lib" ] \
+    && ok "preamble: the image's compat copy is found by the glob, once for three names, after the cache" || fail "preamble with a compat copy on a fake root: $got"
+[ -f "$T/find.calls" ] && fail "preamble: walked although the cache and the glob answered" || ok "preamble: no walk when the glob answers"
 # b. the cache has no libcuda and the image has no compat copy: the fallback
 #    walk of /usr and /opt, on the root filesystem
 printf '\tlibcudart.so.13 (libc6,x86-64) => /usr/local/cuda/lib64/libcudart.so.13\n' > "$T/lc0"
