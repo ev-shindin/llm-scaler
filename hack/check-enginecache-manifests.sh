@@ -140,11 +140,13 @@ check(mounts.get("seed") == {"name": "seed", "mountPath": "/seed", "readOnly": T
 m2 = {m["name"]: m for m in seed2["containers"][0]["volumeMounts"]}
 check("subPath" not in m2.get("seed", {}), "no subPath when none was given: %s" % m2.get("seed"))
 script = seed["containers"][0]["args"][0]
-check('[ ! -e "/engine-cache/$d/$name" ] || continue' in script and 'cp -a --no-preserve=ownership "$e" "/engine-cache/$d/"' in script, "the seed is merged entry by entry: what the node has is kept, what it lacks is copied")
+check('merge() {' in script and 'local e n t' in script and 'merge "$e" "$t"' in script and 'elif [ ! -e "$t" ]' in script and 'cp -a --no-preserve=ownership "$e" "$2/"' in script, "the seed is merged file by file, descending directories both sides have: what the node has is kept, what it lacks is copied")
 check(script.index("if [ -d /seed ]") < script.index('touch "/engine-cache/$MARKER"'), "the seed is copied before the prepared marker is written")
 check('[ "$seeded_from" != "$SEED_ID" ]' in script and 'echo "$SEED_ID" > "/engine-cache/$SEED_MARKER"' in script, "the seed marker records the seed, and a different seed is merged in")
 i_ok = script.index('if [ "$complete" = 1 ]'); i_mark = script.index('echo "$SEED_ID" > "/engine-cache/$SEED_MARKER"'); i_loop = script.index('if cp -a --no-preserve=ownership')
-check(i_loop < i_ok < i_mark and 'else complete=0; rm -rf "/engine-cache/$d/$name"' in script, "the marker is written only after every copy succeeded; a failed copy is removed and the seed retried next start")
+check(i_loop < i_ok < i_mark and 'else complete=0; rm -rf "$t"' in script, "the marker is written only after every copy succeeded; a failed copy is removed and the seed retried next start")
+probe_seed = seed["containers"][0]["readinessProbe"]["exec"]["command"][2]
+check(probe_seed.endswith('&& grep -qx "workload-pvc:engine-cache" /engine-cache/.seeded'), "with a seed, Ready also requires the node to carry that seed: %s" % probe_seed)
 env = {e["name"]: e["value"] for e in seed["containers"][0]["env"]}
 check(env.get("SEED_MARKER") == ".seeded" and env.get("SEED_ID") == "workload-pvc:engine-cache", "the seed marker's name and the seed's identity come from the environment")
 check("$(" not in script and "$$" not in script, "still no $( or $$ in the command")
@@ -158,6 +160,28 @@ for b in bad:
 sys.exit(1 if bad else 0)
 PYEOF
 [ "$FAILED" = 0 ] && ok "render: --seed-claim mounts the seed read-only and the preparer copies it once, before the marker"
+# the merge, run: a fake seed and cache; a key the node has is kept, a key it
+# lacks (under a directory both have) is added, a second run is a no-op, a
+# changed seed adds its new key; under dash when the host has it, sh otherwise
+M="$T/merge"; mkdir -p "$M/seed/vllm/torch_compile_cache/keyA" "$M/seed/vllm/torch_compile_cache/keyB" "$M/seed/triton/x" "$M/cache/vllm/torch_compile_cache/keyA"
+echo old > "$M/cache/vllm/torch_compile_cache/keyA/f"; echo new > "$M/seed/vllm/torch_compile_cache/keyA/f"; echo b > "$M/seed/vllm/torch_compile_cache/keyB/f"; echo t > "$M/seed/triton/x/f"
+sed -n "/^preparer_script() {/,/^SCRIPT$/p" deploy/enginecache.sh | sed '1,2d;$d' | sed "s|/seed|$M/seed|g; s|/engine-cache|$M/cache|g; s|^trap .*||" > "$M/p.sh"
+SH=sh; command -v dash >/dev/null 2>&1 && SH=dash
+SEED_MARKER=.seeded SEED_ID=shared:x MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run1.out" 2>&1
+[ "$(cat "$M/cache/vllm/torch_compile_cache/keyA/f")" = old ] && [ "$(cat "$M/cache/vllm/torch_compile_cache/keyB/f")" = b ] && [ "$(cat "$M/cache/triton/x/f")" = t ] && [ "$(cat "$M/cache/.seeded")" = shared:x ] \
+    && ok "merge ($SH): the node's key kept, the seed's other key added beside it, triton added, the marker records the seed" || fail "merge run 1: $(cat "$M/run1.out"; ls -R "$M/cache" | head -20)"
+grep -q "2 entries added" "$M/run1.out" && ok "merge: two entries added on the first run" || fail "merge run 1 message: $(cat "$M/run1.out")"
+SEED_MARKER=.seeded SEED_ID=shared:x MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run2.out" 2>&1
+grep -q "seeded on" "$M/run2.out" && fail "merge: the same seed was copied again" || ok "merge: the same seed is not copied again"
+mkdir -p "$M/seed/vllm/torch_compile_cache/keyC"; echo c > "$M/seed/vllm/torch_compile_cache/keyC/f"
+SEED_MARKER=.seeded SEED_ID=shared:y MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run3.out" 2>&1
+[ "$(cat "$M/cache/vllm/torch_compile_cache/keyC/f")" = c ] && [ "$(cat "$M/cache/.seeded")" = shared:y ] && grep -q "1 entries added" "$M/run3.out" && ok "merge: a changed seed adds its new key and rewrites the marker" || fail "merge run 3: $(cat "$M/run3.out")"
+# a copy that cannot complete: an unreadable seed entry (the preparer's own
+# chmod 1777 would undo a read-only target directory)
+mkdir -p "$M/seed/triton/y"; echo y > "$M/seed/triton/y/f"; chmod 000 "$M/seed/triton/y"
+SEED_MARKER=.seeded SEED_ID=shared:z MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run4.out" 2>&1; chmod 755 "$M/seed/triton/y"
+if [ "$(id -u)" = 0 ]; then ok "merge: (the failed-copy case needs a non-root check runner)"; else
+grep -q "did not complete" "$M/run4.out" && [ "$(cat "$M/cache/.seeded")" = shared:y ] && [ ! -e "$M/cache/triton/y" ] && ok "merge: a copy that fails leaves the marker at the previous seed and nothing half-copied" || fail "merge run 4: $(cat "$M/run4.out"; cat "$M/cache/.seeded")"; fi
 n="$(grep -c "cat <<'SCRIPT'" deploy/enginecache.sh)"
 [ "$n" = 1 ] && grep -q '^\$(preparer_script | sed' deploy/enginecache.sh && ok "render: the preparer's command comes from a quoted heredoc, so nothing in it is evaluated at apply time" || fail "render: the preparer's command is not in a quoted heredoc ($n)"
 
@@ -184,6 +208,7 @@ refuse "a seed that is the engine-cache claim itself" apply -n ns --path /mnt/lo
 refuse "a seed subPath with '..'" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "shared:../x" --dry-run
 refuse "a seed subPath that is absolute" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "shared:/x" --dry-run
 refuse "a seed claim name that is not one" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "Shared Caches" --dry-run
+refuse "a seed with an empty subPath after the colon" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "shared:" --dry-run
 
 # ---------------------------------------------------------------------------
 # 3. engine_cache_claim.sh against a stub kubectl.

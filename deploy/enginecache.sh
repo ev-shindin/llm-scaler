@@ -170,32 +170,46 @@ check_image() {
 # bake its output into every node's manifest. The markers' names and the
 # seed's identity reach it as environment variables. No `$(` and no `$$` in
 # it: Kubernetes rewrites both in a container's command. The seed is merged
-# entry by entry: an entry the node already has is kept, one it lacks is
-# copied, a copy that fails is removed and the seed marker withheld, so the
-# next start of the pod tries again; the marker records the seed it came
-# from, so a changed --seed-claim is merged in too.
+# file by file, descending directories both sides have: an entry the node
+# already has is kept, one it lacks is copied (so a second engine config's
+# key lands beside the node's own under torch_compile_cache), a copy that
+# fails is removed and the seed marker withheld, so the next start of the
+# pod tries again; the marker records the seed it came from, so a changed
+# --seed-claim is merged in too. A recursive function, with `local`, which
+# dash has.
 preparer_script() {
     cat <<'SCRIPT'
 for d in vllm flashinfer triton; do
   mkdir -p "/engine-cache/$d" || exit 1
   chmod 1777 "/engine-cache/$d" 2>/dev/null || true
 done
+# merge SRC DST: an entry the node has is kept, one it lacks is copied, a
+# directory both have is descended -- so a second engine config's key lands
+# beside the node's own. A copy that fails is removed and the seed marked
+# incomplete.
+merge() {
+  local e n t
+  for e in "$1"/* "$1"/.[!.]*; do
+    [ -e "$e" ] || continue
+    n="${e##*/}"; t="$2/$n"
+    if [ -d "$e" ] && [ ! -L "$e" ] && [ -d "$t" ] && [ ! -L "$t" ]; then
+      merge "$e" "$t"
+    elif [ ! -e "$t" ]; then
+      if cp -a --no-preserve=ownership "$e" "$2/"; then added="$added."; else complete=0; rm -rf "$t"; fi
+    fi
+  done
+}
 seeded_from=""
 [ ! -f "/engine-cache/$SEED_MARKER" ] || read -r seeded_from < "/engine-cache/$SEED_MARKER" || seeded_from=""
 if [ -d /seed ] && [ "$seeded_from" != "$SEED_ID" ]; then
   complete=1; added=""
   for d in vllm flashinfer triton; do
     [ -d "/seed/$d" ] || continue
-    for e in "/seed/$d"/* "/seed/$d"/.[!.]*; do
-      [ -e "$e" ] || continue
-      name="${e##*/}"
-      [ ! -e "/engine-cache/$d/$name" ] || continue
-      if cp -a --no-preserve=ownership "$e" "/engine-cache/$d/"; then added="$added $d/$name"; else complete=0; rm -rf "/engine-cache/$d/$name"; fi
-    done
+    merge "/seed/$d" "/engine-cache/$d"
   done
   if [ "$complete" = 1 ]; then
     echo "$SEED_ID" > "/engine-cache/$SEED_MARKER" || exit 1
-    echo "engine cache: seeded on $HOSTNAME from $SEED_ID:$added (what the node already had was kept)"
+    echo "engine cache: seeded on $HOSTNAME from $SEED_ID: ${#added} entries added, what the node already had kept"
   else
     echo "engine cache: seeding on $HOSTNAME from $SEED_ID did not complete (a copy failed and was removed); it is retried when this pod next starts"
   fi
@@ -212,6 +226,13 @@ seed_volume_yaml() {
     [ -n "$SEED_CLAIM" ] || return 0
     printf '        - name: seed\n          persistentVolumeClaim:\n            claimName: %s\n            readOnly: true\n' "$SEED_CLAIM"
 }
+# seed_probe prints the readiness probe's extra clause with a seed: the node
+# carries the marker of THIS seed. The probe is a single-quoted YAML scalar,
+# so the double quotes in it need no escaping.
+seed_probe() {
+    [ -n "$SEED_CLAIM" ] || return 0
+    printf ' && grep -qx "%s" /engine-cache/%s' "${SEED_CLAIM}${SEED_SUBPATH:+:$SEED_SUBPATH}" "$SEED_MARKER"
+}
 seed_mount_yaml() {
     [ -n "$SEED_CLAIM" ] || return 0
     printf '            - name: seed\n              mountPath: /seed\n              readOnly: true\n'
@@ -227,6 +248,7 @@ check_seed() {
     case "$claim" in
         ""|*[!a-z0-9.-]*) log_error "--seed-claim: not a claim name: '${claim}' (a DNS-1123 name, with an optional :subPath)" ;;
     esac
+    [ "$claim" = "$1" ] || [ -n "$sub" ] || log_error "--seed-claim: '${1}' names an empty subPath; give PVC or PVC:SUBPATH"
     [ "$claim" != "$CLAIM" ] || log_error "--seed-claim: the seed cannot be the engine-cache claim itself"
     case "$sub" in
         *..*|/*|*[!A-Za-z0-9._/-]*) log_error "--seed-claim: not a subPath: '${sub}' (relative, path characters, no '..')" ;;
@@ -377,10 +399,12 @@ $(preparer_script | sed 's/^/              /')
               mountPath: /engine-cache
 $(seed_mount_yaml)
           # Ready is "prepared, and writable by this UID": what the engines
-          # will find, as the UID they run as.
+          # will find, as the UID they run as -- and, with a seed, seeded from
+          # it, so numberReady and status count a node whose seed did not
+          # complete as not ready. The engines do not wait on the preparer.
           readinessProbe:
             exec:
-              command: ["/bin/sh", "-c", "test -f /engine-cache/${MARKER} && test -w /engine-cache/vllm"]
+              command: ["/bin/sh", "-c", 'test -f /engine-cache/${MARKER} && test -w /engine-cache/vllm$(seed_probe)']
             periodSeconds: 10
           resources:
             requests:

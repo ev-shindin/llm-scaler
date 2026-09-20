@@ -348,10 +348,14 @@ engine had used since the switch, Ready 96 s after it was wanted). So
 **seed it**: `ENGINE_CACHE_SEED_CLAIM=<claim>[:<subPath>]` names a claim
 in the namespace -- the shared RWX claim the caches lived on before is
 the natural one -- and the preparer mounts it read-only and merges its
-caches into each node's as it prepares it: an entry the node already has
-is kept, one it lacks is copied, a failed copy is removed and retried at
+caches into each node's as it prepares it, file by file: an entry the
+node already has is kept, one it lacks is copied (a second engine config's
+key lands beside the node's own), a failed copy is removed and retried at
 the pod's next start, and a marker records which seed the node has, so a
-changed seed is merged in too (the seed's subPath must exist). What is
+changed seed is merged in too (the seed's subPath must exist). With a
+seed, a node is Ready only once it carries it, so `engine-cache-status`
+counts a node whose seed did not complete as not prepared; the engines do
+not wait on the preparer either way. What is
 copied is code the engines load, so the seed claim must be trusted as the
 cache itself is, and more: one write to it reaches every node at the next
 prepare, where a write to the cache reaches the one node the writer's pod
