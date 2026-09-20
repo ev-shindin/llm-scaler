@@ -718,7 +718,7 @@ so_pool() {
 # stays silent. It fires for a workload that was pointed at the Hub directly.
 so_weights_note() {
     local ns="$1" resource="$2" name="$3" pod="$4"
-    local gaps engine prestop grace pvcs onvol argv model
+    local gaps engine prestop grace pvcs onvol argv cachevol model
 
     # One detector, shared with the patch emitter. This function used to carry
     # its own copy and the copies disagreed: it accepted "a PVC exists anywhere
@@ -730,7 +730,7 @@ so_weights_note() {
         printf '%s' "Could not read the pod spec, so whether weights persist across scale-ups is unknown -- this is not a report that they do."
         return 0
     fi
-    IFS=$'\037' read -r engine prestop grace pvcs onvol argv <<< "$gaps"
+    IFS=$'\037' read -r engine prestop grace pvcs onvol argv cachevol <<< "$gaps"
     [ -n "$engine" ] || return 0
     [ "${onvol:-0}" -eq 1 ] && return 0
 
@@ -743,6 +743,35 @@ so_weights_note() {
     esac
 
     printf '%s' "Weights do not persist: ${engine} downloads outside any volume it has mounted, so every scale-up re-fetches ${model} from Hugging Face. That is a per-replica cost on the path this ScaledObject is about to start exercising, and a dependency on the Hub being reachable. llm-d's modelservice chart mounts a model cache by default (uriProtocol: pvc at /model-cache); see docs/reference/operations.md#weights-and-the-model-cache."
+    return 0
+}
+
+# so_enginecache_note reports when a scale target compiles its kernels on every
+# start, and returns a note when it does.
+#
+# vLLM keeps its torch.compile artefacts, the FlashInfer autotune table and
+# Triton's JIT cache under VLLM_CACHE_ROOT (its two siblings follow it). Unset,
+# they go to /tmp; on an emptyDir, they die with the pod. Either way no replica
+# finds what the previous one compiled, and measured on one cluster that is
+# 14.4 s of torch.compile against 2.9 s from a warm cache, and 8 s more before
+# the API server answered -- a per-replica cost on the path a ScaledObject is
+# about to start exercising, the same shape as the weights.
+#
+# Silent for anything that is not vLLM (the detector has no opinion there), and
+# silent on an unreadable spec: the drain note already says that out loud, and
+# saying it three times is how a reader learns to skip the notes.
+so_enginecache_note() {
+    local ns="$1" resource="$2" name="$3" pod="$4"
+    local gaps engine prestop grace pvcs onvol argv cachevol
+    gaps="$(so_workload_gaps "$ns" "$resource" "$name" "$pod")" || return 0
+    IFS=$'\037' read -r engine prestop grace pvcs onvol argv cachevol <<< "$gaps"
+    [ -n "$engine" ] || return 0
+    case "$cachevol" in
+        unset)
+            printf '%s' "Every start compiles from nothing: ${engine} keeps its torch.compile, FlashInfer and Triton caches under /tmp (VLLM_CACHE_ROOT is unset), so no replica finds what the previous one compiled -- tens of seconds on every scale-up. \`make workload-patch\` writes the fix; see docs/reference/workload-preparation.md#engine-caches-on-the-nodes-disk." ;;
+        ephemeral:*)
+            printf '%s' "Every start compiles from nothing: ${engine} keeps its compile caches at ${cachevol#ephemeral:}, which is on no volume that outlives the pod, so no replica finds what the previous one compiled -- tens of seconds on every scale-up. \`make workload-patch\` writes the fix; see docs/reference/workload-preparation.md#engine-caches-on-the-nodes-disk." ;;
+    esac
     return 0
 }
 
@@ -842,25 +871,44 @@ so_workload_weights_safe() {
     return 0
 }
 
-# so_workload_weights_can_apply answers so_workload_weights_safe for a live
-# workload, and says out loud why the answer is no.
-so_workload_weights_can_apply() {
-    local ns="$1" name="$2" doc="$3" live volname mountpath claim why
-    volname="$(yq eval '.spec.template.spec.volumes[0].name // ""' "$doc" 2>/dev/null)"
-    [ -n "$volname" ] || return 1          # no weights half in this document
-    mountpath="$(yq eval '.spec.template.spec.containers[0].volumeMounts[0].mountPath // ""' "$doc" 2>/dev/null)"
-    claim="$(yq eval '.spec.template.spec.volumes[0].persistentVolumeClaim.claimName // ""' "$doc" 2>/dev/null)"
+# so_workload_volume_can_apply answers so_workload_weights_safe for ONE volume
+# of a document -- the weights volume or the engine-cache volume, found by
+# name -- against the live workload, and says out loud why the answer is no.
+# The document may carry both halves, so nothing here reads volumes[0].
+#
+# $1 namespace, $2 workload, $3 the document, $4 the volume name, $5 what the
+# volume is for, in words, $6 the opt-in that asked for it.
+so_workload_volume_can_apply() {
+    local ns="$1" name="$2" doc="$3" volname="$4" what="$5" optin="$6" live mountpath claim why
+    claim="$(yq eval ".spec.template.spec.volumes[] | select(.name == \"$volname\") | .persistentVolumeClaim.claimName // \"\"" "$doc" 2>/dev/null)"
+    [ -n "$claim" ] || return 1          # no such half in this document
+    mountpath="$(yq eval ".spec.template.spec.containers[0].volumeMounts[] | select(.name == \"$volname\") | .mountPath // \"\"" "$doc" 2>/dev/null)"
     live="$(kubectl get deployments "$name" -n "$ns" -o json 2>/dev/null)" || return 1
     if why="$(so_workload_weights_safe "$live" "$volname" "$mountpath" "$claim" "$ns")"; then
-        log_info "  $ns/$name: applying the weights volume too (WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true)."
+        log_info "  $ns/$name: applying the $what volume too ($optin=true)."
         return 0
     fi
-    log_warning "  $ns/$name: the weights volume is emitted, NOT applied -- $why."
+    log_warning "  $ns/$name: the $what volume is emitted, NOT applied -- $why."
     return 1
 }
 
+so_workload_weights_can_apply() {
+    so_workload_volume_can_apply "$1" "$2" "$3" "${WVA_MODEL_VOLUME_NAME:-model-storage}" weights WVA_WORKLOAD_PATCH_APPLY_WEIGHTS
+}
+
+# The engine-cache volume has one more thing the weights volume does not: the
+# engine fails hard on a cache directory it cannot write, and the guard that
+# makes that cost a compile rather than the replica lives in the container
+# command, which belongs to the chart and is not patched here. So applying it
+# live is applying it without the guard, and that is said at the time.
+so_workload_enginecache_can_apply() {
+    so_workload_volume_can_apply "$1" "$2" "$3" "${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}" engine-cache WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE || return 1
+    log_warning "  $1/$2: the engine-cache guard is NOT applied with it -- the command belongs to the chart. A node where the cache is not writable then loses the replica, not a compile; the emitted file has the guard."
+    return 0
+}
+
 so_workload_patch_one() {
-    local file="$1" ns="$2" name="$3" doc rc=0
+    local file="$1" ns="$2" name="$3" doc rc=0 keep_w=0 keep_e=0
     doc="$(mktemp)" || return 1
     # shellcheck disable=SC2016
     yq eval-all "select(.metadata.namespace == \"$ns\" and .metadata.name == \"$name\")" \
@@ -870,19 +918,25 @@ so_workload_patch_one() {
         log_warning "  Could not isolate the patch for $ns/$name."
         return 1
     fi
-    # WVA_WORKLOAD_PATCH_APPLY_WEIGHTS is its own opt-in, separate from
-    # APPLY. Adding a hook cannot conflict with anything; mounting storage
-    # changes where an engine reads its weights from, and can be refused by the
-    # API server outright. They are different decisions and get different flags.
+    # WVA_WORKLOAD_PATCH_APPLY_WEIGHTS and _ENGINE_CACHE are their own opt-ins,
+    # separate from APPLY and from each other. Adding a hook cannot conflict
+    # with anything; mounting storage changes where an engine reads its weights
+    # from, or writes code it will load, and can be refused by the API server
+    # outright. They are different decisions and get different flags.
     if [ "${WVA_WORKLOAD_PATCH_APPLY_WEIGHTS:-false}" = "true" ] \
        && so_workload_weights_can_apply "$ns" "$name" "$doc"; then
-        : # keep the weights half in the document
-    elif ! so_workload_patch_drop_cache "$doc"; then
+        keep_w=1
+    fi
+    if [ "${WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE:-false}" = "true" ] \
+       && so_workload_enginecache_can_apply "$ns" "$name" "$doc"; then
+        keep_e=1
+    fi
+    if ! so_workload_patch_trim "$doc" "$keep_w" "$keep_e"; then
         rm -f "$doc"
         # 2, not 1: a DELIBERATE skip. Counting it as a failure made every re-run
         # of the standup announce "scale-downs in this run will truncate
         # in-flight requests" about a workload that already had its drain hook.
-        log_info "  $ns/$name needs only the weights volume -- emitted, not applied."
+        log_info "  $ns/$name needs only a volume -- emitted, not applied."
         return 2
     fi
     # `kubectl patch --type=strategic`, never `kubectl apply`. These objects were
@@ -895,20 +949,44 @@ so_workload_patch_one() {
     return "$rc"
 }
 
-# so_workload_patch_drop_cache rewrites a patch document in place, removing the
-# weights half. It returns non-zero when nothing actionable is left, so the
-# caller can skip a document that was only ever about the cache.
-so_workload_patch_drop_cache() {
-    local doc="$1" stripped keep
+# so_workload_patch_trim rewrites a patch document in place, keeping the drain
+# half and whichever storage halves were asked for ($2 the weights half, $3 the
+# engine-cache half; 1 keeps). It returns non-zero when nothing actionable is
+# left, so the caller can skip a document that was only ever about a volume.
+#
+# Each half is removed BY NAME -- its variables, its mount, its volume -- so the
+# other survives: the document carries one env list, one mount list and one
+# volume list for both. A list emptied by that goes too; an `env: []` left
+# behind is a field the patch would still write.
+so_workload_patch_trim() {
+    local doc="$1" keep_w="${2:-0}" keep_e="${3:-0}" stripped keep prog=""
+    local wvol="${WVA_MODEL_VOLUME_NAME:-model-storage}" evol="${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}"
     stripped="$(mktemp)" || return 1
-    yq eval 'del(.spec.template.spec.volumes)
-             | del(.spec.template.spec.containers[].volumeMounts)
-             | del(.spec.template.spec.containers[].env)' "$doc" > "$stripped" 2>/dev/null
-    # What remains is worth applying only if it still carries a drain change. A
+    if [ "$keep_w" -ne 1 ]; then
+        prog="del(.spec.template.spec.volumes[] | select(.name == \"$wvol\"))
+              | del(.spec.template.spec.containers[].volumeMounts[] | select(.name == \"$wvol\"))
+              | del(.spec.template.spec.containers[].env[] | select(.name == \"HF_HOME\"))"
+    fi
+    if [ "$keep_e" -ne 1 ]; then
+        prog="${prog:+$prog | }del(.spec.template.spec.volumes[] | select(.name == \"$evol\"))
+              | del(.spec.template.spec.containers[].volumeMounts[] | select(.name == \"$evol\"))
+              | del(.spec.template.spec.containers[].env[] | select(.name == \"VLLM_CACHE_ROOT\" or .name == \"FLASHINFER_WORKSPACE_DIR\" or .name == \"TRITON_CACHE_DIR\"))"
+    fi
+    # The comments go too. They are written for whoever reads the FILE, and a
+    # removed half leaves its explanation behind as a comment on the document,
+    # so the body sent to the API server still spoke of a volume it no longer
+    # carried -- harmless to the server, misleading in a log of what was sent.
+    prog="${prog:+$prog | }del(.spec.template.spec.volumes | select(length == 0))
+          | del(.spec.template.spec.containers[].volumeMounts | select(length == 0))
+          | del(.spec.template.spec.containers[].env | select(length == 0))
+          | ... comments=\"\""
+    yq eval "$prog" "$doc" > "$stripped" 2>/dev/null
+    # What remains is worth applying only if it still carries a change. A
     # container entry reduced to its own name patches nothing, and sending it
     # would report a success that changed no field.
     keep="$(yq eval '[.spec.template.spec.terminationGracePeriodSeconds,
-                      .spec.template.spec.containers[].lifecycle]
+                      .spec.template.spec.containers[].lifecycle,
+                      .spec.template.spec.volumes]
                      | map(select(. != null)) | length' "$stripped" 2>/dev/null)"
     if [ ! -s "$stripped" ] || [ "${keep:-0}" -eq 0 ]; then
         rm -f "$stripped"
@@ -916,6 +994,11 @@ so_workload_patch_drop_cache() {
     fi
     mv "$stripped" "$doc" || { rm -f "$stripped"; return 1; }
     return 0
+}
+
+# so_workload_patch_drop_cache is the trim that keeps the drain half only.
+so_workload_patch_drop_cache() {
+    so_workload_patch_trim "$1" 0 0
 }
 
 # so_workload_patch_header writes the preamble of an emitted patch file.
@@ -944,9 +1027,10 @@ so_workload_patch_header() {
 #     kubectl patch deployment <name> -n <namespace> \
 #         --type=strategic --patch-file=<one document from this file>
 #
-# A weights volume below names a PersistentVolumeClaim that MUST ALREADY EXIST,
-# or every pod the rollout creates stays Pending. Its size and storage class are
-# cluster decisions, which is why nothing here creates it.
+# A volume below -- the weights cache, the engine cache -- names a
+# PersistentVolumeClaim that MUST ALREADY EXIST, or every pod the rollout creates
+# stays Pending. Its size, storage class or node directory are cluster
+# decisions, which is why nothing here creates it; each document says how.
 #
 HDR
 }
@@ -985,7 +1069,7 @@ wva_workload_patch() {
     local out="${WVA_WORKLOAD_PATCH_FILE:-wva-workload-patch.yaml}"
     local apply="${WVA_WORKLOAD_PATCH_APPLY:-false}"
     local ns resource pod kind name found=0 tmp rc=0
-    local unreadable=0 skipped=0 scanned=0 patched=0 failed=0 deferred=0 needs_cache=0
+    local unreadable=0 skipped=0 scanned=0 patched=0 failed=0 deferred=0 needs_cache=0 needs_engine=0
     local listing names doc_rc index_lines tool doc_ns doc_name write_rc
 
     # The tool check this path never had. `make workload-patch` sources the
@@ -1071,7 +1155,7 @@ wva_workload_patch() {
             log_warning "Nothing was written: all $scanned workload(s) were skipped (see above)."
             return 0
         fi
-        log_success "$((scanned - skipped)) model server(s) already drain on scale-down and keep their weights on a volume."
+        log_success "$((scanned - skipped)) model server(s) already drain on scale-down and keep their weights and compile caches on a volume."
         [ "$skipped" -gt 0 ] && log_warning "  $skipped other workload(s) were skipped and were not checked."
         so_workload_patch_clear_stale "$out"
         return 0
@@ -1089,6 +1173,15 @@ wva_workload_patch() {
         log_warning "  the easiest to mistake for the autoscaler being slow."
         log_warning "  $out has the pod-spec half, and says which claim to use or create."
     fi
+    needs_engine=$(grep -c '^#   engine-cache:' "$tmp" 2>/dev/null) || needs_engine=0
+    if [ "$needs_engine" -gt 0 ]; then
+        log_warning "$needs_engine model server(s) COMPILE FROM NOTHING every time a replica is added."
+        log_warning "  vLLM keeps its torch.compile, FlashInfer and Triton caches under VLLM_CACHE_ROOT; on no"
+        log_warning "  volume that outlives the pod, no replica finds what the previous one compiled (measured:"
+        log_warning "  14 s of torch.compile against 3 s warm, and 8 s more before the API server answered)."
+        log_warning "  $out has the pod-spec half, and says which claim to use or create -- and what a node"
+        log_warning "  directory for it must be, or how to do without one."
+    fi
 
     if [ "$apply" = "true" ]; then
         log_warning "WVA_WORKLOAD_PATCH_APPLY=true: patching $found workload(s) directly."
@@ -1103,6 +1196,11 @@ wva_workload_patch() {
             log_info "  The weights half is applied too, where it cannot break the workload -- see $out."
         else
             log_info "  The weights half is emitted only -- see $out. Add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true to apply it."
+        fi
+        if [ "${WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE:-false}" = "true" ]; then
+            log_info "  The engine-cache half is applied too, where it cannot break the workload -- see $out."
+        else
+            log_info "  The engine-cache half is emitted only -- see $out. Add WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true to apply it."
         fi
         index_lines=0
         while read -r doc_ns doc_name; do
@@ -1128,7 +1226,7 @@ wva_workload_patch() {
         # message printed the emitted count unconditionally -- it reported
         # "Patched 3" with yq missing and zero patch calls made.
         [ "$patched" -gt 0 ] && log_success "Patched $patched of $found workload(s)."
-        [ "$deferred" -gt 0 ] && log_info "$deferred workload(s) need only the weights volume, which is emitted rather than applied."
+        [ "$deferred" -gt 0 ] && log_info "$deferred workload(s) need only a volume, which is emitted rather than applied."
         if [ "$failed" -gt 0 ]; then
             log_warning "$failed of $found workload(s) were NOT patched."
             rc=1
@@ -1218,6 +1316,27 @@ so_workload_gaps() {
         | ( ((($e.command // []) + ($e.args // []))
              | map(tostring | gsub("[\n\r]"; " ")) | join(" ")) ) as $argv
         | ( ($argv | capture("--download-dir[= ]+(?<d>[^ ]+)").d) // $envdir ) as $dldir
+        # The compile caches: torch.compile, FlashInfer, Triton. vLLM keeps them
+        # under VLLM_CACHE_ROOT (its two siblings follow it); unset, they go to
+        # /tmp and every start compiles from nothing. A durable mount is one
+        # whose volume outlives the pod -- a claim or a hostPath. An emptyDir
+        # dies with the pod, so a cache under it is a cache for one replica,
+        # which is none. SGLang has no such variable, so the field is empty
+        # for it: no opinion, not a clean bill.
+        | ([ $t.spec.volumes[]? | select(.persistentVolumeClaim != null or .hostPath != null) | .name ]) as $durable
+        | ([ $e.volumeMounts[]? | select(.name as $n | $durable | any(. == $n)) | .mountPath ]) as $dmounts
+        # `last`, not `first`: a name listed twice in env is resolved by the
+        # kubelet to its LAST value, and the benchmark harness lists this one
+        # twice (its default /tmp/vllm, then the mount). Reading the first
+        # reported every harness engine as compiling from nothing.
+        | ( [ $e.env[]? | select(.name == "VLLM_CACHE_ROOT") | .value ] | last ) as $cacheroot
+        | ( ((($e.image // "") | ascii_downcase | test("vllm"))
+             or ($argv | ascii_downcase | test("vllm serve"))) ) as $isvllm
+        | ( if ($e | not) or ($isvllm | not) then ""
+            elif ($cacheroot | not) then "unset"
+            elif ([ $dmounts[] | select(. != null)
+                    | select(. as $m | $cacheroot | startswith($m)) ] | length) > 0 then "volume:" + $cacheroot
+            else "ephemeral:" + $cacheroot end ) as $cachevol
         | [ ($e.name // ""),
             (if ($e | not) then 0 elif ($e.lifecycle.preStop != null) then 1 else 0 end),
             ($t.spec.terminationGracePeriodSeconds // 30),
@@ -1238,7 +1357,11 @@ so_workload_gaps() {
              elif ([ $mounts[] | select(. != null)
                      | select(. as $m | $dldir | startswith($m)) ] | length) > 0 then 1
              else 0 end),
-            $argv
+            $argv,
+            # cacheOnVolume, LAST and after argv on purpose: the readers are
+            # `read -r ... argv cachevol`, and a field added before argv would
+            # land inside it on every reader that was not updated.
+            $cachevol
           ] | join("\u001f")' 2>/dev/null || return 1
 }
 
@@ -1461,8 +1584,9 @@ so_model_claim() {
 
 so_workload_patch_doc() {
     local ns="$1" resource="$2" name="$3" pod="$4"
-    local gaps engine prestop grace pvcs onvol argv model
-    local want_drain=0 want_cache=0 grace_want mountpath claim claim_found=0
+    local gaps engine prestop grace pvcs onvol argv cachevol model
+    local want_drain=0 want_cache=0 want_engine=0 grace_want mountpath claim claim_found=0
+    local emount evol eclaim esub eclaim_found=0
 
     # LWS is skipped, deliberately and loudly. Three things would each have to be
     # solved and none is: the pod template is spec.leaderWorkerTemplate, not
@@ -1484,7 +1608,7 @@ so_workload_patch_doc() {
         log_warning "  Could not read $resource/$name in $ns -- skipped. It is not being reported as healthy; it was not readable."
         return 3
     fi
-    IFS=$'\037' read -r engine prestop grace pvcs onvol argv <<< "$gaps"
+    IFS=$'\037' read -r engine prestop grace pvcs onvol argv cachevol <<< "$gaps"
 
     # No identifiable engine means no idea which container to patch, and the
     # fallback that guessed container 0 is what put hooks on routing proxies.
@@ -1513,7 +1637,20 @@ so_workload_patch_doc() {
            fi ;;
     esac
 
-    [ "$want_drain" -eq 1 ] || [ "$want_cache" -eq 1 ] || return 0
+    # The engine-cache half: the same question one layer down. Weights on a
+    # volume make a start a load rather than a download; the compile caches on
+    # a volume make it a load rather than a compile. Only vLLM has the variable
+    # (cachevol is empty for anything else: no opinion, not a clean bill).
+    case "$cachevol" in
+        unset)
+            want_engine=1
+            log_warning "  $ns/$name COMPILES FROM NOTHING on every start: $engine keeps its torch.compile, FlashInfer and Triton caches under /tmp (VLLM_CACHE_ROOT is unset)." ;;
+        ephemeral:*)
+            want_engine=1
+            log_warning "  $ns/$name COMPILES FROM NOTHING on every start: $engine keeps its compile caches at ${cachevol#ephemeral:}, on no volume that outlives the pod." ;;
+    esac
+
+    [ "$want_drain" -eq 1 ] || [ "$want_cache" -eq 1 ] || [ "$want_engine" -eq 1 ] || return 0
 
     cat <<HDR
 ---
@@ -1535,6 +1672,12 @@ DRAINWHY
 #   cache: ${model} is a repository id and the engine downloads outside any
 #          mounted volume, so every scale-up fetches the weights again.
 CACHEWHY
+    fi
+    if [ "$want_engine" -eq 1 ]; then
+        cat <<ENGINEWHY
+#   engine-cache: the compile caches (torch.compile, FlashInfer, Triton) are on
+#          no volume that outlives the pod, so every start compiles from nothing.
+ENGINEWHY
     fi
     cat <<HEAD
 #
@@ -1590,21 +1733,76 @@ PRESTOP
             claim="$(so_model_claim "$ns")"
             if [ -n "$claim" ]; then claim_found=1; else claim="model-pvc"; fi
         fi
-        cat <<CACHE
+    fi
+    if [ "$want_engine" -eq 1 ]; then
+        emount="${WVA_ENGINE_CACHE_PATH:-/engine-cache}"
+        evol="${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}"
+        # The claim `make engine-cache` makes, unless the operator names one --
+        # a shared RWX claim they already have, with an optional subPath, for a
+        # cluster where no node directory is on offer.
+        eclaim="${WVA_ENGINE_CACHE_CLAIM:-engine-cache}"
+        esub=""
+        case "$eclaim" in *:*) esub="${eclaim#*:}"; eclaim="${eclaim%%:*}" ;; esac
+        kubectl get pvc "$eclaim" -n "$ns" >/dev/null 2>&1 && eclaim_found=1
+    fi
+    # env, volumeMounts and volumes are each ONE list, filled from whichever
+    # halves want them. Two `env:` keys in one mapping is a document yq reads as
+    # the second one only, silently, and the API server as invalid.
+    if [ "$want_cache" -eq 1 ] || [ "$want_engine" -eq 1 ]; then
+        echo "        env:"
+        if [ "$want_cache" -eq 1 ]; then
+            cat <<CACHEENV
         # The mount alone changes nothing: vLLM downloads to HF_HOME, so without
         # this the weights land inside the container and the volume sits unused
         # while every replica fetches them again.
-        env:
         - name: HF_HOME
           value: ${mountpath}/huggingface
-        volumeMounts:
+CACHEENV
+        fi
+        if [ "$want_engine" -eq 1 ]; then
+            cat <<ENGINEENV
+        # The three caches vLLM keeps between runs. They are keyed by a hash of
+        # the engine config, so a changed model, flag or version misses rather
+        # than hits stale, and one claim serves every model in the namespace.
+        - name: VLLM_CACHE_ROOT
+          value: ${emount}/vllm
+        - name: FLASHINFER_WORKSPACE_DIR
+          value: ${emount}/flashinfer
+        - name: TRITON_CACHE_DIR
+          value: ${emount}/triton
+ENGINEENV
+        fi
+        echo "        volumeMounts:"
+        if [ "$want_cache" -eq 1 ]; then
+            cat <<CACHEMOUNT
         - name: ${WVA_MODEL_VOLUME_NAME:-model-storage}
           mountPath: ${mountpath}
-      volumes:
+CACHEMOUNT
+        fi
+        if [ "$want_engine" -eq 1 ]; then
+            cat <<ENGINEMOUNT
+        - name: ${evol}
+          mountPath: ${emount}
+ENGINEMOUNT
+            [ -z "$esub" ] || echo "          subPath: ${esub}"
+        fi
+        echo "      volumes:"
+        if [ "$want_cache" -eq 1 ]; then
+            cat <<CACHEVOL
       - name: ${WVA_MODEL_VOLUME_NAME:-model-storage}
         persistentVolumeClaim:
           claimName: ${claim}
-CACHE
+CACHEVOL
+        fi
+        if [ "$want_engine" -eq 1 ]; then
+            cat <<ENGINEVOL
+      - name: ${evol}
+        persistentVolumeClaim:
+          claimName: ${eclaim}
+ENGINEVOL
+        fi
+    fi
+    if [ "$want_cache" -eq 1 ]; then
         # Two different situations, and the file used to print the second one in
         # both: with a claim discovered, it still said "create model-pvc" -- the
         # second claim this feature exists to prevent, and not even the one the
@@ -1650,14 +1848,70 @@ CACHEHAVE
 #           storage: <size>
 CACHENEED
         fi
-        cat <<CACHEEND
-CACHEEND
+    fi
+    if [ "$want_engine" -eq 1 ]; then
+        if [ "$eclaim_found" -eq 1 ]; then
+            cat <<ENGINEHAVE
+#
+#   ${eclaim} already exists in ${ns}, so the engine caches go there. Nothing
+#   to create. If \`make engine-cache\` made it, \`make engine-cache-status
+#   NAMESPACE=${ns}\` says which nodes are prepared.
+ENGINEHAVE
+        else
+            cat <<ENGINENEED
+#
+#   ${eclaim} does NOT exist yet in ${ns}. Create it before applying this, or
+#   every pod the rollout makes stays Pending. On the nodes' own disks:
+#
+#     make engine-cache NAMESPACE=${ns} ENGINE_CACHE_PATH=<node dir> ENGINE_CACHE_IMAGE=<engine image>
+#
+#   <node dir> is a directory on every accelerator node (WEIGHTS_NODE_SELECTOR=<key=value>
+#   narrows which nodes; the model servers must select the same ones). The
+#   caches land under <node dir>/engine-cache, and the directory must be:
+#     - absolute, at least two components (/mnt/local/weights/${ns}), no '..';
+#     - on a disk that is not the node's own, never a network mount, never a
+#       system path (/etc, /var/lib, /tmp, /home, /opt/bin and their kind are
+#       refused); on RHCOS under /var (/var/mnt/weights/${ns}) with the disk
+#       mounted there first;
+#     - one directory per trust domain: what lands there is CODE every engine
+#       on the node loads, world-writable (1777), charged to no quota;
+#     - writable by the preparer: root on Kubernetes; on OpenShift prepared on
+#       each node first (chgrp 0, chmod 2775, chcon -t container_file_t).
+#   And leave to create PersistentVolumes (cluster-scoped; a namespace tenant
+#   has none, storage-admin on OpenShift). docs/reference/workload-preparation.md
+#   has the whole list under "Engine caches on the node's disk".
+#
+#   Without a node directory: name a ReadWriteMany claim this namespace already
+#   has, WVA_ENGINE_CACHE_CLAIM=<claim>[:<subPath>], and the volume above points
+#   at it instead. The first start anywhere then compiles once and every later
+#   one finds it -- until the claim is published read-only on some node (a CSI
+#   driver can; measured, it cost every start on those nodes 25 s), which is
+#   what the guard below is for.
+ENGINENEED
+        fi
+        cat <<'ENGINEGUARD'
+#
+#   Either way, keep the engine tolerant of a cache path that turns out not to
+#   be writable: vLLM fails hard on a read-only cache directory unless the
+#   variable is unset first, and a storage hiccup must cost one compile, not
+#   the replica. In the container command, before the engine starts (the
+#   command belongs to the chart, so it is not patched here):
+#
+#     for v in VLLM_CACHE_ROOT FLASHINFER_WORKSPACE_DIR TRITON_CACHE_DIR; do
+#       eval "d=\${$v}"
+#       [ -n "$d" ] || continue
+#       if ! mkdir -p "$d" 2>/dev/null || ! touch "$d/.writable" 2>/dev/null; then
+#         echo "engine cache $v=$d is not writable; using the engine default instead"
+#         unset $v
+#       fi
+#     done
+ENGINEGUARD
     fi
 }
 
 so_drain_note() {
     local ns="$1" resource="$2" name="$3" pod="$4"
-    local gaps engine prestop grace pvcs onvol argv
+    local gaps engine prestop grace pvcs onvol argv cachevol
 
     # preStop is checked on the ENGINE, not pod-wide. The previous copy counted
     # containers with a hook across the whole pod, so an llm-d deployment whose
@@ -1667,7 +1921,7 @@ so_drain_note() {
         printf '%s' "Could not read the pod spec, so whether scale-down drains cleanly is unknown -- this is not a report that it does."
         return 0
     fi
-    IFS=$'\037' read -r engine prestop grace pvcs onvol argv <<< "$gaps"
+    IFS=$'\037' read -r engine prestop grace pvcs onvol argv cachevol <<< "$gaps"
     [ -n "$engine" ] || return 0
     # A hook of any shape counts. Whether it drains for long enough is the
     # operator's judgement, and guessing at a threshold would produce a warning
@@ -1921,6 +2175,8 @@ so_discover() {
                 [ -n "$drain" ] && note="${note:+$note}$drain"
                 weights=$(so_weights_note "$ns" "$resource" "$name" "$pod")
                 [ -n "$weights" ] && note="${note:+$note}$weights"
+                caches=$(so_enginecache_note "$ns" "$resource" "$name" "$pod")
+                [ -n "$caches" ] && note="${note:+$note}$caches"
                 so_plan_entry "$apply" "$ns" "$kind" "$name" "$model" \
                     "$min" "$max" "$cost" "$policy" "$pool" "$existing_name" "$note"
             done < <(kubectl get "$resource" -n "$ns" -o json 2>/dev/null \

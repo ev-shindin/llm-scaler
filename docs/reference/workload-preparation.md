@@ -308,6 +308,56 @@ make engine-cache-status NAMESPACE=<ns>     # per accelerator node: prepared / n
 make engine-cache-delete NAMESPACE=<ns>     # drop the claim, volume and preparer; the caches stay
 ```
 
+**What the node directory must be.** `ENGINE_CACHE_PATH` is one path that
+has to hold on every node the preparer selects -- by default every node
+carrying a known GPU product label, or `WEIGHTS_NODE_SELECTOR=<key=value>`
+narrows it to the nodes your model servers select on (the model servers
+must then select the same ones: a replica on a node the preparer did not
+reach finds no cache there, and with the guard below costs a compile rather
+than the replica). The directory must be:
+
+- **absolute, at least two components, no `..`**, no trailing slash
+  (`/mnt/local/weights/<ns>`; the whole of a top-level directory is refused);
+- **on a disk that is not the node's own, and never a network mount.** A
+  hostPath is a bind mount with no driver in its path -- which is the point
+  -- and what is written there is charged to no quota, so a fill is
+  `DiskPressure` for every pod on the node. On CoreWeave that is
+  `/mnt/local/...`; on RHCOS the NVMe mounted at `/var/mnt/<x>` (a
+  MachineConfig mount unit) first, since `/var/mnt` on its own is the root
+  disk and the script cannot tell a mountpoint from a directory;
+- **never a system path**: `/etc`, `/usr`, `/var/lib`, `/var/log`, `/tmp`,
+  `/home`, `/opt/bin` and their kind are refused (and where RHCOS keeps them:
+  `/var/home`, `/var/roothome`, `/var/usrlocal`, `/sysroot`, `/ostree`), as
+  are `/var/mnt` and `/var/srv` themselves;
+- **one directory per trust domain**, because what lands there is code every
+  engine on the node loads (the paragraph below); on OpenShift one per
+  project is the only thing that works;
+- **creatable by the preparer**: root on Kubernetes; on OpenShift prepared
+  on each node before `make engine-cache` (`chgrp 0`, `chmod 2775`,
+  `chcon -t container_file_t`, below).
+
+And the one thing that is not about the directory: leave to create
+PersistentVolumes, which are cluster-scoped and which a namespace tenant
+does not have (`storage-admin` on OpenShift) -- ask the cluster admin to run
+`make engine-cache`, or to create the volume.
+
+**Without a node directory.** The caches only need a read-write path that
+outlives the pod, and a shared `ReadWriteMany` claim the namespace already
+has is one: `make workload-patch` with
+`WVA_ENGINE_CACHE_CLAIM=<claim>[:<subPath>]` writes the same three
+variables and mount against that claim instead (the benchmark harness ran
+this way, on its workload claim under `engine-cache/`, before the node-local
+cache existed). The first start anywhere then compiles once and every later
+replica finds it, on any node -- at the cost this section opened with: a
+CSI driver can publish the claim read-only on a node, and every start there
+compiles. So that layout needs the guard from the table above in the
+engine's command, without exception; the emitted patch carries it as a
+comment, because the command belongs to the chart. A node selector does not
+remove the need for a directory -- it only decides which nodes get one --
+and a `local`/`local-path` StorageClass does not either: such a claim binds
+to one node, and a per-node cache shared by every pod on that node is what
+the static hostPath volume is.
+
 One static `hostPath` PersistentVolume at `<dir>/engine-cache`, one claim
 named `engine-cache` bound to it (and to no other: the volume carries a
 `claimRef`), and one DaemonSet that creates the three cache directories on
@@ -479,16 +529,19 @@ note: Scale-down will cut in-flight requests: vllm declares no preStop hook,
 
 ## Writing the patch: `make workload-patch`
 
-The two sections above describe the same shape of problem — a pod spec that is
+The sections above describe the same shape of problem — a pod spec that is
 fine while the replica count is fixed and costly once something starts changing
-it — and `make workload-patch` writes the fix for both:
+it — and `make workload-patch` writes the fix for three of them: the drain hook,
+the weights volume, and the engine-cache volume (vLLM's `VLLM_CACHE_ROOT` and
+its two siblings on no volume that outlives the pod, so every start compiles
+from nothing):
 
 ```bash
 make workload-patch                       # everything in scope
 make workload-patch NAMESPACE=my-models   # one namespace
 ```
 
-### The whole flow, when it reports both problems
+### The whole flow, when it reports all three problems
 
 ```bash
 # 1. What is missing, and why it costs something. Changes nothing.
@@ -502,34 +555,47 @@ make model-cache NAMESPACE=my-models
 make model-cache NAMESPACE=my-models \
     WVA_MODEL_PVC_SIZE=500Gi WVA_MODEL_PVC_CLASS=<an-rwx-class>
 
-# 3. Apply. The drain half needs nothing; the weights half needs the claim from
-#    step 2 and its own opt-in, because mounting storage is a bigger change than
-#    adding a hook.
+# 3. Only if it reported compiling from nothing: prepare the engine cache on
+#    the nodes. The emitted file says what <node dir> must be (the list under
+#    "Engine caches on the node's disk" above), or set
+#    WVA_ENGINE_CACHE_CLAIM=<claim>[:<subPath>] on the next step to use a shared
+#    ReadWriteMany claim you already have instead, and skip this.
+make engine-cache NAMESPACE=my-models ENGINE_CACHE_PATH=<node dir> ENGINE_CACHE_IMAGE=<engine image>
+
+# 4. Apply. The drain half needs nothing; each storage half needs its claim from
+#    step 2 or 3 and its own opt-in, because mounting storage is a bigger change
+#    than adding a hook.
 make workload-patch NAMESPACE=my-models \
     WVA_WORKLOAD_PATCH_APPLY=true \
-    WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true
+    WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true \
+    WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true
 ```
 
-Step 3 patches the live objects, which **replaces their pods**. The durable
+Step 4 patches the live objects, which **replaces their pods**. The durable
 alternative is to copy the emitted file's contents into your modelservice values
 and let the chart roll them out — the next `helm upgrade` reverts anything
-applied directly. Either way step 2 is the same: the claim is yours, not the
-chart's.
+applied directly. Either way steps 2 and 3 are the same: the claims are yours,
+not the chart's. And one thing the patch cannot carry either way: the guard
+that makes an unwritable cache path cost a compile rather than the replica
+lives in the container command, which belongs to the chart. The emitted file
+has it as a comment next to the engine-cache half; put it in the command.
 
 `make model-cache` is safe to re-run. If the claim already exists it reports what
 it is and changes nothing, so "did I already create this?" is a question you can
 answer by typing the command again.
 
-**The weights half is refused, with the reason, when it would break something:**
+**A storage half is refused, with the reason, when it would break something:**
 a volume of that name already exists on the workload (a strategic merge cannot
 replace one, so the API server rejects the whole object — including the drain
 hook), something is already mounted at that path, or the claim does not exist
 (every pod the rollout creates would stay `Pending`). In each case the drain half
-is still applied and the weights half stays in the emitted file.
+is still applied, the other storage half is judged on its own, and what was
+refused stays in the emitted file.
 
 It writes `wva-workload-patch.yaml`: one document per model server that needs
-something, naming the engine container, with a comment saying which of the two
-problems that workload has.
+something, naming the engine container, with a comment saying which of the three
+problems that workload has. A document that needs two storage halves carries one
+`env`, one `volumeMounts` and one `volumes` list for both.
 
 **It writes a file rather than applying it, and that is deliberate.** The pod
 spec belongs to the model server's chart. A server-side apply is not merely
@@ -553,6 +619,16 @@ named per workload on the console rather than left in the file:
 On a cluster with no egress it is not a cost but a failure, and the first time
 anyone sees it is the first scale-up.
 
+The engine cache is reported the same way, per workload and in the summary --
+`COMPILES FROM NOTHING on every start` -- because it has the same property: it
+costs nothing while the replica count holds and tens of seconds at every
+scale-up (measured, 14 s of `torch.compile` against 3 s from a warm cache, and
+8 s more before the API server answered). The emitted document names the claim
+it mounts (`engine-cache`, or `WVA_ENGINE_CACHE_CLAIM`), says whether it exists,
+and where it does not, what `make engine-cache` needs of a node directory and
+how to do without one. Only vLLM has the variable; for another engine the
+detector has no opinion, which is not a clean bill.
+
 `WVA_WORKLOAD_PATCH_APPLY=true` additionally applies the **drain half** to the
 live objects, for a cluster where that is the trade you want. Two things it says
 at the time, and both are worth reading before you type it:
@@ -563,13 +639,17 @@ at the time, and both are worth reading before you type it:
   With the default strategy at `replicas: 1` the new pod must schedule before the
   old one goes, so on a cluster with no spare GPU the rollout stalls with the old
   pod still serving.
-- **The weights half has its own opt-in**, `WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true`,
-  because mounting storage is a bigger change than adding a hook: it can be
-  refused by the API server outright, and it changes where an engine reads its
-  weights from. With the opt-in it is applied only where it cannot break the
-  workload — no volume of that name, nothing already mounted at that path, and
-  the claim exists. Any of those three refuses it, says which, and still applies
-  the drain half.
+- **Each storage half has its own opt-in**, `WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true`
+  for the weights volume and `WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true` for
+  the engine-cache volume, because mounting storage is a bigger change than
+  adding a hook: it can be refused by the API server outright, and it changes
+  where an engine reads its weights from, or writes code it will load. With the
+  opt-in a half is applied only where it cannot break the workload — no volume
+  of that name, nothing already mounted at that path, and the claim exists. Any
+  of those three refuses it, says which, and still applies the rest. The
+  engine-cache half applied live is applied **without the guard** (the command
+  belongs to the chart), and says so: until the guard is in the chart, a node
+  where the cache path is not writable loses the replica rather than a compile.
 
   The first check is the one that matters: `volumes` merges with `retainKeys`,
   and only `kubectl apply` generates that directive, so
@@ -586,8 +666,13 @@ at the time, and both are worth reading before you type it:
 | `WVA_MODEL_PVC_NAME` | discovered, else `model-pvc` | the claim the emitted weights volume names. Setting it wins over discovery |
 | `WVA_MODEL_VOLUME_NAME` | `model-storage` | the volume name in the emitted patch |
 | `WVA_MODEL_CACHE_PATH` | `/model-cache` | where that volume is mounted, and the parent of the emitted `HF_HOME` |
+| `WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE` | `false` | `true` also applies the engine-cache half where it cannot break the workload |
+| `WVA_ENGINE_CACHE_CLAIM` | `engine-cache` | the claim the emitted engine-cache volume names, `<claim>[:<subPath>]` — the one `make engine-cache` makes, or a shared RWX claim you already have |
+| `WVA_ENGINE_CACHE_VOLUME_NAME` | `engine-cache` | the volume name in the emitted patch |
+| `WVA_ENGINE_CACHE_PATH` | `/engine-cache` | where that volume is mounted, and the parent of the emitted `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` |
 
-The last three affect the emitted file only — nothing applies a volume.
+The `*_NAME` and `*_PATH` variables affect the emitted file only — without the
+opt-in nothing applies a volume.
 
 What it will and will not do:
 
@@ -599,9 +684,10 @@ What it will and will not do:
   takes the one whose name says what it holds, and with two equally plausible
   ones it names none and falls back to the default rather than guessing at
   someone else's data.
-- **`workload-patch` does not create the PersistentVolumeClaim** — `make
-  model-cache` does, as a separate, deliberate step. Two fields decide whether
-  the cache helps or breaks scale-up, and neither is guessed:
+- **`workload-patch` does not create the PersistentVolumeClaims** — `make
+  model-cache` makes the weights one and `make engine-cache` the engine-cache
+  one, as separate, deliberate steps. For the weights claim two fields decide
+  whether the cache helps or breaks scale-up, and neither is guessed:
 
   - **`accessModes` must be `ReadWriteMany`.** Many replicas reading one copy is
     the entire point. A cluster's *default* StorageClass is often RWO block

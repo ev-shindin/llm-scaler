@@ -32,7 +32,43 @@
 #   --path DIR                  directory on the node, e.g. /mnt/local/weights/<ns>
 #                               -- the same DIR weights.sh takes; the caches
 #                               land under DIR/engine-cache (/var/mnt/weights/<ns>
-#                               on RHCOS, under /var)
+#                               on RHCOS, under /var). What DIR must be:
+#                                 * absolute, at least two components, no `..`,
+#                                   no trailing slash; the whole of a top-level
+#                                   directory is refused
+#                                 * on a disk that is not the node's own, and
+#                                   never a network mount: a hostPath is a
+#                                   bind mount, and what is written there is
+#                                   charged to no quota -- a fill is
+#                                   DiskPressure for every pod on the node
+#                                 * never a system path: /etc, /usr, /var/lib,
+#                                   /var/log, /tmp, /home, /opt/bin and their
+#                                   kind are refused, and so are /var/mnt and
+#                                   /var/srv themselves (RHCOS's root disk;
+#                                   mount the NVMe at a subdirectory first --
+#                                   the script cannot tell a mountpoint from a
+#                                   directory)
+#                                 * one DIR per trust domain (see below: what
+#                                   lands there is code every engine on the
+#                                   node loads); on OpenShift one per project
+#                                   is the only thing that works
+#                                 * creatable by the preparer, which runs as
+#                                   root on Kubernetes; on OpenShift prepare
+#                                   DIR/engine-cache on each node first (see
+#                                   the end of this text)
+#                               The same DIR must exist on EVERY node the
+#                               preparer selects (--node-selector; a node it
+#                               cannot prepare shows in `status`, and an
+#                               engine there costs a compile, not the
+#                               replica, with the guard). Without a node
+#                               directory at all, the engines can keep the
+#                               caches on a shared ReadWriteMany claim
+#                               instead -- `make workload-patch` with
+#                               WVA_ENGINE_CACHE_CLAIM=<claim>[:<subPath>]
+#                               writes that -- at the cost this script exists
+#                               to remove: a CSI driver can publish that claim
+#                               read-only on a node, and every start there
+#                               then compiles.
 #   --image IMG                 image to prepare with: any image carrying /bin/sh
 #                               -- the engine image itself is the natural
 #                               choice, and it is then held on the node as a

@@ -686,8 +686,10 @@ weights-delete: ## Drop the claim, volume and downloader for WEIGHTS_MODEL=<hf i
 ## <dir>/engine-cache; defaults to WEIGHTS_PATH), ENGINE_CACHE_IMAGE any image
 ## with /bin/sh (defaults to WEIGHTS_IMAGE; the engine image). Model servers
 ## mount the claim read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR
-## and TRITON_CACHE_DIR under it. Needs leave to create PersistentVolumes.
-## deploy/enginecache.sh --help has the rest; the nodes are picked as for prepull.
+## and TRITON_CACHE_DIR under it (`make workload-patch` writes that half for a
+## model server that lacks it). Needs leave to create PersistentVolumes. What
+## the node directory must be is in deploy/enginecache.sh --help; the nodes are
+## picked as for prepull (WEIGHTS_NODE_SELECTOR / WEIGHTS_TOLERATIONS).
 ENGINE_CACHE_PATH ?= $(WEIGHTS_PATH)
 ENGINE_CACHE_IMAGE ?= $(WEIGHTS_IMAGE)
 ENGINE_CACHE_CAPACITY ?=
@@ -711,7 +713,7 @@ engine-cache-delete: ## Drop the engine-cache claim, volume and preparer in NAME
 	@bash deploy/enginecache.sh delete -n "$(NAMESPACE)"
 
 .PHONY: workload-patch
-workload-patch: ## Write a patch for model servers that do not drain on scale-down, or download weights outside every volume they mount. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the volume, after `make model-cache`).
+workload-patch: ## Write a patch for model servers that do not drain on scale-down, download weights outside every volume they mount, or compile their kernels on every start. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the weights volume, after `make model-cache`; WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true for the engine-cache volume, after `make engine-cache`).
 	@# NAMESPACE pins the SCAN, not just the connection. Without the
 	@# WVA_DEFAULT_SO_NS fallback below, `make workload-patch NAMESPACE=x` under a
 	@# cluster-scoped install still walked every namespace on the cluster:
