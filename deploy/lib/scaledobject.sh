@@ -923,17 +923,34 @@ so_workload_weights_can_apply() {
 # DaemonSet says per node whether the directory is there and writable, and a
 # node it has not reached is exactly the node where an unguarded engine dies.
 # So the half is refused while any selected node is unprepared -- the number
-# is printed, and `make engine-cache-status` names them. A claim the operator
-# named themselves has no preparer, and gets no such check.
+# is printed, and `make engine-cache-status` names them. The gate applies to
+# the claim `make engine-cache` makes, by its fixed name (engine-cache, which
+# is also its DaemonSet's); a claim the operator named themselves has no
+# preparer, and a DaemonSet that happens to share its name is not one.
+#
+# A preparer that cannot be READ refuses too. Forbidden is not absent: a token
+# that can patch Deployments but not list DaemonSets would otherwise skip the
+# gate and apply the half on nodes nobody has looked at. Only a confirmed
+# NotFound (--ignore-not-found: empty output, rc 0) means there is no
+# preparer to ask -- the claim exists, checked above, but not through
+# `make engine-cache`. And a DaemonSet whose status is not reported yet
+# (0 of 0, the seconds after `make engine-cache`) is not "every node
+# prepared" either.
 so_workload_enginecache_can_apply() {
     local ns="$1" name="$2" doc="$3" claim ds ready want
     so_workload_volume_can_apply "$ns" "$name" "$doc" "${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}" engine-cache WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE || return 1
     claim="${WVA_ENGINE_CACHE_CLAIM:-engine-cache}"; claim="${claim%%:*}"
-    if ds="$(kubectl get daemonset "$claim" -n "$ns" -o json 2>/dev/null)" && [ -n "$ds" ]; then
-        read -r ready want <<< "$(printf '%s' "$ds" | jq -r '"\(.status.numberReady // 0) \(.status.desiredNumberScheduled // 0)"' 2>/dev/null)"
-        if [ "${ready:-0}" -lt "${want:-0}" ]; then
-            log_warning "  $ns/$name: the engine-cache volume is emitted, NOT applied -- $((want - ready)) of $want accelerator node(s) are not prepared (make engine-cache-status NAMESPACE=$ns), and without the guard a replica on one of them loses the engine, not a compile."
+    if [ "$claim" = "engine-cache" ]; then
+        if ! ds="$(kubectl get daemonset engine-cache -n "$ns" -o json --ignore-not-found 2>/dev/null)"; then
+            log_warning "  $ns/$name: the engine-cache volume is emitted, NOT applied -- the preparer DaemonSet could not be read, so which nodes are prepared is unknown."
             return 1
+        fi
+        if [ -n "$ds" ]; then
+            read -r ready want <<< "$(printf '%s' "$ds" | jq -r '"\(.status.numberReady // 0) \(.status.desiredNumberScheduled // 0)"' 2>/dev/null)"
+            if [ "${want:-0}" -eq 0 ] || [ "${ready:-0}" -lt "${want:-0}" ]; then
+                log_warning "  $ns/$name: the engine-cache volume is emitted, NOT applied -- $((${want:-0} - ${ready:-0})) of ${want:-0} accelerator node(s) are not prepared (make engine-cache-status NAMESPACE=$ns), and without the guard a replica on one of them loses the engine, not a compile."
+                return 1
+            fi
         fi
     fi
     log_warning "  $ns/$name: the engine-cache guard is NOT applied with it -- the command belongs to the chart. A node where the cache stops being writable then loses the replica, not a compile; the emitted file has the guard."
@@ -1086,6 +1103,28 @@ so_workload_patch_clear_stale() {
     return 0
 }
 
+# so_workload_check_claim_ref refuses a <claim>[:<subPath>] that the API
+# server, or the mount, would: the claim part a DNS-1123 subdomain (lower-case
+# letters, digits, `-` and `.`, starting and ending alphanumeric), the subPath
+# relative, without `..`, and made of letters, digits, `.`, `_`, `-` and `/`.
+# Says which half was wrong, since "not <claim>[:<subPath>]" was not telling.
+so_workload_check_claim_ref() {
+    local ref="$1" claim sub
+    claim="${ref%%:*}"
+    case "$claim" in
+        ""|*[!a-z0-9.-]*|-*|*-|.*|*.|*..*)
+            log_warning "WVA_ENGINE_CACHE_CLAIM: '$claim' is not a claim name (lower-case letters, digits, - and ., starting and ending with a letter or digit)."
+            return 1 ;;
+    esac
+    case "$ref" in *:*) sub="${ref#*:}" ;; *) return 0 ;; esac
+    case "$sub" in
+        ""|/*|*[!A-Za-z0-9._/-]*|..|../*|*/..|*/../*|*:*)
+            log_warning "WVA_ENGINE_CACHE_CLAIM: '$sub' is not a subPath (relative, no '..', letters, digits, . _ - and /)."
+            return 1 ;;
+    esac
+    return 0
+}
+
 # wva_workload_patch walks the model servers the plan discovers and writes a patch
 # for each one that needs it.
 #
@@ -1126,13 +1165,22 @@ wva_workload_patch() {
     # leave the claim.
     for tool in WVA_MODEL_VOLUME_NAME WVA_ENGINE_CACHE_VOLUME_NAME; do
         case "${!tool:-x}" in
-            ""|*[!a-z0-9-]*|-*|*-) log_warning "$tool must be a DNS-1123 label (lower-case letters, digits, -), not '${!tool}'."; return 1 ;;
+            *[!a-z0-9-]*|-*|*-) log_warning "$tool must be a DNS-1123 label (lower-case letters, digits, -), not '${!tool}'."; return 1 ;;
         esac
     done
-    case "${WVA_ENGINE_CACHE_CLAIM:-x}" in
-        ""|*[!a-z0-9.:/_-]*|-*|:*|*..*|*:/*|*:)
-            log_warning "WVA_ENGINE_CACHE_CLAIM must be <claim>[:<subPath>] -- a DNS-1123 claim name, and a relative subPath without '..' -- not '${WVA_ENGINE_CACHE_CLAIM}'."; return 1 ;;
-    esac
+    # Two volumes of one name is a document the API server rejects, and with
+    # both opt-ins a refusal that quotes two claim names on one line.
+    if [ "${WVA_MODEL_VOLUME_NAME:-model-storage}" = "${WVA_ENGINE_CACHE_VOLUME_NAME:-engine-cache}" ]; then
+        log_warning "WVA_MODEL_VOLUME_NAME and WVA_ENGINE_CACHE_VOLUME_NAME are both '${WVA_MODEL_VOLUME_NAME:-model-storage}'; the two volumes need two names."
+        return 1
+    fi
+    # <claim>[:<subPath>]: the claim a DNS-1123 subdomain (what the API server
+    # takes for a PersistentVolumeClaim name), the subPath relative and
+    # without `..` (what it takes for a volumeMount's subPath, and what
+    # enginecache.sh --seed-claim takes -- same syntax, same rule).
+    if [ -n "${WVA_ENGINE_CACHE_CLAIM:-}" ]; then
+        so_workload_check_claim_ref "$WVA_ENGINE_CACHE_CLAIM" || return 1
+    fi
 
     tmp="$(mktemp)" || return 1
     # Cleared before the success path returns, so it only fires on the error
@@ -1434,9 +1482,10 @@ so_workload_gaps() {
 # response is to provision a SECOND terabyte for weights that are already on the
 # cluster. Naming what is there is the difference between one claim and two.
 #
-# Only RWX/ROX claims qualify. A ReadWriteOnce claim binds to one node, so
-# proposing it as a shared model cache would produce replicas that cannot
-# schedule -- the failure this whole area exists to avoid.
+# Only ReadWriteMany claims qualify. A ReadWriteOnce claim binds to one node,
+# so proposing it as a shared model cache would produce replicas that cannot
+# schedule -- the failure this whole area exists to avoid; and ReadOnlyMany is
+# not enough for a path the engine downloads INTO (the jq below says why).
 #
 # Silent on ambiguity, and silent on Forbidden: with two candidates, guessing
 # picks someone else's data, and a 403 says nothing about what exists. The

@@ -691,7 +691,8 @@ What it will and will not do:
   A namespace whose cache is called `llm-d-model-cache` should not be told to
   use `model-pvc`, because the obvious response is to provision a second
   terabyte for weights that are already on the cluster. Only a **Bound**
-  `ReadWriteMany`/`ReadOnlyMany` claim qualifies; with several candidates it
+  `ReadWriteMany` claim qualifies (`ReadOnlyMany` would mount read-only under
+  a path the engine downloads into); with several candidates it
   takes the one whose name says what it holds, and with two equally plausible
   ones it names none and falls back to the default rather than guessing at
   someone else's data.

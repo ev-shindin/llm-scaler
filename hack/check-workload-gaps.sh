@@ -65,6 +65,7 @@ PATCH_BODY=""     # the last --patch-file content kubectl was handed
 PVC_FIXTURE='{"items":[]}'   # JSON for `kubectl get pvc -n <ns>`
 PVC_RC=0
 DS_FIXTURE=""     # JSON for `kubectl get daemonset <name>`; empty: none
+DS_RC=0           # or the failure the read returns instead
 # Per-NAME object fixtures, for the cases about a namespace holding more than
 # one workload. A single FIXTURE cannot express "this one is readable and that
 # one is not", nor tell two patch documents apart. "__RC1__" means the read
@@ -97,7 +98,10 @@ kubectl() {
                     printf '%s' "$PVC_FIXTURE"
                     ;;
                 daemonset|daemonsets|ds)
-                    [ -n "$DS_FIXTURE" ] || return 1
+                    # --ignore-not-found semantics: an absent object is empty
+                    # output with rc 0; DS_RC is any other failure (Forbidden,
+                    # a timeout), which the library must not read as absent.
+                    [ "$DS_RC" -eq 0 ] || return "$DS_RC"
                     printf '%s' "$DS_FIXTURE"
                     ;;
                 deployments|leaderworkersets)
@@ -325,7 +329,7 @@ f_unreadable() { FIXTURE=""; FIXTURE_RC=1; }
 reset() {
     FIXTURE=""; FIXTURE_RC=0; LIST_FIXTURE=''; LIST_RC=0; CRD_RC=1
     PATCH_CALLS=0; PATCH_RC=0; PATCH_BODY=""
-    PVC_FIXTURE='{"items":[]}'; PVC_RC=0; DS_FIXTURE=""
+    PVC_FIXTURE='{"items":[]}'; PVC_RC=0; DS_FIXTURE=""; DS_RC=0
     FIXTURE_MAP=()
 }
 
@@ -1983,13 +1987,93 @@ DRIVER_RC=0
 WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_CLAIM='shared:../etc' WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
     wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
 assert_eq "$DRIVER_RC" "1" "return code"
-assert_contains "$(cat "$dir/log")" "WVA_ENGINE_CACHE_CLAIM must be"
+assert_contains "$(cat "$dir/log")" "is not a subPath"
 # ...and a well-formed one passes the gate (anchor).
 DRIVER_RC=0
 WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_CLAIM='shared-cache:engine-cache' WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
     wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
 assert_eq "$DRIVER_RC" "0" "return code"
 assert_contains "$(cat "$dir/p.yaml")" "claimName: shared-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+# --- review round 4: the preparer gate, and the names -----------------------
+
+engine_apply_run() {  # the engine-cache opt-in against $FIXTURE, results in DRIVER_*
+    DRIVER_OUT="$(mktemp -d)/p.yaml"; DRIVER_LOG="$(mktemp)"; DRIVER_RC=0
+    WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+        WVA_WORKLOAD_PATCH_FILE="$DRIVER_OUT" wva_workload_patch >"$DRIVER_LOG" 2>&1 || DRIVER_RC=$?
+}
+
+CASE="engine cache: a preparer that cannot be READ refuses the half (Forbidden is not absent)"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_RC=1                      # a token that may not list DaemonSets, or a timeout
+engine_apply_run
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
+assert_contains "$(cat "$DRIVER_LOG")" "preparer DaemonSet could not be read"
+assert_contains "$(cat "$DRIVER_OUT")" "claimName: engine-cache"   # emitted still
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: no preparer at all (NotFound) is not a refusal -- the claim was checked"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_FIXTURE=""; DS_RC=0       # --ignore-not-found: empty, rc 0
+engine_apply_run
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "claimName: engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a preparer with no status yet (0 of 0) is not 'every node prepared'"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_FIXTURE='{"status":{}}'
+engine_apply_run
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
+assert_contains "$(cat "$DRIVER_LOG")" "0 of 0 accelerator node(s) are not prepared"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the gate is for the claim make engine-cache makes, not a namesake DaemonSet"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list my-rwx:ReadWriteMany)"
+DS_FIXTURE='{"status":{"desiredNumberScheduled":3,"numberReady":2}}'   # an unrelated DaemonSet called my-rwx
+WVA_ENGINE_CACHE_CLAIM=my-rwx engine_apply_run
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "claimName: my-rwx"
+assert_not_contains "$(cat "$DRIVER_LOG")" "not prepared"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="the two volume names may not be the same"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+dir="$(mktemp -d)"; DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_VOLUME_NAME=model-storage WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "1" "return code"
+assert_contains "$(cat "$dir/log")" "the two volumes need two names"
+[ -f "$dir/p.yaml" ] && fail "nothing should be written"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="the claim reference is checked as claim and subPath, each by its own rule"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+dir="$(mktemp -d)"
+run_ref() { DRIVER_RC=0; WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_CLAIM="$1" WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?; rm -f "$dir/p.yaml"; }
+# refused: a slash, an underscore, upper case or a leading dot in the CLAIM part
+for bad in a/b a_b Shared .a a..b; do
+    run_ref "$bad"; assert_eq "$DRIVER_RC" "1" "rc for claim '$bad'"; assert_contains "$(cat "$dir/log")" "is not a claim name"
+done
+# refused: an absolute, empty or escaping SUBPATH
+for bad in shared:/abs shared: shared:.. shared:../x shared:a/../b; do
+    run_ref "$bad"; assert_eq "$DRIVER_RC" "1" "rc for '$bad'"; assert_contains "$(cat "$dir/log")" "is not a subPath"
+done
+# accepted: a dotted claim, a mixed-case and nested subPath (what --seed-claim takes too)
+for good in shared-cache shared.cache:engine-cache shared-cache:Models/qwen_3; do
+    run_ref "$good"; assert_eq "$DRIVER_RC" "0" "rc for '$good'"
+done
 [ "$FAILED" -eq "$before" ] && ok
 
 # ----------------------------------------------------------------------------
