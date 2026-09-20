@@ -12,16 +12,17 @@
 # export. It needs no cluster and no GPU. The preamble is written for the
 # engine image (GNU coreutils and findutils: readlink -f, find -printf,
 # xargs -r), and running it here needs the same: on macOS, brew install
-# coreutils findutils and put their gnubin directories first on PATH, or
-# this check skips.
+# coreutils findutils and put their gnubin directories first on PATH; the
+# check fails without them (a skip would leave every assertion unmade).
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY=${PYTHON:-python3}
 FAILED=0
 if ! readlink -f / >/dev/null 2>&1 || ! find / -maxdepth 0 -printf '' >/dev/null 2>&1; then
-    echo "  SKIP GNU coreutils/findutils not on PATH (readlink -f, find -printf): the preamble is the engine image's; brew install coreutils findutils on macOS" >&2
-    exit 0
+    printf 'FATAL: GNU coreutils and findutils are required (readlink -f, find -printf): the preamble is the engine image'"'"'s; on macOS brew install coreutils findutils and put their gnubin directories first on PATH
+' >&2
+    exit 1
 fi
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
