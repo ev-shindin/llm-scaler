@@ -64,6 +64,8 @@ PATCH_RC=0
 PATCH_BODY=""     # the last --patch-file content kubectl was handed
 PVC_FIXTURE='{"items":[]}'   # JSON for `kubectl get pvc -n <ns>`
 PVC_RC=0
+DS_FIXTURE=""     # JSON for `kubectl get daemonset <name>`; empty: none
+DS_RC=0           # or the failure the read returns instead
 # Per-NAME object fixtures, for the cases about a namespace holding more than
 # one workload. A single FIXTURE cannot express "this one is readable and that
 # one is not", nor tell two patch documents apart. "__RC1__" means the read
@@ -78,7 +80,29 @@ kubectl() {
                 crd) return "$CRD_RC" ;;
                 pvc|persistentvolumeclaims)
                     [ "$PVC_RC" -eq 0 ] || return "$PVC_RC"
+                    # `get pvc -n <ns>` is the listing; `get pvc <name> -n <ns>`
+                    # is one claim, and the real client answers NotFound (rc 1)
+                    # for a name the listing does not carry. The stub used to
+                    # print the listing for both, so "does this claim exist?"
+                    # was yes for every name -- and a patch that asked it
+                    # reported a claim that was never created as reused.
+                    case "${3:-}" in ""|-*) : ;; *)
+                        # ...and with -o json it is that one object, as the
+                        # real client prints it, not the listing.
+                        printf '%s' "$PVC_FIXTURE" \
+                            | jq -e --arg n "$3" '[.items[]? | select(.metadata.name == $n)] | length > 0' >/dev/null 2>&1 \
+                            || return 1
+                        printf '%s' "$PVC_FIXTURE" | jq -c --arg n "$3" '[.items[] | select(.metadata.name == $n)] | first'
+                        return 0 ;;
+                    esac
                     printf '%s' "$PVC_FIXTURE"
+                    ;;
+                daemonset|daemonsets|ds)
+                    # --ignore-not-found semantics: an absent object is empty
+                    # output with rc 0; DS_RC is any other failure (Forbidden,
+                    # a timeout), which the library must not read as absent.
+                    [ "$DS_RC" -eq 0 ] || return "$DS_RC"
+                    printf '%s' "$DS_FIXTURE"
                     ;;
                 deployments|leaderworkersets)
                     # `get <kind> -n <ns>` is a listing; `get <kind> <name> …` is
@@ -135,12 +159,13 @@ ok() { RAN=$((RAN + 1)); printf 'ok    %s\n' "$CASE"; }
 # line-oriented and re-emits a delimiterless line whole, so it cannot see the
 # truncation that `read` suffers when a field still contains newlines.
 gaps_field() {
-    local idx="$1" gaps f1 f2 f3 f4 f5 f6
+    local idx="$1" gaps f1 f2 f3 f4 f5 f6 f7
     gaps="$(so_workload_gaps ns deployments w "$POD_DEPLOY")" || return 1
-    IFS=$'\037' read -r f1 f2 f3 f4 f5 f6 <<< "$gaps"
+    IFS=$'\037' read -r f1 f2 f3 f4 f5 f6 f7 <<< "$gaps"
     case "$idx" in
         1) printf '%s' "$f1" ;; 2) printf '%s' "$f2" ;; 3) printf '%s' "$f3" ;;
         4) printf '%s' "$f4" ;; 5) printf '%s' "$f5" ;; 6) printf '%s' "$f6" ;;
+        7) printf '%s' "$f7" ;;
     esac
 }
 
@@ -201,12 +226,16 @@ f_mount_without_hf_home() {
                        "args":["vllm serve Qwen/Qwen3-0.6B --port 8000"]}]}}}}'
 }
 
+# Nothing wrong with it: drains, weights on the claim, and the engine caches
+# on it too (a second cache half is the same claim under another directory,
+# which is the layout the benchmark harness uses).
 f_cached_properly() {
     FIXTURE='{"spec":{"template":{"spec":{
         "terminationGracePeriodSeconds":120,
         "volumes":[{"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
         "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
-                       "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"}],
+                       "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"},
+                              {"name":"VLLM_CACHE_ROOT","value":"/model-cache/engine-cache/vllm"}],
                        "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"}],
                        "lifecycle":{"preStop":{"exec":{"command":["sleep","45"]}}},
                        "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
@@ -300,7 +329,7 @@ f_unreadable() { FIXTURE=""; FIXTURE_RC=1; }
 reset() {
     FIXTURE=""; FIXTURE_RC=0; LIST_FIXTURE=''; LIST_RC=0; CRD_RC=1
     PATCH_CALLS=0; PATCH_RC=0; PATCH_BODY=""
-    PVC_FIXTURE='{"items":[]}'; PVC_RC=0
+    PVC_FIXTURE='{"items":[]}'; PVC_RC=0; DS_FIXTURE=""; DS_RC=0
     FIXTURE_MAP=()
 }
 
@@ -482,8 +511,9 @@ reset; f_llmd_real
 before=$FAILED
 doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
 assert_contains "$doc" "preStop"          # the drain half is still owed
-assert_not_contains "$doc" "claimName"    # ...but not a second cache
+assert_not_contains "$doc" "claimName: model-pvc"    # ...but not a second cache
 assert_not_contains "$doc" "HF_HOME"
+assert_not_contains "$doc" "#   cache:"
 [ "$FAILED" -eq "$before" ] && ok
 
 CASE="a re-downloading workload is warned about ON THE CONSOLE, not just in the file"
@@ -534,8 +564,9 @@ reset; f_local_path
 before=$FAILED
 doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
 assert_contains "$doc" "preStop"          # anchor: a document was produced
-assert_not_contains "$doc" "claimName"
+assert_not_contains "$doc" "claimName: model-pvc"
 assert_not_contains "$doc" "HF_HOME"
+assert_not_contains "$doc" "#   cache:"
 [ "$FAILED" -eq "$before" ] && ok
 
 CASE="nothing is emitted for a workload that is already fine"
@@ -1226,7 +1257,7 @@ WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_FILE="$di
     wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
 assert_eq "$DRIVER_RC" "0" "return code"
 assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
-assert_contains "$(cat "$dir/log")" "need only the weights volume"
+assert_contains "$(cat "$dir/log")" "need only a volume"
 assert_not_contains "$(cat "$dir/log")" "were NOT patched"
 assert_contains "$(cat "$dir/p.yaml")" "claimName: model-pvc"
 [ "$FAILED" -eq "$before" ] && ok
@@ -1296,6 +1327,754 @@ assert_not_contains "$(cat "$DRIVER_LOG")" "Skipping LeaderWorkerSet"
 reset; LIST_FIXTURE="$(serving_list)"; f_lws; CRD_RC=0
 run_driver
 assert_contains "$(cat "$DRIVER_LOG")" "Skipping LeaderWorkerSet"
+[ "$FAILED" -eq "$before" ] && ok
+
+# --- the engine-cache half --------------------------------------------------
+#
+# The same question as the weights, one layer down: vLLM keeps its compile
+# caches under VLLM_CACHE_ROOT, and a replica that does not find them warm
+# compiles from nothing -- measured, 14 s of torch.compile against 3 s. The
+# detector answers where the caches LAND, as the weights one does: unset is
+# /tmp, an emptyDir dies with the pod, and only a claim or a hostPath counts.
+
+f_engine_cache_on_claim() {
+    FIXTURE='{"spec":{"template":{"spec":{
+        "terminationGracePeriodSeconds":120,
+        "volumes":[{"name":"engine-cache","persistentVolumeClaim":{"claimName":"engine-cache"}},
+                   {"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+        "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                       "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"},
+                              {"name":"VLLM_CACHE_ROOT","value":"/engine-cache/vllm"}],
+                       "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"},
+                                       {"name":"engine-cache","mountPath":"/engine-cache"}],
+                       "lifecycle":{"preStop":{"exec":{"command":["sleep","45"]}}},
+                       "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+}
+
+# The cache variable set, and pointing at an emptyDir: every llm-d pod mounts
+# one at /dev/shm, and a cache there is a cache for one replica, which is none.
+f_engine_cache_on_emptydir() {
+    FIXTURE='{"spec":{"template":{"spec":{
+        "terminationGracePeriodSeconds":120,
+        "volumes":[{"name":"dshm","emptyDir":{"medium":"Memory"}},
+                   {"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+        "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                       "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"},
+                              {"name":"VLLM_CACHE_ROOT","value":"/dev/shm/vllm-cache"}],
+                       "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"},
+                                       {"name":"dshm","mountPath":"/dev/shm"}],
+                       "lifecycle":{"preStop":{"exec":{"command":["sleep","45"]}}},
+                       "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+}
+
+# A hostPath counts: it is the node's disk, and it outlives the pod.
+f_engine_cache_on_hostpath() {
+    FIXTURE='{"spec":{"template":{"spec":{
+        "terminationGracePeriodSeconds":120,
+        "volumes":[{"name":"local","hostPath":{"path":"/mnt/local/caches"}},
+                   {"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+        "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                       "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"},
+                              {"name":"VLLM_CACHE_ROOT","value":"/mnt/caches/vllm"}],
+                       "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"},
+                                       {"name":"local","mountPath":"/mnt/caches"}],
+                       "lifecycle":{"preStop":{"exec":{"command":["sleep","45"]}}},
+                       "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+}
+
+# Drains, weights on a volume, no cache variable at all: the engine-cache half
+# and nothing else.
+f_engine_cache_only_gap() {
+    FIXTURE='{"spec":{"template":{"spec":{
+        "terminationGracePeriodSeconds":120,
+        "volumes":[{"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+        "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                       "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"}],
+                       "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"}],
+                       "lifecycle":{"preStop":{"exec":{"command":["sleep","45"]}}},
+                       "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+}
+
+CASE="engine cache: unset VLLM_CACHE_ROOT is reported as unset"
+reset; f_vllm_plain
+before=$FAILED
+assert_field 7 "unset"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: on a claim the engine mounts counts as on a volume"
+reset; f_engine_cache_on_claim
+before=$FAILED
+assert_field 7 "volume:/engine-cache/vllm"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: on a hostPath counts as on a volume"
+reset; f_engine_cache_on_hostpath
+before=$FAILED
+assert_field 7 "volume:/mnt/caches/vllm"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: on an emptyDir is ephemeral, not a volume"
+reset; f_engine_cache_on_emptydir
+before=$FAILED
+assert_field 7 "ephemeral:/dev/shm/vllm-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a name listed twice in env resolves to its LAST value, as the kubelet does"
+reset
+before=$FAILED
+# Seen live on the benchmark stand: the harness lists VLLM_CACHE_ROOT twice,
+# its default /tmp/vllm and then the mount. The kubelet takes the last; a
+# detector reading the first reported every harness engine as cold.
+FIXTURE='{"spec":{"template":{"spec":{
+    "volumes":[{"name":"engine-cache","persistentVolumeClaim":{"claimName":"engine-cache"}}],
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"VLLM_CACHE_ROOT","value":"/tmp/vllm"},
+                          {"name":"VLLM_CACHE_ROOT","value":"/engine-cache/vllm"}],
+                   "volumeMounts":[{"name":"engine-cache","mountPath":"/engine-cache"}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 7 "volume:/engine-cache/vllm"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a claim the SIDECAR mounts is not one the engine can use"
+reset
+before=$FAILED
+FIXTURE='{"spec":{"template":{"spec":{
+    "volumes":[{"name":"engine-cache","persistentVolumeClaim":{"claimName":"engine-cache"}}],
+    "containers":[
+      {"name":"routing-proxy","image":"quay.io/x/proxy:1",
+       "volumeMounts":[{"name":"engine-cache","mountPath":"/engine-cache"}]},
+      {"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+       "env":[{"name":"VLLM_CACHE_ROOT","value":"/engine-cache/vllm"}],
+       "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 7 "ephemeral:/engine-cache/vllm"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: SGLang has no such variable, so the field is empty (no opinion)"
+reset; f_sglang_proxy_has_hook
+before=$FAILED
+assert_field 1 "server"      # anchor: the engine was found
+assert_field 7 ""
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "preStop"                  # anchor: a document was produced
+assert_not_contains "$doc" "engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the field is LAST, so an un-updated reader keeps a clean argv"
+reset; f_vllm_plain
+before=$FAILED
+gaps="$(so_workload_gaps ns deployments w "$POD_DEPLOY")"
+IFS=$'\037' read -r e1 e2 e3 e4 e5 e6 e7 e8 <<< "$gaps"
+assert_eq "$e6" "vllm serve Qwen/Qwen3-0.6B" "argv (field 6)"
+assert_eq "$e7" "unset" "cachevol (field 7)"
+assert_eq "$e8" "" "an eighth field"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the patch carries the three variables, the mount and the claim"
+reset; f_engine_cache_only_gap
+before=$FAILED
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "#   engine-cache:"
+assert_contains "$doc" "- name: VLLM_CACHE_ROOT"
+assert_contains "$doc" "value: /engine-cache/vllm"
+assert_contains "$doc" "- name: FLASHINFER_WORKSPACE_DIR"
+assert_contains "$doc" "- name: TRITON_CACHE_DIR"
+assert_contains "$doc" "mountPath: /engine-cache"
+assert_contains "$doc" "claimName: engine-cache"
+# ...and only that half: no drain, no weights.
+assert_not_contains "$doc" "preStop"
+assert_not_contains "$doc" "HF_HOME"
+assert_not_contains "$doc" "#   cache:"
+# The guard travels with it: the command belongs to the chart, so the patch
+# cannot add it, and without it a read-only cache directory is a lost replica.
+assert_contains "$doc" 'unset $v'
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: with the weights half too, env/volumeMounts/volumes are each ONE list"
+reset; f_vllm_plain
+before=$FAILED
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "HF_HOME"
+assert_contains "$doc" "VLLM_CACHE_ROOT"
+assert_contains "$doc" "preStop"
+assert_eq "$(printf '%s\n' "$doc" | grep -c '^        env:$')" "1" "env lists"
+assert_eq "$(printf '%s\n' "$doc" | grep -c '^        volumeMounts:$')" "1" "volumeMounts lists"
+assert_eq "$(printf '%s\n' "$doc" | grep -c '^      volumes:$')" "1" "volumes lists"
+# ...and the document is YAML yq reads back with BOTH volumes in it, which a
+# second `volumes:` key would silently have replaced.
+d="$(mktemp)"; printf '%s\n' "$doc" > "$d"
+assert_eq "$(yq eval '.spec.template.spec.volumes | length' "$d" 2>/dev/null)" "2" "volumes read back"
+assert_eq "$(yq eval '.spec.template.spec.containers[0].env | length' "$d" 2>/dev/null)" "4" "env read back"
+rm -f "$d"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: an ephemeral cache is warned about ON THE CONSOLE, with its path"
+reset; f_engine_cache_on_emptydir
+before=$FAILED
+warn="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>&1 >/dev/null)"
+assert_contains "$warn" "COMPILES FROM NOTHING"
+assert_contains "$warn" "/dev/shm/vllm-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a cache on a claim is not warned about, and gets no half"
+reset; f_engine_cache_on_claim
+before=$FAILED
+out="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>&1)"
+[ -z "$out" ] || fail "expected nothing, got: $out"
+reset; f_engine_cache_only_gap    # anchor: the same call does produce one here
+assert_contains "$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)" "engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a missing claim is said to be missing, with what a node directory must be"
+reset; f_engine_cache_only_gap
+before=$FAILED
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "engine-cache does NOT exist yet in ns"
+assert_contains "$doc" "make engine-cache NAMESPACE=ns ENGINE_CACHE_PATH=<node dir>"
+assert_contains "$doc" "ENGINE_CACHE_SEED_CLAIM"      # the seed is part of the same instruction
+assert_contains "$doc" "at least two components"
+assert_contains "$doc" "not the node's own"
+assert_contains "$doc" "one directory per trust domain"
+assert_contains "$doc" "PersistentVolumes"
+assert_contains "$doc" "WEIGHTS_NODE_SELECTOR"
+# ...and the way to do without one.
+assert_contains "$doc" "Without a node directory"
+assert_contains "$doc" "WVA_ENGINE_CACHE_CLAIM"
+assert_not_contains "$doc" "already exists"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: an existing claim is reused, not followed by instructions to create one"
+reset; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "engine-cache already exists in ns"
+assert_contains "$doc" "engine-cache-status"
+assert_not_contains "$doc" "does NOT exist"
+assert_not_contains "$doc" "ENGINE_CACHE_PATH"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: WVA_ENGINE_CACHE_CLAIM names a shared claim, with its subPath"
+reset; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list shared-cache:ReadWriteMany)"
+doc="$(WVA_ENGINE_CACHE_CLAIM=shared-cache:caches so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "claimName: shared-cache"
+assert_contains "$doc" "subPath: caches"
+assert_contains "$doc" "shared-cache already exists in ns"
+assert_not_contains "$doc" "claimName: engine-cache"
+# ...and the document parses with the subPath on the mount, not the volume.
+d="$(mktemp)"; printf '%s\n' "$doc" > "$d"
+assert_eq "$(yq eval '.spec.template.spec.containers[0].volumeMounts[0].subPath' "$d" 2>/dev/null)" "caches" "subPath read back"
+rm -f "$d"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the plan note fires for an unset cache and names the fix"
+reset; f_vllm_plain
+before=$FAILED
+note="$(so_enginecache_note ns deployments w "$POD_DEPLOY")"
+assert_contains "$note" "compiles from nothing"
+assert_contains "$note" "VLLM_CACHE_ROOT is unset"
+assert_contains "$note" "make workload-patch"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the plan note is silent on a claim, on SGLang, and on an unreadable spec"
+reset; f_engine_cache_on_claim
+before=$FAILED
+assert_eq "$(so_enginecache_note ns deployments w "$POD_DEPLOY")" "" "note for a cache on a claim"
+reset; f_sglang_proxy_has_hook
+assert_eq "$(so_enginecache_note ns deployments w "$POD_DEPLOY")" "" "note for SGLang"
+reset; f_unreadable
+assert_eq "$(so_enginecache_note ns deployments w "$POD_DEPLOY")" "" "note for an unreadable spec (the drain note says so)"
+assert_contains "$(so_drain_note ns deployments w "$POD_DEPLOY")" "unknown"   # anchor
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the summary counts the workloads that compile from nothing"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+dir="$(mktemp -d)"
+DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "0" "return code"
+assert_contains "$(cat "$dir/log")" "1 model server(s) COMPILE FROM NOTHING"
+assert_not_contains "$(cat "$dir/log")" "RE-DOWNLOAD"
+assert_contains "$(cat "$dir/p.yaml")" "claimName: engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: without its opt-in the half is emitted, never applied"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany model-pvc:ReadWriteMany)"
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || true
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "preStop"
+assert_not_contains "$PATCH_BODY" "VLLM_CACHE_ROOT"
+assert_not_contains "$PATCH_BODY" "engine-cache"
+assert_not_contains "$PATCH_BODY" "env:"
+assert_contains "$(cat "$dir/log")" "engine-cache half is emitted only"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: with its opt-in and the claim, the half IS applied -- and the weights half is not"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany model-pvc:ReadWriteMany)"
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || true
+assert_contains "$PATCH_BODY" "preStop"
+assert_contains "$PATCH_BODY" "VLLM_CACHE_ROOT"
+assert_contains "$PATCH_BODY" "claimName: engine-cache"
+assert_not_contains "$PATCH_BODY" "HF_HOME"
+assert_not_contains "$PATCH_BODY" "claimName: model-pvc"
+assert_not_contains "$PATCH_BODY" "model-storage"
+# The body is a document the API server would take: one env list of three.
+d="$(mktemp)"; printf '%s\n' "$PATCH_BODY" > "$d"
+assert_eq "$(yq eval '.spec.template.spec.containers[0].env | length' "$d" 2>/dev/null)" "3" "env read back"
+assert_eq "$(yq eval '.spec.template.spec.volumes | length' "$d" 2>/dev/null)" "1" "volumes read back"
+rm -f "$d"
+# ...and the guard's absence is said at the time.
+assert_contains "$(cat "$dir/log")" "guard is NOT applied"
+assert_contains "$(cat "$dir/log")" "WITHOUT the guard"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: both opt-ins keep both halves"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany model-pvc:ReadWriteMany)"
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || true
+assert_contains "$PATCH_BODY" "claimName: engine-cache"
+assert_contains "$PATCH_BODY" "claimName: model-pvc"
+assert_contains "$PATCH_BODY" "HF_HOME"
+assert_contains "$PATCH_BODY" "TRITON_CACHE_DIR"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a missing claim blocks the half rather than stranding pods Pending"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+dir="$(mktemp -d)"
+DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "0" "return code"
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"        # nothing left to send
+assert_contains "$(cat "$dir/log")" "does not exist"
+assert_contains "$(cat "$dir/log")" "need only a volume"
+assert_contains "$(cat "$dir/p.yaml")" "claimName: engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a mount already at /engine-cache blocks the half, NOT the drain half"
+reset; LIST_FIXTURE="$(serving_list)"
+before=$FAILED
+FIXTURE='{"spec":{"template":{"spec":{
+    "terminationGracePeriodSeconds":30,
+    "volumes":[{"name":"scratch","emptyDir":{}},
+               {"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"}],
+                   "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"},
+                                   {"name":"scratch","mountPath":"/engine-cache"}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || true
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "preStop"
+assert_not_contains "$PATCH_BODY" "engine-cache"
+assert_contains "$(cat "$dir/log")" "already mounted at /engine-cache"
+assert_contains "$(cat "$dir/p.yaml")" "claimName: engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a workload with everything on a volume reports the all-clear"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_on_claim
+before=$FAILED
+dir="$(mktemp -d)"
+DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "0" "return code"
+assert_contains "$(cat "$dir/log")" "no vLLM among them compiles from nothing"
+[ -f "$dir/p.yaml" ] && fail "no file should be written for a converged workload"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="trim: the weights half can be kept while the engine-cache half goes, and back"
+before=$FAILED
+mk_both() {
+cat > "$1" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: w, namespace: ns1}
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+      - name: vllm
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 45"]
+        env:
+        - name: HF_HOME
+          value: /model-cache/huggingface
+        - name: VLLM_CACHE_ROOT
+          value: /engine-cache/vllm
+        - name: FLASHINFER_WORKSPACE_DIR
+          value: /engine-cache/flashinfer
+        - name: TRITON_CACHE_DIR
+          value: /engine-cache/triton
+        volumeMounts:
+        - name: model-storage
+          mountPath: /model-cache
+        - name: engine-cache
+          mountPath: /engine-cache
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc
+      - name: engine-cache
+        persistentVolumeClaim:
+          claimName: engine-cache
+YAML
+}
+d="$(mktemp)"; mk_both "$d"
+so_workload_patch_trim "$d" 1 0 || fail "expected the weights half to survive"
+left="$(cat "$d")"
+assert_contains "$left" "HF_HOME"
+assert_contains "$left" "claimName: model-pvc"
+assert_contains "$left" "preStop"
+assert_not_contains "$left" "VLLM_CACHE_ROOT"
+assert_not_contains "$left" "engine-cache"
+assert_eq "$(yq eval '.spec.template.spec.containers[0].env | length' "$d")" "1" "env left"
+assert_eq "$(yq eval '.spec.template.spec.volumes | length' "$d")" "1" "volumes left"
+mk_both "$d"
+so_workload_patch_trim "$d" 0 1 || fail "expected the engine-cache half to survive"
+left="$(cat "$d")"
+assert_contains "$left" "claimName: engine-cache"
+assert_contains "$left" "TRITON_CACHE_DIR"
+assert_not_contains "$left" "HF_HOME"
+assert_not_contains "$left" "model-storage"
+assert_eq "$(yq eval '.spec.template.spec.containers[0].env | length' "$d")" "3" "env left"
+mk_both "$d"
+so_workload_patch_trim "$d" 0 0 || fail "expected the drain half to survive"
+left="$(cat "$d")"
+assert_not_contains "$left" "env:"
+assert_not_contains "$left" "volumes:"
+assert_contains "$left" "preStop"
+rm -f "$d"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="trim: a document with only the two storage halves and neither kept is skipped (rc 1)"
+before=$FAILED
+d="$(mktemp)"
+cat > "$d" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: w, namespace: ns1}
+spec:
+  template:
+    spec:
+      containers:
+      - name: vllm
+        env:
+        - name: HF_HOME
+          value: /model-cache/huggingface
+        - name: VLLM_CACHE_ROOT
+          value: /engine-cache/vllm
+        volumeMounts:
+        - name: model-storage
+          mountPath: /model-cache
+        - name: engine-cache
+          mountPath: /engine-cache
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc
+      - name: engine-cache
+        persistentVolumeClaim:
+          claimName: engine-cache
+YAML
+trim_rc=0
+so_workload_patch_trim "$d" 0 0 || trim_rc=$?
+assert_eq "$trim_rc" "1" "return code"
+assert_contains "$(cat "$d")" "VLLM_CACHE_ROOT"   # anchor: the file was left intact
+# ...while keeping one half makes it worth sending.
+so_workload_patch_trim "$d" 0 1 || fail "expected the engine-cache half to be worth sending"
+assert_contains "$(cat "$d")" "claimName: engine-cache"
+rm -f "$d"
+[ "$FAILED" -eq "$before" ] && ok
+
+# --- review round: the detector's edges, the claim's kind, the preparer ------
+
+CASE="engine cache: a value from a ConfigMap or Secret is no opinion, never unset"
+reset
+before=$FAILED
+# A strategic merge of `value` into an env entry that has `valueFrom` is
+# rejected by the API server -- the whole document, drain hook included -- so
+# a detector that called this "unset" and emitted the half took the drain
+# half down with it on apply.
+FIXTURE='{"spec":{"template":{"spec":{
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"VLLM_CACHE_ROOT","valueFrom":{"configMapKeyRef":{"name":"c","key":"k"}}}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 1 "vllm"      # anchor: the engine was found
+assert_field 7 ""
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "preStop"
+assert_not_contains "$doc" "VLLM_CACHE_ROOT"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: an empty value is unset, not a cache at ''"
+reset
+before=$FAILED
+FIXTURE='{"spec":{"template":{"spec":{
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"VLLM_CACHE_ROOT","value":""}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 7 "unset"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a mount is matched by path component, not string prefix"
+reset
+before=$FAILED
+# /engine-cache2/vllm is not under a claim mounted at /engine-cache; a prefix
+# test said it was, and gave an emptyDir cache a clean bill.
+FIXTURE='{"spec":{"template":{"spec":{
+    "volumes":[{"name":"engine-cache","persistentVolumeClaim":{"claimName":"engine-cache"}},
+               {"name":"scratch","emptyDir":{}}],
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"VLLM_CACHE_ROOT","value":"/engine-cache2/vllm"}],
+                   "volumeMounts":[{"name":"engine-cache","mountPath":"/engine-cache"},
+                                   {"name":"scratch","mountPath":"/engine-cache2"}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 7 "ephemeral:/engine-cache2/vllm"
+# ...and the same rule for the weights: HF_HOME=/model-cache2/hf is not on
+# the claim at /model-cache.
+FIXTURE='{"spec":{"template":{"spec":{
+    "volumes":[{"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"HF_HOME","value":"/model-cache2/hf"}],
+                   "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 5 "0"
+# ...while the mount path itself, and a path under it, still count.
+FIXTURE='{"spec":{"template":{"spec":{
+    "volumes":[{"name":"engine-cache","persistentVolumeClaim":{"claimName":"engine-cache"}}],
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"VLLM_CACHE_ROOT","value":"/engine-cache"}],
+                   "volumeMounts":[{"name":"engine-cache","mountPath":"/engine-cache"}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 7 "volume:/engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: an inline nfs volume outlives the pod and counts"
+reset
+before=$FAILED
+FIXTURE='{"spec":{"template":{"spec":{
+    "volumes":[{"name":"nas","nfs":{"server":"filer","path":"/export/caches"}}],
+    "containers":[{"name":"vllm","image":"quay.io/x/vllm-openai:v0.11",
+                   "env":[{"name":"VLLM_CACHE_ROOT","value":"/cache/vllm"}],
+                   "volumeMounts":[{"name":"nas","mountPath":"/cache"}],
+                   "args":["vllm","serve","Qwen/Qwen3-0.6B"]}]}}}}'
+assert_field 7 "volume:/cache/vllm"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a NAMED claim that is missing is not answered with make engine-cache"
+reset; f_engine_cache_only_gap
+before=$FAILED
+# `make engine-cache` creates a claim called engine-cache, never the one the
+# operator named, so that remedy would leave every pod Pending on the name the
+# patch above actually mounts -- the same defect the weights half once had.
+doc="$(WVA_ENGINE_CACHE_CLAIM=my-rwx so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "claimName: my-rwx"
+assert_contains "$doc" "my-rwx (WVA_ENGINE_CACHE_CLAIM) does NOT exist in ns"
+assert_contains "$doc" "drop WVA_ENGINE_CACHE_CLAIM"
+assert_not_contains "$doc" "ENGINE_CACHE_PATH="
+assert_not_contains "$doc" "make engine-cache NAMESPACE"
+# ...and what it asks of that claim is said: the trust it takes.
+assert_contains "$doc" "runs code in every"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the shared-claim alternative states what it must be trusted as"
+reset; f_engine_cache_only_gap
+before=$FAILED
+doc="$(so_workload_patch_doc ns deployments w "$POD_DEPLOY" 2>/dev/null)"
+assert_contains "$doc" "Without a node directory"
+assert_contains "$doc" "runs code in every engine, on every node at"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the all-clear does not vouch for an engine the detector has no opinion on"
+reset; LIST_FIXTURE="$(serving_list)"
+before=$FAILED
+# An SGLang server that drains and keeps its weights: the all-clear must not
+# say its compile caches are on a volume, because nothing looked.
+FIXTURE='{"spec":{"template":{"spec":{
+    "terminationGracePeriodSeconds":120,
+    "volumes":[{"name":"model-storage","persistentVolumeClaim":{"claimName":"model-pvc"}}],
+    "containers":[{"name":"server","image":"lmsysorg/sglang:latest",
+                   "env":[{"name":"HF_HOME","value":"/model-cache/huggingface"}],
+                   "volumeMounts":[{"name":"model-storage","mountPath":"/model-cache"}],
+                   "lifecycle":{"preStop":{"exec":{"command":["sleep","45"]}}},
+                   "args":["python3","-m","sglang.launch_server","--model-path","meta-llama/Llama-3.1-8B"]}]}}}}'
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || true
+assert_contains "$(cat "$dir/log")" "already drain on scale-down"
+assert_contains "$(cat "$dir/log")" "no vLLM among them compiles from nothing"
+assert_not_contains "$(cat "$dir/log")" "compile caches on a volume"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="a claim that is not Bound blocks the half, with its phase"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany:Pending)"
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || true
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
+assert_contains "$(cat "$dir/log")" "is not Bound (Pending)"
+assert_contains "$(cat "$dir/p.yaml")" "claimName: engine-cache"   # anchor: emitted still
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="a ReadWriteOnce claim blocks the half: it binds to one node"
+reset; LIST_FIXTURE="$(serving_list)"; f_llmd_real_downloads
+before=$FAILED
+# The weights half shares the check, so the second replica of a workload
+# whose cache is RWO is refused there too.
+PVC_FIXTURE="$(pvc_list model-pvc:ReadWriteOnce)"
+apply_weights_run
+assert_contains "$PATCH_BODY" "preStop"
+assert_not_contains "$PATCH_BODY" "claimName"
+assert_contains "$(cat "$DRIVER_LOG")" "not ReadWriteMany"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: an unprepared node blocks the half, and is counted"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_FIXTURE='{"status":{"desiredNumberScheduled":16,"numberReady":14}}'
+dir="$(mktemp -d)"
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || true
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
+assert_contains "$(cat "$dir/log")" "2 of 16 accelerator node(s) are not prepared"
+assert_contains "$(cat "$dir/log")" "engine-cache-status"
+# ...and with every node prepared the same run applies it.
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_FIXTURE='{"status":{"desiredNumberScheduled":16,"numberReady":16}}'
+WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+    WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || true
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "claimName: engine-cache"
+assert_contains "$(cat "$dir/log")" "WITHOUT the guard"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="a volume or claim name that is not a DNS-1123 label is refused at entry"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+dir="$(mktemp -d)"
+DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_VOLUME_NAME='engine"cache' WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "1" "return code"
+assert_contains "$(cat "$dir/log")" "WVA_ENGINE_CACHE_VOLUME_NAME must be a DNS-1123 label"
+[ -f "$dir/p.yaml" ] && fail "nothing should be written"
+DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_CLAIM='shared:../etc' WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "1" "return code"
+assert_contains "$(cat "$dir/log")" "is not a subPath"
+# ...and a well-formed one passes the gate (anchor).
+DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_CLAIM='shared-cache:engine-cache' WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "0" "return code"
+assert_contains "$(cat "$dir/p.yaml")" "claimName: shared-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+# --- review round 4: the preparer gate, and the names -----------------------
+
+engine_apply_run() {  # the engine-cache opt-in against $FIXTURE, results in DRIVER_*
+    DRIVER_OUT="$(mktemp -d)/p.yaml"; DRIVER_LOG="$(mktemp)"; DRIVER_RC=0
+    WVA_DEFAULT_SO_NS=ns1 WVA_WORKLOAD_PATCH_APPLY=true WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true \
+        WVA_WORKLOAD_PATCH_FILE="$DRIVER_OUT" wva_workload_patch >"$DRIVER_LOG" 2>&1 || DRIVER_RC=$?
+}
+
+CASE="engine cache: a preparer that cannot be READ refuses the half (Forbidden is not absent)"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_RC=1                      # a token that may not list DaemonSets, or a timeout
+engine_apply_run
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
+assert_contains "$(cat "$DRIVER_LOG")" "preparer DaemonSet could not be read"
+assert_contains "$(cat "$DRIVER_OUT")" "claimName: engine-cache"   # emitted still
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: no preparer at all (NotFound) is not a refusal -- the claim was checked"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_FIXTURE=""; DS_RC=0       # --ignore-not-found: empty, rc 0
+engine_apply_run
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "claimName: engine-cache"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: a preparer with no status yet (0 of 0) is not 'every node prepared'"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list engine-cache:ReadWriteMany)"
+DS_FIXTURE='{"status":{}}'
+engine_apply_run
+assert_eq "$PATCH_CALLS" "0" "kubectl patch calls"
+assert_contains "$(cat "$DRIVER_LOG")" "0 of 0 accelerator node(s) are not prepared"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="engine cache: the gate is for the claim make engine-cache makes, not a namesake DaemonSet"
+reset; LIST_FIXTURE="$(serving_list)"; f_engine_cache_only_gap
+before=$FAILED
+PVC_FIXTURE="$(pvc_list my-rwx:ReadWriteMany)"
+DS_FIXTURE='{"status":{"desiredNumberScheduled":3,"numberReady":2}}'   # an unrelated DaemonSet called my-rwx
+WVA_ENGINE_CACHE_CLAIM=my-rwx engine_apply_run
+assert_eq "$PATCH_CALLS" "1" "kubectl patch calls"
+assert_contains "$PATCH_BODY" "claimName: my-rwx"
+assert_not_contains "$(cat "$DRIVER_LOG")" "not prepared"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="the two volume names may not be the same"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+dir="$(mktemp -d)"; DRIVER_RC=0
+WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_VOLUME_NAME=model-storage WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" \
+    wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?
+assert_eq "$DRIVER_RC" "1" "return code"
+assert_contains "$(cat "$dir/log")" "the two volumes need two names"
+[ -f "$dir/p.yaml" ] && fail "nothing should be written"
+[ "$FAILED" -eq "$before" ] && ok
+
+CASE="the claim reference is checked as claim and subPath, each by its own rule"
+reset; LIST_FIXTURE="$(serving_list)"; f_vllm_plain
+before=$FAILED
+dir="$(mktemp -d)"
+run_ref() { DRIVER_RC=0; WVA_DEFAULT_SO_NS=ns1 WVA_ENGINE_CACHE_CLAIM="$1" WVA_WORKLOAD_PATCH_FILE="$dir/p.yaml" wva_workload_patch >"$dir/log" 2>&1 || DRIVER_RC=$?; rm -f "$dir/p.yaml"; }
+# refused: a slash, an underscore, upper case or a leading dot in the CLAIM part
+for bad in a/b a_b Shared .a a..b; do
+    run_ref "$bad"; assert_eq "$DRIVER_RC" "1" "rc for claim '$bad'"; assert_contains "$(cat "$dir/log")" "is not a claim name"
+done
+# refused: an absolute, empty or escaping SUBPATH
+for bad in shared:/abs shared: shared:.. shared:../x shared:a/../b; do
+    run_ref "$bad"; assert_eq "$DRIVER_RC" "1" "rc for '$bad'"; assert_contains "$(cat "$dir/log")" "is not a subPath"
+done
+# accepted: a dotted claim, a mixed-case and nested subPath (what --seed-claim takes too)
+for good in shared-cache shared.cache:engine-cache shared-cache:Models/qwen_3; do
+    run_ref "$good"; assert_eq "$DRIVER_RC" "0" "rc for '$good'"
+done
 [ "$FAILED" -eq "$before" ] && ok
 
 # ----------------------------------------------------------------------------

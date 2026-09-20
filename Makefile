@@ -624,6 +624,12 @@ BENCHMARK_MODEL_HOSTPATH ?=
 # weights directory; set on its own to have the caches local and the weights
 # shared. Empty: the harness's workload PVC, as before.
 BENCHMARK_ENGINE_CACHE_HOSTPATH ?= $(BENCHMARK_MODEL_HOSTPATH)
+# What the node-local cache is seeded from: `auto` copies the harness's own
+# workload PVC's engine-cache directory (the shared home the caches had
+# before) onto each node when that claim already exists -- a re-standup in a
+# namespace with history -- so no node's first start compiles; `none` seeds
+# nothing; anything else is a claim[:subPath] in the namespace.
+BENCHMARK_ENGINE_CACHE_SEED ?= auto
 .PHONY: prepull prepull-status prepull-delete
 prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> narrows the nodes, PREPULL_TOLERATIONS=<key>[,<key>] adds taints.
 	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
@@ -683,18 +689,23 @@ weights-delete: ## Drop the claim, volume and downloader for WEIGHTS_MODEL=<hf i
 ## <dir>/engine-cache; defaults to WEIGHTS_PATH), ENGINE_CACHE_IMAGE any image
 ## with /bin/sh (defaults to WEIGHTS_IMAGE; the engine image). Model servers
 ## mount the claim read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR
-## and TRITON_CACHE_DIR under it. Needs leave to create PersistentVolumes.
-## deploy/enginecache.sh --help has the rest; the nodes are picked as for prepull.
+## and TRITON_CACHE_DIR under it (`make workload-patch` writes that half for a
+## model server that lacks it). Needs leave to create PersistentVolumes. What
+## the node directory must be is in deploy/enginecache.sh --help; the nodes are
+## picked as for prepull (WEIGHTS_NODE_SELECTOR / WEIGHTS_TOLERATIONS).
 ENGINE_CACHE_PATH ?= $(WEIGHTS_PATH)
 ENGINE_CACHE_IMAGE ?= $(WEIGHTS_IMAGE)
 ENGINE_CACHE_CAPACITY ?=
+# A claim[:subPath] whose caches are copied onto each node as it is prepared
+# (the shared claim they lived on before), so no node's first start compiles.
+ENGINE_CACHE_SEED_CLAIM ?=
 .PHONY: engine-cache engine-cache-status engine-cache-delete
-engine-cache: ## Prepare ENGINE_CACHE_PATH=<node dir>/engine-cache on every accelerator node of NAMESPACE=<ns>, with ENGINE_CACHE_IMAGE=<image>; claim engine-cache. [ENGINE_CACHE_CAPACITY=<size>]
+engine-cache: ## Prepare ENGINE_CACHE_PATH=<node dir>/engine-cache on every accelerator node of NAMESPACE=<ns>, with ENGINE_CACHE_IMAGE=<image>; claim engine-cache. [ENGINE_CACHE_CAPACITY=<size>] [ENGINE_CACHE_SEED_CLAIM=<pvc>[:<subPath>]]
 	@test -n "$(ENGINE_CACHE_PATH)" || { echo "engine-cache: set ENGINE_CACHE_PATH=<absolute directory on the node> (or WEIGHTS_PATH)" >&2; exit 1; }
 	@test -n "$(ENGINE_CACHE_IMAGE)" || { echo "engine-cache: set ENGINE_CACHE_IMAGE=<an image with /bin/sh; the engine image> (or WEIGHTS_IMAGE)" >&2; exit 1; }
 	@test -n "$(prepull_namespace_given)" || { echo "engine-cache: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
 	@bash deploy/enginecache.sh apply -n "$(NAMESPACE)" --path "$(ENGINE_CACHE_PATH)" --image "$(ENGINE_CACHE_IMAGE)" \
-		$(if $(ENGINE_CACHE_CAPACITY),--capacity "$(ENGINE_CACHE_CAPACITY)",) $(WEIGHTS_ARGS)
+		$(if $(ENGINE_CACHE_CAPACITY),--capacity "$(ENGINE_CACHE_CAPACITY)",) $(if $(ENGINE_CACHE_SEED_CLAIM),--seed-claim "$(ENGINE_CACHE_SEED_CLAIM)",) $(WEIGHTS_ARGS)
 
 engine-cache-status: ## Per accelerator node: is the engine cache directory prepared and writable. NAMESPACE=<ns>
 	@test -n "$(prepull_namespace_given)" || { echo "engine-cache-status: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
@@ -705,7 +716,7 @@ engine-cache-delete: ## Drop the engine-cache claim, volume and preparer in NAME
 	@bash deploy/enginecache.sh delete -n "$(NAMESPACE)"
 
 .PHONY: workload-patch
-workload-patch: ## Write a patch for model servers that do not drain on scale-down, or download weights outside every volume they mount. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the volume, after `make model-cache`).
+workload-patch: ## Write a patch for model servers that do not drain on scale-down, download weights outside every volume they mount, or compile their kernels on every start. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the weights volume, after `make model-cache`; WVA_WORKLOAD_PATCH_APPLY_ENGINE_CACHE=true for the engine-cache volume, after `make engine-cache`).
 	@# NAMESPACE pins the SCAN, not just the connection. Without the
 	@# WVA_DEFAULT_SO_NS fallback below, `make workload-patch NAMESPACE=x` under a
 	@# cluster-scoped install still walked every namespace on the cluster:
@@ -1659,7 +1670,13 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 		img=$${img%%,*}; \
 		[ -n "$$img" ] || { echo "benchmark-standup: cannot read the engine image from the clone for the engine-cache preparer; set BENCHMARK_PREPULL_IMAGES=<image>" >&2; exit 1; }; \
 		kubectl create namespace "$(BENCHMARK_NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f - >/dev/null; \
-		bash deploy/enginecache.sh apply -n "$(BENCHMARK_NAMESPACE)" --path "$(BENCHMARK_ENGINE_CACHE_HOSTPATH)" --image "$$img" $(PREPULL_ARGS) || exit 1; \
+		seed="$(BENCHMARK_ENGINE_CACHE_SEED)"; \
+		if [ "$$seed" = auto ]; then \
+			if kubectl get pvc -n "$(BENCHMARK_NAMESPACE)" workload-pvc >/dev/null 2>&1; then seed=workload-pvc:engine-cache; else seed=""; fi; \
+		fi; \
+		[ "$$seed" != none ] || seed=""; \
+		[ -z "$$seed" ] || echo "Seeding the node-local engine cache from $$seed (BENCHMARK_ENGINE_CACHE_SEED=none skips)"; \
+		bash deploy/enginecache.sh apply -n "$(BENCHMARK_NAMESPACE)" --path "$(BENCHMARK_ENGINE_CACHE_HOSTPATH)" --image "$$img" $(PREPULL_ARGS) $${seed:+--seed-claim "$$seed"} || exit 1; \
 		bash hack/benchmark/engine_cache_claim.sh "$(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml" "$(BENCHMARK_NAMESPACE)"; \
 	fi
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) standup \

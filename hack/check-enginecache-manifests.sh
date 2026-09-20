@@ -122,6 +122,66 @@ for b in bad:
 sys.exit(1 if bad else 0)
 PYEOF
 [ "$FAILED" = 0 ] && ok "render: volume, claim and preparer have the shape the header promises"
+bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" --seed-claim workload-pvc:engine-cache --dry-run > "$T/render-seed.yaml" || fail "seed render failed"
+bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" --seed-claim shared-caches --dry-run > "$T/render-seed2.yaml" || fail "seed render (no subPath) failed"
+"$PY" - "$T/render-seed.yaml" "$T/render-seed2.yaml" "$T/render-default.yaml" <<'PYEOF' || FAILED=1
+import sys, yaml
+bad = []
+def check(cond, msg):
+    if not cond:
+        bad.append(msg)
+seed = [d for d in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")) if d][3]["spec"]["template"]["spec"]
+seed2 = [d for d in yaml.safe_load_all(open(sys.argv[2], encoding="utf-8")) if d][3]["spec"]["template"]["spec"]
+plain = [d for d in yaml.safe_load_all(open(sys.argv[3], encoding="utf-8")) if d][3]
+vols = {v["name"]: v for v in seed["volumes"]}
+check(vols.get("seed", {}).get("persistentVolumeClaim") == {"claimName": "workload-pvc", "readOnly": True}, "the seed claim is a read-only volume: %s" % vols.get("seed"))
+mounts = {m["name"]: m for m in seed["containers"][0]["volumeMounts"]}
+check(mounts.get("seed") == {"name": "seed", "mountPath": "/seed", "readOnly": True, "subPath": "engine-cache"}, "the seed is mounted read-only at /seed with its subPath: %s" % mounts.get("seed"))
+m2 = {m["name"]: m for m in seed2["containers"][0]["volumeMounts"]}
+check("subPath" not in m2.get("seed", {}), "no subPath when none was given: %s" % m2.get("seed"))
+script = seed["containers"][0]["args"][0]
+check('merge() {' in script and 'local e n t' in script and 'merge "$e" "$t"' in script and 'elif [ ! -e "$t" ]' in script and 'cp -a --no-preserve=ownership "$e" "$2/"' in script, "the seed is merged file by file, descending directories both sides have: what the node has is kept, what it lacks is copied")
+check(script.index("if [ -d /seed ]") < script.index('touch "/engine-cache/$MARKER"'), "the seed is copied before the prepared marker is written")
+check('[ "$seeded_from" != "$SEED_ID" ]' in script and 'echo "$SEED_ID" > "/engine-cache/$SEED_MARKER"' in script, "the seed marker records the seed, and a different seed is merged in")
+i_ok = script.index('if [ "$complete" = 1 ]'); i_mark = script.index('echo "$SEED_ID" > "/engine-cache/$SEED_MARKER"'); i_loop = script.index('if cp -a --no-preserve=ownership')
+check(i_loop < i_ok < i_mark and 'else complete=0; rm -rf "$t"' in script, "the marker is written only after every copy succeeded; a failed copy is removed and the seed retried next start")
+probe_seed = seed["containers"][0]["readinessProbe"]["exec"]["command"][2]
+check(probe_seed.endswith('&& grep -qx "workload-pvc:engine-cache" /engine-cache/.seeded'), "with a seed, Ready also requires the node to carry that seed: %s" % probe_seed)
+env = {e["name"]: e["value"] for e in seed["containers"][0]["env"]}
+check(env.get("SEED_MARKER") == ".seeded" and env.get("SEED_ID") == "workload-pvc:engine-cache", "the seed marker's name and the seed's identity come from the environment")
+check("$(" not in script and "$$" not in script, "still no $( or $$ in the command")
+plain_ps = plain["spec"]["template"]["spec"]
+check(all(v["name"] != "seed" for v in plain_ps["volumes"]) and all(m["name"] != "seed" for m in plain_ps["containers"][0]["volumeMounts"]), "no --seed-claim: no seed volume or mount")
+check(plain["metadata"]["annotations"]["wva.llmd.ai/engine-cache-seed"] == "", "no --seed-claim: an empty seed annotation")
+seed_ds = [d for d in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")) if d][3]
+check(seed_ds["metadata"]["annotations"]["wva.llmd.ai/engine-cache-seed"] == "workload-pvc:engine-cache", "the DaemonSet records the seed")
+for b in bad:
+    print("  FAIL seed render: " + b)
+sys.exit(1 if bad else 0)
+PYEOF
+[ "$FAILED" = 0 ] && ok "render: --seed-claim mounts the seed read-only and the preparer copies it once, before the marker"
+# the merge, run: a fake seed and cache; a key the node has is kept, a key it
+# lacks (under a directory both have) is added, a second run is a no-op, a
+# changed seed adds its new key; under dash when the host has it, sh otherwise
+M="$T/merge"; mkdir -p "$M/seed/vllm/torch_compile_cache/keyA" "$M/seed/vllm/torch_compile_cache/keyB" "$M/seed/triton/x" "$M/cache/vllm/torch_compile_cache/keyA"
+echo old > "$M/cache/vllm/torch_compile_cache/keyA/f"; echo new > "$M/seed/vllm/torch_compile_cache/keyA/f"; echo b > "$M/seed/vllm/torch_compile_cache/keyB/f"; echo t > "$M/seed/triton/x/f"
+sed -n "/^preparer_script() {/,/^SCRIPT$/p" deploy/enginecache.sh | sed '1,2d;$d' | sed "s|/seed|$M/seed|g; s|/engine-cache|$M/cache|g; s|^trap .*||" > "$M/p.sh"
+SH=sh; command -v dash >/dev/null 2>&1 && SH=dash
+SEED_MARKER=.seeded SEED_ID=shared:x MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run1.out" 2>&1
+[ "$(cat "$M/cache/vllm/torch_compile_cache/keyA/f")" = old ] && [ "$(cat "$M/cache/vllm/torch_compile_cache/keyB/f")" = b ] && [ "$(cat "$M/cache/triton/x/f")" = t ] && [ "$(cat "$M/cache/.seeded")" = shared:x ] \
+    && ok "merge ($SH): the node's key kept, the seed's other key added beside it, triton added, the marker records the seed" || fail "merge run 1: $(cat "$M/run1.out"; ls -R "$M/cache" | head -20)"
+grep -q "2 entries added" "$M/run1.out" && ok "merge: two entries added on the first run" || fail "merge run 1 message: $(cat "$M/run1.out")"
+SEED_MARKER=.seeded SEED_ID=shared:x MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run2.out" 2>&1
+grep -q "seeded on" "$M/run2.out" && fail "merge: the same seed was copied again" || ok "merge: the same seed is not copied again"
+mkdir -p "$M/seed/vllm/torch_compile_cache/keyC"; echo c > "$M/seed/vllm/torch_compile_cache/keyC/f"
+SEED_MARKER=.seeded SEED_ID=shared:y MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run3.out" 2>&1
+[ "$(cat "$M/cache/vllm/torch_compile_cache/keyC/f")" = c ] && [ "$(cat "$M/cache/.seeded")" = shared:y ] && grep -q "1 entries added" "$M/run3.out" && ok "merge: a changed seed adds its new key and rewrites the marker" || fail "merge run 3: $(cat "$M/run3.out")"
+# a copy that cannot complete: an unreadable seed entry (the preparer's own
+# chmod 1777 would undo a read-only target directory)
+mkdir -p "$M/seed/triton/y"; echo y > "$M/seed/triton/y/f"; chmod 000 "$M/seed/triton/y"
+SEED_MARKER=.seeded SEED_ID=shared:z MARKER=.prepared HOSTNAME=n1 "$SH" "$M/p.sh" > "$M/run4.out" 2>&1; chmod 755 "$M/seed/triton/y"
+if [ "$(id -u)" = 0 ]; then ok "merge: (the failed-copy case needs a non-root check runner)"; else
+grep -q "did not complete" "$M/run4.out" && [ "$(cat "$M/cache/.seeded")" = shared:y ] && [ ! -e "$M/cache/triton/y" ] && ok "merge: a copy that fails leaves the marker at the previous seed and nothing half-copied" || fail "merge run 4: $(cat "$M/run4.out"; cat "$M/cache/.seeded")"; fi
 n="$(grep -c "cat <<'SCRIPT'" deploy/enginecache.sh)"
 [ "$n" = 1 ] && grep -q '^\$(preparer_script | sed' deploy/enginecache.sh && ok "render: the preparer's command comes from a quoted heredoc, so nothing in it is evaluated at apply time" || fail "render: the preparer's command is not in a quoted heredoc ($n)"
 
@@ -144,6 +204,11 @@ refuse "a selector with a quote" apply -n ns --path /mnt/local/w --image "$IMG" 
 refuse "--dry-run on status" status -n ns --dry-run
 refuse "an unknown command" prepare -n ns
 refuse "an unknown option" apply -n ns --path /mnt/local/w --image "$IMG" --bogus --dry-run
+refuse "a seed that is the engine-cache claim itself" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim engine-cache --dry-run
+refuse "a seed subPath with '..'" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "shared:../x" --dry-run
+refuse "a seed subPath that is absolute" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "shared:/x" --dry-run
+refuse "a seed claim name that is not one" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "Shared Caches" --dry-run
+refuse "a seed with an empty subPath after the colon" apply -n ns --path /mnt/local/w --image "$IMG" --seed-claim "shared:" --dry-run
 
 # ---------------------------------------------------------------------------
 # 3. engine_cache_claim.sh against a stub kubectl.
@@ -303,7 +368,11 @@ case "\$1 \$2" in
       esac ;;
   "get pvc")
       want -n check-ns
-      case "\$ARGV" in *" engine-cache "*) ;; *) echo "stub kubectl: the claim read names no claim:\$ARGV" >&2; exit 2 ;; esac
+      case "\$ARGV" in
+        *" workload-pvc "*) case "\$ARGV" in *"jsonpath={.status.phase}"*) printf '%s' "\${STUB_SEED_PHASE-Bound}"; exit 0 ;; *) echo "stub kubectl: unexpected seed read:\$ARGV" >&2; exit 2 ;; esac ;;
+        *" engine-cache "*) ;;
+        *) echo "stub kubectl: the claim read names no claim:\$ARGV" >&2; exit 2 ;;
+      esac
       case "\$ARGV" in
         *"jsonpath={.status.phase}"*) printf '%s' "\${STUB_PVC_PHASE-Bound}" ;;
         *"jsonpath={.metadata.name}/{.spec.storageClassName}"*) [ -z "\${STUB_PVC_PHASE-Bound}" ] || printf 'engine-cache/%s' "\${STUB_PVC_CLASS-}" ;;
@@ -380,6 +449,14 @@ if STUB_DS_PATH="" STUB_PVC_CLASS="" PATH="$STUB_PATH" bash deploy/enginecache.s
     grep -q "already has a claim named engine-cache on storage class ''" "$T/noclass.out" && ok "apply: an existing claim on no class is refused too" || fail "apply no-class claim: $(tail -1 "$T/noclass.out")"; fi
 STUB_DS_PATH="" STUB_PVC_PHASE="" STUB_OPENSHIFT=1 PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /var/mnt/weights/p --image "$IMG" > "$T/ocp.out" 2>&1 || true
 grep -q 'OpenShift: the preparer and the engines run as the project UID' "$T/ocp.out" && grep -q 'chcon -t container_file_t /var/mnt/weights/p/engine-cache' "$T/ocp.out" && ok "apply: on a cluster with SecurityContextConstraints the node-directory steps are printed, with the cache directory" || fail "apply on OpenShift: $(grep -c OpenShift "$T/ocp.out") notice(s)"
+# the seed claim must be Bound: the preparer would otherwise mount it and never start
+: > "$T/calls"
+if STUB_DS_PATH="" STUB_PVC_PHASE="" STUB_SEED_PHASE=Pending PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" --seed-claim workload-pvc:engine-cache > "$T/seedp.out" 2>&1; then fail "apply must refuse a seed claim that is not Bound"; else
+    grep -q "no Bound claim of that name" "$T/seedp.out" && ! grep -q '^apply -f' "$T/calls" && ok "apply: a seed claim that is not Bound is refused, nothing applied" || fail "apply seed Pending: $(tail -1 "$T/seedp.out")"; fi
+: > "$T/calls"
+STUB_DS_PATH="" STUB_PVC_PHASE="" PATH="$STUB_PATH" bash deploy/enginecache.sh apply -n check-ns --path /mnt/local/weights/check-ns --image "$IMG" --seed-claim workload-pvc:engine-cache > "$T/seedok.out" 2>&1 || true
+grep -q '^apply -f' "$T/calls" && grep -q 'seeded from workload-pvc:engine-cache' "$T/seedok.out" && ok "apply: with a Bound seed claim it applies and says what seeds it" || fail "apply with a seed: $(head -2 "$T/seedok.out" | tr '\n' ';')"
+grep -q 'seed: none' "$T/status.out" && ok "status: reports no seed when none was applied" || fail "status: seed line: $(head -1 "$T/status.out")"
 # delete: DaemonSet, claim and ServiceAccount in the namespace; the volume found
 # by OUR labels and its claimRef into this namespace and claim, no other
 : > "$T/calls"
@@ -402,7 +479,10 @@ case "$line" in
     *'-n "ns"'*'--path "/mnt/local/w"'*'--image "i:1"'*'--capacity "50Gi"'*'--toleration t1'*) ok "make engine-cache: namespace, path, image, capacity and toleration reach the script" ;;
     *) fail "make engine-cache argv: $line" ;;
 esac
+line="$(make -n engine-cache ENGINE_CACHE_PATH=/mnt/local/w ENGINE_CACHE_IMAGE=i:1 ENGINE_CACHE_SEED_CLAIM=shared:caches NAMESPACE=ns 2>/dev/null | tr -d '\\\n' | grep -o 'bash deploy/enginecache.sh apply.*' || true)"
+case "$line" in *'--seed-claim "shared:caches"'*) ok "make engine-cache: ENGINE_CACHE_SEED_CLAIM reaches the script" ;; *) fail "make engine-cache seed argv: $line" ;; esac
 line="$(make -n engine-cache WEIGHTS_PATH=/mnt/local/w WEIGHTS_IMAGE=i:2 NAMESPACE=ns 2>/dev/null | tr -d '\\\n' | grep -o 'bash deploy/enginecache.sh apply.*' || true)"
+case "$line" in *'--seed-claim'*) fail "make engine-cache: a --seed-claim with no ENGINE_CACHE_SEED_CLAIM" ;; *) ok "make engine-cache: no seed unless asked" ;; esac
 case "$line" in *'--path "/mnt/local/w"'*'--image "i:2"'*) ok "make engine-cache: defaults to the weights' path and image" ;; *) fail "make engine-cache defaults: $line" ;; esac
 # the guard tests $(origin NAMESPACE): given on the command line it expands to a word, otherwise to nothing
 if make -n engine-cache ENGINE_CACHE_PATH=/mnt/local/w ENGINE_CACHE_IMAGE=i NAMESPACE=ns 2>/dev/null | grep -q 'test -n "command line"'; then ok "make engine-cache: NAMESPACE must be given on the command line (the Makefile default is not taken)"; else fail "make engine-cache: the NAMESPACE guard is missing"; fi
@@ -422,5 +502,12 @@ if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_SPEC=guides/pd-dis
 # preparer's image assignment right after it), not on a token anywhere in it
 if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -A1 'if \[ -n "/mnt/local/c" \]; then' | grep -q 'img='; then ok "benchmark-standup: the cache step is guarded by BENCHMARK_ENGINE_CACHE_HOSTPATH itself" ; else fail "benchmark-standup: the cache step's guard is not on BENCHMARK_ENGINE_CACHE_HOSTPATH"; fi
 if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -q -- 'enginecache.sh apply -n "ns" --path "/mnt/local/c"'; then ok "benchmark-standup: BENCHMARK_ENGINE_CACHE_HOSTPATH on its own takes its own directory" ; else fail "benchmark-standup: the cache directory did not reach the apply"; fi
+rec="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null)"
+printf '%s\n' "$rec" | grep -q 'seed="auto";' && printf '%s\n' "$rec" | grep -q 'kubectl get pvc -n "ns" workload-pvc' && printf '%s\n' "$rec" | grep -q 'seed=workload-pvc:engine-cache' && ok "benchmark-standup: the default seed is the harness workload PVC's engine-cache, when that claim exists" || fail "benchmark-standup: the auto seed is not the workload PVC"
+# make -n prints the shell, not its evaluation: the assertion is that the
+# seed rides on the guarded apply line itself, as a shell conditional
+printf '%s\n' "$rec" | grep -A12 'if \[ -n "/mnt/local/c" \]; then' | grep -q 'enginecache.sh apply -n "ns" --path "/mnt/local/c" .*${seed:+--seed-claim "$seed"}' && ok "benchmark-standup: the seed rides on the guarded apply, as a shell conditional on its value" || fail "benchmark-standup: --seed-claim is not on the guarded apply line"
+rec="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_ENGINE_CACHE_SEED=none BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null)"
+printf '%s\n' "$rec" | grep -q 'seed="none";' && ok "benchmark-standup: BENCHMARK_ENGINE_CACHE_SEED=none reaches the step" || fail "benchmark-standup: seed=none did not reach the recipe"
 
 exit $FAILED

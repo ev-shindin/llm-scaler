@@ -440,7 +440,17 @@ bind mount with no storage driver in its path, so no driver publishes it
 read-only (the filesystem under it can still go read-only, which is what the
 preparer's readiness and the guard are for); the first start on a node
 compiles once and every start after it on that node hits. `make
-engine-cache-status NAMESPACE=$BENCHMARK_NAMESPACE` lists the nodes.
+engine-cache-status NAMESPACE=$BENCHMARK_NAMESPACE` lists the nodes. The
+cache is one per node, so until every node has started an engine once a
+scale-up can land on a cold one (measured: a second replica Ready 96 s
+after it was wanted, on a node no engine had used since the switch); the
+standup therefore seeds it -- `BENCHMARK_ENGINE_CACHE_SEED` is `auto`,
+which copies the harness's own `workload-pvc` `engine-cache` directory (the
+caches' shared home before) onto each node when that claim already exists,
+a re-standup in a namespace with history; `none` seeds nothing; a
+`<claim>[:<subPath>]` seeds from that. On a fresh namespace the claim does
+not exist yet at that point and the first start per node compiles, as it
+always did.
 
 After a standup, check what was rendered rather than trusting the scenario:
 
