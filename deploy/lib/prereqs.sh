@@ -577,8 +577,8 @@ check_permissions() {
 
     # What this install creates, read from the RENDERED overlay rather than
     # inferred from the scope name. The scope does not decide it: the
-    # namespace-scoped overlay creates eight cluster-scoped objects on Kubernetes
-    # (four ClusterRoles and four ClusterRoleBindings) and ten on OpenShift, where
+    # namespace-scoped overlay creates ten cluster-scoped objects on Kubernetes
+    # (five ClusterRoles and five ClusterRoleBindings) and twelve on OpenShift, where
     # the platform's monitoring wiring — cluster-monitoring-view for Thanos, among
     # others — adds two more bindings that components/tenant-installable does not
     # subtract.

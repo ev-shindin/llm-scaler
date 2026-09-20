@@ -144,25 +144,14 @@ func GPUBudgets(constraints []*ResourceConstraints, namespace string) (map[strin
 // workload's nodeSelector may carry either the full product name
 // ("NVIDIA-A100-PCIE-80GB") or the short one.
 //
-// Matching the declared name first and only then its normalization is what keeps
-// this correct in both directions. Normalizing unconditionally is not safe:
-// NormalizeAcceleratorName falls back to "the segment after the first hyphen" for
-// names with no vendor prefix it knows, so an already-short "Gaudi-2" becomes "2"
-// and matches nothing. Trying the declared name first means such a name is found
-// directly, and only names that genuinely need de-vendoring are normalized.
+// The matching order (declared name, then its short name, then either ignoring
+// case) lives in accelerator.FindKey, with the reasons. The case fold is what
+// lets a GKE node's "nvidia-l4" land on an operator's "L4".
 //
 // Shared by every accelerator-keyed lookup — physical limits, quotas, and the
 // demand check — so they cannot drift in how they reconcile a name.
 func resolveAcceleratorKey(known map[string]int, declared string) (string, bool) {
-	if _, ok := known[declared]; ok {
-		return declared, true
-	}
-	if normalized := accelerator.NormalizeAcceleratorName(declared); normalized != declared {
-		if _, ok := known[normalized]; ok {
-			return normalized, true
-		}
-	}
-	return "", false
+	return accelerator.FindKey(known, declared)
 }
 
 // anyPoolFits reports whether some pool in budgets can take need GPUs.

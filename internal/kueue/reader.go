@@ -113,14 +113,20 @@ func (r *Reader) Quotas(ctx context.Context) (config.ExternalQuotas, error) {
 	if !r.lastTry.IsZero() && r.opts.RefreshInterval > 0 && now.Sub(r.lastTry) < r.opts.RefreshInterval {
 		return r.last, r.lastErr
 	}
-	r.lastTry = now
 	quotas, err := r.read(ctx)
 	if err != nil {
-		r.lastErr = err
+		if ctx.Err() != nil {
+			// The CALLER ran out of time, not the source. One reader serves
+			// both engines; recording this would hand the other engine a
+			// "deadline exceeded" it did not incur for the rest of the
+			// interval. Nothing is recorded; the next caller reads afresh.
+			return r.last, err
+		}
+		r.lastTry, r.lastErr = now, err
 		return r.last, err
 	}
 	quotas.ObservedAt = now
-	r.last, r.lastErr = quotas, nil
+	r.lastTry, r.last, r.lastErr = now, quotas, nil
 	return quotas, nil
 }
 
@@ -142,20 +148,18 @@ func (r *Reader) read(ctx context.Context) (config.ExternalQuotas, error) {
 	if err != nil {
 		return config.ExternalQuotas{}, err
 	}
-	perQueue := make(map[string]map[string]int, len(queues))
-	cluster := make(map[string]int)
+	perQueue := make(map[string]config.ExternalCaps, len(queues))
+	var cluster config.ExternalCaps
 	for i := range queues {
 		caps, err := r.clusterQueueCaps(&queues[i], flavorType)
 		if err != nil {
 			return config.ExternalQuotas{}, err
 		}
-		if len(caps) == 0 {
+		if caps.IsZero() {
 			continue // declares no GPU resource: this queue governs no accelerator
 		}
 		perQueue[queues[i].GetName()] = caps
-		for accType, n := range caps {
-			cluster[accType] = addCapped(cluster[accType], n)
-		}
+		cluster = addCaps(cluster, caps)
 	}
 
 	var listOpts []client.ListOption
@@ -169,7 +173,7 @@ func (r *Reader) read(ctx context.Context) (config.ExternalQuotas, error) {
 	// A namespace with two LocalQueues on one ClusterQueue has that queue's
 	// budget once, not twice: the budget belongs to the ClusterQueue.
 	seen := make(map[string]map[string]bool)
-	byNamespace := make(map[string]map[string]int)
+	byNamespace := make(map[string]config.ExternalCaps)
 	for i := range localQueues {
 		lq := &localQueues[i]
 		ns := lq.GetNamespace()
@@ -195,14 +199,38 @@ func (r *Reader) read(ctx context.Context) (config.ExternalQuotas, error) {
 			// nothing and is kept.
 			continue
 		}
-		if byNamespace[ns] == nil {
-			byNamespace[ns] = make(map[string]int, len(caps))
-		}
-		for accType, n := range caps {
-			byNamespace[ns][accType] = addCapped(byNamespace[ns][accType], n)
-		}
+		byNamespace[ns] = addCaps(byNamespace[ns], caps)
 	}
 	return config.ExternalQuotas{Namespace: byNamespace, Cluster: cluster}, nil
+}
+
+// addCaps sums two grants. Typed caps are merged by accelerator identity: two
+// grants of one product add up under one key whatever their case, while two
+// different products of one family (PCIe and SXM) stay two keys until a static
+// key says they are one (config.BoundBy sums a family for a short static key).
+func addCaps(into, add config.ExternalCaps) config.ExternalCaps {
+	for accType, n := range add.ByType {
+		into.ByType = addTyped(into.ByType, accType, n)
+	}
+	if add.HasUntyped {
+		into.Untyped = addCapped(into.Untyped, add.Untyped)
+		into.HasUntyped = true
+	}
+	return into
+}
+
+// addTyped adds n under the key of caps that names the same accelerator as
+// accType, or under accType itself when none does.
+func addTyped(caps map[string]int, accType string, n int) map[string]int {
+	if caps == nil {
+		caps = make(map[string]int)
+	}
+	key := accType
+	if existing, ok := accelerator.FindKey(caps, accType); ok {
+		key = existing
+	}
+	caps[key] = addCapped(caps[key], n)
+	return caps
 }
 
 // list fetches every object of a Kueue kind at whatever version the cluster
@@ -227,12 +255,37 @@ func (r *Reader) list(ctx context.Context, kind string, opts ...client.ListOptio
 // clusterQueueCaps sums a ClusterQueue's nominalQuota over its GPU resources,
 // per accelerator type. Two flavors of the same type (an SXM and a PCIe H100
 // flavor, say) add up, as the static maps could not tell them apart either.
-func (r *Reader) clusterQueueCaps(cq *unstructured.Unstructured, flavorType map[string]string) (map[string]int, error) {
+//
+// A flavor whose ResourceFlavor carries no product label — Kueue's quickstart
+// `default-flavor`, or any single-GPU-type cluster that never bothered — is an
+// UNTYPED grant. It is not named after the flavor: a flavor called
+// "default-flavor" or "h100-sxm" is not an accelerator type, and treating it as
+// one would make it compete with every static key and zero them all.
+//
+// An untyped grant carries no vendor either, so within one queue the untyped
+// figures of different GPU resources (nvidia.com/gpu and amd.com/gpu, say) are
+// not summed — the LARGEST is taken. The grant bounds every static type alike,
+// and a sum would bound an H100 entry by the AMD queue's GPUs too; the largest
+// single resource is the loosest bound no one resource contradicts. A cluster
+// that needs the distinction pins `kueue.resources` to one vendor.
+func (r *Reader) clusterQueueCaps(cq *unstructured.Unstructured, flavorType map[string]string) (config.ExternalCaps, error) {
+	var caps config.ExternalCaps
 	groups, _, err := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
 	if err != nil {
-		return nil, fmt.Errorf("kueue: ClusterQueue %q: spec.resourceGroups: %w", cq.GetName(), err)
+		return caps, fmt.Errorf("kueue: ClusterQueue %q: spec.resourceGroups: %w", cq.GetName(), err)
 	}
-	caps := make(map[string]int)
+	untypedByResource := map[string]int{}
+	// A queue Kueue will not admit from is a GOVERNING queue that grants nothing
+	// -- not an absent one. Absent would leave the namespace to the static
+	// entry, which with the recommended `default: {H100: -1}` is unlimited: the
+	// exact opposite of what Kueue is doing. Two things make a queue inactive
+	// here: a stopPolicy that holds admission, and a flavor the cluster does not
+	// have (FlavorNotFound). Either way the queue's whole grant becomes an
+	// untyped grant of zero, which bounds every static type at nothing.
+	inactive := false
+	if policy, _, _ := unstructured.NestedString(cq.Object, "spec", "stopPolicy"); policy == "Hold" || policy == "HoldAndDrain" {
+		inactive = true
+	}
 	for _, g := range groups {
 		group, _ := g.(map[string]interface{})
 		flavors, _, _ := unstructured.NestedSlice(group, "flavors")
@@ -248,34 +301,47 @@ func (r *Reader) clusterQueueCaps(cq *unstructured.Unstructured, flavorType map[
 				}
 				n, err := quantityField(rq, "nominalQuota")
 				if err != nil {
-					return nil, fmt.Errorf("kueue: ClusterQueue %q flavor %q resource %q: %w", cq.GetName(), name, resName, err)
+					return caps, fmt.Errorf("kueue: ClusterQueue %q flavor %q resource %q: %w", cq.GetName(), name, resName, err)
 				}
-				accType, ok := flavorType[name]
-				if !ok || accType == "" {
-					// No ResourceFlavor, or one without a product label: the
-					// flavor name is the type. Operators commonly name flavors
-					// after the model ("h100"), and sameAccelerator matches that
-					// to a static "H100" ignoring case.
-					accType = name
+				accType, known := flavorType[name]
+				switch {
+				case !known:
+					inactive = true
+				case accType != "":
+					caps.ByType = addTyped(caps.ByType, accType, n)
+				default:
+					untypedByResource[resName] = addCapped(untypedByResource[resName], n)
 				}
-				caps[accType] = addCapped(caps[accType], n)
 			}
 		}
+	}
+	if inactive {
+		return config.ExternalCaps{HasUntyped: true}, nil
+	}
+	for _, n := range untypedByResource {
+		caps.HasUntyped = true
+		caps.Untyped = max(caps.Untyped, n)
 	}
 	return caps, nil
 }
 
 // flavorAcceleratorType derives the accelerator type from a ResourceFlavor's
-// node labels — the product label of any known vendor (or its aliases), reduced
-// to the short name the static maps and usage keys normalize to. Empty when the
-// flavor carries no product label.
+// node labels — the product label of any known vendor (or its aliases), kept AS
+// WRITTEN. Empty when the flavor carries no product label.
+//
+// Not reduced to the short name here. A ResourceFlavor exists to tell one
+// product from another within a family — a 40GB PCIe A100 from an 80GB SXM one
+// — and reducing both to "A100" before aggregation would sum their quotas and
+// bind an SXM entry by a PCIe grant. Long names meet short static keys at bound
+// time through accelerator.SameName, which is built for exactly that and never
+// equates two different long names.
 func flavorAcceleratorType(rf *unstructured.Unstructured) string {
 	labels, _, _ := unstructured.NestedStringMap(rf.Object, "spec", "nodeLabels")
 	for _, v := range constants.VendorResources {
 		keys := append([]string{v.ProductLabel}, v.ProductLabelAliases...)
 		for _, k := range keys {
 			if product := labels[k]; product != "" {
-				return accelerator.NormalizeAcceleratorName(product)
+				return product
 			}
 		}
 	}

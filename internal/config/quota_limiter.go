@@ -100,6 +100,13 @@ type QuotaLimiterConfig struct {
 // granted the caps of every ClusterQueue one of its LocalQueues points at; the
 // cluster figure is the sum over all ClusterQueues. Borrowing limits and cohorts
 // are deliberately NOT counted — the bound wants the guaranteed figure.
+//
+// A ClusterQueue shared by several namespaces is a per-namespace CEILING here,
+// not a partition: each namespace with a LocalQueue on it is bounded at the
+// queue's full nominal quota, so in sum they may still ask for more than the
+// queue admits, and Kueue holds the excess pending. The bound removes the
+// single-namespace over-ask; where namespaces share a queue, the shared budget
+// is Kueue's to arbitrate, as it was before.
 type KueueQuotaSource struct {
 	// Enabled turns the reader on. A `kueue:` block with enabled false is the
 	// same as no block at all.
@@ -178,22 +185,43 @@ func (k *KueueQuotaSource) clone() *KueueQuotaSource {
 	return &out
 }
 
+// ExternalCaps is what an external source grants one subject — a namespace, or
+// the cluster. Values are finite caps; a source never emits QuotaUnlimited.
+type ExternalCaps struct {
+	// ByType caps per accelerator type, keyed by the short name the source could
+	// attribute (a Kueue flavor whose node labels name a product).
+	ByType map[string]int
+	// Untyped is a grant the source could NOT attribute to an accelerator type —
+	// a Kueue flavor without a product label, which Kueue's own quickstart uses.
+	// It bounds every type the static entry names for this subject; on its own
+	// it names no type and so cannot open one. HasUntyped tells a real grant of
+	// 0 apart from no untyped grant.
+	Untyped    int
+	HasUntyped bool
+}
+
+// IsZero reports whether the source granted this subject nothing at all —
+// neither a typed nor an untyped cap.
+func (c ExternalCaps) IsZero() bool {
+	return len(c.ByType) == 0 && !c.HasUntyped
+}
+
 // ExternalQuotas is a snapshot of GPU caps read from an external authority
-// (today Kueue) in the shape the quota entry maps use: per namespace and per
-// accelerator type for the namespace scope, per accelerator type for the
-// cluster scope. Values are finite caps; the source never emits QuotaUnlimited.
+// (today Kueue), per namespace for the namespace scope and for the whole
+// cluster for the cluster scope.
 //
-// Absence carries meaning, and it differs between the two levels:
+// Absence carries meaning, and it differs between the levels:
 //   - A namespace missing from Namespace is NOT governed by the source (no
 //     LocalQueue of its reaches a ClusterQueue that declares a GPU resource), so
 //     the static entry alone decides for it.
-//   - A type missing from a PRESENT namespace's map is a cap of 0: the source
-//     knows the namespace and grants it nothing of that type.
-//   - An empty Cluster map means the source declares no GPU budget at all, so
-//     it contributes nothing at cluster scope.
+//   - A type missing from a PRESENT namespace's ByType is a cap of 0 — unless
+//     that namespace has an untyped grant, which then applies — because the
+//     source knows the namespace and grants it nothing of that type.
+//   - A zero Cluster means the source declares no GPU budget at all, so it
+//     contributes nothing at cluster scope.
 type ExternalQuotas struct {
-	Namespace map[string]map[string]int
-	Cluster   map[string]int
+	Namespace map[string]ExternalCaps
+	Cluster   ExternalCaps
 	// ObservedAt is when the source was last read successfully; zero when it
 	// never was, in which case the maps are empty and mean nothing.
 	ObservedAt time.Time
@@ -221,24 +249,31 @@ type ExternalQuotas struct {
 //
 // Namespaces the snapshot does not mention keep their static treatment.
 //
-// min over two maps is taken over the UNION of their type keys, with a type
-// absent from one side counting as 0 — both maps are closed allowlists, so
-// "not listed" already means "denied" on each. Type keys are matched across the
-// two maps by accelerator identity (exact, or equal short names; see
-// sameAccelerator) and the static spelling is kept, so a Kueue flavor labelled
+// min over a static map and an external grant is taken over the UNION of their
+// type keys: a static type the source does not name gets the source's untyped
+// grant if there is one, else 0; a source type the static map does not name is
+// 0 — both are closed allowlists, so "not listed" already means "denied" on
+// each. Type keys are matched by accelerator identity (accelerator.SameName) and
+// the static spelling is kept, so a Kueue flavor labelled
 // "NVIDIA-H100-80GB-HBM3" bounds a static "H100". QuotaUnlimited (-1) on either
-// side yields the other side's value.
+// side yields the other side's value — which is how an entry hands the numbers
+// to Kueue while keeping the type names: `default: {H100: -1}` plus a Kueue
+// flavor with no product label gives every namespace min(-1, untyped).
 //
-// Cluster scope: an empty ext.Cluster changes nothing; an empty static quotas map
-// takes ext.Cluster as is; otherwise min over the union, as above.
+// An untyped grant standing alone names no type, so where the static entry
+// names none either (Kueue-alone paths) it cannot be applied; UnappliedUntyped
+// reports those subjects so the limiter can say so.
+//
+// Cluster scope: a zero ext.Cluster changes nothing; an empty static quotas map
+// takes ext.Cluster's typed caps as is; otherwise min over the union, as above.
 func (q QuotaLimiterConfig) BoundBy(ext ExternalQuotas) QuotaLimiterConfig {
 	out := q.clone()
 	switch q.Scope {
 	case QuotaScopeCluster:
 		switch {
-		case len(ext.Cluster) == 0:
+		case ext.Cluster.IsZero():
 		case len(q.ClusterQuotas) == 0:
-			out.ClusterQuotas = maps.Clone(ext.Cluster)
+			out.ClusterQuotas = maps.Clone(ext.Cluster.ByType)
 		default:
 			out.ClusterQuotas = minTypeQuotas(q.ClusterQuotas, ext.Cluster)
 		}
@@ -251,41 +286,82 @@ func (q QuotaLimiterConfig) BoundBy(ext ExternalQuotas) QuotaLimiterConfig {
 		}
 		staticDefault, hasDefault := q.NamespaceQuotas[QuotaLimiterReservedNamespaceKey]
 		staticEmpty := len(q.NamespaceQuotas) == 0
-		for ns, extQuotas := range ext.Namespace {
-			if ns == QuotaLimiterReservedNamespaceKey || q.IsExcluded(ns) {
+		for ns, caps := range ext.Namespace {
+			if ns == QuotaLimiterReservedNamespaceKey || q.IsExcluded(ns) || caps.IsZero() {
 				continue
 			}
 			switch base, listed := q.NamespaceQuotas[ns]; {
 			case listed:
-				out.NamespaceQuotas[ns] = minTypeQuotas(base, extQuotas)
+				out.NamespaceQuotas[ns] = minTypeQuotas(base, caps)
 			case hasDefault:
-				out.NamespaceQuotas[ns] = minTypeQuotas(staticDefault, extQuotas)
-			case staticEmpty:
-				out.NamespaceQuotas[ns] = maps.Clone(extQuotas)
+				out.NamespaceQuotas[ns] = minTypeQuotas(staticDefault, caps)
+			case staticEmpty && len(caps.ByType) > 0:
+				out.NamespaceQuotas[ns] = maps.Clone(caps.ByType)
 			}
 		}
 	}
 	return out
 }
 
-// minTypeQuotas combines two per-type maps by taking the smaller cap over the
-// union of their keys; a key one side lacks counts as 0 there. Keys are matched
-// by accelerator identity and the result keeps base's spelling for matched keys,
-// other's for the rest.
-func minTypeQuotas(base, other map[string]int) map[string]int {
-	out := make(map[string]int, len(base)+len(other))
+// UnappliedUntyped lists the subjects whose untyped external grant BoundBy could
+// not apply because the static entry names no accelerator type for them: the
+// namespaces (by name), and "cluster" for the cluster scope. Such a grant is
+// real — Kueue would admit that many GPUs — but the limiter needs a type to
+// budget under; the fix is to name the types in the static map, with -1 to let
+// the source supply the figure.
+func (q QuotaLimiterConfig) UnappliedUntyped(ext ExternalQuotas) []string {
+	var out []string
+	switch q.Scope {
+	case QuotaScopeCluster:
+		if ext.Cluster.HasUntyped && len(q.ClusterQuotas) == 0 {
+			out = append(out, "cluster")
+		}
+	case QuotaScopeNamespace:
+		_, hasDefault := q.NamespaceQuotas[QuotaLimiterReservedNamespaceKey]
+		for ns, caps := range ext.Namespace {
+			if !caps.HasUntyped || ns == QuotaLimiterReservedNamespaceKey || q.IsExcluded(ns) {
+				continue
+			}
+			if _, listed := q.NamespaceQuotas[ns]; listed || hasDefault {
+				continue
+			}
+			out = append(out, ns)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// minTypeQuotas bounds a static per-type map by an external grant, over the
+// union of type keys. A static type the grant does not name takes the untyped
+// grant when there is one, else 0; a granted type the static map does not name
+// is 0. Keys are matched by accelerator identity and the result keeps the static
+// spelling for matched keys, the grant's for the rest.
+func minTypeQuotas(base map[string]int, caps ExternalCaps) map[string]int {
+	out := make(map[string]int, len(base)+len(caps.ByType))
+	matched := make(map[string]bool, len(caps.ByType))
 	for accType, baseCap := range base {
-		otherCap := 0
-		if key, ok := lookupAccelerator(other, accType); ok {
-			otherCap = other[key]
+		// Every grant naming this accelerator, summed: a static "H100" is
+		// bounded by the PCIe flavor's quota PLUS the SXM flavor's, since it
+		// means either; a static "NVIDIA-H100-PCIE-80GB" meets only its own.
+		otherCap, found := 0, false
+		for grantType, n := range caps.ByType {
+			if accelerator.SameName(grantType, accType) {
+				otherCap += n
+				found = true
+				matched[grantType] = true
+			}
+		}
+		if !found && caps.HasUntyped {
+			otherCap = caps.Untyped
 		}
 		out[accType] = minQuota(baseCap, otherCap)
 	}
-	for accType, otherCap := range other {
-		if _, ok := lookupAccelerator(base, accType); ok {
-			continue // already combined under base's spelling
+	for accType := range caps.ByType {
+		if matched[accType] {
+			continue // already combined under the static spelling
 		}
-		out[accType] = minQuota(0, otherCap)
+		out[accType] = 0
 	}
 	return out
 }
@@ -299,32 +375,6 @@ func minQuota(a, b int) int {
 		return a
 	}
 	return min(a, b)
-}
-
-// lookupAccelerator finds the key in quotas that names the same accelerator as
-// name: an exact match first, then one whose short name matches. Two keys of the
-// same map can normalize alike ("H100" and "NVIDIA-H100-PCIE-80GB"); the exact
-// match wins and otherwise the first found is used.
-func lookupAccelerator(quotas map[string]int, name string) (string, bool) {
-	if _, ok := quotas[name]; ok {
-		return name, true
-	}
-	for key := range quotas {
-		if sameAccelerator(key, name) {
-			return key, true
-		}
-	}
-	return "", false
-}
-
-// sameAccelerator reports whether two type keys name the same accelerator:
-// identical, or the same short name ignoring case, so an operator's "H100", a
-// node label's "NVIDIA-H100-80GB-HBM3" and a Kueue flavor named "h100" all meet.
-func sameAccelerator(a, b string) bool {
-	if a == b {
-		return true
-	}
-	return strings.EqualFold(accelerator.NormalizeAcceleratorName(a), accelerator.NormalizeAcceleratorName(b))
 }
 
 // IsExcluded reports whether the given namespace bypasses this limiter.

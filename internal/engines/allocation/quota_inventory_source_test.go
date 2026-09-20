@@ -64,7 +64,10 @@ var _ = Describe("QuotaInventory with an external QuotaSource", func() {
 	It("installs min(static, external) as the effective entry on Refresh", func() {
 		src := &fakeQuotaSource{}
 		src.push(config.ExternalQuotas{
-			Namespace:  map[string]map[string]int{"team-a": {"NVIDIA-H100-80GB-HBM3": 3}, "team-b": {"H100": 10}},
+			Namespace: map[string]config.ExternalCaps{
+				"team-a": {ByType: map[string]int{"NVIDIA-H100-80GB-HBM3": 3}},
+				"team-b": {ByType: map[string]int{"H100": 10}},
+			},
 			ObservedAt: observed,
 		}, nil)
 		inv := NewQuotaInventoryWithSource(nsEntry, src)
@@ -88,7 +91,7 @@ var _ = Describe("QuotaInventory with an external QuotaSource", func() {
 	It("keeps a stale snapshot in force when a later read fails", func() {
 		src := &fakeQuotaSource{}
 		good := config.ExternalQuotas{
-			Namespace:  map[string]map[string]int{"team-a": {"H100": 3}},
+			Namespace:  map[string]config.ExternalCaps{"team-a": {ByType: map[string]int{"H100": 3}}},
 			ObservedAt: observed,
 		}
 		src.push(good, nil)
@@ -102,8 +105,8 @@ var _ = Describe("QuotaInventory with an external QuotaSource", func() {
 
 	It("follows the source when its figures change", func() {
 		src := &fakeQuotaSource{}
-		src.push(config.ExternalQuotas{Namespace: map[string]map[string]int{"team-a": {"H100": 3}}, ObservedAt: observed}, nil)
-		src.push(config.ExternalQuotas{Namespace: map[string]map[string]int{"team-a": {"H100": 6}}, ObservedAt: observed.Add(time.Minute)}, nil)
+		src.push(config.ExternalQuotas{Namespace: map[string]config.ExternalCaps{"team-a": {ByType: map[string]int{"H100": 3}}}, ObservedAt: observed}, nil)
+		src.push(config.ExternalQuotas{Namespace: map[string]config.ExternalCaps{"team-a": {ByType: map[string]int{"H100": 6}}}, ObservedAt: observed.Add(time.Minute)}, nil)
 		inv := NewQuotaInventoryWithSource(nsEntry, src)
 
 		Expect(inv.Refresh(ctx)).To(Succeed())
@@ -114,7 +117,7 @@ var _ = Describe("QuotaInventory with an external QuotaSource", func() {
 
 	It("bounds a cluster-scoped entry the same way", func() {
 		src := &fakeQuotaSource{}
-		src.push(config.ExternalQuotas{Cluster: map[string]int{"H100": 12, "A100": 4}, ObservedAt: observed}, nil)
+		src.push(config.ExternalQuotas{Cluster: config.ExternalCaps{ByType: map[string]int{"H100": 12, "A100": 4}}, ObservedAt: observed}, nil)
 		inv := NewQuotaInventoryWithSource(config.QuotaLimiterConfig{
 			Name: "cluster-quota", Type: "quota", Scope: config.QuotaScopeCluster,
 			ClusterQuotas: map[string]int{"H100": 16},
@@ -136,7 +139,7 @@ var _ = Describe("QuotaInventory with an external QuotaSource", func() {
 	It("reaches the optimizer's constraints through DefaultLimiter.ComputeConstraints", func() {
 		src := &fakeQuotaSource{}
 		src.push(config.ExternalQuotas{
-			Namespace:  map[string]map[string]int{"team-a": {"H100": 3}},
+			Namespace:  map[string]config.ExternalCaps{"team-a": {ByType: map[string]int{"H100": 3}}},
 			ObservedAt: observed,
 		}, nil)
 		limiter := NewDefaultLimiter("namespace-quota", NewQuotaInventoryWithSource(nsEntry, src))
@@ -170,6 +173,26 @@ var _ = Describe("NewLimiterFromConfig with a kueue-enabled quota entry", func()
 	It("refuses to build without a client rather than silently dropping the source", func() {
 		_, err := NewLimiterFromConfig(configWithLimiters(entry), nil)
 		Expect(err).To(MatchError(ContainSubstring("enables kueue but no Kubernetes client")))
+	})
+
+	It("shares one reader between limiters built for the same entry", func() {
+		c := fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()
+		cfg := configWithLimiters(entry)
+		first, err := NewLimiterFromConfig(cfg, c)
+		Expect(err).NotTo(HaveOccurred())
+		second, err := NewLimiterFromConfig(cfg, c)
+		Expect(err).NotTo(HaveOccurred())
+		src := func(l Limiter) QuotaSource {
+			return l.(*DefaultLimiter).inventory.(*QuotaInventory).source
+		}
+		Expect(src(first)).To(BeIdenticalTo(src(second)),
+			"both engines build a limiter from the same config; one Kueue reader must serve both")
+
+		changed := entry
+		changed.Kueue = &config.KueueQuotaSource{Enabled: true, RefreshInterval: "1m"}
+		third, err := NewLimiterFromConfig(configWithLimiters(changed), c)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(src(third)).NotTo(BeIdenticalTo(src(first)), "different reader options need a new reader")
 	})
 
 	It("changes the limiter signature when the kueue block changes", func() {

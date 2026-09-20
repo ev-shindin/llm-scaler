@@ -44,6 +44,12 @@ func NormalizeAcceleratorName(fullName string) string {
 	case "NVIDIA":
 		// NVIDIA-A100-PCIE-80GB -> A100
 		// NVIDIA-H100-SXM5-80GB -> H100
+		// nvidia-tesla-t4 -> t4 (GKE spells the Tesla family with the brand in
+		// the middle; "tesla" is not a model, and taking it would make every
+		// T4, V100 and A100-40GB node one accelerator)
+		if len(parts) >= 3 && strings.EqualFold(parts[1], "tesla") {
+			return parts[2]
+		}
 		if len(parts) >= 2 {
 			return parts[1]
 		}

@@ -141,9 +141,10 @@ func (q *QuotaInventory) Refresh(ctx context.Context) error {
 	}
 	// Maps marshal with sorted keys, so equal snapshots fingerprint equal.
 	fp, _ := json.Marshal(struct {
-		N map[string]map[string]int
-		C map[string]int
-	}{ext.Namespace, ext.Cluster})
+		Read bool // never-read and read-but-empty must not fingerprint alike
+		N    map[string]config.ExternalCaps
+		C    config.ExternalCaps
+	}{!ext.ObservedAt.IsZero(), ext.Namespace, ext.Cluster})
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -152,9 +153,24 @@ func (q *QuotaInventory) Refresh(ctx context.Context) error {
 		if ext.ObservedAt.IsZero() {
 			logger.Info("quota entry effective without external caps")
 		} else {
-			logger.Info("quota entry bounded by external caps",
+			msg := "quota entry bounded by external caps"
+			if len(ext.Namespace) == 0 && ext.Cluster.IsZero() {
+				msg = "external quota source grants no GPUs; the static quota entry applies as written"
+			}
+			logger.Info(msg,
 				"externalNamespaceQuotas", ext.Namespace, "externalClusterQuotas", ext.Cluster,
 				"effectiveNamespaceQuotas", effective.NamespaceQuotas, "effectiveClusterQuotas", effective.ClusterQuotas)
+			if unapplied := q.static.UnappliedUntyped(ext); len(unapplied) > 0 {
+				// A real grant the limiter cannot budget under: the source could
+				// not name the accelerator (a Kueue flavor with no product
+				// label) and the static entry names none for these subjects
+				// either. Saying so is the difference between "Kueue grants 16
+				// and nothing scales" reading as a bug and as a config gap.
+				logger.Info("external quota source grants GPUs of no named accelerator type; "+
+					"the quota entry names no type to apply them to, so they do not bound anything. "+
+					"Name the accelerator types in the entry (with -1 to let the source supply the figure)",
+					"subjects", unapplied)
+			}
 		}
 	}
 	q.cfg = effective

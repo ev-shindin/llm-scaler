@@ -174,11 +174,30 @@ type. Neither source can raise what the other granted. With no static map at all
 
 | Kueue object | Scope | Used for |
 |---|---|---|
-| `ResourceFlavor` | cluster | `spec.nodeLabels` names the accelerator behind a flavor — the vendor product label (`nvidia.com/gpu.product`, `amd.com/gpu.product-name`, …, or the GKE alias), reduced to the short name (`NVIDIA-H100-80GB-HBM3` → `H100`). A flavor without a product label is named after **itself** (`h100`), and matching is case-insensitive, so a flavor called `h100` bounds a static `H100`. |
-| `ClusterQueue` | cluster | `spec.resourceGroups[].flavors[].resources[].nominalQuota` for each GPU resource, per flavor, summed per accelerator type. Two flavors of one type (SXM and PCIe H100) add up. **`borrowingLimit`, `lendingLimit` and cohorts are not counted** — the bound wants the guaranteed figure. |
+| `ResourceFlavor` | cluster | `spec.nodeLabels` names the accelerator behind a flavor — the vendor product label (`nvidia.com/gpu.product`, `amd.com/gpu.product-name`, …, or the GKE alias), kept **as written**: a flavor exists to tell one product from another (a 40GB PCIe A100 from an 80GB SXM one), so the grant is keyed by the full product and meets a static key at bound time (see below). A ClusterQueue that names a flavor **not present** on the cluster, or whose `stopPolicy` is `Hold`/`HoldAndDrain`, is inactive in Kueue and admits nothing — here it stays a *governing* queue that grants **nothing** (an untyped grant of 0), so its namespaces are denied rather than left to the static entry. `namespaceSelector` is not evaluated (it would need namespace labels a tenant install cannot read). A flavor **without** a product label — Kueue's quickstart `default-flavor`, or any single-GPU-type cluster — is an **untyped grant**: it is *not* named after the flavor (a flavor called `default-flavor` or `h100-sxm` is not an accelerator type, and treating it as one would compete with every static key and zero them all). |
+| `ClusterQueue` | cluster | `spec.resourceGroups[].flavors[].resources[].nominalQuota` for each GPU resource, per flavor, summed per product (typed flavors) or into the untyped grant (unlabelled flavors). Two grants of the **same** product add up; two products of one family (SXM and PCIe H100) stay apart until the static key says they are one. **`borrowingLimit`, `lendingLimit` and cohorts are not counted** — the bound wants the guaranteed figure. |
 | `LocalQueue` | namespaced | `spec.clusterQueue` links a namespace to a ClusterQueue. A namespace is granted the caps of every ClusterQueue one of its LocalQueues points at; two LocalQueues on one ClusterQueue count it once. |
 
-The cluster-scope figure is the sum over **all** ClusterQueues. The reads are
+The cluster-scope figure is the sum over **all** ClusterQueues. Two things this
+attribution does *not* do, deliberately:
+
+- **A shared ClusterQueue is a per-namespace ceiling, not a partition.** Every
+  namespace with a LocalQueue on it is bounded at the queue's full nominal
+  quota, so several such namespaces may in sum still ask for more than the
+  queue admits and Kueue holds the excess pending. The bound removes the
+  single-namespace over-ask; a shared budget stays Kueue's to arbitrate. Give
+  each tenant its own ClusterQueue (cohorts for borrowing) where that matters.
+- **Untyped grants carry no vendor.** Within one ClusterQueue the untyped
+  figures of different GPU resources (`nvidia.com/gpu`, `amd.com/gpu`) are not
+  summed; the largest is taken, the loosest bound no single resource
+  contradicts. Pin `kueue.resources` to one vendor when a mixed queue needs the
+  distinction.
+- **An untyped grant bounds each static type separately, not their sum.** A
+  namespace that names two types with `-1` and holds an untyped grant of 8 may
+  reach 8 of *each*. The limiter has no per-namespace total; if the total is
+  what must hold, give the flavors product labels so the grant is typed.
+
+The reads are
 unstructured and go through the API server directly (no informer, no watch),
 at most once per `refreshInterval`; the API version is whatever the cluster
 serves (the fields used are identical in `v1beta1` and `v1beta2`), and the
@@ -191,9 +210,9 @@ that:
 
 | Situation | Effective cap |
 |---|---|
-| Namespace listed in `namespaceQuotas` **and** governed by Kueue | per type, `min(static, kueue)` over the **union** of types; a type only one side lists is **0** (both maps are closed allowlists) |
+| Namespace listed in `namespaceQuotas` **and** governed by Kueue | per type, `min(static, kueue)` over the **union** of types; a static type Kueue does not name takes Kueue's **untyped** grant if there is one, else **0**; a Kueue type the static map does not name is **0** (both maps are closed allowlists) |
 | Namespace governed by Kueue, unlisted, static `default` present | `min(default, kueue)`; the namespace becomes explicitly listed at that budget |
-| Namespace governed by Kueue, unlisted, **no** static map at all | Kueue's map, as is |
+| Namespace governed by Kueue, unlisted, **no** static map at all | Kueue's **typed** caps, as is. An untyped grant alone names no type and so cannot open anything; the limiter logs it as unapplied — name the types in the entry (`default: {H100: -1}`) and Kueue supplies the figure |
 | Namespace governed by Kueue, unlisted, strict static allowlist without `default` | **denied**, as before — Kueue cannot open a namespace the operator's list denies |
 | Namespace **not** governed by Kueue | static treatment, unchanged |
 | Namespace in `exclude` | bypasses both sources |
@@ -211,9 +230,26 @@ Kueue never produces the reserved `default` key. Quotas Kueue holds for the
 Kubernetes namespace literally named `default` are skipped, for the same reason
 that namespace cannot be configured statically (see the reserved-key note above).
 
-Type keys are matched across the two maps by accelerator identity — exact, or
-the same short name ignoring case — and the **static spelling is kept**, so usage
-that arrives keyed by the raw product label still lands on the right pool.
+Type keys are matched across the two maps by accelerator identity
+(`accelerator.SameName`: identical, equal ignoring case, or one being the
+other's short name — two different full product names are never equated) and
+the **static spelling is kept**. A short static key (`H100`) is bounded by the
+**sum** of every grant in its family (PCIe + SXM); a full-product static key
+(`NVIDIA-H100-PCIE-80GB`) only by its own grant, which is how a per-flavor
+Kueue split (PCIe 4, SXM 0) is honoured. Every accelerator-keyed lookup in the
+allocator resolves through the same identity (`accelerator.FindKey`), so usage
+keyed by a raw product label, or by a lower-case GKE value, lands on the right
+pool whichever spelling the effective map carries.
+
+**The common Kueue install has no product labels on its flavors.** Then the
+whole of Kueue's grant is untyped and the pattern is: name the types in the
+static entry, let Kueue give the numbers:
+
+```yaml
+kueue: { enabled: true }
+namespaceQuotas:
+  default: { H100: -1 }      # every Kueue-governed namespace: H100 ≤ its Kueue nominal quota
+```
 
 #### Failure posture
 
