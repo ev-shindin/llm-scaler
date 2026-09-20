@@ -140,11 +140,13 @@ check(mounts.get("seed") == {"name": "seed", "mountPath": "/seed", "readOnly": T
 m2 = {m["name"]: m for m in seed2["containers"][0]["volumeMounts"]}
 check("subPath" not in m2.get("seed", {}), "no subPath when none was given: %s" % m2.get("seed"))
 script = seed["containers"][0]["args"][0]
-check('cp -a -n "/seed/$d/." "/engine-cache/$d/"' in script, "the copy keeps what the node already has (-n), into each cache directory")
+check('[ ! -e "/engine-cache/$d/$name" ] || continue' in script and 'cp -a --no-preserve=ownership "$e" "/engine-cache/$d/"' in script, "the seed is merged entry by entry: what the node has is kept, what it lacks is copied")
 check(script.index("if [ -d /seed ]") < script.index('touch "/engine-cache/$MARKER"'), "the seed is copied before the prepared marker is written")
-check('[ ! -f "/engine-cache/$SEED_MARKER" ]' in script and 'touch "/engine-cache/$SEED_MARKER"' in script, "seeding happens once per node, on its own marker")
+check('[ "$seeded_from" != "$SEED_ID" ]' in script and 'echo "$SEED_ID" > "/engine-cache/$SEED_MARKER"' in script, "the seed marker records the seed, and a different seed is merged in")
+i_ok = script.index('if [ "$complete" = 1 ]'); i_mark = script.index('echo "$SEED_ID" > "/engine-cache/$SEED_MARKER"'); i_loop = script.index('if cp -a --no-preserve=ownership')
+check(i_loop < i_ok < i_mark and 'else complete=0; rm -rf "/engine-cache/$d/$name"' in script, "the marker is written only after every copy succeeded; a failed copy is removed and the seed retried next start")
 env = {e["name"]: e["value"] for e in seed["containers"][0]["env"]}
-check(env.get("SEED_MARKER") == ".seeded", "the seed marker's name comes from the environment")
+check(env.get("SEED_MARKER") == ".seeded" and env.get("SEED_ID") == "workload-pvc:engine-cache", "the seed marker's name and the seed's identity come from the environment")
 check("$(" not in script and "$$" not in script, "still no $( or $$ in the command")
 plain_ps = plain["spec"]["template"]["spec"]
 check(all(v["name"] != "seed" for v in plain_ps["volumes"]) and all(m["name"] != "seed" for m in plain_ps["containers"][0]["volumeMounts"]), "no --seed-claim: no seed volume or mount")
@@ -477,7 +479,9 @@ if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTP
 if make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null | grep -q -- 'enginecache.sh apply -n "ns" --path "/mnt/local/c"'; then ok "benchmark-standup: BENCHMARK_ENGINE_CACHE_HOSTPATH on its own takes its own directory" ; else fail "benchmark-standup: the cache directory did not reach the apply"; fi
 rec="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null)"
 printf '%s\n' "$rec" | grep -q 'seed="auto";' && printf '%s\n' "$rec" | grep -q 'kubectl get pvc -n "ns" workload-pvc' && printf '%s\n' "$rec" | grep -q 'seed=workload-pvc:engine-cache' && ok "benchmark-standup: the default seed is the harness workload PVC's engine-cache, when that claim exists" || fail "benchmark-standup: the auto seed is not the workload PVC"
-printf '%s\n' "$rec" | grep -q -- '--seed-claim "$seed"' && ok "benchmark-standup: the seed reaches the apply only when set" || fail "benchmark-standup: --seed-claim missing from the apply"
+# make -n prints the shell, not its evaluation: the assertion is that the
+# seed rides on the guarded apply line itself, as a shell conditional
+printf '%s\n' "$rec" | grep -A12 'if \[ -n "/mnt/local/c" \]; then' | grep -q 'enginecache.sh apply -n "ns" --path "/mnt/local/c" .*${seed:+--seed-claim "$seed"}' && ok "benchmark-standup: the seed rides on the guarded apply, as a shell conditional on its value" || fail "benchmark-standup: --seed-claim is not on the guarded apply line"
 rec="$(make -n benchmark-standup BENCHMARK_NAMESPACE=ns BENCHMARK_ENGINE_CACHE_HOSTPATH=/mnt/local/c BENCHMARK_ENGINE_CACHE_SEED=none BENCHMARK_SPEC=guides/pd-disaggregation 2>/dev/null)"
 printf '%s\n' "$rec" | grep -q 'seed="none";' && ok "benchmark-standup: BENCHMARK_ENGINE_CACHE_SEED=none reaches the step" || fail "benchmark-standup: seed=none did not reach the recipe"
 

@@ -347,13 +347,21 @@ cold one (measured on a benchmark pass: the second replica on a node no
 engine had used since the switch, Ready 96 s after it was wanted). So
 **seed it**: `ENGINE_CACHE_SEED_CLAIM=<claim>[:<subPath>]` names a claim
 in the namespace -- the shared RWX claim the caches lived on before is
-the natural one -- and the preparer mounts it read-only and copies its
-caches onto each node as it prepares it, once (a marker), keeping
-whatever the node already has. The caches are portable across nodes of
-one accelerator model, driver and engine version, keyed by a hash of the
-engine config, so one claim per namespace serves every model and flag set
-in it, a changed engine misses rather than hits stale, and a seeded node
-starts warm on its first engine. Keep the guard from the table: a node the
+the natural one -- and the preparer mounts it read-only and merges its
+caches into each node's as it prepares it: an entry the node already has
+is kept, one it lacks is copied, a failed copy is removed and retried at
+the pod's next start, and a marker records which seed the node has, so a
+changed seed is merged in too (the seed's subPath must exist). What is
+copied is code the engines load, so the seed claim must be trusted as the
+cache itself is, and more: one write to it reaches every node at the next
+prepare, where a write to the cache reaches the one node the writer's pod
+landed on. The caches are keyed by a hash of the engine config, not the
+node, so one claim per namespace serves every model and flag set in it and
+a changed engine misses rather than hits stale; a seeded node starts warm
+on its first engine. That a node loads what another compiled is what this
+cluster shows -- one accelerator model, one driver, one engine build on
+every node; a fleet with mixed drivers or engine versions has not been
+tried. Keep the guard from the table: a node the
 preparer has not reached (`engine-cache-status` lists it, with the seed)
 costs a compile, not the replica.
 

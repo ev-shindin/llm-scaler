@@ -51,6 +51,13 @@
 #                               start on EVERY node compiles (the scheduler
 #                               spreads replicas, so that is one cold start
 #                               per node), with one no node starts cold.
+#                               What is copied is code the engines load (see
+#                               below): the seed claim must be trusted as
+#                               the cache itself is, and more -- one write
+#                               to it reaches every node at the next
+#                               prepare, not the one node a pod landed on.
+#                               A changed seed is merged in too (the marker
+#                               records the seed); the subPath must exist.
 #   --node-selector KEY=VALUE   which nodes count as accelerator nodes. The
 #                               default is any node carrying a known GPU
 #                               product label (deploy/lib/accelerator_nodes.sh);
@@ -160,24 +167,38 @@ check_image() {
 # preparer_script is the preparer's command. A quoted heredoc: nothing in it
 # is bash's to evaluate at render time -- it runs on the node, as written. A
 # `$(...)` here would otherwise run on the operator's machine at apply and
-# bake its output into every node's manifest. The marker's name reaches it
-# as an environment variable. No `$(` and no `$$` in it: Kubernetes rewrites
-# both in a container's command.
+# bake its output into every node's manifest. The markers' names and the
+# seed's identity reach it as environment variables. No `$(` and no `$$` in
+# it: Kubernetes rewrites both in a container's command. The seed is merged
+# entry by entry: an entry the node already has is kept, one it lacks is
+# copied, a copy that fails is removed and the seed marker withheld, so the
+# next start of the pod tries again; the marker records the seed it came
+# from, so a changed --seed-claim is merged in too.
 preparer_script() {
     cat <<'SCRIPT'
 for d in vllm flashinfer triton; do
   mkdir -p "/engine-cache/$d" || exit 1
   chmod 1777 "/engine-cache/$d" 2>/dev/null || true
 done
-if [ -d /seed ] && [ ! -f "/engine-cache/$SEED_MARKER" ]; then
-  seeded=""
+seeded_from=""
+[ ! -f "/engine-cache/$SEED_MARKER" ] || read -r seeded_from < "/engine-cache/$SEED_MARKER" || seeded_from=""
+if [ -d /seed ] && [ "$seeded_from" != "$SEED_ID" ]; then
+  complete=1; added=""
   for d in vllm flashinfer triton; do
     [ -d "/seed/$d" ] || continue
-    cp -a -n "/seed/$d/." "/engine-cache/$d/" 2>/dev/null || true
-    seeded="$seeded $d"
+    for e in "/seed/$d"/* "/seed/$d"/.[!.]*; do
+      [ -e "$e" ] || continue
+      name="${e##*/}"
+      [ ! -e "/engine-cache/$d/$name" ] || continue
+      if cp -a --no-preserve=ownership "$e" "/engine-cache/$d/"; then added="$added $d/$name"; else complete=0; rm -rf "/engine-cache/$d/$name"; fi
+    done
   done
-  touch "/engine-cache/$SEED_MARKER" || exit 1
-  echo "engine cache: seeded$seeded on $HOSTNAME from the seed claim (what the node already had was kept)"
+  if [ "$complete" = 1 ]; then
+    echo "$SEED_ID" > "/engine-cache/$SEED_MARKER" || exit 1
+    echo "engine cache: seeded on $HOSTNAME from $SEED_ID:$added (what the node already had was kept)"
+  else
+    echo "engine cache: seeding on $HOSTNAME from $SEED_ID did not complete (a copy failed and was removed); it is retried when this pod next starts"
+  fi
 fi
 touch "/engine-cache/$MARKER" || exit 1
 echo "engine cache: prepared on $HOSTNAME: /engine-cache/{vllm,flashinfer,triton}"
@@ -345,6 +366,8 @@ $(preparer_script | sed 's/^/              /')
               value: "${MARKER}"
             - name: SEED_MARKER
               value: "${SEED_MARKER}"
+            - name: SEED_ID
+              value: "${SEED_CLAIM}${SEED_SUBPATH:+:$SEED_SUBPATH}"
             # Engine images bake in NVIDIA_VISIBLE_DEVICES=all, and the NVIDIA
             # runtime honours it from a container that requested no GPU.
             - name: NVIDIA_VISIBLE_DEVICES
