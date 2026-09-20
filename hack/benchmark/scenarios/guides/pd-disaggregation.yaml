@@ -467,7 +467,10 @@ scenario:
           # a second mount of it inherits read-only) -- see additionalVolumes --
           # so a replica after the first finds the caches warm. vLLM keys them by
           # a hash of the engine config: a change of model, flags or version
-          # is a miss, never a stale hit.
+          # is a miss, never a stale hit. BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>
+          # at standup moves the volume to the node's disk (the claim
+          # deploy/enginecache.sh makes, no subPath): a shared claim published
+          # read-only on a node cost every start there 25 s, measured.
           - name: VLLM_CACHE_ROOT
             value: /engine-cache/vllm
           - name: FLASHINFER_WORKSPACE_DIR
@@ -691,7 +694,10 @@ scenario:
           # a second mount of it inherits read-only) -- see additionalVolumes --
           # so a replica after the first finds the caches warm. vLLM keys them by
           # a hash of the engine config: a change of model, flags or version
-          # is a miss, never a stale hit.
+          # is a miss, never a stale hit. BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>
+          # at standup moves the volume to the node's disk (the claim
+          # deploy/enginecache.sh makes, no subPath): a shared claim published
+          # read-only on a node cost every start there 25 s, measured.
           - name: VLLM_CACHE_ROOT
             value: /engine-cache/vllm
           - name: FLASHINFER_WORKSPACE_DIR

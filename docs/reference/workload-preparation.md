@@ -76,7 +76,7 @@ and hold with or without a benchmark harness in front of the workload:
 |---|---|
 | **Nothing installed at container start.** | The container's command runs the engine and nothing else: no `apt`, `pip`, `curl` or clone before it. Anything the engine needs is in the image. A start that depends on a package mirror is as slow as the mirror that day, which is the one term that makes start time *vary* between otherwise identical replicas. |
 | **`startupProbe` period.** | `periodSeconds` of a few seconds; a probe that fires every 30 s reports a started engine up to 30 s late, every time. Keep the time budget by raising `failureThreshold` (period 5 with threshold 360 is the same 30 minutes as period 30 with threshold 60). The first probes fail on connection refused while the server binds; that is what the threshold is for. |
-| **Engine caches that outlive the pod.** | vLLM writes its torch.compile artefacts, the FlashInfer autotune table and Triton's JIT cache under `/tmp` unless told otherwise, so every replica recompiles from nothing. Point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` at a read-write path shared across replicas -- a subPath of an RWX claim -- and the second replica finds the first one's. If the model claim is mounted read-only, use another claim rather than mounting it a second time: a CSI driver publishes a claim once per pod, and the second mount inherits read-only. And make the engine tolerate a cache path that turns out not to be writable -- a storage hiccup must cost one compile, not the replica; vLLM fails hard on a read-only cache directory unless the variable is unset first. The cache is keyed by a hash of the engine config, so a changed model, flag or version misses rather than hits stale. |
+| **Engine caches that outlive the pod.** | vLLM writes its torch.compile artefacts, the FlashInfer autotune table and Triton's JIT cache under `/tmp` unless told otherwise, so every replica recompiles from nothing. Point `VLLM_CACHE_ROOT`, `FLASHINFER_WORKSPACE_DIR` and `TRITON_CACHE_DIR` at a read-write path that outlives the pod and the second replica finds the first one's. The best home is the node's own disk -- [Engine caches on the node's disk](#engine-caches-on-the-nodes-disk), `make engine-cache` -- a shared RWX claim is the other. If the model claim is mounted read-only, use another claim rather than mounting it a second time: a CSI driver publishes a claim once per pod, and the second mount inherits read-only. And make the engine tolerate a cache path that turns out not to be writable -- a storage hiccup must cost one compile, not the replica; vLLM fails hard on a read-only cache directory unless the variable is unset first. The cache is keyed by a hash of the engine config, so a changed model, flag or version misses rather than hits stale. |
 | **The image is already on the node.** | An engine image is 10-20 GB; a node that has to pull it adds a minute or more before the container even starts, and the kubelet evicts unused images under disk pressure, so "it was pulled once" does not stay true. `make prepull IMAGES=<image> NAMESPACE=<ns>` holds the image open on every accelerator node (one DaemonSet per image, the image itself asleep, no accelerator requested), and `make prepull-status` says per node whether the kubelet has it -- see [Holding the image on the nodes](#holding-the-image-on-the-nodes). With the image held, a pinned tag should pull `IfNotPresent`: `Always` contacts the registry at every start for a digest that cannot have changed. |
 | **The weights** | are the [section above](#weights-and-the-model-cache) -- the download; for a large model, also [Weights on the node's disk](#weights-on-the-nodes-disk) -- the read. |
 
@@ -282,6 +282,108 @@ many threads exist and are a further step, unmeasured here.
 
 The benchmark standup has the same measure under
 `BENCHMARK_MODEL_HOSTPATH=<dir>`; what the harness does with it is in
+[Benchmark WVA](../guides/benchmarking/README.md#replica-start-time-in-the-harness).
+
+### Engine caches on the node's disk
+
+The caches in the table above -- torch.compile, FlashInfer autotune, Triton
+JIT -- are worth keeping only if the next replica finds them, and on a
+shared RWX claim that holds until the claim does not. Measured on one
+cluster: nine starts of one decode pod spec, three per node on three nodes,
+were repeatable within 2.5 s on a node and split by node into 51-56 s and
+75-81 s. The 25 s was the cache. On the slow nodes the CSI driver had
+published the shared claim read-only (`ro` in `/proc/mounts`; `touch` fails
+with "Read-only file system"), the guard in the engine's command fell back
+to the engine default under `/tmp`, and every start on those nodes compiled
+from nothing: 14.4 s of torch.compile against 2.9 s from the cache, and
+8 s more in the API server before the engine came up. Which node a
+replica landed on decided its start time, and nothing in the pod said so.
+
+```bash
+# any image with /bin/sh; the engine image is the natural choice. Same directory as the weights.
+make engine-cache ENGINE_CACHE_PATH=/mnt/local/weights/<ns> \
+     ENGINE_CACHE_IMAGE=docker.io/vllm/vllm-openai:v0.26.0 NAMESPACE=<ns>
+# with make weights already run, the path and image default to WEIGHTS_PATH / WEIGHTS_IMAGE
+make engine-cache-status NAMESPACE=<ns>     # per accelerator node: prepared / not, and why
+make engine-cache-delete NAMESPACE=<ns>     # drop the claim, volume and preparer; the caches stay
+```
+
+One static `hostPath` PersistentVolume at `<dir>/engine-cache`, one claim
+named `engine-cache` bound to it (and to no other: the volume carries a
+`claimRef`), and one DaemonSet that creates the three cache directories on
+every accelerator node -- world-writable and sticky, so any UID the engines
+run as can write and none removes another's files -- writes a marker, and
+stays Ready, so `engine-cache-status` and the DaemonSet's `numberReady`
+both mean "prepared, and writable by this UID". A model server mounts the
+claim read-write and points the three variables under it:
+
+```yaml
+volumes:
+  - name: engine-cache
+    persistentVolumeClaim:
+      claimName: engine-cache
+containers:
+  - name: vllm
+    volumeMounts:
+      - name: engine-cache
+        mountPath: /engine-cache
+    env:
+      - {name: VLLM_CACHE_ROOT,          value: /engine-cache/vllm}
+      - {name: FLASHINFER_WORKSPACE_DIR, value: /engine-cache/flashinfer}
+      - {name: TRITON_CACHE_DIR,         value: /engine-cache/triton}
+```
+
+A hostPath is a bind mount with no storage driver in its path, so no
+driver publishes it read-only (the filesystem under it can still go
+read-only -- an NVMe error, an admin's remount -- which is what the
+preparer's readiness and the guard are for), and each node's cache is warm
+from the second start on that node -- the first start on a node compiles once (measured: 76 s and
+81 s on two nodes whose cache was empty, then 55 s and 55 s; 50 s on a
+third whose cache a previous pod had already filled), as on the shared
+claim the first start anywhere did. The caches are keyed by a hash of the
+engine config, so one claim per namespace serves every model and flag set
+in it, and a changed engine misses rather than hits stale. Keep the guard
+from the table: a node the preparer has not reached (`engine-cache-status`
+lists it) costs a compile, not the replica.
+
+What it costs, and what it needs, is the weights section's list with two
+things changed. The size: a few gigabytes per engine config per node rather
+than a model. And what the directory holds: **code**. The caches are
+torch.compile artefacts, FlashInfer and Triton kernels that every engine
+on the node loads and runs, and the three directories are world-writable
+(1777: any UID the engines run as can write; sticky, so one UID's files are
+not another's to remove). Whoever can write the directory runs code in
+every engine on that node. On Kubernetes that is anyone with `pods/create`
+in a namespace that can mount the claim -- no more than `pods/create`
+already grants, since such a pod runs as root and could overwrite the
+weights too; in a namespace that separates its workloads by UID (Pod
+Security `restricted`, a `runAsUser` per Deployment) it is more, and the
+1770 variant below is for that -- and across namespaces it is everyone
+pointed at the same directory. So the weights section's rules hold harder here: one directory
+per trust domain, on a disk that is not the node's own, never a system
+path (the script refuses the same paths); and wipe `<dir>/engine-cache` on
+the nodes when a namespace or a directory changes hands -- `delete` keeps
+the caches, and a new tenant of the same namespace name and directory
+would load the old one's. 1777 is a trade-off, taken so the engines need no
+`fsGroup`; a namespace that runs its engines under one UID and wants the
+separation can `chown` the three directories to it and `chmod 1770` them
+on each node. The rest is the same: leave to create PersistentVolumes (the
+claim's `ENGINE_CACHE_CAPACITY`, 200Gi unless set, is what a storage quota
+charges); Pod Security `baseline` (the preparer mounts the claim, not a
+hostPath). On OpenShift -- by analysis, not yet run there --
+`restricted-v2` runs the preparer and the engines as the project's range
+UID, and the kubelet does not relabel a hostPath: prepare
+`<dir>/engine-cache` on each node as the weights section says (`chgrp 0`,
+`chmod 2775`, `chcon -t container_file_t`, or a `context=` mount). The
+preparer then creates the three directories inside it as that UID, owns
+them, and its `chmod 1777` takes; the files carry the project's SELinux
+level, so another project's pods cannot read them unless the disk is
+mounted with `context=`, in which case the directory split is the only
+separation.
+
+The benchmark standup has the same measure under
+`BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>`, which defaults to
+`BENCHMARK_MODEL_HOSTPATH`; what the harness does with it is in
 [Benchmark WVA](../guides/benchmarking/README.md#replica-start-time-in-the-harness).
 
 The benchmark harness this repository uses puts its own steps on the engine's

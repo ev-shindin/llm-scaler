@@ -613,6 +613,14 @@ BENCHMARK_PREPULL_IMAGES ?=
 # the engines start. Empty: the shared volume, as before. Needs leave to
 # create PersistentVolumes.
 BENCHMARK_MODEL_HOSTPATH ?=
+# ... and the engines' compile caches on the same disk (docs/reference/
+# workload-preparation.md, "Engine caches on the node's disk"): a claim the
+# scenarios' /engine-cache volume is repointed at, prepared on every
+# accelerator node before the engines start, so a start never depends on the
+# shared volume being writable and compiles once per node. Defaults to the
+# weights directory; set on its own to have the caches local and the weights
+# shared. Empty: the harness's workload PVC, as before.
+BENCHMARK_ENGINE_CACHE_HOSTPATH ?= $(BENCHMARK_MODEL_HOSTPATH)
 .PHONY: prepull prepull-status prepull-delete
 prepull: ## Hold IMAGES=<img>[,<img>] on every accelerator node of NAMESPACE=<ns>. PREPULL_NODE_SELECTOR=<key=value> narrows the nodes, PREPULL_TOLERATIONS=<key>[,<key>] adds taints.
 	@test -n "$(IMAGES)" || { echo "prepull: set IMAGES=<image>[,<image>] to exactly what the model server's pod spec names" >&2; exit 1; }
@@ -662,6 +670,36 @@ weights-status: ## Per accelerator node: does it hold the weights, or is the dow
 weights-delete: ## Drop the claim, volume and downloader for WEIGHTS_MODEL=<hf id> (or every model with it unset) in NAMESPACE=<ns>. The files on the nodes stay.
 	@test -n "$(prepull_namespace_given)" || { echo "weights-delete: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
 	@bash deploy/weights.sh delete -n "$(NAMESPACE)" $(if $(WEIGHTS_MODEL),--model "$(WEIGHTS_MODEL)",--all)
+
+## Keep the engines' compile caches (torch.compile, FlashInfer autotune,
+## Triton JIT) on every accelerator node's local disk, behind a claim named
+## engine-cache: a replica's start then never depends on a shared volume being
+## writable, and the caches are warm from the second start on a node. Measured:
+## a shared claim published read-only on some nodes cost every start there 25 s.
+## ENGINE_CACHE_PATH is the directory on the node (the caches land under
+## <dir>/engine-cache; defaults to WEIGHTS_PATH), ENGINE_CACHE_IMAGE any image
+## with /bin/sh (defaults to WEIGHTS_IMAGE; the engine image). Model servers
+## mount the claim read-write and point VLLM_CACHE_ROOT, FLASHINFER_WORKSPACE_DIR
+## and TRITON_CACHE_DIR under it. Needs leave to create PersistentVolumes.
+## deploy/enginecache.sh --help has the rest; the nodes are picked as for prepull.
+ENGINE_CACHE_PATH ?= $(WEIGHTS_PATH)
+ENGINE_CACHE_IMAGE ?= $(WEIGHTS_IMAGE)
+ENGINE_CACHE_CAPACITY ?=
+.PHONY: engine-cache engine-cache-status engine-cache-delete
+engine-cache: ## Prepare ENGINE_CACHE_PATH=<node dir>/engine-cache on every accelerator node of NAMESPACE=<ns>, with ENGINE_CACHE_IMAGE=<image>; claim engine-cache. [ENGINE_CACHE_CAPACITY=<size>]
+	@test -n "$(ENGINE_CACHE_PATH)" || { echo "engine-cache: set ENGINE_CACHE_PATH=<absolute directory on the node> (or WEIGHTS_PATH)" >&2; exit 1; }
+	@test -n "$(ENGINE_CACHE_IMAGE)" || { echo "engine-cache: set ENGINE_CACHE_IMAGE=<an image with /bin/sh; the engine image> (or WEIGHTS_IMAGE)" >&2; exit 1; }
+	@test -n "$(prepull_namespace_given)" || { echo "engine-cache: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/enginecache.sh apply -n "$(NAMESPACE)" --path "$(ENGINE_CACHE_PATH)" --image "$(ENGINE_CACHE_IMAGE)" \
+		$(if $(ENGINE_CACHE_CAPACITY),--capacity "$(ENGINE_CACHE_CAPACITY)",) $(WEIGHTS_ARGS)
+
+engine-cache-status: ## Per accelerator node: is the engine cache directory prepared and writable. NAMESPACE=<ns>
+	@test -n "$(prepull_namespace_given)" || { echo "engine-cache-status: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/enginecache.sh status -n "$(NAMESPACE)" $(if $(WEIGHTS_NODE_SELECTOR),--node-selector "$(WEIGHTS_NODE_SELECTOR)",)
+
+engine-cache-delete: ## Drop the engine-cache claim, volume and preparer in NAMESPACE=<ns>. The caches on the nodes stay.
+	@test -n "$(prepull_namespace_given)" || { echo "engine-cache-delete: set NAMESPACE=<ns> (the Makefile default is not taken here)" >&2; exit 1; }
+	@bash deploy/enginecache.sh delete -n "$(NAMESPACE)"
 
 .PHONY: workload-patch
 workload-patch: ## Write a patch for model servers that do not drain on scale-down, or download weights outside every volume they mount. NAMESPACE=<ns> scopes it; WVA_WORKLOAD_PATCH_APPLY=true applies the drain half live (add WVA_WORKLOAD_PATCH_APPLY_WEIGHTS=true for the volume, after `make model-cache`).
@@ -1603,6 +1641,20 @@ benchmark-standup: ## Stand up the benchmark environment, then install WVA from 
 		bash hack/benchmark/model_hostpath.sh "$(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml" \
 			"$(BENCHMARK_MODEL_HOSTPATH)" "$(BENCHMARK_NAMESPACE)" "$(PREPULL_NODE_SELECTOR)" "$(PREPULL_TOLERATIONS)"; \
 	fi
+	@# Node-local engine caches: the claim is applied here (the volume must
+	@# exist before the engines mount it), prepared with the harness's own
+	@# engine image, and the scenario copy is repointed at it. The edit script
+	@# refuses a namespace without a Bound claim, and fails the standup: engines
+	@# whose cache volume never mounts sit in ContainerCreating for good.
+	@if [ -n "$(BENCHMARK_ENGINE_CACHE_HOSTPATH)" ]; then \
+		img="$(BENCHMARK_PREPULL_IMAGES)"; \
+		[ -n "$$img" ] || img=$$(bash hack/benchmark/engine_image.sh "$(BENCHMARK_REPO_DIR)" || true); \
+		img=$${img%%,*}; \
+		[ -n "$$img" ] || { echo "benchmark-standup: cannot read the engine image from the clone for the engine-cache preparer; set BENCHMARK_PREPULL_IMAGES=<image>" >&2; exit 1; }; \
+		kubectl create namespace "$(BENCHMARK_NAMESPACE)" --dry-run=client -o yaml | kubectl apply -f - >/dev/null; \
+		bash deploy/enginecache.sh apply -n "$(BENCHMARK_NAMESPACE)" --path "$(BENCHMARK_ENGINE_CACHE_HOSTPATH)" --image "$$img" $(PREPULL_ARGS) || exit 1; \
+		bash hack/benchmark/engine_cache_claim.sh "$(BENCHMARK_REPO_DIR)/config/scenarios/$(BENCHMARK_SPEC).yaml" "$(BENCHMARK_NAMESPACE)"; \
+	fi
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) standup \
 		-p $(BENCHMARK_NAMESPACE) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
@@ -2357,6 +2409,8 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash -n deploy/weights.sh
 	@bash -n deploy/lib/nodedir.sh
 	@bash -n hack/benchmark/model_hostpath.sh
+	@bash -n deploy/enginecache.sh
+	@bash -n hack/benchmark/engine_cache_claim.sh
 	@bash -n hack/benchmark/engine_image.sh
 	@for script in deploy/lib/*.sh; do bash -n "$$script"; done
 	@for script in deploy/*/install.sh; do if [ -f "$$script" ]; then bash -n "$$script"; fi; done
@@ -2392,6 +2446,8 @@ lint-deploy-scripts: ## Run bash -n for deploy/install.sh, deploy/lib/*.sh, and 
 	@bash hack/check-prepull-manifests.sh
 	@echo "Checking what weights.sh and model_hostpath.sh actually emit..."
 	@bash hack/check-weights-manifests.sh
+	@echo "Checking what enginecache.sh and engine_cache_claim.sh actually emit..."
+	@bash hack/check-enginecache-manifests.sh
 	@echo "Checking every scrape interval is 10s, the harness default included..."
 	@# 30s on the engine PodMonitor is 0..30s of jitter on every scaling
 	@# decision; the P/D scenario took the harness default and paid it.

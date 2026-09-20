@@ -419,6 +419,29 @@ command: Kubernetes rewrites `$$` to `$` and expands `$(NAME)` in a
 container's `command`/`args`, so neither may appear in it; and the generator
 leaves its script without a trailing newline.)
 
+That fallback is silent and it is the start-time variance: nine bare starts
+of the decode pod spec, three per node on three nodes, were repeatable
+within 2.5 s on a node and split by node into 51-56 s and 75-81 s, and
+the slow nodes were the ones where `workload-pvc` had come up read-only --
+every start there compiled from nothing (14.4 s against 2.9 s from the
+cache, and 8 s more before the engine). `BENCHMARK_ENGINE_CACHE_HOSTPATH=<dir>`
+(defaulting to `BENCHMARK_MODEL_HOSTPATH`, so one directory turns both on)
+makes the standup put the caches on the node's disk instead: it runs
+`deploy/enginecache.sh apply` with the harness's engine image -- one
+`hostPath` volume at `<dir>/engine-cache`, a claim named `engine-cache`, a
+DaemonSet that prepares the directory on every accelerator node
+([Engine caches on the node's disk](../../reference/workload-preparation.md#engine-caches-on-the-nodes-disk))
+-- and `hack/benchmark/engine_cache_claim.sh` repoints every `engine-cache`
+volume in the scenario copy at that claim, without the `subPath`. The env
+vars and the guard stay as they are. The edit refuses a namespace without a
+Bound `engine-cache` claim and fails the standup: engines whose cache
+volume never mounts sit in `ContainerCreating` for good. A hostPath is a
+bind mount with no storage driver in its path, so no driver publishes it
+read-only (the filesystem under it can still go read-only, which is what the
+preparer's readiness and the guard are for); the first start on a node
+compiles once and every start after it on that node hits. `make
+engine-cache-status NAMESPACE=$BENCHMARK_NAMESPACE` lists the nodes.
+
 After a standup, check what was rendered rather than trusting the scenario:
 
 ```bash
@@ -428,10 +451,13 @@ kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{range .spec.containers[
 # 0 on a single-NIC node; 1 (iproute2) where the script carries routing lines
 kubectl exec -n $BENCHMARK_NAMESPACE $D -c vllm -- grep -c apt-get /shared-config/llmdbench_env.sh
 # the second replica should report a compile-cache hit, not a compile; a
-# "not writable" line here means the guard fell back to the engine default
+# "not writable" line here means the guard fell back to the engine default;
+# with BENCHMARK_ENGINE_CACHE_HOSTPATH the directory is /engine-cache/... on the node's disk
 kubectl logs -n $BENCHMARK_NAMESPACE $D -c vllm | grep -E 'torch.compile took|Using cache directory|not writable'
 # 0: the preamble asks the loader cache (fix 14); a count here is the walk of /
 kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{.spec.containers[?(@.name=="vllm")].args}' | grep -c 'find / -name libcuda'
+# with BENCHMARK_ENGINE_CACHE_HOSTPATH: the engine-cache volume names the node-local claim, no subPath
+kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{range .spec.volumes[?(@.name=="engine-cache")]}{.persistentVolumeClaim.claimName}{"\n"}{end}{range .spec.containers[?(@.name=="vllm")].volumeMounts[?(@.name=="engine-cache")]}{.mountPath} subPath={.subPath}{"\n"}{end}'
 # the image was on the node: container started within seconds of scheduling
 kubectl get pod -n $BENCHMARK_NAMESPACE $D -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].lastTransitionTime}{" scheduled, container up "}{.status.containerStatuses[?(@.name=="vllm")].state.running.startedAt}{"\n"}'
 ```
