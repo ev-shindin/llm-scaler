@@ -253,16 +253,23 @@ only: the stale-metrics sanity issue is reported but not currently used to gate 
 ### Package Structure
 
 ```text
+internal/signals/shape/
+├── shape.go                   Shape: (IL, OL, hit rate) and the derived ILeff, KVreq
+└── tracker.go                 Tracker: current shape + change detection
+internal/signals/itl/
+├── window.go                  Observation, Window: rolling (k,ITL) pairs, Ready flag
+└── model.go                   Model{A,B}, Fit (OLS), ValidModel, ITLAt(k), DefaultKSat
 internal/engines/analyzers/throughput/
-├── constants.go               thresholds, window params, tuning defaults
-├── types.go                   WorkloadShape, ITLObservation, SanityIssue, SanityReport,
-│                              ThroughputVariantState
-├── shape_tracker.go           ShapeTracker: (IL,OL) bucket + change detection
-├── observation_window.go      ObservationWindow: rolling (k,ITL) pairs, Ready flag
+├── constants.go               thresholds, tuning defaults
+├── signals.go                 the analyzer's names for the signal types and their defaults
+├── types.go                   SanityIssue, SanityReport, ThroughputVariantState
 ├── sanity.go                  CheckModelMetrics: 6 SanityIssue types
-├── itl_model.go               ITLModel{A,B}, FitITLModel (OLS), ITLAt(k)
 └── analyzer.go                ThroughputAnalyzer: Observe() + full Analyze()
 ```
+
+The shape and ITL signals moved to `internal/signals` (engine-structure
+proposal, stage 1); the analyzer refers to them by the names below through
+type aliases in `signals.go`.
 
 ### Components
 
@@ -280,19 +287,19 @@ The remaining TA fields (`TotalKvCapacityTokens`, `AvgITL`, `AvgOutputTokens`, `
 `PrefixCacheHitRate`, `ArrivalRate`) are populated by the other registrations in
 `internal/collector/registration/`.
 
-**ShapeTracker (`shape_tracker.go`)**  
+**ShapeTracker (`signals/shape/tracker.go`)**  
 Maintains the current workload shape bucket `(IL, OL, IL_eff, KVreq)`. Detects shape changes
 (>20% shift in IL or OL) and triggers observation window reset.
 
 - `IL_eff = IL × (1 − PrefixCacheHitRate)` — effective input length after prefix cache
 - `KVreq = IL_eff + OL/2` — time-averaged KV footprint per decode request
 
-**ObservationWindow (`observation_window.go`)**  
+**ObservationWindow (`signals/itl/window.go`)**  
 Rolling window of `(k*, ITL_obs)` pairs collected per replica per cycle. Filters observations
 to `k ∈ [0.15, 0.85]` (reliable linear-model range). Reports `Ready()` when ≥ 10 samples with
 ≥ 0.30 k-spread are accumulated within the 30-minute default window.
 
-**ITLModel (`itl_model.go`)**  
+**ITLModel (`signals/itl/model.go`)**  
 Two-tier calibration of `ITL(k) = A·k + B`. See [ITL Model Calibration](#itl-model-calibration).
 
 **ThroughputAnalyzer (`analyzer.go`)**  

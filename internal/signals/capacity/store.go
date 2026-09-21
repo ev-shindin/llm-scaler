@@ -1,4 +1,4 @@
-package saturation_v2
+package capacity
 
 import (
 	"fmt"
@@ -10,11 +10,11 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
 )
 
-// CapacityRecord holds cached capacity knowledge for a specific variant.
+// Record holds cached capacity knowledge for a specific variant.
 // This allows the analyzer to make capacity estimates for variants that
 // currently have zero replicas, either from their own prior data or from
 // a compatible variant via FindCompatible.
-type CapacityRecord struct {
+type Record struct {
 	AcceleratorName       string
 	GpuCount              int
 	NumGpuBlocks          int64
@@ -26,22 +26,22 @@ type CapacityRecord struct {
 	LearnedAt             time.Time
 }
 
-// CapacityKnowledgeStore is a thread-safe in-memory cache of capacity
+// Store is a thread-safe in-memory cache of capacity
 // records keyed by "namespace|modelID|variantName". It enables the analyzer
 // to estimate capacity for zero-replica variants and newly created
 // deployments before any live metrics are available.
 //
 // For cross-variant estimation, use FindCompatible which searches for records
 // from other variants with matching hardware and engine parameters.
-type CapacityKnowledgeStore struct {
+type Store struct {
 	mu      sync.RWMutex
-	records map[string]*CapacityRecord
+	records map[string]*Record
 }
 
-// NewCapacityKnowledgeStore creates an empty capacity store.
-func NewCapacityKnowledgeStore() *CapacityKnowledgeStore {
-	return &CapacityKnowledgeStore{
-		records: make(map[string]*CapacityRecord),
+// NewStore creates an empty capacity store.
+func NewStore() *Store {
+	return &Store{
+		records: make(map[string]*Record),
 	}
 }
 
@@ -54,7 +54,7 @@ func storeKey(namespace, modelID, variantName string) string {
 
 // Update stores or overwrites a capacity record for a specific variant.
 // Live data is always authoritative and should always be written via Update.
-func (s *CapacityKnowledgeStore) Update(namespace, modelID, variantName string, record CapacityRecord) {
+func (s *Store) Update(namespace, modelID, variantName string, record Record) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record.LearnedAt = time.Now()
@@ -63,29 +63,29 @@ func (s *CapacityKnowledgeStore) Update(namespace, modelID, variantName string, 
 
 // Get returns the stored capacity record for a specific variant, or nil
 // if none exists. For cross-variant lookup, use FindCompatible instead.
-func (s *CapacityKnowledgeStore) Get(namespace, modelID, variantName string) *CapacityRecord {
+func (s *Store) Get(namespace, modelID, variantName string) *Record {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.records[storeKey(namespace, modelID, variantName)]
 }
 
 // IsStale returns true if the record for the given variant is older than
-// CapacityStalenessTimeout, or if no record exists.
-func (s *CapacityKnowledgeStore) IsStale(namespace, modelID, variantName string) bool {
+// StalenessTimeout, or if no record exists.
+func (s *Store) IsStale(namespace, modelID, variantName string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rec, ok := s.records[storeKey(namespace, modelID, variantName)]
 	if !ok {
 		return true
 	}
-	return time.Since(rec.LearnedAt) > CapacityStalenessTimeout
+	return time.Since(rec.LearnedAt) > StalenessTimeout
 }
 
 // LoadFromScaleTarget parses the engine args from a scale target (dispatching by
 // detected engine via ParseEngineArgs) and stores an estimated capacity record for
 // the variant. It does NOT overwrite an existing "live" record — scale
 // target-derived data is a fallback only.
-func (s *CapacityKnowledgeStore) LoadFromScaleTarget(namespace, modelID, variantName, accelerator string, gpuCount int, scaleTarget scaletarget.ScaleTargetAccessor) {
+func (s *Store) LoadFromScaleTarget(namespace, modelID, variantName, accelerator string, gpuCount int, scaleTarget scaletarget.ScaleTargetAccessor) {
 	if scaleTarget == nil {
 		return
 	}
@@ -96,12 +96,12 @@ func (s *CapacityKnowledgeStore) LoadFromScaleTarget(namespace, modelID, variant
 	key := storeKey(namespace, modelID, variantName)
 
 	// Don't overwrite live data
-	if existing, ok := s.records[key]; ok && existing.LearnedFrom == learnedFromLive {
+	if existing, ok := s.records[key]; ok && existing.LearnedFrom == LearnedFromLive {
 		return
 	}
 
 	params := ParseEngineArgs(inferenceengine.Detect(scaleTarget), scaleTarget)
-	record := &CapacityRecord{
+	record := &Record{
 		AcceleratorName: accelerator,
 		GpuCount:        gpuCount,
 		EngineParams:    &params,
@@ -134,7 +134,7 @@ func (s *CapacityKnowledgeStore) LoadFromScaleTarget(namespace, modelID, variant
 // given timeout. This prevents unbounded memory growth from deleted or
 // long-unused variants. Use a long timeout (e.g. EvictionTimeout = 24h)
 // since historical capacity data is valuable for zero-replica estimation.
-func (s *CapacityKnowledgeStore) EvictStale(timeout time.Duration) int {
+func (s *Store) EvictStale(timeout time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	evicted := 0
@@ -155,11 +155,11 @@ func (s *CapacityKnowledgeStore) EvictStale(timeout time.Duration) int {
 //
 // Returns the best match (preferring "live" records over "deployment"/"lws" records),
 // or nil if no compatible record exists.
-func (s *CapacityKnowledgeStore) FindCompatible(modelID, accelerator string, gpuCount int, params *EngineParams) *CapacityRecord {
+func (s *Store) FindCompatible(modelID, accelerator string, gpuCount int, params *EngineParams) *Record {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var best *CapacityRecord
+	var best *Record
 	for key, rec := range s.records {
 		// Parse key: "namespace|modelID|variantName"
 		parts := strings.SplitN(key, "|", 3)
@@ -183,7 +183,7 @@ func (s *CapacityKnowledgeStore) FindCompatible(modelID, accelerator string, gpu
 		}
 
 		// Prefer live data over deployment/lws-derived
-		if best == nil || (best.LearnedFrom != "live" && rec.LearnedFrom == learnedFromLive) {
+		if best == nil || (best.LearnedFrom != "live" && rec.LearnedFrom == LearnedFromLive) {
 			best = rec
 		}
 	}

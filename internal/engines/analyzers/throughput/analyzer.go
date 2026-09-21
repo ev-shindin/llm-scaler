@@ -11,6 +11,8 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
 )
 
 // ThroughputAnalyzer accumulates per-variant workload shape and ITL observations
@@ -519,8 +521,8 @@ func (a *ThroughputAnalyzer) getOrCreateVariantState(key string) *variantState {
 		return state
 	}
 	state := &variantState{
-		shapeTracker: newShapeTracker(DefaultShapeChangeTolerance),
-		observationWindow: newObservationWindow(
+		shapeTracker: shape.NewTracker(DefaultShapeChangeTolerance),
+		observationWindow: itl.NewWindow(
 			DefaultWindowMaxSize,
 			DefaultObservationMaxAge,
 			DefaultMinSamples,
@@ -551,7 +553,7 @@ func (a *ThroughputAnalyzer) resolveITLModel(ctx context.Context, state *variant
 	// Tier 1: OLS fit.
 	if state.observationWindow.Ready() {
 		obs := state.observationWindow.Observations()
-		if model, ok := FitITLModel(obs); ok {
+		if model, ok := itl.Fit(obs); ok {
 			ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("throughput analyzer: tier-1 OLS fit",
 				"namespace", namespace, "modelID", modelID, "variant", variantName,
 				"A", model.A, "B", model.B, "samples", len(obs),
@@ -588,7 +590,7 @@ func (a *ThroughputAnalyzer) resolveITLModel(ctx context.Context, state *variant
 	}
 	if n > 0 && sumK2 > 0 {
 		A := numerator / sumK2
-		if validITLModel(A, baselineB) {
+		if itl.ValidModel(A, baselineB) {
 			ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("throughput analyzer: tier-2 constrained OLS fit",
 				"namespace", namespace, "modelID", modelID, "variant", variantName,
 				"A", A, "B", baselineB, "replicas", int(n),

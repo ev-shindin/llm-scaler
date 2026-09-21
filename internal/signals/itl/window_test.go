@@ -1,21 +1,22 @@
-package throughput
+package itl
 
 import (
+	"math"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("ObservationWindow", func() {
+var _ = Describe("Window", func() {
 	var (
-		window *ObservationWindow
+		window *Window
 		now    time.Time
 	)
 
 	BeforeEach(func() {
 		now = time.Now()
-		window = newObservationWindow(
+		window = NewWindow(
 			DefaultWindowMaxSize,
 			DefaultObservationMaxAge,
 			DefaultMinSamples,
@@ -42,7 +43,7 @@ var _ = Describe("ObservationWindow", func() {
 		})
 
 		It("rejects NaN k", func() {
-			window.Add(float64NaN(), 0.040, now)
+			window.Add(math.NaN(), 0.040, now)
 			Expect(window.Len()).To(Equal(0))
 		})
 
@@ -57,7 +58,7 @@ var _ = Describe("ObservationWindow", func() {
 		})
 
 		It("rejects NaN ITL", func() {
-			window.Add(0.50, float64NaN(), now)
+			window.Add(0.50, math.NaN(), now)
 			Expect(window.Len()).To(Equal(0))
 		})
 
@@ -72,7 +73,7 @@ var _ = Describe("ObservationWindow", func() {
 		})
 
 		It("evicts the oldest observation when at capacity", func() {
-			small := newObservationWindow(3, DefaultObservationMaxAge,
+			small := NewWindow(3, DefaultObservationMaxAge,
 				DefaultMinSamples, DefaultMinKSpread, DefaultMinObservableK, DefaultMaxObservableK)
 
 			t0 := now

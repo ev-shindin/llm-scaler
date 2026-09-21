@@ -1,4 +1,4 @@
-package throughput
+package shape
 
 import (
 	"math"
@@ -7,11 +7,11 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("ShapeTracker", func() {
-	var tracker *ShapeTracker
+var _ = Describe("Tracker", func() {
+	var tracker *Tracker
 
 	BeforeEach(func() {
-		tracker = newShapeTracker(DefaultShapeChangeTolerance)
+		tracker = NewTracker(DefaultChangeTolerance)
 	})
 
 	Describe("first Observe call", func() {

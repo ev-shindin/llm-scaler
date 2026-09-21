@@ -1,4 +1,4 @@
-package saturation_v2
+package capacity
 
 import (
 	"strconv"

@@ -1,6 +1,8 @@
 package throughput
 
 import (
+	"math"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -115,7 +117,7 @@ var _ = Describe("CheckModelMetrics", func() {
 
 		It("flags SanityIssueKVOutOfRange for NaN KvUsageInstant (k*)", func() {
 			m := healthyReplica("pod-0")
-			m.KvUsageInstant = float64NaN()
+			m.KvUsageInstant = math.NaN()
 			report := CheckModelMetrics([]domain.ReplicaMetrics{m})
 			Expect(report.Has(SanityIssueKVOutOfRange)).To(BeTrue())
 		})
@@ -148,7 +150,7 @@ var _ = Describe("CheckModelMetrics", func() {
 
 		It("flags SanityIssueITLNonPositive when AvgITL is NaN", func() {
 			m := healthyReplica("pod-0")
-			m.AvgITL = float64NaN()
+			m.AvgITL = math.NaN()
 			report := CheckModelMetrics([]domain.ReplicaMetrics{m})
 			Expect(report.Has(SanityIssueITLNonPositive)).To(BeTrue())
 		})
@@ -179,7 +181,7 @@ var _ = Describe("CheckModelMetrics", func() {
 
 		It("flags SanityIssueMissingShape when AvgInputTokens is NaN", func() {
 			m := healthyReplica("pod-0")
-			m.AvgInputTokens = float64NaN()
+			m.AvgInputTokens = math.NaN()
 			report := CheckModelMetrics([]domain.ReplicaMetrics{m})
 			Expect(report.Has(SanityIssueMissingShape)).To(BeTrue())
 		})

@@ -160,7 +160,8 @@ the run ended with an order for 6.
 ## A backlog is charged as residency -- built on `fix/backlog-by-throughput`
 
 What follows is the analysis that led to it and the direction it proposed;
-the implementation is in `throughput_floor.go` and described in [the
+the implementation is in `internal/signals/floor` and the saturation
+analyzer's `throughput_floor.go`, and described in [the
 throughput floor](../developer-guide/saturation-demand-floor.md). Two things
 changed against the direction below, both from measurement: the local engine
 queue is priced by throughput too, not only the scheduler's (on the first

@@ -1,4 +1,4 @@
-package saturation_v2
+package capacity
 
 import (
 	"strconv"
@@ -299,7 +299,7 @@ func applyParam(key, value string, params *EngineParams) {
 
 // IsCapacityCompatible checks whether two EngineParams configurations
 // would produce equivalent per-replica capacity (both k1 and k2).
-// Used by CapacityKnowledgeStore.FindCompatible to identify variants
+// Used by Store.FindCompatible to identify variants
 // whose stored capacity can be reused for zero-replica estimation.
 func (p *EngineParams) IsCapacityCompatible(other *EngineParams) bool {
 	if p == nil || other == nil {

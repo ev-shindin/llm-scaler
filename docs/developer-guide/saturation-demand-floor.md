@@ -5,7 +5,9 @@ what the floor is and is not invariant to, which of the claims here are measured
 versus assumed -- and why the floor it replaced, built on Little's law, was
 retired.
 
-Code: `internal/engines/analyzers/saturation_v2/throughput_floor.go`.
+Code: the model and its arithmetic are `internal/signals/floor`; the window of
+saturated readings, the borrow between buckets and the application to the
+measured demand are `internal/engines/analyzers/saturation_v2/throughput_floor.go`.
 
 ## The problem
 
