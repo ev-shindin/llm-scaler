@@ -366,7 +366,7 @@ dashboards-check: ## Fail if a Grafana dashboard has overlapping panels, duplica
 	python3 hack/check-dashboards.py
 
 .PHONY: check-import-direction
-check-import-direction: ## Fail on a pipeline package importing one above it (docs/proposals/engine-structure.md)
+check-import-direction: ## Fail on a pipeline package importing one above it (the engine-structure proposal, PR #87)
 	@bash hack/check-import-direction.sh
 
 .PHONY: test

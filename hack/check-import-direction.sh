@@ -2,8 +2,8 @@
 #
 # Fails when a pipeline package imports one above it.
 #
-# docs/proposals/engine-structure.md gives the dependency order of the
-# pipeline: engine > policy > plan > analyze > signals > collect / actuate >
+# The engine-structure proposal (https://github.com/ev-shindin/llm-scaler/pull/87)
+# gives the dependency order of the pipeline: engine > policy > plan > analyze > signals > collect / actuate >
 # decision > domain. A package may import only what is below it in that
 # order, plus the infrastructure leaves (config, constants, metrics, logging,
 # prometheus, accelerator, gpunodes, kueue, inferenceengine, variant,
@@ -66,7 +66,7 @@ done <<< "$listing"
 
 [ "$checked" -gt 0 ] || { echo "FATAL: no layered package was found; the layer table no longer matches the tree" >&2; exit 1; }
 if [ "$bad" -gt 0 ]; then
-    echo "$bad upward import(s) across $checked layered package(s); see docs/proposals/engine-structure.md" >&2
+    echo "$bad upward import(s) across $checked layered package(s); see the engine-structure proposal (PR #87)" >&2
     exit 1
 fi
 echo "import direction OK ($checked layered packages, no upward edge)"
