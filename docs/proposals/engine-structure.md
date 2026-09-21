@@ -27,9 +27,9 @@ the package's own directory):
 | `controller` | 1,167 | 8 | the reconcilers; wired from `cmd/main.go`, which itself imports 23 internal packages |
 | `config` | 3,067 | 10 | |
 | `metrics` | 1,504 | 1 | every gauge and counter of the controller in one file |
-| `registry` | 974 | 3 | imported by `collector/locator`, `scalefromzero`, `steadystate`, `scaler`, `warmpool` |
+| `registry` | 974 | 3 | imported by `cmd`, `collector/locator`, `scalefromzero`, `steadystate`, `scaler`, `utils`, `warmpool` |
 | `scaler` | 761 | 4 | the KEDA external scaler; imports `decision`, `registry` |
-| `decision` | 1,350 | 10 | a leaf: no internal imports; imported by nine packages (`actuator`, `collector`, `allocation`, `scalefromzero`, `steadystate`, `gpuusage`, `scaler`, `warmpool`, and the controller through them) |
+| `decision` | 1,350 | 10 | a leaf: no internal imports; imported by nine packages (`actuator`, `collector`, `allocation`, `scalefromzero`, `steadystate`, `gpuusage`, `scaler`, `warmpool`, `cmd`) |
 
 Four structural problems, each with a cost that has already been paid:
 
@@ -47,11 +47,13 @@ Four structural problems, each with a cost that has already been paid:
    second under output-length buckets -- while `throughput` next to it
    carries a model that has none of those failure modes (below). Nobody
    chose one; each was extended where the last fix landed.
-3. **Layering runs both ways.** An analyzer imports the optimizer package
-   (`saturation_v2` → `allocation`, for two reason strings); the collector
-   imports `decision`; the engine imports the collector, every analyzer and
-   the optimizers at once. The dependency direction is not a rule anyone
-   can point to.
+3. **Layering is not a rule.** An analyzer imports the optimizer package
+   (`saturation_v2` → `allocation`, for two reason strings) -- the one
+   import that runs against the order below; the collector reads a decision
+   output (the warm pool's lending) straight from the decision store to
+   attribute Pods -- downward as an import, a cycle as a pipeline; and the
+   engine imports the collector, every analyzer and the optimizers at once.
+   The dependency direction is not a rule anyone can point to.
 4. **The comments are histories, not contracts.** `throughput_floor.go`
    opens with 80 lines on what was measured on which pass and why each
    earlier variant was dropped. That is valuable -- it is the only record
@@ -87,31 +89,44 @@ analyze/           demand estimation: signals → per-role demand and supply, wi
 signals/           stateless functions and small trackers over ReplicaMetrics: shape,
                    capacity (k1/k2 and its store), throughput models, windows, backlog,
                    and today's engines/aggregation
-collect/           scrapes → domain.ReplicaMetrics; sources, locator, attribution, freshness
-actuate/           actuator + scaler + registry (what talks to the cluster and to KEDA)
+collect/  actuate/ one layer, two concerns: collect/ is scrapes → domain.ReplicaMetrics
+                   (sources, locator, attribution, freshness); actuate/ is actuator +
+                   scaler + registry (what talks to the cluster and to KEDA); siblings
+                   may import each other (collector/locator reads the registry)
 decision/          the store, as today
 domain/            the types
 infrastructure     config, constants, metrics, logging, prometheus, accelerator,
                    gpunodes, kueue, inferenceengine, variant, datastore, utils/*:
-                   leaves, importable from anywhere, importing only domain/constants/logging
+                   leaves, importable from anywhere; they import each other, domain,
+                   constants and logging -- with two edges into the pipeline that exist
+                   today and are to be removed: utils → registry, datastore → collector/source
 ```
 
-`controller/` and `cmd/main.go` sit above `engine/` (they wire it). `warmpool/`
-is a separate subsystem that imports `decision`, `registry`, `datastore` and
-`metrics` and nothing in the pipeline imports it, so it sits beside `engine/`
-and the rule holds for it as-is.
+Today's helper packages take these places: `engines/aggregation` and
+`engines/common` are `signals`; `engines/executor` and `engines/variantmeta`
+are `analyze`; `gpuusage` (publishes GPU usage from the decision store,
+imports `decision` and `gpunodes`, nothing in the pipeline imports it) is a
+reporter that sits beside `engine/`, like `warmpool/`. `controller/` and
+`cmd/main.go` sit above `engine/` (they wire it). `warmpool/` is a separate
+subsystem that imports `decision`, `registry`, `datastore` and `metrics` and
+nothing in the pipeline imports it, so it sits beside `engine/` and the rule
+holds for it as-is.
 
 Rules that make it stay this way:
 
 - **Imports point down the dependency order.** The check
-  (`hack/check-import-direction.sh` over `go list -deps`) enforces the
-  relative order among the named pipeline packages -- `engine`, `policy`,
-  `plan/*`, `analyze`, `signals`, `collect`, `actuate`, `decision`,
-  `domain` -- and lets any of them import the infrastructure leaves. It does
-  not claim `plan` imports only `domain` and `decision`: `allocation` today
+  (`hack/check-import-direction.sh`, over each package's direct imports from
+  `go list`; landed in PR #88, run by `make test`) enforces the relative
+  order among the named pipeline packages -- `engine`, `policy`, `plan/*`,
+  `analyze`, `signals`, `collect`/`actuate`, `decision`, `domain` -- and
+  lets any of them import the infrastructure leaves. It does not claim
+  `plan` imports only `domain` and `decision`: `allocation` today
   legitimately reads `config`, `kueue`, `gpunodes`, `accelerator` and
-  `metrics`, and will keep doing so. What it forbids is exactly the three
-  upward edges that exist today and any new one.
+  `metrics`, and will keep doing so. What it forbids is the one upward edge
+  that existed on `main` (`saturation_v2` → `allocation`, reported by the
+  check there and gone in #88) and any new one. The collector's read of
+  the decision store is downward by this order and was removed in #88 for
+  the other reason: collecting must not read a decision output directly.
 - **A file is one concern and under ~500 lines.** `engine.go` at 2,158 and
   `analyzer.go` at 1,663 are the symptoms; the rule is what stops them
   growing back.
@@ -188,16 +203,23 @@ that role only; the model-level coverage rule
 (`min(cov(prefill), cov(decode)) + cov(both)`) is what ties the roles back
 together for the fleet-level view.
 
-**Decision -- who owns the identity fields.** The composite branch's D1
-says saturation is the unconditional source of ready/pending/cost/GPUs on
-the result, "read from sat only because that is where the data lives
-today". The refactor plan's phase 3 already moved cost/accelerator/role to
-discovery via the builder overlay. This proposal completes that: the input
-builder owns every identity field, from `VariantStates` and discovery
-metadata, and no analyzer -- saturation included -- is the source of any
-of them. D1 is the interim state the composite branch had to live with;
-stage 3 below retires it, and the composite is adjusted then (its own spec
-calls this "in an ideal world a separate, non-per-analyzer computation").
+**Decision -- who owns the identity fields.** The composite branch's
+redesign record (`.session/composite-signal-redesign.md` §6, D1) makes
+saturation the unconditional source of the non-`(D, P)` fields on the
+result, "read from sat today only because that is where the data currently
+lives" -- "in an ideal world it would be a separate, non-per-analyzer
+computation". The refactor plan already assigns identity to discovery
+(§3.1: `VariantMetadata` "is the authoritative per-variant identity + state
+for one cycle"; §3.2: cost, accelerator name and the rest "leave the
+result"), with one recorded deviation: replica counts stay
+analyzer-measured ("measured this cycle, not a lagging status") and the
+builder caps them at discovery's `CurrentReplicas`. This proposal keeps
+that deviation and completes the rest: the input builder owns cost,
+accelerator, role, GPUs per replica and pending from discovery; the ready
+count a replica row proves is a measurement and stays the collector's, on
+the input; no analyzer -- saturation included -- is the source of any
+identity field. D1 is the interim the composite branch had to live with;
+stage 3 below retires it, and the composite is adjusted then.
 
 What a new analyzer then has to do, and nothing else: implement `Name` and
 `Analyze`, put demand and per-replica capacity in the **same unit** (so that
@@ -227,7 +249,7 @@ identity, since upstream squash-merges).
 | branch | what it is | in ours? |
 |---|---|---|
 | `ta-anchor-dynamic-refresh` (33 commits over our merge-base, 2026-08-06..08; includes `ta-anchor-refactor-v2` = upstream PR #1516) | the multi-vote pipeline in `internal/engines/pipeline` (our `engines/allocation`): **one combine core** `combineVotes(votes, up) → (count, binder)` -- max for scale-up, min for scale-down, rounding once at the caller, the *binding analyzer* returned with the count; **abstain ≠ zero** -- a role an analyzer has no model for is tagged `ReasonRoleUnmodeled` and casts no vote; **score as a dominance correction** (`v* = e − Σ(e − v_i)(s_i − s_e)⁺ / Σs_j`); the **live-only veto gate** (`roleSpareVetoed`); **coverage per GPU freed** (`max_i PRC_i[v] / GPUsPerReplica[v]`) as the scale-down tie-break; a per-iteration anchor refresh; goldens and invariant specs | **no**: none of `combineVotes`, `ReasonRoleUnmodeled`, `bindingAnchor`, `roleSpareVetoed`, the coverage tie-break. We have the liveness half only (#1481, `f5261c8e`) |
-| the same branch's `docs/developer-guide/multi-analyzer-pipeline.md` | our `main` already has this guide (562 lines); the branch's is +579/−58 on it: the three ballot collectors, the veto gate, the abstention rule, liveness's three no-data cases | partly: the guide, yes; his update to it, no |
+| the same branch's `docs/developer-guide/multi-analyzer-pipeline.md` | our `main` already has this guide (562 lines); the branch's is +579/−58 against its own merge-base (a 475-line version) and +618/−184 against ours: the three ballot collectors, the veto gate, the abstention rule, liveness's three no-data cases | partly: the guide, yes; his update to it, no |
 | `analyzer-metric-proposal` | the analyzer contract collapsed to `D` and `P` per finest-grain item; results as Prometheus metrics; external analyzers as PromQL with `match` per ScaledObject/role | **yes** (`docs/proposals/analyzer-metric-interface.md`, three lines behind his) |
 | `ta3-e2e`, `ta-correctness-guards`, `ta-veto-liveness`, `ta-model-level-demand` | TA fixes | yes, through the upstream merges we adopted |
 | `benchmark`, `autoscaling-viz` | a results tree with `postprocess.py` and a generated `REPORT.md`; a real-trace visualiser | no; superseded by the branches on the other fork below |
@@ -252,8 +274,9 @@ must change before it merges, in the order found: (1) **a regression of
 the quota only when `CompositeHasSignal`, so a running replica with no
 per-variant decision path this cycle (startup, a scrape gap, every SO at
 `C4-no-signal`) is not charged and the warm pool is told a GPU is free that
-a model holds; `TestASteadyFleetStillPublishesHeadroom` passes on the
-merge-base and fails on the branch. The quota charge is a fact about
+a model holds; `TestASteadyFleetStillPublishesHeadroom` passes on
+`main` before #85 (`fe8340ca`) and fails on the branch merged onto today's
+`main`. The quota charge is a fact about
 `VariantStates.CurrentReplicas`, not about signal; (2) the saturation
 fallback checks `Eligible(sat)` (whole result) and PRC > 0 but not the
 per-SO `Reason` filter the contributor loop applies, so an SO with
@@ -283,21 +306,26 @@ by the benchmark scorecard on the two shape-swap traces (runs 16 and 18 of
 p95 or target path has changed behaviour and stops).
 
 1. **`signals`** -- extract, do not rewrite. Move `ShapeTracker`,
-   `ObservationWindow`, `ITLModel`, `rollingAverage` and `engines/aggregation`
-   out of the two analyzers into `internal/signals` with their tests, as
-   they are (the two windows stay two types, above); move the floor's
-   arithmetic (`estimateThroughputDemand`, `medianFloat`, `throughputFloor`
-   and its terms -- they take `[]ReplicaCapacity` and call
-   `aggregation.AggregateByRole`, which comes with them). `signals/capacity`
-   -- k1/k2 and the store -- is part of this stage, so that stage 3 can
-   hand capacity to every analyzer through the input. Analyzers keep
-   working unchanged, importing them.
-2. **Cut the upward edges.** The two reason strings `ReasonError` and
-   `ReasonNoData` move to `domain` (`ResultIsInformative` stays in
-   `allocation`: it takes the optimizer's `NamedAnalyzerResult`); the
-   collector's `decision.BridgeVariant` call is replaced by the value it
-   reads. Add the import-direction check with the scope stated above.
-   Nothing else moves.
+   `ObservationWindow` and `ITLModel` out of `throughput`, and
+   `rollingAverage`, the capacity store (k1/k2, history, eviction) and the
+   floor's arithmetic (`estimateThroughputDemand`, `medianFloat`,
+   `throughputFloor` and its terms, with `ReplicaCapacity`, the per-replica
+   record they take) out of `saturation_v2`, into `internal/signals` with
+   their tests, as they are (the two windows stay two types, above).
+   `engines/aggregation` **stays where it is** for now: the colleague's
+   `composite-analyzer` branch adds three files to it, and moving the
+   directory first would turn stage 4's rebase into a conflict; the check
+   already ranks it at the signals layer, the moved code keeps importing it
+   at its current path, and it moves under `signals` after stage 4.
+   Analyzers keep working unchanged, importing the moved code.
+2. **Cut the upward edge, and make the direction a rule** -- done in
+   PR #88. `ReasonError` and `ReasonNoData` are `domain` constants,
+   aliased under their old names in `allocation` (`ResultIsInformative`
+   stays there: it takes the optimizer's `NamedAnalyzerResult`); the
+   collector's `decision.BridgeVariant` call is replaced by an injected
+   `BridgeResolver` that the engine wires to the decision store; the
+   import-direction check runs as a `make test` prerequisite. Nothing else
+   moved.
 3. **Split the engine by concern**, and the analyzer surface with it.
    `sticky_scale_down.go`, `inventory_gate.go`, `scaling_blocked.go`,
    `policy_report.go` and the hold/gate logic now inside `engine.go` become
