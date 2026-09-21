@@ -27,10 +27,6 @@ type (
 const (
 	// RollingAverageWindowSize is capacity.RollingAverageWindowSize.
 	RollingAverageWindowSize = capacity.RollingAverageWindowSize
-	// CapacityStalenessTimeout is capacity.StalenessTimeout.
-	CapacityStalenessTimeout = capacity.StalenessTimeout
-	// CapacityEvictionTimeout is capacity.EvictionTimeout.
-	CapacityEvictionTimeout = capacity.EvictionTimeout
 	// HistoryEvictionTimeout is capacity.HistoryEvictionTimeout.
 	HistoryEvictionTimeout = capacity.HistoryEvictionTimeout
 	// BacklogDrainSeconds is floor.BacklogDrainSeconds.

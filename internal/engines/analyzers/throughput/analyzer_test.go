@@ -556,11 +556,11 @@ var _ = Describe("ThroughputAnalyzer", func() {
 			Expect(reason).To(Equal(itlReasonT2Failed))
 		})
 
-		It("resolveITLModel returns T2-failed when the computed fit is rejected by validITLModel", func() {
+		It("resolveITLModel returns T2-failed when the computed fit is rejected by itl.ValidModel", func() {
 			// AvgITL below the constant baseline B (DefaultBaselineITLSec = 0.006, default path) at
 			// k=0.5 produces numerator = (0.001 - 0.006) * 0.5 = -0.0025, sumK2 = 0.25 → A = -0.01
 			// (negative, inverted slope) — a real Tier-2 fit is computed (n=1, sumK2>0) but
-			// validITLModel rejects it, unlike the existing "all idle" test which never reaches the
+			// itl.ValidModel rejects it, unlike the existing "all idle" test which never reaches the
 			// fit at all.
 			belowBaseline := domain.ReplicaMetrics{
 				VariantName: "v1", KvUsageInstant: 0.5, KvCacheUsage: 0.5,

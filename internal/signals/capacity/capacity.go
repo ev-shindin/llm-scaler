@@ -40,6 +40,7 @@ const LearnedFromLive = "live"
 // estimate for a replica.
 type K2Source int
 
+// The K2 sources, in priority order: the analyzer takes the first that yields.
 const (
 	K2SrcObserved   K2Source = iota + 1 // queue saturated: tokensInUse
 	K2SrcHistorical                     // rolling average from prior observations
@@ -47,6 +48,8 @@ const (
 	K2SrcFallback                       // fallback to k1 (memory-bound)
 )
 
+// K2Labels is the log label of each K2Source; the labels are what the k2
+// decision log line and the analyzer result's Reason carry.
 var K2Labels = map[K2Source]string{
 	K2SrcObserved:   "P1-obs",
 	K2SrcHistorical: "P2-hist",

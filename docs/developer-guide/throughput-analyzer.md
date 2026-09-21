@@ -438,8 +438,8 @@ utilization k. It is calibrated independently per variant (different hardware �
 ### Tier 1 — OLS Fit
 
 When `ObservationWindow.Ready()` is true (≥ 10 samples spanning ≥ 30% of the k range),
-`FitITLModel` fits A and B by ordinary least squares, minimizing `Σ(ITL_i − A·k_i − B)²`.
-The fit is accepted only when the resulting `(A, B)` passes `validITLModel` — finite, a
+`itl.Fit` fits A and B by ordinary least squares, minimizing `Σ(ITL_i − A·k_i − B)²`.
+The fit is accepted only when the resulting `(A, B)` passes `itl.ValidModel` — finite, a
 meaningfully positive slope, and positive ITL at saturation (physically required: more
 concurrent requests → higher latency). On success, the fitted model is used for both supply
 and demand estimation this cycle.
@@ -455,7 +455,7 @@ A = Σ((ITL_i − B) · k_i) / Σ(k_i²)
 This is least-squares with B fixed, applied to all replicas with k* > 0. For a single replica
 it reduces to the single-point formula `A = (ITL − B) / k*`. For multiple replicas it is
 strictly better — same OLS criterion as tier-1 but with one fewer degree of freedom. The
-resulting `(A, B)` is accepted through the same `validITLModel` predicate as Tier 1, so Tier 2
+resulting `(A, B)` is accepted through the same `itl.ValidModel` predicate as Tier 1, so Tier 2
 cannot accept a model Tier 1 would reject.
 
 **B selection:** B is taken from `variantState.lastFittedB` when a prior successful Tier-1 fit

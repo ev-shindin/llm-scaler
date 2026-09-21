@@ -50,8 +50,8 @@ func (r *RollingAverage) Touch() {
 	r.TouchAt(time.Now())
 }
 
-// TouchAt is Touch at a given time. A caller on an injected clock keeps the
-// window on that clock with it, and a test ages a window by it.
+// TouchAt is Touch at a given time; Touch is TouchAt(time.Now()). A test
+// ages a window by it.
 func (r *RollingAverage) TouchAt(t time.Time) {
 	r.lastUpdated = t
 }

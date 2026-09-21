@@ -419,12 +419,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// what one of this variant's replicas does. The window keeps a max, so
 	// one such reading would price the whole variant for the rest of the
 	// window; the read side already leaves bridges out
-	// (estimateThroughputDemand), and the write side has to match it.
+	// (floor.Estimate), and the write side has to match it.
 	//
 	// Recorded and read under the FLEET's output-length bucket, not this
 	// replica's. The k2 key above is the replica's own, and rightly: its
 	// occupancy is its own. Its throughput is priced per role, as the median
-	// over the role's replicas (estimateThroughputDemand), and a median over
+	// over the role's replicas (floor.Estimate), and a median over
 	// readings from different buckets is a reading of nothing. A replica's
 	// own average output length is a few minutes of its own completions,
 	// and at a shape switch that is noise: a fresh replica's first
