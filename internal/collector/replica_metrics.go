@@ -58,7 +58,6 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/inferenceengine"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -73,9 +72,21 @@ import (
 
 // ReplicaMetricsCollector collects replica-level metrics for both saturation
 // analysis and queueing model analysis using the source infrastructure.
+// BridgeResolver answers which variant a warm-pool Pod is lent to right now.
+// The decision store implements it; the collector takes it as an interface so
+// that collecting does not import deciding -- the lending is a decision
+// output that reaches the collector as an input, the way everything else the
+// collector attributes by does.
+type BridgeResolver interface {
+	VariantFor(namespace, pod string, maxAge time.Duration, now time.Time) (string, bool)
+}
+
 type ReplicaMetricsCollector struct {
 	source    source.MetricsSource
 	k8sClient client.Client
+	// bridges says which Pods are lent bridges this cycle and to whom. Nil
+	// means no warm pool: no Pod is a bridge.
+	bridges BridgeResolver
 	// apiReader is UNCACHED, and is how Pod serving state is read. The manager's
 	// cache holds no Pods, so reading them through k8sClient would start a Pod
 	// informer -- cluster-wide on a cluster-scoped install. See podStates.
@@ -109,6 +120,21 @@ func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient cl
 		locator:               podLocator,
 		metricsAvailableState: make(map[string]bool),
 	}
+}
+
+// SetBridgeResolver names where the warm pool's lending is read from. The
+// engine wires the decision store here; a collector without one attributes
+// every Pod by its owner walk alone.
+func (c *ReplicaMetricsCollector) SetBridgeResolver(r BridgeResolver) {
+	c.bridges = r
+}
+
+// bridgeFor asks the resolver, if there is one, whether pod is a lent bridge.
+func (c *ReplicaMetricsCollector) bridgeFor(namespace, pod string) (string, bool) {
+	if c.bridges == nil {
+		return "", false
+	}
+	return c.bridges.VariantFor(namespace, pod, warmPoolLendingMaxAge, time.Now())
 }
 
 // BeginCycle opens an optimize cycle, arming the memo that lets every model in a
@@ -1065,7 +1091,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// lent Pod is not reported as a mapping miss, and before the FMA hop
 		// because the two cannot both apply.
 		fromWarmPool := false
-		if bridgeFor, lent := decision.BridgeVariant(namespace, podName, warmPoolLendingMaxAge, time.Now()); lent {
+		if bridgeFor, lent := c.bridgeFor(namespace, podName); lent {
 			if vaName != "" && vaName != bridgeFor {
 				logger.V(logging.DEBUG).Info(
 					"a warm pool Pod resolved to a scale target of its own; attributing it to the variant it is lent to",

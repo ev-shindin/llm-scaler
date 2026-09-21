@@ -58,6 +58,7 @@ func collectOne(t *testing.T, podName string, located map[string]string) []metri
 	}
 
 	c := NewReplicaMetricsCollector(mockSource, k8sClient, nil, nil, scalerLocator(located))
+	c.SetBridgeResolver(decision.DefaultBridges)
 	results, err := c.CollectReplicaMetrics(
 		context.Background(), "test-model", bridgeNS,
 		make(map[string]scaletarget.ScaleTargetAccessor),

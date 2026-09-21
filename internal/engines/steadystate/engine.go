@@ -254,12 +254,18 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 		panic(fmt.Sprintf("locator.New: %v", err))
 	}
 
+	// The collector attributes a lent warm-pool Pod to the variant it is lent
+	// to; the lending lives in the decision store, handed in here so the
+	// collector does not read the store itself.
+	replicaCollector := collector.NewReplicaMetricsCollector(promSource, client, apiReader, recorder, podLocator)
+	replicaCollector.SetBridgeResolver(decision.DefaultBridges)
+
 	engine = Engine{
 		client:                  client,
 		scheme:                  scheme,
 		Recorder:                recorder,
 		Config:                  cfg,
-		ReplicaMetricsCollector: collector.NewReplicaMetricsCollector(promSource, client, apiReader, recorder, podLocator),
+		ReplicaMetricsCollector: replicaCollector,
 		ScaleToZeroEnforcer:     allocation.NewEnforcer(requestCountFunc, cfg),
 		GPULimiter:              gpuLimiter,
 		policies:                newPolicyReporter(),

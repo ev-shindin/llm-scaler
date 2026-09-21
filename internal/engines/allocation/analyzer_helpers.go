@@ -40,10 +40,10 @@ func rolesOf(vcs []variantRecord) []string {
 const (
 	// ReasonNoData marks a variant for which the analyzer had no usable input
 	// (no live replicas and no store record).
-	ReasonNoData = "no-data"
+	ReasonNoData = domain.ReasonNoData
 	// ReasonError marks a variant whose capacity could not be resolved due to
 	// an internal analyzer error.
-	ReasonError = "error"
+	ReasonError = domain.ReasonError
 )
 
 // ResultIsInformative reports whether nr carries a usable capacity signal:

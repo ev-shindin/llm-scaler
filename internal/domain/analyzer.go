@@ -21,6 +21,21 @@ type Analyzer interface {
 	Analyze(ctx context.Context, input AnalyzerInput) (*AnalyzerResult, error)
 }
 
+// The two Reason values that mean "this VariantCapacity carries no usable
+// figure". They are named here, at the bottom of the dependency order, so an
+// analyzer can emit them and the optimizer can test for them without either
+// importing the other: the analyzers used to reach into the optimizer package
+// for these two strings, the one upward import in the pipeline.
+const (
+	// ReasonNoData marks a variant for which the analyzer had no usable
+	// measurement this cycle -- no metrics, no rows -- as opposed to a
+	// measurement of zero.
+	ReasonNoData = "no-data"
+	// ReasonError marks a variant whose figure the analyzer could not produce
+	// because something failed, as opposed to being absent.
+	ReasonError = "error"
+)
+
 // AnalyzerConfig is the interface for analyzer-specific configuration.
 // Each analyzer defines its own config type that implements this interface.
 type AnalyzerConfig interface {

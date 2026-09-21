@@ -365,8 +365,12 @@ vet: ## Run go vet against code.
 dashboards-check: ## Fail if a Grafana dashboard has overlapping panels, duplicate ids/titles or the wrong namespace label (CI).
 	python3 hack/check-dashboards.py
 
+.PHONY: check-import-direction
+check-import-direction: ## Fail on a pipeline package importing one above it (the engine-structure proposal, PR #87)
+	@bash hack/check-import-direction.sh
+
 .PHONY: test
-test: manifests generate fmt vet setup-envtest helm ## Run tests.
+test: manifests generate fmt vet setup-envtest helm check-import-direction ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" PATH="$(LOCALBIN):$(PATH)" go test $$(go list ./... | grep -v /e2e | grep -v /benchmark) -coverprofile cover.out
 
 # Creates a multi-node Kind cluster
