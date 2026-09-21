@@ -15,7 +15,6 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/allocation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
@@ -1636,7 +1635,7 @@ func k2SourceLabel(replicas []ReplicaCapacity) string {
 	if label, ok := k2Labels[sorted[medIdx].K2Priority]; ok {
 		return label
 	}
-	return allocation.ReasonError
+	return domain.ReasonError
 }
 
 // median returns the median value from a sorted slice of int64 values.
