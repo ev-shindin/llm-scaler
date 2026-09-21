@@ -1373,6 +1373,34 @@ var _ = Describe("SaturationAnalyzer", func() {
 })
 
 // makeAnalyzerInput creates a standard AnalyzerInput with default config.
+var _ = Describe("fleetOutputLength", func() {
+	roles := map[string]string{"d": domain.RoleDecode, "p": domain.RolePrefill}
+	It("weights each replica's average output by its request rate, so a fresh replica barely moves it", func() {
+		// Three replicas serving ~3400-token outputs at 1.4 req/s and two
+		// fresh ones whose handful of completions average 900 at 0.2 req/s:
+		// the plain mean, 2400, is `xlong`; the rate-weighted one, ~3180,
+		// is `xxlong` -- the shape the fleet is actually serving.
+		rms := []domain.ReplicaMetrics{
+			{VariantName: "d", AvgOutputTokens: 3400, RequestRate: 1.4},
+			{VariantName: "d", AvgOutputTokens: 3400, RequestRate: 1.4},
+			{VariantName: "d", AvgOutputTokens: 3400, RequestRate: 1.4},
+			{VariantName: "d", AvgOutputTokens: 900, RequestRate: 0.2},
+			{VariantName: "d", AvgOutputTokens: 900, RequestRate: 0.2},
+			{VariantName: "p", AvgOutputTokens: 1, RequestRate: 6}, // prefill: not a generating replica
+		}
+		got := fleetOutputLength(rms, roles)
+		Expect(got).To(BeNumerically("~", (3*1.4*3400+2*0.2*900)/(3*1.4+2*0.2), 1e-9))
+		Expect(classifyOutputLength(got)).To(Equal("xxlong"))
+		Expect(classifyOutputLength(2400)).To(Equal("xlong"), "the plain mean would have landed one bucket short")
+	})
+	It("falls back to the plain mean without rates, and to zero without completions", func() {
+		Expect(fleetOutputLength([]domain.ReplicaMetrics{
+			{VariantName: "d", AvgOutputTokens: 1000}, {VariantName: "d", AvgOutputTokens: 3000},
+		}, roles)).To(Equal(2000.0))
+		Expect(fleetOutputLength([]domain.ReplicaMetrics{{VariantName: "d", RequestRate: 2}}, roles)).To(Equal(0.0))
+	})
+})
+
 func makeAnalyzerInput(
 	metrics []domain.ReplicaMetrics,
 	states []domain.VariantReplicaState,

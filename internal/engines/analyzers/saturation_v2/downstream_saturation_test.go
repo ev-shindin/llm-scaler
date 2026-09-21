@@ -43,6 +43,11 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		prefillK1      = 919_449.0 // prefillKv x 0.8, truncated
 		prefillKey     = "test-model|H200|1|prefill|short|q5"
 		decodeKey      = "test-model|H200|1|decode|long|q5"
+		// The throughput window is keyed by the FLEET's output length
+		// (fleetOutputLength: the decode rows' 1000 here, `long`), not the
+		// replica's own -- prefill's own average output is ~1 and says
+		// nothing about the shape. The k2 history stays on the own key.
+		prefillMuKey = "test-model|H200|1|prefill|long|q5"
 	)
 	decode := func(pod string, tokensInUse int64, queue int) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, decodeVariant, tokensInUse, runKvCapacity, queue, 6000, 1000)
@@ -88,7 +93,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		Expect(prefillP(result)).To(Equal(prefillK1),
 			"prefill stays memory-bound: 357 800 resident tokens while decode is full is decode's backlog, not prefill's capacity")
 		Expect(analyzer.computeCapacityHistory).NotTo(HaveKey(prefillKey), "no k2 history for prefill")
-		Expect(analyzer.saturatedThroughput).NotTo(HaveKey(prefillKey), "no mu for prefill")
+		Expect(analyzer.saturatedThroughput).NotTo(HaveKey(prefillMuKey), "no mu for prefill")
 		// Its demand -- 357 800 held plus 30 x 6000 queued at input-only
 		// footprint, 537 800, as for any role without a mu -- is 58 % of the
 		// one replica: under the 0.70 release boundary, so without the hold
@@ -116,8 +121,8 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 
 		Expect(prefillP(result)).To(Equal(357_800.0))
 		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey))
-		Expect(analyzer.saturatedThroughput).To(HaveKey(prefillKey))
-		Expect(analyzer.saturatedThroughput[prefillKey].Max()).To(Equal(4.77))
+		Expect(analyzer.saturatedThroughput).To(HaveKey(prefillMuKey))
+		Expect(analyzer.saturatedThroughput[prefillMuKey].Max()).To(Equal(4.77))
 	})
 
 	It("holds prefill in the band where the engine neither orders nor releases", func() {
@@ -192,7 +197,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 			_, err := analyzer.Analyze(ctx, in)
 			Expect(err).NotTo(HaveOccurred())
 		}
-		Expect(analyzer.saturatedThroughput[prefillKey].Len()).To(Equal(MinThroughputSamplesToOrder))
+		Expect(analyzer.saturatedThroughput[prefillMuKey].Len()).To(Equal(MinThroughputSamplesToOrder))
 
 		By("the floor ordering on it while decode is not saturated")
 		idle := prefill()
@@ -232,7 +237,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		_, err := analyzer.Analyze(ctx, makeAnalyzerInput(drained, states))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(analyzer.computeCapacityHistory).NotTo(HaveKey(prefillKey), "the stale row is still decode's")
-		Expect(analyzer.saturatedThroughput).NotTo(HaveKey(prefillKey))
+		Expect(analyzer.saturatedThroughput).NotTo(HaveKey(prefillMuKey))
 
 		By("and letting the same row record once the window has passed")
 		forget()
@@ -302,7 +307,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		result, err := analyzer.Analyze(ctx, makeAnalyzerInput(inFlight, states))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(analyzer.computeCapacityHistory).To(HaveKey(prefillKey))
-		Expect(analyzer.saturatedThroughput).To(HaveKey(prefillKey))
+		Expect(analyzer.saturatedThroughput).To(HaveKey(prefillMuKey))
 		// Priced by its own reading: k2 = 357 800, the queue as a backlog
 		// against its mu, the resident KV standing -- 100 % of the replica,
 		// above the band's cap of 85 %, so an order, and not held.
@@ -359,7 +364,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(prefillP(result)).To(Equal(357_800.0), "the seeded history, at P2-hist")
 		Expect(analyzer.computeCapacityHistory[prefillKey].Len()).To(Equal(1), "the gated reading was not added to it")
-		Expect(analyzer.saturatedThroughput[prefillKey].Len()).To(Equal(1), "nor to the throughput window")
+		Expect(analyzer.saturatedThroughput[prefillMuKey].Len()).To(Equal(1), "nor to the throughput window")
 	})
 
 	It("does not gate decode on prefill, nor a non-disaggregated fleet on anything", func() {
