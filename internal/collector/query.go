@@ -129,10 +129,10 @@ func (c *ReplicaMetricsCollector) queryReplicaSeries(
 			"modelID", modelID, "namespace", namespace, "engines", engineNames)
 	}
 
-	// Refresh all Prometheus-sourced queries:
+	// Refresh all Prometheus-sourced queries (engine_queries.go lists them):
 	// - Saturation: KV cache, queue length, cache config, prefix cache hit rate
-	// - Shared (saturation + queueing model): avg input tokens, avg output tokens
-	// - Queueing model: scheduler dispatch rate, avg TTFT, avg ITL
+	// - Shared: avg input tokens, avg output tokens
+	// - Per-request timings: avg ITL, avg service time
 	// - Throughput analyzer: generation token rate, instantaneous KV usage (k*), request rate
 	queries := buildEngineQueryList(engines, engineSpecificReplicaQueries, agnosticReplicaQueries)
 

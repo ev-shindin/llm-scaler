@@ -19,12 +19,13 @@ limitations under the License.
 // This package provides ReplicaMetricsCollector which collects replica-level
 // metrics for both saturation analysis and queueing model analysis using the
 // source infrastructure. Saturation metrics (KV cache, queue length, token
-// capacity) and queueing model metrics (scheduler dispatch rate, max batch
-// size) are collected together and exposed via the shared ReplicaMetrics struct.
+// capacity), per-request timings (average ITL, average service time) and the
+// throughput analyzer's rates are collected together and exposed via the
+// shared ReplicaMetrics struct.
 //
 // # Pod label fallback
 //
-// Every series passes through buildInstanceKey (attribute.go), which takes
+// Every replica series passes through buildInstanceKey (attribute.go), which takes
 // the Pod's name from the labels through seriesPodName
 // (pod_serving_state.go) with a two-step fallback: "pod", then "pod_name".
 //
@@ -224,9 +225,10 @@ func (c *ReplicaMetricsCollector) recordMetricsUnavailableEvent(
 // metrics collection fails or returns no data, using edge-triggered emission (only on
 // transitions from available → unavailable) to avoid flooding the event stream.
 //
-// The collected metrics serve both the saturation analyzer and the queueing model analyzer:
+// The collected metrics serve the saturation and throughput analyzers:
 //   - Saturation metrics: KV cache usage, queue length, token capacity, prefix cache hit rate
-//   - Queueing model metrics: scheduler dispatch rate (arrival rate), max batch size
+//   - Per-request timings: average ITL, average service time
+//   - Throughput analyzer: generation token rate, instantaneous KV usage, request rate
 //
 // Parameters:
 //   - ctx: Context for the operation
