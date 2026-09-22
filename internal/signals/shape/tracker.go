@@ -1,21 +1,24 @@
-package throughput
+package shape
 
-// ShapeTracker maintains the current workload shape bucket for one variant and
-// detects when the workload has shifted enough to require a new ITL model fit.
+// Tracker maintains the current workload shape bucket for one variant and
+// detects when the workload has shifted enough that a model fitted on the old
+// shape should be refitted.
 //
 // The shape is characterised by the variant-average (IL, OL) across all replicas.
 // A shape change is declared when either IL or OL deviates from the stored shape
 // by more than the configured tolerance fraction.
-type ShapeTracker struct {
-	current   WorkloadShape
+//
+// Not safe for concurrent use: the owner serialises access.
+type Tracker struct {
+	current   Shape
 	hasShape  bool
 	tolerance float64
 }
 
-// newShapeTracker creates a ShapeTracker with the given fractional tolerance.
+// NewTracker creates a Tracker with the given fractional tolerance.
 // For example, tolerance=0.20 means a ≥20% change in IL or OL triggers a reset.
-func newShapeTracker(tolerance float64) *ShapeTracker {
-	return &ShapeTracker{tolerance: tolerance}
+func NewTracker(tolerance float64) *Tracker {
+	return &Tracker{tolerance: tolerance}
 }
 
 // Observe updates the tracker with the variant-averaged (il, ol, hitRate) for
@@ -27,8 +30,8 @@ func newShapeTracker(tolerance float64) *ShapeTracker {
 // On subsequent calls, changed=true is returned when the new shape falls outside
 // the tolerance band of the stored shape. The stored shape is updated to the new
 // value regardless.
-func (t *ShapeTracker) Observe(il, ol, hitRate float64) (shape WorkloadShape, changed bool) {
-	next := newWorkloadShape(il, ol, hitRate)
+func (t *Tracker) Observe(il, ol, hitRate float64) (shape Shape, changed bool) {
+	next := New(il, ol, hitRate)
 
 	if !t.hasShape {
 		t.current = next
@@ -42,14 +45,14 @@ func (t *ShapeTracker) Observe(il, ol, hitRate float64) (shape WorkloadShape, ch
 }
 
 // Current returns the most recently stored shape and whether any shape has been
-// observed yet. Returns (zero WorkloadShape, false) before the first Observe call.
-func (t *ShapeTracker) Current() (WorkloadShape, bool) {
+// observed yet. Returns (zero Shape, false) before the first Observe call.
+func (t *Tracker) Current() (Shape, bool) {
 	return t.current, t.hasShape
 }
 
 // Reset clears the stored shape, as if the tracker had just been created.
 // The next Observe call will set a fresh shape without triggering a change event.
-func (t *ShapeTracker) Reset() {
-	t.current = WorkloadShape{}
+func (t *Tracker) Reset() {
+	t.current = Shape{}
 	t.hasShape = false
 }

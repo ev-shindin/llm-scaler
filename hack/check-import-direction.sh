@@ -33,7 +33,7 @@ layer_of() {
         internal/engines/steadystate|internal/engines/scalefromzero) echo 7 ;;
         internal/engines/allocation|internal/engines/allocation/*) echo 5 ;;
         internal/engines/analyzers/*|internal/engines/executor|internal/engines/variantmeta) echo 4 ;;
-        internal/engines/aggregation|internal/engines/common) echo 3 ;;
+        internal/engines/aggregation|internal/engines/common|internal/signals/*) echo 3 ;;
         internal/collector|internal/collector/*) echo 2 ;;
         internal/actuator|internal/scaler|internal/registry) echo 2 ;;
         internal/decision) echo 1 ;;

@@ -1,4 +1,4 @@
-package saturation_v2
+package capacity
 
 import (
 	. "github.com/onsi/ginkgo/v2"
@@ -9,7 +9,7 @@ var _ = Describe("Rolling Average", func() {
 
 	Describe("Add and Average", func() {
 		It("should compute the mean of added values", func() {
-			ra := newRollingAverage(5)
+			ra := NewRollingAverage(5)
 			ra.Add(10)
 			ra.Add(20)
 			ra.Add(30)
@@ -21,7 +21,7 @@ var _ = Describe("Rolling Average", func() {
 
 	Describe("Window eviction", func() {
 		It("should evict oldest values when window is full", func() {
-			ra := newRollingAverage(3)
+			ra := NewRollingAverage(3)
 			ra.Add(1)
 			ra.Add(2)
 			ra.Add(3)
@@ -33,7 +33,7 @@ var _ = Describe("Rolling Average", func() {
 		})
 
 		It("raises the last value, never a lower one, and reports it", func() {
-			ra := newRollingAverage(3)
+			ra := NewRollingAverage(3)
 			Expect(ra.Last()).To(Equal(0.0), "empty")
 			ra.Add(1.5)
 			ra.RaiseLast(1.2)
@@ -49,7 +49,7 @@ var _ = Describe("Rolling Average", func() {
 
 	Describe("Empty average", func() {
 		It("should return 0 for an empty rolling average", func() {
-			ra := newRollingAverage(5)
+			ra := NewRollingAverage(5)
 			Expect(ra.Average()).To(Equal(0.0))
 			Expect(ra.Len()).To(Equal(0))
 		})
@@ -57,7 +57,7 @@ var _ = Describe("Rolling Average", func() {
 
 	Describe("Single value", func() {
 		It("should return the value itself as the average", func() {
-			ra := newRollingAverage(5)
+			ra := NewRollingAverage(5)
 			ra.Add(42)
 
 			Expect(ra.Average()).To(Equal(42.0))
@@ -67,7 +67,7 @@ var _ = Describe("Rolling Average", func() {
 
 	Describe("Large window with overflow", func() {
 		It("should retain only the last maxSize values", func() {
-			ra := newRollingAverage(RollingAverageWindowSize)
+			ra := NewRollingAverage(RollingAverageWindowSize)
 			for i := 1; i <= 15; i++ {
 				ra.Add(float64(i))
 			}

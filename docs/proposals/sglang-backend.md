@@ -48,8 +48,8 @@ WVA bakes vLLM into four distinct layers:
 |---|-------|----------|----------------------|
 | 1 | Metric name constants | `internal/constants/metrics.go` | All `vllm:*` names |
 | 2 | PromQL query templates | `internal/collector/registration/*.go` | `vllm:*` names baked into templates |
-| 3 | Deployment arg parser | `internal/engines/analyzers/saturation_v2/deployment_parser.go` | `ParseVLLMArgs`, vLLM CLI flags |
-| 4 | KV-cache config gauge | `vllm:cache_config_info` (consumed in `replica_metrics.go` / `capacity_store.go`) | vLLM info-gauge → token capacity |
+| 3 | Deployment arg parser | `internal/signals/capacity/deployment_parser.go` (was `saturation_v2/`) | `ParseVLLMArgs`, vLLM CLI flags |
+| 4 | KV-cache config gauge | `vllm:cache_config_info` (consumed in `replica_metrics.go` / `signals/capacity/store.go`) | vLLM info-gauge → token capacity |
 
 The query layer already has a clean seam: queries are registered as named
 `source.QueryTemplate`s in a `QueryList` and refreshed by name. What is missing is a way to

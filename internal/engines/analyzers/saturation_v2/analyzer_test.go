@@ -257,7 +257,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			analyzer.mu.Lock()
 			Expect(analyzer.computeCapacityHistory).NotTo(BeEmpty())
 			for _, ra := range analyzer.computeCapacityHistory {
-				ra.lastUpdated = time.Now().Add(-2 * HistoryEvictionTimeout)
+				ra.TouchAt(time.Now().Add(-2 * HistoryEvictionTimeout))
 			}
 			analyzer.mu.Unlock()
 

@@ -1,4 +1,4 @@
-package saturation_v2
+package capacity
 
 import (
 	"sync"
@@ -13,17 +13,17 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-var _ = Describe("CapacityKnowledgeStore", func() {
+var _ = Describe("Store", func() {
 
-	var store *CapacityKnowledgeStore
+	var store *Store
 
 	BeforeEach(func() {
-		store = NewCapacityKnowledgeStore()
+		store = NewStore()
 	})
 
 	Describe("Store and retrieve", func() {
 		It("should store and retrieve a capacity record by namespace/model/variant", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				NumGpuBlocks:          1000,
@@ -42,11 +42,11 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 		})
 
 		It("should keep records separate across namespaces", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				TotalKvCapacityTokens: 16000,
 				LearnedFrom:           "live",
 			})
-			store.Update("ns-2", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-2", "model-a", "variant-h100", Record{
 				TotalKvCapacityTokens: 32000,
 				LearnedFrom:           "live",
 			})
@@ -107,7 +107,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 		})
 
 		It("should not overwrite live data with deployment data", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				TotalKvCapacityTokens: 16000,
 				LearnedFrom:           "live",
 			})
@@ -159,17 +159,17 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 		})
 
 		It("should report fresh records as not stale", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{LearnedFrom: "live"})
+			store.Update("ns-1", "model-a", "variant-h100", Record{LearnedFrom: "live"})
 			Expect(store.IsStale("ns-1", "model-a", "variant-h100")).To(BeFalse())
 		})
 
 		It("should report old records as stale", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{LearnedFrom: "live"})
+			store.Update("ns-1", "model-a", "variant-h100", Record{LearnedFrom: "live"})
 
 			// Manually age the record
 			store.mu.Lock()
 			rec := store.records[storeKey("ns-1", "model-a", "variant-h100")]
-			rec.LearnedAt = time.Now().Add(-CapacityStalenessTimeout - time.Minute)
+			rec.LearnedAt = time.Now().Add(-StalenessTimeout - time.Minute)
 			store.mu.Unlock()
 
 			Expect(store.IsStale("ns-1", "model-a", "variant-h100")).To(BeTrue())
@@ -184,7 +184,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
-					store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+					store.Update("ns-1", "model-a", "variant-h100", Record{
 						TotalKvCapacityTokens: int64(i * 1000),
 						LearnedFrom:           "live",
 					})
@@ -209,12 +209,12 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 	Describe("Cross-variant lookup", func() {
 		It("should keep separate records for the same model on different variants", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				AcceleratorName:       "H100",
 				TotalKvCapacityTokens: 32000,
 				LearnedFrom:           "live",
 			})
-			store.Update("ns-1", "model-a", "variant-a100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-a100", Record{
 				AcceleratorName:       "A100",
 				TotalKvCapacityTokens: 16000,
 				LearnedFrom:           "live",
@@ -234,7 +234,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should find a compatible record from another variant", func() {
 			params := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100-1", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100-1", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -251,7 +251,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should not match across different accelerator types", func() {
 			params := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -267,7 +267,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should not match across different GPU counts", func() {
 			params := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100-1gpu", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100-1gpu", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -283,7 +283,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should not match across different engine parameters", func() {
 			params1 := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100-high-util", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100-high-util", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -301,7 +301,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should match across different namespaces (capacity is hardware-dependent)", func() {
 			params := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -318,7 +318,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should not match across different models", func() {
 			params := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -335,7 +335,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 		It("should prefer live records over deployment-derived records", func() {
 			params := defaultParams()
 
-			store.Update("ns-1", "model-a", "variant-h100-deploy", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100-deploy", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 30000,
@@ -343,7 +343,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 				EngineParams:          params,
 				LearnedFrom:           "deployment",
 			})
-			store.Update("ns-1", "model-a", "variant-h100-live", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100-live", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,
@@ -360,7 +360,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 
 		It("should skip records with no useful capacity data", func() {
 			params := defaultParams()
-			store.Update("ns-1", "model-a", "variant-h100-empty", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100-empty", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				EngineParams:          params,
@@ -374,7 +374,7 @@ var _ = Describe("CapacityKnowledgeStore", func() {
 		})
 
 		It("should return nil when nil params are provided", func() {
-			store.Update("ns-1", "model-a", "variant-h100", CapacityRecord{
+			store.Update("ns-1", "model-a", "variant-h100", Record{
 				AcceleratorName:       "H100",
 				GpuCount:              1,
 				TotalKvCapacityTokens: 32000,

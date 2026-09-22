@@ -1246,7 +1246,7 @@ func observeAccelerators(cfg *config.Config) variantmeta.ObserveAccelerators {
 	// pool, so with no limiter the observation buys nothing and the cluster-scoped
 	// node read can be skipped. The budgeting half of that is true. The rest is not
 	// — accelerator identity is also how the V2 capacity store keys learned
-	// capacity (saturation_v2/capacity_store.go:171 matches on AcceleratorName
+	// capacity (signals/capacity: FindCompatible matches on AcceleratorName
 	// before reusing a record), so leaving it unresolved denies a variant its own
 	// prior capacity knowledge and any compatible variant's.
 	//

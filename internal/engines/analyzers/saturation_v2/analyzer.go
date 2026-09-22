@@ -16,6 +16,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 // SaturationAnalyzer implements the domain.Analyzer interface using a
@@ -59,7 +60,8 @@ type SaturationAnalyzer struct {
 	// saturatedThroughput stores rolling averages of the per-replica completion
 	// rate (requests/s) observed while the replica's queue was saturated, keyed
 	// exactly like computeCapacityHistory. It is what the throughput floor
-	// (throughput_floor.go) divides the arrival rate by: k2 says how much KV a
+	// (signals/floor, applied in throughput_floor.go) divides the arrival rate
+	// by: k2 says how much KV a
 	// saturated replica HOLDS, this says how fast it COMPLETES, and only the
 	// latter tells how many replicas a given arrival rate needs.
 	saturatedThroughput map[string]*rollingAverage
@@ -128,7 +130,7 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	defer a.mu.Unlock()
 	evicted := 0
 	for key, ra := range a.computeCapacityHistory {
-		if time.Since(ra.lastUpdated) > timeout {
+		if ra.Stale(timeout) {
 			delete(a.computeCapacityHistory, key)
 			evicted++
 		}
@@ -141,7 +143,7 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	// The saturated-throughput windows live and die with the k2 windows they
 	// were recorded beside: same key, same observation, same timeout.
 	for key, ra := range a.saturatedThroughput {
-		if time.Since(ra.lastUpdated) > timeout {
+		if ra.Stale(timeout) {
 			delete(a.saturatedThroughput, key)
 			delete(a.throughputSampledAt, key)
 			delete(a.throughputLastRead, key)
@@ -260,7 +262,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	roleDemand := a.aggregateRoleDemand(variantCapacities, queueDemand.byRole)
 
 	// Floor the demand at what the load requires in THROUGHPUT
-	// (throughput_floor.go).
+	// (signals/floor, applied in throughput_floor.go).
 	//
 	// Everything above measures occupancy, which falls as capacity rises: a
 	// fleet that is keeping up looks idle, and the target follows the signal
@@ -417,12 +419,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// what one of this variant's replicas does. The window keeps a max, so
 	// one such reading would price the whole variant for the rest of the
 	// window; the read side already leaves bridges out
-	// (estimateThroughputDemand), and the write side has to match it.
+	// (floor.Estimate), and the write side has to match it.
 	//
 	// Recorded and read under the FLEET's output-length bucket, not this
 	// replica's. The k2 key above is the replica's own, and rightly: its
 	// occupancy is its own. Its throughput is priced per role, as the median
-	// over the role's replicas (estimateThroughputDemand), and a median over
+	// over the role's replicas (floor.Estimate), and a median over
 	// readings from different buckets is a reading of nothing. A replica's
 	// own average output length is a few minutes of its own completions,
 	// and at a shape switch that is noise: a fresh replica's first
@@ -756,7 +758,7 @@ func (a *SaturationAnalyzer) computeK2(
 			a.mu.Lock()
 			ra, ok := a.computeCapacityHistory[historyKey]
 			if !ok || ra.Stale(HistoryEvictionTimeout) {
-				ra = newRollingAverage(RollingAverageWindowSize)
+				ra = capacity.NewRollingAverage(RollingAverageWindowSize)
 				a.computeCapacityHistory[historyKey] = ra
 			}
 			ra.Add(float64(k2Observed))
@@ -1643,8 +1645,8 @@ func k2SourceLabel(replicas []ReplicaCapacity) string {
 //
 // Averages the central pair on an even count: this blends learned
 // per-replica capacities, where every reading is trusted and the midpoint is
-// the better estimate. medianFloat in throughput_floor.go follows the same
-// convention for the same reason.
+// the better estimate. The floor's median follows the same convention for
+// the same reason.
 func median(values []int64) int64 {
 	n := len(values)
 	if n == 0 {

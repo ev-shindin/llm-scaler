@@ -87,7 +87,8 @@ DECISION_MSG = "Applied saturation decision via shared cache"
 K2_MSG = "k2-decision"
 RC_MSG = "replica-capacity-decision"
 SQ_MSG = "scheduler-queue-demand"
-# The throughput floor (saturation_v2/throughput_floor.go). TFLOOR_MSG fires
+# The throughput floor (signals/floor, applied in saturation_v2/throughput_floor.go).
+# TFLOOR_MSG fires
 # only when the floor actually changes demand, so its presence in a dump marks
 # the cycles where the fleet was sized by throughput -- held at, or ordered up
 # to, (lambda + backlog / drain) / mu replicas -- rather than by occupancy: the
