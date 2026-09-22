@@ -23,7 +23,7 @@ type podServingState struct {
 	// startedAt is when the kubelet started the Pod, zero when it has not yet
 	// (or the field is unset). It bounds how long any request this Pod reports
 	// can possibly have taken -- see podUptime, and the guard in
-	// collectReplicaMetrics that spends it.
+	// attributeInstance that spends it.
 	startedAt time.Time
 }
 

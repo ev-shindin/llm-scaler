@@ -279,9 +279,10 @@ Registers three PromQL templates exclusive to the throughput analyzer:
 `RegisterThroughputAnalyzerQueries` must be called once at startup alongside
 `RegisterSaturationQueries` and `RegisterQueueingModelQueries`.
 
-**Metrics Collector (`internal/collector/replica_metrics.go`)**  
-Populates all `interfaces.ReplicaMetrics` fields in a single `Refresh()` call covering all
-12 registered queries. The three TA-exclusive fields are:
+**Metrics Collector (`internal/collector/`)**  
+Populates all `interfaces.ReplicaMetrics` fields in a single `Refresh()` call covering the
+eleven per-replica queries `engine_queries.go` lists (`query.go` fetches, `extract.go` reads the series per instance,
+`attribute.go` builds the rows, `replica_metrics.go` sequences them). The three TA-exclusive fields are:
 `GenerationTokenRate`, `KvUsageInstant`, `RequestRate`.
 The remaining TA fields (`TotalKvCapacityTokens`, `AvgITL`, `AvgOutputTokens`, `AvgInputTokens`,
 `PrefixCacheHitRate`, `ArrivalRate`) are populated by the other registrations in
@@ -392,7 +393,7 @@ On leader failover the incoming leader starts with an empty analyzer. During war
        │ inference_extension_flow_control_*      (QuerySchedulerQueueSize    → QueueSize)
        ↓
 ┌─────────────────────────┐
-│ ReplicaMetricsCollector │  ← internal/collector/replica_metrics.go
+│ ReplicaMetricsCollector │  ← internal/collector/ (replica_metrics.go sequences query/extract/attribute)
 │ CollectReplicaMetrics() │     single Refresh() call, 12 queries
 └──────┬──────────────────┘
        │ []interfaces.ReplicaMetrics + SchedulerQueueMetrics
