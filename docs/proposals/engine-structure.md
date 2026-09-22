@@ -305,7 +305,7 @@ by the benchmark scorecard on the two shape-swap traces (runs 16 and 18 of
 2026-09-20 are the fixed references: any stage that moves their windowed
 p95 or target path has changed behaviour and stops).
 
-1. **`signals`** -- done in PR #89, the shims removed after it. Move `ShapeTracker`,
+1. **`signals`** -- done in PR #89, finished in #91. Move `ShapeTracker`,
    `ObservationWindow` and `ITLModel` out of `throughput`, and
    `rollingAverage`, the capacity store (k1/k2, history, eviction) and the
    floor's arithmetic (`estimateThroughputDemand`, `medianFloat`,
@@ -317,13 +317,26 @@ p95 or target path has changed behaviour and stops).
    directory first would turn stage 4's rebase into a conflict; the check
    already ranks it at the signals layer, the moved code keeps importing it
    at its current path, and it moves under `signals` after stage 4.
-   Analyzers keep working unchanged, importing the moved code. What
-   landed: `signals/shape`, `signals/itl`, `signals/capacity` (the store,
-   its window, the engine-arg parsers, `ReplicaCapacity` and `K2Source`)
-   and `signals/floor`; the analyzers name them by package, and the one
-   alias left is `saturation_v2.CapacityKnowledgeStore` with its
-   constructor, which `steadystate/engine.go` reads until stage 3 touches
-   that file.
+   Analyzers keep working: their behaviour is unchanged, and they name the
+   moved code by its package. What landed: `signals/shape`
+   (`ShapeTracker` is `shape.Tracker`), `signals/itl` (`ObservationWindow`
+   is `itl.Window`, `ITLModel` is `itl.Model`), `signals/capacity`
+   (`rollingAverage` is `capacity.RollingAverage`, with the store, the
+   engine-arg parsers, `ReplicaCapacity` and `K2Source`) and
+   `signals/floor` (`estimateThroughputDemand` is `floor.Estimate`,
+   `throughputFloor` and its terms are `floor.Floor` and `floor.Term`).
+   #91 removed the transitional aliases, `steadystate/engine.go`
+   included: no alias is left.
+
+   Two things stage 3 inherits. The per-replica row `capacity.ReplicaCapacity`
+   is the input the proposal's plugin table says the builder hands every
+   analyzer -- but `AnalyzerInput` lives in `domain`, the bottom layer, so
+   stage 3 either moves the row (and `capacity.Record`) into `domain` or
+   moves `AnalyzerInput` up into `analyze`; the check forbids the third
+   option. And `floor.Estimate` reads five of that row's sixteen fields
+   and none of its capacity fields, so a five-field reading projected by
+   the analyzer would remove `floor`'s dependency on `capacity`
+   altogether.
 2. **Cut the upward edge, and make the direction a rule** -- done in
    PR #88. `ReasonError` and `ReasonNoData` are `domain` constants,
    aliased under their old names in `allocation` (`ResultIsInformative`
