@@ -339,9 +339,13 @@ p95 or target path has changed behaviour and stops).
    with the three fixes from the review above; then **`plan/optimize` and
    `plan/limit`** from `allocation`, the composite into `analyze/combine`,
    and `analyzer_helpers.go` to `analyze`.
-5. **Collector by concern**: `replica_metrics.go` → `query.go`,
-   `collapse.go`, `attribute.go`, `freshness.go` (the sub-packages are
-   already right).
+5. **Collector by concern** -- done. `replica_metrics.go` keeps
+   the type, the cycle and the sequencing; the 850-line collection became
+   four phases in four files: `query.go` (fetch, merge, filter),
+   `extract.go` (series → per-instance data), `attribute.go` (instance →
+   the row the analyzers read, or why not), `freshness.go`; `pod_collapse.go`
+   already held the per-Pod merge (the sub-packages were already right).
+   Same statements, moved.
 6. **Comment policy**, applied file by file as each is touched: contract
    at the top, the measured history moved to
    `docs/developer-guide/analyzer-evidence.md` with its date and pass.

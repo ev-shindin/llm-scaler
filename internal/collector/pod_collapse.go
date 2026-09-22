@@ -193,8 +193,3 @@ func mergeMetadata(group []domain.ReplicaMetrics) *domain.ReplicaMetricsMetadata
 	}
 	return merged
 }
-
-// freshnessSeverity orders freshness statuses from best to worst, so both the
-// per-instance rollup in collectReplicaMetrics and the pod merge above can pick
-// the single worst status across a set of metrics.
-var freshnessSeverity = map[string]int{"fresh": 0, "stale": 1, "unavailable": 2, "missing": 3}
