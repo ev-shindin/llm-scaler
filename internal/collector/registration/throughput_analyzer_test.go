@@ -122,7 +122,7 @@ var _ = Describe("RegisterThroughputAnalyzerQueries", func() {
 // because every one of them builds AnalyzerInput in Go with the field already
 // populated. Only a live run surfaced it.
 var _ = Describe("arrival-rate query registration", func() {
-	It("registers lambda's sources without the throughput analyzer", func() {
+	It("registers the floor's rate sources without the throughput analyzer", func() {
 		reg := source.NewSourceRegistry()
 		Expect(reg.Register("prometheus", prometheus.NewPrometheusSource(
 			context.Background(), &mockPrometheusAPI{}, prometheus.DefaultPrometheusSourceConfig()))).To(Succeed())
@@ -136,6 +136,17 @@ var _ = Describe("arrival-rate query registration", func() {
 		Expect(ql.Get(QueryRequestRate)).NotTo(BeNil(),
 			"nor the completion-rate fallback it degrades to")
 		Expect(ql.Get(EngineQuery(inferenceengine.EngineSGLang, QueryRequestRate))).NotTo(BeNil(),
+			"including on SGLang")
+
+		// The saturation analyzer's floor prices mu from generated tokens over
+		// the shape's output length, so this is as load-bearing for it as
+		// lambda is, and as invisible when it is missing: left registered only
+		// with the opt-in throughput analyzer, the field was structurally zero
+		// and the floor recorded nothing for a whole benchmark run -- 21
+		// saturated cycles, no window, no floor, measured 2026-09-22.
+		Expect(ql.Get(QueryGenerationTokenRate)).NotTo(BeNil(),
+			"mu's source must not depend on the throughput analyzer either")
+		Expect(ql.Get(EngineQuery(inferenceengine.EngineSGLang, QueryGenerationTokenRate))).NotTo(BeNil(),
 			"including on SGLang")
 	})
 
