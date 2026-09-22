@@ -7,6 +7,7 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 // pricedReplica is one live row with a capacity the caller chooses, so that a
@@ -14,15 +15,15 @@ import (
 // helper in warmpool_bridge_test.go fixes every row at the same capacity, which
 // is what the count-focused tests there want and precisely what these cannot
 // use: a blended median is invisible when every row reads the same.
-func pricedReplica(pod string, demand, capacity int64, fromPool bool) ReplicaCapacity {
-	return ReplicaCapacity{
+func pricedReplica(pod string, demand, tokens int64, fromPool bool) capacity.ReplicaCapacity {
+	return capacity.ReplicaCapacity{
 		PodName:               pod,
 		VariantName:           "variant-a",
 		TokensInUse:           demand,
-		TotalKvCapacityTokens: capacity,
-		MemoryBoundCapacity:   capacity,
-		ComputeBoundCapacity:  capacity,
-		EffectiveCapacity:     capacity,
+		TotalKvCapacityTokens: tokens,
+		MemoryBoundCapacity:   tokens,
+		ComputeBoundCapacity:  tokens,
+		EffectiveCapacity:     tokens,
 		ReplicaDemand:         demand,
 		FromWarmPool:          fromPool,
 	}
@@ -43,12 +44,12 @@ func pricedReplica(pod string, demand, capacity int64, fromPool bool) ReplicaCap
 // One own replica and one bridge is the worst case, and the one used here: a
 // two-element median is the average of the two, so the whole gap lands in P.
 func TestABridgeDoesNotSetTheVariantsPerReplicaPrice(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
 	own := pricedReplica("variant-a-0", 100, 1000, false)
 	bridge := pricedReplica("pool-0", 100, 600, true)
 
-	got := a.aggregateByVariant([]ReplicaCapacity{own, bridge},
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{own, bridge},
 		nil, oneVariantState(1), "model", "ns", 0.9, logr.Discard())
 
 	if len(got) != 1 {
@@ -81,9 +82,9 @@ func TestABridgeDoesNotSetTheVariantsPerReplicaPrice(t *testing.T) {
 // measurements -- and every derived capacity belongs to the capacity-build step.
 // A derived value written inside one analyzer is absent from the other two.
 func TestTheAnalyzerLeavesTheDerivedBridgeCapacityToTheBuilder(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
-	got := a.aggregateByVariant([]ReplicaCapacity{
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{
 		pricedReplica("variant-a-0", 100, 1000, false),
 		pricedReplica("pool-0", 100, 600, true),
 	}, nil, oneVariantState(1), "model", "ns", 0.9, logr.Discard())
@@ -110,9 +111,9 @@ func TestTheAnalyzerLeavesTheDerivedBridgeCapacityToTheBuilder(t *testing.T) {
 // per-replica capacity is <= 0, so a variant a bridge is currently carrying
 // would stop being scaled at all, exactly while it is short.
 func TestAVariantCarriedOnlyByABridgeIsStillPriced(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
-	got := a.aggregateByVariant([]ReplicaCapacity{
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{
 		pricedReplica("pool-0", 400, 600, true),
 	}, nil, oneVariantState(0), "model", "ns", 0.9, logr.Discard())
 
@@ -135,7 +136,7 @@ func TestAVariantCarriedOnlyByABridgeIsStillPriced(t *testing.T) {
 // what the in-flight scale-up is about to deliver, and anticipated supply exists
 // precisely to stop a second scale-up being ordered while the first is booting.
 func TestAnticipatedSupplyIsPricedAtTheOwnReading(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
 	states := []domain.VariantReplicaState{{
 		VariantName:     "variant-a",
@@ -144,7 +145,7 @@ func TestAnticipatedSupplyIsPricedAtTheOwnReading(t *testing.T) {
 		GPUsPerReplica:  1,
 	}}
 
-	got := a.aggregateByVariant([]ReplicaCapacity{
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{
 		pricedReplica("variant-a-0", 100, 1000, false),
 		pricedReplica("pool-0", 100, 600, true),
 	}, nil, states, "model", "ns", 0.9, logr.Discard())

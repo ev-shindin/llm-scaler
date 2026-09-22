@@ -12,6 +12,8 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
 )
 
 // makeMetrics builds a slice of healthy ReplicaMetrics for a single variant,
@@ -122,8 +124,8 @@ var _ = Describe("ThroughputAnalyzer", func() {
 			}
 
 			state, _ := analyzer.VariantState(modelID, namespace, "v1")
-			Expect(state.SampleCount).To(BeNumerically(">=", DefaultMinSamples))
-			Expect(state.KSpread).To(BeNumerically(">=", DefaultMinKSpread))
+			Expect(state.SampleCount).To(BeNumerically(">=", itl.DefaultMinSamples))
+			Expect(state.KSpread).To(BeNumerically(">=", itl.DefaultMinKSpread))
 			Expect(state.ObservationReady).To(BeTrue())
 		})
 	})
@@ -2002,11 +2004,11 @@ var _ = Describe("ThroughputAnalyzer", func() {
 })
 
 var _ = Describe("computeLocalDemand", func() {
-	shape := WorkloadShape{
+	shape := shape.Shape{
 		AvgOutputTokens: 50, // above DefaultMinDecodeOLForLocalDemand
 		KVreq:           1024,
 	}
-	model := ITLModel{A: 0.073, B: 0.006}
+	model := itl.Model{A: 0.073, B: 0.006}
 
 	replicaAt := func(k float64) domain.ReplicaMetrics {
 		return domain.ReplicaMetrics{
@@ -2034,7 +2036,7 @@ var _ = Describe("computeLocalDemand", func() {
 	})
 
 	It("skips a replica whose model produces a NaN ITL", func() {
-		nanModel := ITLModel{A: math.NaN(), B: 0.006}
+		nanModel := itl.Model{A: math.NaN(), B: 0.006}
 		total := computeLocalDemand([]domain.ReplicaMetrics{replicaAt(0.5)}, shape, nanModel)
 		Expect(total).To(Equal(0.0))
 	})
@@ -2052,7 +2054,7 @@ var _ = Describe("computeLocalDemand", func() {
 	It("skips a replica whose model produces a finite non-positive ITL", func() {
 		// B negative enough that A*k+B <= 0 at k=0.5 without A or B being NaN/Inf —
 		// distinct from the existing NaN-ITL case, which uses a NaN model coefficient.
-		negativeITLModel := ITLModel{A: 0.01, B: -0.1}
+		negativeITLModel := itl.Model{A: 0.01, B: -0.1}
 		Expect(negativeITLModel.ITLAt(0.5)).To(BeNumerically("<=", 0), "fixture sanity check")
 		total := computeLocalDemand([]domain.ReplicaMetrics{replicaAt(0.5)}, shape, negativeITLModel)
 		Expect(total).To(Equal(0.0))
@@ -2136,7 +2138,7 @@ var _ = Describe("aggregateRoleDemand", func() {
 })
 
 var _ = Describe("computeVariantSupply", func() {
-	shape := WorkloadShape{KVreq: 1024}
+	shape := shape.Shape{KVreq: 1024}
 	const itlSat = 0.05
 
 	replicaWithCap := func(capTokens int64) domain.ReplicaMetrics {
@@ -2152,7 +2154,7 @@ var _ = Describe("computeVariantSupply", func() {
 			shape, itlSat)
 		Expect(nKV).To(Equal(2))
 		// Σ_r DefaultKSat × KV_max_r / KVreq / itlSat over the KV-capable replicas.
-		Expect(total).To(BeNumerically("~", DefaultKSat*(65536+131072)/shape.KVreq/itlSat, 1e-6))
+		Expect(total).To(BeNumerically("~", itl.DefaultKSat*(65536+131072)/shape.KVreq/itlSat, 1e-6))
 		Expect(perReplica).To(BeNumerically("~", total/2, 1e-9))
 	})
 

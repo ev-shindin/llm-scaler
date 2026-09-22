@@ -21,11 +21,19 @@ const (
 	K2SrcFallback                       // fallback to k1 (memory-bound)
 )
 
-// K2Labels is the log label of each K2Source; the labels are what the k2
-// decision log line and the analyzer result's Reason carry.
-var K2Labels = map[K2Source]string{
-	K2SrcObserved:   "P1-obs",
-	K2SrcHistorical: "P2-hist",
-	K2SrcDerived:    "P3-k2",
-	K2SrcFallback:   "P4-k1",
+// String is the log label of a K2Source; the labels are what the k2 decision
+// log line and the analyzer result's Reason carry. Empty for a source that is
+// none of the four.
+func (s K2Source) String() string {
+	switch s {
+	case K2SrcObserved:
+		return "P1-obs"
+	case K2SrcHistorical:
+		return "P2-hist"
+	case K2SrcDerived:
+		return "P3-k2"
+	case K2SrcFallback:
+		return "P4-k1"
+	}
+	return ""
 }

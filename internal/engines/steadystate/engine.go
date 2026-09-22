@@ -54,6 +54,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/variant"
@@ -124,7 +125,7 @@ type Engine struct {
 	saturationV2Analyzer domain.Analyzer
 
 	// capacityStore is shared with the V2 analyzer for caching capacity knowledge.
-	capacityStore *saturation_v2.CapacityKnowledgeStore
+	capacityStore *capacity.Store
 
 	// lastGoodAnalysis records, per model (keyed by utils.GetNamespacedKey(namespace,
 	// modelID)) and analyzer name, the AnalyzedAt of the most recent informative
@@ -235,7 +236,7 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 		return registration.CollectModelRequestCountForEngine(ctx, promSource, engine, modelID, namespace, retentionPeriod)
 	}
 
-	capacityStore := saturation_v2.NewCapacityKnowledgeStore()
+	capacityStore := capacity.NewStore()
 	satV2 := saturation_v2.NewSaturationAnalyzer(capacityStore)
 
 	// Initialize with default optimizer. The actual optimizer is selected

@@ -5,6 +5,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 // Figures from the shape-swap P/D run (biran-20260915-102548-571), H200,
@@ -26,10 +27,10 @@ var _ = Describe("Estimate", func() {
 	}
 	// Readings from the variant's own bucket with enough samples to order;
 	// the specs on holding build their own.
-	replicas := func(n int) []ReplicaCapacity {
-		out := make([]ReplicaCapacity, 0, n)
+	replicas := func(n int) []capacity.ReplicaCapacity {
+		out := make([]capacity.ReplicaCapacity, 0, n)
 		for i := 0; i < n; i++ {
-			out = append(out, ReplicaCapacity{VariantName: "v", SaturatedThroughput: runMu,
+			out = append(out, capacity.ReplicaCapacity{VariantName: "v", SaturatedThroughput: runMu,
 				SaturatedThroughputSamples: MinThroughputSamplesToOrder})
 		}
 		return out
@@ -79,16 +80,16 @@ var _ = Describe("Estimate", func() {
 		// The shape-swap benchmark's phase 2 starts exactly so: the 4000-token
 		// shape reads the 1000-token shape's mu until it has its own. Borrowed
 		// readings hold the fleet at its size and no more.
-		borrowed := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 2.67, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true}
-		f := Estimate(runLambda, []ReplicaCapacity{borrowed}, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
+		borrowed := capacity.ReplicaCapacity{VariantName: "v", SaturatedThroughput: 2.67, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true}
+		f := Estimate(runLambda, []capacity.ReplicaCapacity{borrowed}, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", runLambda/2.67, 1e-6), "the uncapped figure is reported")
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*float64(runK1), 1e-6), "capped at scaleUp x one replica")
 		Expect(f.Terms[domain.RoleDecode].Held).To(BeTrue())
 		Expect(f.Terms[domain.RoleDecode].HeldWhy).To(Equal("borrowed"))
 
 		By("ordering once one replica has a reading of its own")
-		own := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 2.67, SaturatedThroughputSamples: MinThroughputSamplesToOrder}
-		g := Estimate(runLambda, []ReplicaCapacity{borrowed, own}, variants(domain.RoleDecode, 2), nil, BacklogDrainSeconds, 0.85)
+		own := capacity.ReplicaCapacity{VariantName: "v", SaturatedThroughput: 2.67, SaturatedThroughputSamples: MinThroughputSamplesToOrder}
+		g := Estimate(runLambda, []capacity.ReplicaCapacity{borrowed, own}, variants(domain.RoleDecode, 2), nil, BacklogDrainSeconds, 0.85)
 		Expect(g.Terms[domain.RoleDecode].Held).To(BeFalse())
 		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/2.67*float64(runK1), 1e-6))
 	})
@@ -99,7 +100,7 @@ var _ = Describe("Estimate", func() {
 		// over-provisioned fleet never saturates again to correct it.
 		// Letting one reading order one replica was tried and dropped: a
 		// ratchet across starts, and one cycle's worth of benefit measured.
-		one := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu / 2, SaturatedThroughputSamples: 1}}
+		one := []capacity.ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu / 2, SaturatedThroughputSamples: 1}}
 		f := Estimate(runLambda, one, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", 2.22, 0.01))
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*float64(runK1), 1e-6),
@@ -113,7 +114,7 @@ var _ = Describe("Estimate", func() {
 		Expect(pend.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*300, 1e-6))
 
 		By("ordering from the second reading on")
-		two := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu / 2, SaturatedThroughputSamples: 2}}
+		two := []capacity.ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu / 2, SaturatedThroughputSamples: 2}}
 		g := Estimate(runLambda, two, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85)
 		Expect(g.Terms[domain.RoleDecode].Held).To(BeFalse())
 		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", 2.22*float64(runK1), 0.01*float64(runK1)))
@@ -150,7 +151,7 @@ var _ = Describe("Estimate", func() {
 	})
 
 	It("has no opinion for a role that has never been seen saturated", func() {
-		rcs := append(replicas(2), ReplicaCapacity{VariantName: "p", SaturatedThroughput: 0})
+		rcs := append(replicas(2), capacity.ReplicaCapacity{VariantName: "p", SaturatedThroughput: 0})
 		vcs := append(variants(domain.RoleDecode, 2),
 			domain.VariantCapacity{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 1, PerReplicaCapacity: 919_449})
 		f := Estimate(runLambda, rcs, vcs, nil, BacklogDrainSeconds, 0.85)
@@ -162,7 +163,7 @@ var _ = Describe("Estimate", func() {
 		// A warm-pool bridge runs its engine on different terms (lower
 		// --gpu-memory-utilization, and it is going home); its rate is not
 		// this variant's.
-		rcs := []ReplicaCapacity{{VariantName: "v", SaturatedThroughput: 1, FromWarmPool: true}}
+		rcs := []capacity.ReplicaCapacity{{VariantName: "v", SaturatedThroughput: 1, FromWarmPool: true}}
 		f := Estimate(runLambda, rcs, variants(domain.RoleBoth, 0), nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole).To(BeEmpty())
 	})
@@ -174,7 +175,7 @@ var _ = Describe("Estimate", func() {
 		// the role's floor toward nothing for the replicas that are priced.
 		vcs := append(variants(domain.RoleDecode, 1),
 			domain.VariantCapacity{VariantName: "unpriced", Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: 0})
-		rcs := append(replicas(1), ReplicaCapacity{VariantName: "unpriced", SaturatedThroughput: runMu})
+		rcs := append(replicas(1), capacity.ReplicaCapacity{VariantName: "unpriced", SaturatedThroughput: runMu})
 		f := Estimate(runLambda, rcs, vcs, nil, BacklogDrainSeconds, 0.85)
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/runMu*float64(runK1), 1e-6),
 			"the priced replica alone decides the floor")
@@ -197,10 +198,10 @@ var _ = Describe("Estimate with mixed readings", func() {
 		// backlog of 441 requests read as two replicas' worth instead of five,
 		// and the target went from 10 to 4 while the backlog grew.
 		variants := []domain.VariantCapacity{{VariantName: "v", Role: domain.RoleDecode, ReplicaCount: 3, PerReplicaCapacity: 930_000}}
-		own := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.74, SaturatedThroughputSamples: MinThroughputSamplesToOrder}
-		fresh := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 4.38, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true}
+		own := capacity.ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.74, SaturatedThroughputSamples: MinThroughputSamplesToOrder}
+		fresh := capacity.ReplicaCapacity{VariantName: "v", SaturatedThroughput: 4.38, SaturatedThroughputSamples: 10, SaturatedThroughputBorrowed: true}
 		backlog := map[string]float64{domain.RoleDecode: 441}
-		f := Estimate(1.68, []ReplicaCapacity{fresh, own, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
+		f := Estimate(1.68, []capacity.ReplicaCapacity{fresh, own, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
 		term := f.Terms[domain.RoleDecode]
 		Expect(term.Mu).To(Equal(1.74), "the own reading, however many replicas borrow")
 		Expect(term.Replicas).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/1.74, 1e-6))
@@ -208,7 +209,7 @@ var _ = Describe("Estimate with mixed readings", func() {
 		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/1.74*930_000, 1e-6))
 
 		By("taking the borrowed readings when no replica reads its own")
-		g := Estimate(1.68, []ReplicaCapacity{fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
+		g := Estimate(1.68, []capacity.ReplicaCapacity{fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
 		Expect(g.Terms[domain.RoleDecode].Mu).To(Equal(4.38))
 		Expect(g.Terms[domain.RoleDecode].Replicas).To(BeNumerically("~", (1.68+441/BacklogDrainSeconds)/4.38, 1e-6))
 		// Not held: two replicas' worth is under the fleet's cap (0.85 x 3 x
@@ -218,8 +219,8 @@ var _ = Describe("Estimate with mixed readings", func() {
 		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("<", 0.85*3*930_000))
 
 		By("keeping the own readings' median when they disagree among themselves")
-		own2 := ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.26, SaturatedThroughputSamples: 1}
-		h := Estimate(1.68, []ReplicaCapacity{fresh, own, own2, fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
+		own2 := capacity.ReplicaCapacity{VariantName: "v", SaturatedThroughput: 1.26, SaturatedThroughputSamples: 1}
+		h := Estimate(1.68, []capacity.ReplicaCapacity{fresh, own, own2, fresh, fresh}, variants, backlog, BacklogDrainSeconds, 0.85)
 		Expect(h.Terms[domain.RoleDecode].Mu).To(BeNumerically("~", (1.74+1.26)/2, 1e-9), "the central pair of the two own readings, three borrowed ones ignored")
 		Expect(h.Terms[domain.RoleDecode].Held).To(BeFalse(), "one own window has enough samples")
 	})
@@ -234,7 +235,7 @@ var _ = Describe("Estimate with mixed readings", func() {
 			{VariantName: "fast", Role: domain.RoleDecode, ReplicaCount: 3, PerReplicaCapacity: 930_000},
 			{VariantName: "slow", Role: domain.RoleDecode, ReplicaCount: 2, PerReplicaCapacity: 600_000},
 		}
-		replicas := []ReplicaCapacity{
+		replicas := []capacity.ReplicaCapacity{
 			{VariantName: "fast", SaturatedThroughput: 5.4},
 			{VariantName: "fast", SaturatedThroughput: 5.4},
 			{VariantName: "fast", SaturatedThroughput: 5.4},

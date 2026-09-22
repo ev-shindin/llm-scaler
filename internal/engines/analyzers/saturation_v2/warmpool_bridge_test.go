@@ -6,6 +6,7 @@ import (
 	"github.com/go-logr/logr"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 // perReplica is the capacity every row in these tests reports, so the medians
@@ -13,16 +14,16 @@ import (
 const perReplica = 1000
 
 // bridgeReplica is one live row as the collector would hand it over.
-func bridgeReplica(pod string, demand int64, fromPool bool) ReplicaCapacity {
-	capacity := int64(perReplica)
-	return ReplicaCapacity{
+func bridgeReplica(pod string, demand int64, fromPool bool) capacity.ReplicaCapacity {
+	tokens := int64(perReplica)
+	return capacity.ReplicaCapacity{
 		PodName:               pod,
 		VariantName:           "variant-a",
 		TokensInUse:           demand,
-		TotalKvCapacityTokens: capacity,
-		MemoryBoundCapacity:   capacity,
-		ComputeBoundCapacity:  capacity,
-		EffectiveCapacity:     capacity,
+		TotalKvCapacityTokens: tokens,
+		MemoryBoundCapacity:   tokens,
+		ComputeBoundCapacity:  tokens,
+		EffectiveCapacity:     tokens,
 		ReplicaDemand:         demand,
 		FromWarmPool:          fromPool,
 	}
@@ -44,12 +45,12 @@ func oneVariantState(ready int) []domain.VariantReplicaState {
 // when the Pod is handed back, which looks like a spike arriving rather than
 // capacity leaving.
 func TestABridgesDemandIsCountedTowardTheVariant(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
 	own := bridgeReplica("variant-a-0", 100, false)
 	bridge := bridgeReplica("pool-0", 400, true)
 
-	got := a.aggregateByVariant([]ReplicaCapacity{own, bridge},
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{own, bridge},
 		nil, oneVariantState(1), "model", "ns", 0.9, logr.Discard())
 
 	if len(got) != 1 {
@@ -70,12 +71,12 @@ func TestABridgesDemandIsCountedTowardTheVariant(t *testing.T) {
 // it prevented. The pool would have talked the optimizer out of ending the
 // borrow.
 func TestABridgeIsNotCountedAsSupply(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
 	own := bridgeReplica("variant-a-0", 100, false)
 	bridge := bridgeReplica("pool-0", 400, true)
 
-	got := a.aggregateByVariant([]ReplicaCapacity{own, bridge},
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{own, bridge},
 		nil, oneVariantState(1), "model", "ns", 0.9, logr.Discard())
 
 	if got[0].ReplicaCount != 1 {
@@ -102,11 +103,11 @@ func TestABridgeIsNotCountedAsSupply(t *testing.T) {
 // scale target owns -- while the bridge figures say where the serving is
 // actually coming from, which is what a switching decision needs.
 func TestAVariantCarriedEntirelyByThePoolHasNoSupplyOfItsOwn(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
 	bridge := bridgeReplica("pool-0", 400, true)
 
-	got := a.aggregateByVariant([]ReplicaCapacity{bridge},
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{bridge},
 		nil, oneVariantState(0), "model", "ns", 0.9, logr.Discard())
 
 	if got[0].ReplicaCount != 0 {
@@ -125,9 +126,9 @@ func TestAVariantCarriedEntirelyByThePoolHasNoSupplyOfItsOwn(t *testing.T) {
 // With no bridge anywhere, nothing changes: the counts are the variant's own and
 // the bridge figures are zero rather than absent.
 func TestAVariantWithNoBridgeIsUnaffected(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
-	got := a.aggregateByVariant([]ReplicaCapacity{
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{
 		bridgeReplica("variant-a-0", 100, false),
 		bridgeReplica("variant-a-1", 150, false),
 	}, nil, oneVariantState(2), "model", "ns", 0.9, logr.Discard())
@@ -152,9 +153,9 @@ func TestAVariantWithNoBridgeIsUnaffected(t *testing.T) {
 // supply that included the bridge would report a comfortable figure and the
 // shortfall would never be acted on.
 func TestUtilizationMeasuresTheVariantsOwnFleet(t *testing.T) {
-	a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	a := NewSaturationAnalyzer(capacity.NewStore())
 
-	got := a.aggregateByVariant([]ReplicaCapacity{
+	got := a.aggregateByVariant([]capacity.ReplicaCapacity{
 		bridgeReplica("variant-a-0", 500, false),
 		bridgeReplica("pool-0", 400, true),
 	}, nil, oneVariantState(1), "model", "ns", 0.9, logr.Discard())

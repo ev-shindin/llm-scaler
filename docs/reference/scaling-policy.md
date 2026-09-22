@@ -411,7 +411,7 @@ demand/supply models, so the difference is by design, not an inconsistency:
 | Analyzer | Per-request KV unit | Meaning |
 |----------|--------------------|---------|
 | Saturation V2 (demand) | `I + O` | Peak footprint — what a replica must be able to hold |
-| Throughput (`WorkloadShape.KVreq`) | `ILeff + O/2` | Time-averaged residency (`ILeff = I × (1 − PrefixHitRate)`) |
+| Throughput (`shape.Shape.KVreq`) | `ILeff + O/2` | Time-averaged residency (`ILeff = I × (1 − PrefixHitRate)`) |
 
 One asymmetry *is* internal to saturation V2 and should not be confused with the
 above: its own k2 derivation (`estimateCapacityFromParams`) prices a *concurrent*

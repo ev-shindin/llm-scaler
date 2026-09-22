@@ -4,9 +4,9 @@ import "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 
 // k2ReasonObsImplausible labels the diagnostic emitted when an observation is
 // discarded for exceeding the KV cache's physical ceiling. It is deliberately
-// not a k2Source: no capacity comes from it -- the analyzer falls through to
-// the next priority -- so it must not appear where a k2Source label is
-// expected. It shares the P-prefix vocabulary because it is read from the same
+// not a capacity.K2Source: no capacity comes from it -- the analyzer falls
+// through to the next priority -- so it must not appear where a K2Source label
+// is expected. It shares the P-prefix vocabulary because it is read from the same
 // k2-decision log line.
 const k2ReasonObsImplausible = "P1-obs-invalid"
 
@@ -14,7 +14,7 @@ const k2ReasonObsImplausible = "P1-obs-invalid"
 // replica's saturated queue is left unrecorded because the decode role is
 // saturated in the same cycle: a prefill request completes only when decode
 // admits it, so what prefill shows then is decode's saturation, not its own
-// (computeK2). Like k2ReasonObsImplausible it is not a k2Source -- the
+// (computeK2). Like k2ReasonObsImplausible it is not a capacity.K2Source -- the
 // analyzer falls through to the next priority.
 const k2ReasonObsDownstream = "P1-obs-downstream"
 

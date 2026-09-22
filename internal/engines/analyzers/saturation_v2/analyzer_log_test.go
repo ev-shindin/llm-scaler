@@ -19,6 +19,8 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/inferenceengine"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 )
 
 // The analyzer's capacity-decision logs are a machine-readable contract with
@@ -141,8 +143,8 @@ func stringField(t *testing.T, fields map[string]any, key string) string {
 // deploymentParams builds engine params good enough for k2 derivation. Returned
 // fresh each call so compatibility is decided by value, the way FindCompatible
 // decides it, not by two variants sharing one pointer.
-func deploymentParams() *EngineParams {
-	return &EngineParams{
+func deploymentParams() *capacity.EngineParams {
+	return &capacity.EngineParams{
 		Engine:                    inferenceengine.EngineVLLM,
 		BlockSize:                 16,
 		MaxNumSeqs:                256,
@@ -152,7 +154,7 @@ func deploymentParams() *EngineParams {
 
 func TestLogContract_LiveReplicaEmitsCycleFields(t *testing.T) {
 	ctx, logs := observedCtx(t)
-	analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 	input := makeAnalyzerInput(
 		[]domain.ReplicaMetrics{
@@ -179,7 +181,7 @@ func TestLogContract_LiveReplicaEmitsCycleFields(t *testing.T) {
 // whose label the analyzer picks from live queue state rather than a fallback.
 func TestLogContract_SaturatedQueueReportsObservedTier(t *testing.T) {
 	ctx, logs := observedCtx(t)
-	analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 	input := makeAnalyzerInput(
 		// QueueLength 6 >= the fixture's QueueLengthThreshold of 5.
@@ -210,7 +212,7 @@ func TestLogContract_FallbackOutcomesHaveDistinctMessages(t *testing.T) {
 
 	t.Run("no capacity-store record", func(t *testing.T) {
 		ctx, logs := observedCtx(t)
-		analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 		_, err := analyzer.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{noRecord}, states))
 		require.NoError(t, err)
@@ -221,12 +223,12 @@ func TestLogContract_FallbackOutcomesHaveDistinctMessages(t *testing.T) {
 
 	t.Run("covered by a capacity-store record", func(t *testing.T) {
 		ctx, logs := observedCtx(t)
-		store := NewCapacityKnowledgeStore()
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store := capacity.NewStore()
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			AcceleratorName:   "H100",
 			GpuCount:          1,
 			EffectiveCapacity: 10000,
-			LearnedFrom:       learnedFromLive,
+			LearnedFrom:       capacity.LearnedFromLive,
 			LearnedAt:         time.Now(),
 		})
 		analyzer := NewSaturationAnalyzer(store)
@@ -249,12 +251,12 @@ func TestLogContract_ZeroReplicaEstimateNamesItsSource(t *testing.T) {
 
 	t.Run("reused live observation", func(t *testing.T) {
 		ctx, logs := observedCtx(t)
-		store := NewCapacityKnowledgeStore()
-		store.Update("test-ns", "test-model", "variant-zero", CapacityRecord{
+		store := capacity.NewStore()
+		store.Update("test-ns", "test-model", "variant-zero", capacity.Record{
 			AcceleratorName:   "H100",
 			GpuCount:          1,
 			EffectiveCapacity: 10000,
-			LearnedFrom:       learnedFromLive,
+			LearnedFrom:       capacity.LearnedFromLive,
 		})
 		analyzer := NewSaturationAnalyzer(store)
 
@@ -267,8 +269,8 @@ func TestLogContract_ZeroReplicaEstimateNamesItsSource(t *testing.T) {
 
 	t.Run("derived from deployment args", func(t *testing.T) {
 		ctx, logs := observedCtx(t)
-		store := NewCapacityKnowledgeStore()
-		store.Update("test-ns", "test-model", "variant-zero", CapacityRecord{
+		store := capacity.NewStore()
+		store.Update("test-ns", "test-model", "variant-zero", capacity.Record{
 			AcceleratorName:   "H100",
 			GpuCount:          1,
 			EffectiveCapacity: 4000,
@@ -298,10 +300,10 @@ func TestLogContract_ZeroReplicaEstimateNamesItsSource(t *testing.T) {
 
 	t.Run("no derivation possible", func(t *testing.T) {
 		ctx, logs := observedCtx(t)
-		store := NewCapacityKnowledgeStore()
+		store := capacity.NewStore()
 		// Deployment-learned but with no engine params, so there is nothing to
 		// derive from and the raw stored value is all that is left.
-		store.Update("test-ns", "test-model", "variant-zero", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-zero", capacity.Record{
 			AcceleratorName:   "H100",
 			GpuCount:          1,
 			EffectiveCapacity: 4000,
@@ -323,9 +325,9 @@ func TestLogContract_ZeroReplicaEstimateNamesItsSource(t *testing.T) {
 func TestLogContract_BorrowedCapacityNamesItsDonor(t *testing.T) {
 	ctx, logs := observedCtx(t)
 
-	store := NewCapacityKnowledgeStore()
+	store := capacity.NewStore()
 	// No capacity of its own, so the stored-estimate branch cannot fire...
-	store.Update("test-ns", "test-model", "variant-borrow", CapacityRecord{
+	store.Update("test-ns", "test-model", "variant-borrow", capacity.Record{
 		AcceleratorName:       "H100",
 		GpuCount:              1,
 		EffectiveCapacity:     0,
@@ -334,12 +336,12 @@ func TestLogContract_BorrowedCapacityNamesItsDonor(t *testing.T) {
 		LearnedFrom:           "deployment",
 	})
 	// ...but a sibling on the same hardware, with equal-valued params, has one.
-	store.Update("test-ns", "test-model", "variant-donor", CapacityRecord{
+	store.Update("test-ns", "test-model", "variant-donor", capacity.Record{
 		AcceleratorName:   "H100",
 		GpuCount:          1,
 		EffectiveCapacity: 9000,
 		EngineParams:      deploymentParams(),
-		LearnedFrom:       learnedFromLive,
+		LearnedFrom:       capacity.LearnedFromLive,
 	})
 	analyzer := NewSaturationAnalyzer(store)
 
@@ -351,12 +353,12 @@ func TestLogContract_BorrowedCapacityNamesItsDonor(t *testing.T) {
 	fields := requireLogged(t, logs, "variant-capacity-source")
 	assert.Contains(t, stringField(t, fields, "reason"), "borrowed from a compatible variant")
 	assert.Equal(t, float64(9000), fields["perReplicaCapacity"])
-	assert.Equal(t, learnedFromLive, stringField(t, fields, "engineParamsSource"))
+	assert.Equal(t, capacity.LearnedFromLive, stringField(t, fields, "engineParamsSource"))
 }
 
 func TestLogContract_NoDataVariantSaysSo(t *testing.T) {
 	ctx, logs := observedCtx(t)
-	analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 	_, err := analyzer.Analyze(ctx, makeAnalyzerInput(nil, []domain.VariantReplicaState{
 		{VariantName: "variant-zero", AcceleratorName: "H100", CurrentReplicas: 0, GPUsPerReplica: 1},
@@ -379,7 +381,7 @@ func TestLogContract_NoDataVariantSaysSo(t *testing.T) {
 func TestLogContract_PerReplicaLinesAreVerbosityGated(t *testing.T) {
 	t.Run("routine decisions are hidden at -v=0", func(t *testing.T) {
 		ctx, logs := infoOnlyCtx()
-		analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 		input := makeAnalyzerInput(
 			[]domain.ReplicaMetrics{
@@ -404,7 +406,7 @@ func TestLogContract_PerReplicaLinesAreVerbosityGated(t *testing.T) {
 
 	t.Run("a replica contributing nothing is not", func(t *testing.T) {
 		ctx, logs := infoOnlyCtx()
-		analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 		_, err := analyzer.Analyze(ctx, makeAnalyzerInput(
 			[]domain.ReplicaMetrics{
@@ -426,7 +428,7 @@ func TestLogContract_PerReplicaLinesAreVerbosityGated(t *testing.T) {
 // not diagnosable without knowing whether lambda moved or mu did.
 func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	ctx, logs := observedCtx(t)
-	analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	analyzer := NewSaturationAnalyzer(capacity.NewStore())
 	states := []domain.VariantReplicaState{
 		{VariantName: "variant-a", AcceleratorName: "H100", CurrentReplicas: 1, GPUsPerReplica: 1},
 	}
@@ -438,7 +440,7 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	sat.Ready = true
 	input := makeAnalyzerInput([]domain.ReplicaMetrics{sat}, states)
 	input.ArrivalRate = 14
-	for i := 0; i < MinThroughputSamplesToOrder; i++ {
+	for i := 0; i < floor.MinThroughputSamplesToOrder; i++ {
 		_, err := analyzer.Analyze(ctx, input)
 		require.NoError(t, err)
 	}
@@ -461,6 +463,6 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	entries := logs.FilterMessage("throughput-demand-floor").All()
 	last := entries[len(entries)-1].ContextMap()
 	assert.Equal(t, 0.0, last["backlogRequests"], "nothing queued: the floor is the load's alone")
-	assert.Equal(t, BacklogDrainSeconds, last["drainSeconds"])
+	assert.Equal(t, floor.BacklogDrainSeconds, last["drainSeconds"])
 	assert.Equal(t, false, last["heldAtFleet"], "two readings of its own: the floor is the load's, not the cap's")
 }
