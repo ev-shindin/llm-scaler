@@ -719,7 +719,7 @@ func (a *SaturationAnalyzer) computeK2(
 	// at 31 % of its cache on the gated rows, so it was not block-starved.
 	// The reading is left unrecorded: k2 falls through to history or k1,
 	// and the throughput floor records no mu (computeReplicaCapacity keys
-	// that on k2SrcObserved). A prefill bottleneck reduces decode's
+	// that on capacity.K2SrcObserved). A prefill bottleneck reduces decode's
 	// arrivals, so the two saturate at once only when decode is short at
 	// prefill's completion rate; prefill's reading then waits for decode to
 	// recover.

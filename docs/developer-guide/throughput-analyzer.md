@@ -690,18 +690,22 @@ use the same decode-rate framework.
 
 ## Constants and Tuning
 
+The window's and the model's constants live in `internal/signals/itl`, the
+shape tracker's in `internal/signals/shape`; the analyzer's own in
+`throughput/constants.go`.
+
 | Constant | Default | Description |
 |---|---|---|
-| `DefaultKSat` | 0.85 | KV utilization at which μ_dec_sat is evaluated |
+| `itl.DefaultKSat` | 0.85 | KV utilization at which μ_dec_sat is evaluated |
 | `DefaultBaselineITLSec` | 0.006 | B in tier-2 ITL model (H100 near-zero-load baseline) |
 | `DefaultQueueDrainFactor` | 2.0 | Bounds queueing time to ≤ factor × ITL(k_sat) × OL |
-| `DefaultWindowMaxSize` | 20 | Max (k*, ITL) pairs in ObservationWindow |
-| `DefaultObservationMaxAge` | 30m | Observations older than this are pruned |
-| `DefaultMinSamples` | 10 | Minimum samples for OLS Ready flag |
-| `DefaultMinKSpread` | 0.30 | Minimum k-spread for OLS Ready flag |
-| `DefaultMinObservableK` | 0.15 | Lower k* filter for ObservationWindow |
-| `DefaultMaxObservableK` | 0.85 | Upper k* filter for ObservationWindow |
-| `DefaultShapeChangeTolerance` | 0.20 | IL or OL shift that triggers window reset |
+| `itl.DefaultWindowMaxSize` | 20 | Max (k*, ITL) pairs in the observation window |
+| `itl.DefaultObservationMaxAge` | 30m | Observations older than this are pruned (by the analyzer's `Prune` call) |
+| `itl.DefaultMinSamples` | 10 | Minimum samples for OLS Ready flag |
+| `itl.DefaultMinKSpread` | 0.30 | Minimum k-spread for OLS Ready flag |
+| `itl.DefaultMinObservableK` | 0.15 | Lower k* filter for the observation window |
+| `itl.DefaultMaxObservableK` | 0.85 | Upper k* filter for the observation window (equals `DefaultKSat`) |
+| `shape.DefaultChangeTolerance` | 0.20 | IL or OL shift that triggers window reset |
 | `DefaultGPSMismatchThresholdPct` | 15.0 | GPS error % above which SpareCapacity is suppressed |
 | `DefaultGPSMinKForVerification` | 0.30 | Minimum k* for GPS check to apply |
 | `DefaultNearKSatMargin` | 0.10 | k* within this margin of k_sat triggers deeper diagnostics |
