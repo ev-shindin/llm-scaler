@@ -24,13 +24,9 @@ limitations under the License.
 //
 // # Pod label fallback
 //
-// Every processing block in Refresh() extracts a pod identity from Prometheus
-// labels using a two-step fallback:
-//
-//	podName := value.Labels["pod"]
-//	if podName == "" {
-//	    podName = value.Labels["pod_name"]
-//	}
+// Every series passes through buildInstanceKey (attribute.go), which takes
+// the Pod's name from the labels through seriesPodName
+// (pod_serving_state.go) with a two-step fallback: "pod", then "pod_name".
 //
 // Engine metrics are typically scraped via a PodMonitor or ServiceMonitor that
 // applies the Prometheus operator's default target-relabeling, which produces
@@ -78,7 +74,11 @@ type BridgeResolver interface {
 // series into per-instance data (extract.go), each instance into the row the
 // analyzers read -- or a reason it is not one (attribute.go), with the
 // series' freshness classified beside it (freshness.go); then the instances
-// of one Pod are merged into its replica (pod_collapse.go).
+// of one Pod are merged into its replica (pod_collapse.go). Around them:
+// engine_queries.go names the queries per engine and merges and filters their
+// results; pod_serving_state.go reads the Pods' serving state (gone, Ready,
+// started) once per namespace per cycle; query.go also holds the two
+// model-level collectors that share refreshShared's memo.
 type ReplicaMetricsCollector struct {
 	source    source.MetricsSource
 	k8sClient client.Client
@@ -145,8 +145,9 @@ func (c *ReplicaMetricsCollector) bridgeFor(namespace, pod string) (string, bool
 }
 
 // BeginCycle opens an optimize cycle, arming the memo that lets every model in a
-// namespace share one execution of the namespace-scoped queries. Pair it with
-// EndCycle.
+// namespace share one execution of the namespace-scoped queries (read by
+// refreshShared in query.go) and one listing of the namespace's Pods (read by
+// servingState in pod_serving_state.go). Pair it with EndCycle.
 //
 // Sharing is deliberately opt-in per cycle rather than time-based: results are
 // reused only within the collection they were fetched for, never carried into

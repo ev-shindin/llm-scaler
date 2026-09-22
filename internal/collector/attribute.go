@@ -26,8 +26,8 @@ import (
 // and the query's own evaluation lag, so the comparison would be measuring the
 // metrics pipeline rather than the engine. Anything an engine can report before
 // it has been up a minute is a startup artifact the readiness gate in
-// attributeInstance has already dropped; this only has to cover a Pod that passes readiness
-// immediately, which is short-lived by definition.
+// attributeInstance has already dropped; this only has to cover a Pod that
+// passes readiness immediately, which is short-lived by definition.
 const minUptimeForServiceTimeBound = time.Minute
 
 // buildInstanceKey returns (instanceKey, podName, vaName) for a series's labels.
@@ -326,8 +326,8 @@ func (c *ReplicaMetricsCollector) attributeInstance(
 	// Second guard, independent of readiness: no request can have taken
 	// longer than the Pod reporting it has been running.
 	//
-	// Every filter before this point (extractPodMetrics) tests one value in
-	// isolation -- NaN, Inf, negative, outside [0,1] -- and the reading that caused the
+	// Every value filter before this point (extractPodMetrics) tests one value
+	// in isolation -- NaN, Inf, negative, outside [0,1] -- and the reading that caused the
 	// incident passed all of them: 521368 is finite, positive, and a
 	// perfectly ordinary float. What makes 145 hours impossible is not the
 	// number itself but the Pod: it had just started, and was still failing

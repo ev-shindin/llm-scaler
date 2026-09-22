@@ -51,12 +51,13 @@ type podMetricData struct {
 // podMetricData per engine instance, keyed by buildInstanceKey.
 //
 // Two kinds of query. The model-scoped ones that DEFINE the fleet (KV cache
-// usage, queue length, the token averages, the timings) create an entry for
-// an instance they see; a query error on the two saturation series is the
-// collection's error. The namespace-wide or supplementary ones (cache config,
-// which carries no model label; the throughput analyzer's rates) attach to
-// instances already seen and skip the rest, so a foreign model's pod or a
-// scrape-skewed row cannot enter this model's fleet. Values are taken as
+// usage, queue length, the token averages, the prefix-cache hit rate, the
+// timings) create an entry for an instance they see; a query error on the two
+// saturation series is the collection's error. The namespace-wide or
+// supplementary ones (cache config, whose vLLM series carries no model label;
+// the throughput analyzer's rates) attach to instances already seen and skip
+// the rest, so a foreign model's pod or a scrape-skewed row cannot enter this
+// model's fleet. Values are taken as
 // scraped, with the validity rule each series needs (finite, in range,
 // positive) stated at its block.
 func (c *ReplicaMetricsCollector) extractPodMetrics(
