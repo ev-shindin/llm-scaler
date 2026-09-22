@@ -2,6 +2,7 @@ package saturation_v2
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,6 +27,16 @@ const (
 	runKvCapacity = int64(1_162_240)
 
 	decodeVariant = "decode-v"
+)
+
+// A second run, the other direction: biran-20260921-235843-225 (2026-09-21),
+// same cluster and model, 1000/6000 for 1100s then 8000/1000 for 1100s. Its
+// figures are not the ones above and must not be read as a phase of them.
+const (
+	// shortenSwapLambda is the arrival rate measured over that run's second
+	// phase, where the floor divided it by a mu of 0.039928 and asked for
+	// 142 replicas.
+	shortenSwapLambda = 5.68
 )
 
 var _ = Describe("the saturated-throughput window", func() {
@@ -807,5 +818,103 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		P := result.VariantCapacities[0].PerReplicaCapacity
 		Expect(result.TotalDemand).To(BeNumerically("~", (runLambda+100.0/floor.BacklogDrainSeconds)/runMu*P, 1))
 		Expect(result.TotalDemand / P).To(BeNumerically("~", 1.42, 0.01))
+	})
+
+	It("bounds the floor when the outputs shorten under a longer prompt", func() {
+		// Replayed from the 1000/6000 -> 8000/1000 shape-swap trace
+		// (2026-09-21, run biran-20260921-235843-225, cycles 21:19-21:27).
+		// The other direction from the spec above, and the one the fleet
+		// reads worst: phase 1 generates 6000-token outputs, phase 2 takes
+		// 8000-token prompts and generates 1000.
+		//
+		// On the run the decode replicas kept their own output-length
+		// buckets across the switch, and the fleet split: six replicas had
+		// completed enough of the new short requests to classify `long`,
+		// where the only reading was one fresh replica's first, extrapolated
+		// rate window -- 0.039928 req/s -- and four still read `xxlong` at
+		// 3.012173. Six of ten put the under-read at the median, and the
+		// four `xxlong` replicas' own two-sample window was what let the
+		// role order on it: mu = 0.039928 against 5.68 arriving asked for
+		// 142 replicas (logged replicasImplied 134-181, demand 134-213 M
+		// tokens, utilization 12.98 rising to 27.49). Only maxReplicas = 10
+		// and, from 21:27, the single-sample hold stopped it.
+		//
+		// Priced under the fleet's shape there is one bucket per cycle, the
+		// replicas that serve the load fill it, and the floor stays within
+		// a replica or two of what the fleet is running.
+		phase1 := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
+			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 5000)
+			rm.RequestRate = rate
+			rm.Ready = true
+			return rm
+		}
+		// After the switch a replica's own average slides from the old shape
+		// to the new one as its long requests finish: the ones that have
+		// turned over read ~900 output tokens, the ones still draining a
+		// 6000-token batch read ~5000.
+		turned := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
+			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 8000, 900)
+			rm.RequestRate = rate
+			rm.Ready = true
+			return rm
+		}
+		draining := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
+			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 8000, 5000)
+			rm.RequestRate = rate
+			rm.Ready = true
+			return rm
+		}
+		cycle := func(rms []domain.ReplicaMetrics, decodeN int) *domain.AnalyzerResult {
+			in := makeAnalyzerInput(append(rms, prefill("prefill-0", 8_065)), states(decodeN, 1))
+			in.ArrivalRate = shortenSwapLambda
+			out, err := analyzer.Analyze(ctx, in)
+			Expect(err).NotTo(HaveOccurred())
+			return out
+		}
+
+		// Phase 1, saturated on the 6000-token output shape -- the replicas
+		// average ~5000 over their recent completions, which is what buckets
+		// (both land in `xxlong`): the fleet's bucket
+		// learns 3.012173, the figure the four `xxlong` replicas carried
+		// into the switch on the run.
+		for _, rate := range []float64{3.01, 3.012173} {
+			cycle([]domain.ReplicaMetrics{phase1("d0", 1_158_912, 10, rate)}, 1)
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		}
+		// A replica that has just joined and is queued reports its first,
+		// extrapolated rate window -- the 0.039928 that became the whole
+		// `long` bucket on the run. Under the fleet's shape it lands in the
+		// bucket the fleet is serving, beside the readings of replicas that
+		// are keeping up, and the window's max discards it.
+		cycle([]domain.ReplicaMetrics{
+			turned("d0", 266_654, 10, 0.039928),
+			draining("d1", 1_158_912, 10, 3.012173),
+		}, 2)
+		clock = clock.Add(ThroughputSampleSpacing + time.Second)
+
+		// 21:23:34-21:26:04: ten decode replicas, ~17k resident each, no
+		// queue anywhere, 5.68 req/s still arriving. Six have turned over
+		// to the short shape, four are still draining the long one.
+		rms := make([]domain.ReplicaMetrics, 0, 10)
+		for i := 0; i < 6; i++ {
+			rms = append(rms, turned(fmt.Sprintf("turned-%d", i), 17_282, 0, 0.61))
+		}
+		for i := 0; i < 4; i++ {
+			rms = append(rms, draining(fmt.Sprintf("draining-%d", i), 17_538, 0, 0.61))
+		}
+		result := cycle(rms, 10)
+
+		var decodeP float64
+		for _, vc := range result.VariantCapacities {
+			if vc.VariantName == decodeVariant {
+				decodeP = vc.PerReplicaCapacity
+			}
+		}
+		Expect(decodeP).To(BeNumerically(">", 0))
+		implied := result.RoleDemand[domain.RoleDecode] / decodeP
+		Expect(implied).To(BeNumerically("<", 14),
+			"the floor must stay within reach of the ten replicas serving the load; on the run it asked for 142")
+		Expect(implied).To(BeNumerically(">", 1),
+			"and it is still a floor: 5.68 req/s is not one replica's work")
 	})
 })
