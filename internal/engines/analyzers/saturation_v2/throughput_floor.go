@@ -264,6 +264,10 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	roleDemand map[string]float64,
 	eppByRole map[string]float64,
 	eppQueued float64,
+	// staleShape is set while a fleet-shape change is outstanding: every
+	// mu on record was learned under a shape the fleet has left, so the
+	// floor may hold on one but not order on it (shape_change.go).
+	staleShape bool,
 	logger logr.Logger,
 ) float64 {
 	roleOf := make(map[string]string, len(variants))
@@ -294,7 +298,7 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	// a cap drawn at the policy-level figure while the engine divides by a
 	// per-analyzer override would leave a gap that orders a replica.
 	scaleUp, _ := cfg.AnalyzerThresholds(domain.SaturationAnalyzerName)
-	tf := floor.Estimate(offeredArrivalRate(input), replicas, variants, backlog, floor.BacklogDrainSeconds, scaleUp)
+	tf := floor.Estimate(offeredArrivalRate(input), replicas, variants, backlog, floor.BacklogDrainSeconds, scaleUp, staleShape)
 
 	// Prefill with no mu: the scheduler queue's prompts are not resident work
 	// for prefill (file header). Only the disaggregated case has a prefill

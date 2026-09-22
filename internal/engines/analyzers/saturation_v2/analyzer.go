@@ -79,6 +79,10 @@ type SaturationAnalyzer struct {
 	// (rememberDecodeSaturation); swept by EvictStaleHistory beside the
 	// history, one time.Time per model that ever saturated.
 	decodeSaturatedAt map[string]time.Time
+	// fleetShape is the (I, O) bucket pair last seen per namespace|model,
+	// and when a change of either was raised and not yet settled. See
+	// shape_change.go for what the event is for.
+	fleetShape map[string]*shapeMemo
 	// now is the clock the memory reads; tests set it.
 	now func() time.Time
 }
@@ -102,6 +106,7 @@ func NewSaturationAnalyzer(store *capacity.Store) *SaturationAnalyzer {
 		throughputLastRead:     make(map[string]float64),
 		capacityStore:          store,
 		decodeSaturatedAt:      make(map[string]time.Time),
+		fleetShape:             make(map[string]*shapeMemo),
 		now:                    time.Now,
 	}
 }
@@ -213,6 +218,12 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// replica's throughput key (computeReplicaCapacity says why the key is
 	// the fleet's shape and not the replica's).
 	fleetOutput := fleetOutputLength(input.ReplicaMetrics, rolesByVariant)
+	// The other axis, and the event. The prompt length arriving reads the
+	// switch within a scrape of it, where the output half waits for a
+	// completion; a change on either says the learned figures describe a
+	// workload that is no longer running (shape_change.go).
+	fleetInput := fleetInputLength(input.SchedulerQueue, input.ReplicaMetrics)
+	shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID, fleetInput, fleetOutput, logger)
 
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]capacity.ReplicaCapacity, 0, len(input.ReplicaMetrics))
@@ -230,6 +241,22 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
+	}
+
+	// A replica reading a throughput window of its OWN, rather than a
+	// neighbouring bucket's, is the fleet having measured itself under the
+	// shape now arriving -- which is what an outstanding shape change was
+	// waiting for (shape_change.go).
+	if shapeChanged {
+		ownReading := false
+		for _, rc := range replicaCapacities {
+			if rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed {
+				ownReading = true
+				break
+			}
+		}
+		a.settleFleetShape(input.Namespace, input.ModelID, ownReading)
+		shapeChanged = !ownReading
 	}
 
 	// Phase 2: Per-variant aggregation
@@ -293,7 +320,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		eppQueued = float64(input.SchedulerQueue.QueueSize)
 	}
 	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
-		totalDemand, roleDemand, queueDemand.byRole, eppQueued, logger)
+		totalDemand, roleDemand, queueDemand.byRole, eppQueued, shapeChanged, logger)
 
 	// While decode is saturated, prefill's DEMAND is not a reading of prefill
 	// either: the KV it holds and the queue behind it are decode's backlog
@@ -328,6 +355,17 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 				"modelID", input.ModelID, "namespace", input.Namespace,
 				"demandBefore", h.before, "demandHeld", h.after, "holdFloor", h.lo, "holdCap", h.hi,
 				"reason", "decode saturated: the KV prefill holds and the queue behind it are decode's backlog; prefill is neither ordered nor released on them")
+		}
+	}
+
+	// The fleet is not released on figures the switch made stale. A floor,
+	// not a clamp: an I-up switch genuinely needs more capacity, and
+	// occupancy and the throughput floor still order (shape_change.go).
+	if shapeChanged && roleDemand != nil {
+		_, scaleDown := satConfig.AnalyzerThresholds(domain.SaturationAnalyzerName)
+		if moved, raised := holdFleetFloor(roleDemand, variantCapacities, scaleDown); moved > 0 {
+			totalDemand += moved
+			logShapeHold(logger, input.ModelID, input.Namespace, moved, raised)
 		}
 	}
 

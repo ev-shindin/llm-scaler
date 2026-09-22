@@ -15,6 +15,22 @@ const (
 	// recorded.
 	DecodeSaturationMemory = time.Minute
 
+	// ShapeChangeHoldMax is how long the fleet is withheld from release
+	// after its shape changes, when nothing settles the hold sooner.
+	//
+	// The hold normally ends the moment a replica reads a throughput window
+	// of its own under the new shape (settleFleetShape). A fleet that is
+	// over-provisioned for the new shape never saturates, so it never records
+	// one: on run biran-20260921-235843-225 the second phase ran 8-21
+	// requests across 11 replicas with nothing queued, and an unbounded hold
+	// would have pinned all 11 for its remaining 16 minutes. Five minutes is
+	// longer than a 6000-token generation plus the rate window that would
+	// record it (~60 s + 60 s on that run, the longest shape in the benchmark
+	// set), so it does not cut short a fleet that is about to measure itself,
+	// and short enough that a fleet that never will is released while the
+	// phase is still running.
+	ShapeChangeHoldMax = 5 * time.Minute
+
 	// BytesPerToken is the approximate number of bytes per LLM token.
 	// Used to convert scheduler queue bytes to estimated token count.
 	// Based on the OpenAI tiktoken observation that each token corresponds

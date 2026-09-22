@@ -674,7 +674,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		roleDemand := map[string]float64{domain.RoleDecode: 100_000}
 		in := makeAnalyzerInput(nil, states(1, 1))
 		in.ArrivalRate = runLambda
-		total := analyzer.applyThroughputFloor(in, in.Config.(*config.ScalingPolicy), rcs, vcs, 100_000, roleDemand, nil, 0, GinkgoLogr)
+		total := analyzer.applyThroughputFloor(in, in.Config.(*config.ScalingPolicy), rcs, vcs, 100_000, roleDemand, nil, 0, false, GinkgoLogr)
 		want := (runLambda + 10.0/floor.BacklogDrainSeconds) / runMu * float64(runK1)
 		Expect(roleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
 		Expect(total).To(BeNumerically("~", want, 1))

@@ -1,0 +1,200 @@
+package saturation_v2
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+)
+
+var _ = Describe("the arriving prompt length", func() {
+	It("reads the scheduler queue when there is one", func() {
+		// Run biran-20260921-235843-225, cycle at 20.7 min: 681 requests
+		// queued, 31,071,039 bytes. The trace's phase-2 prompt is 8000
+		// tokens; BytesPerToken is 4 against the ~5.8 the run measured, so
+		// the figure reads high and is compared as a ratio (shape_change.go).
+		sq := &domain.SchedulerQueueMetrics{QueueSize: 681, QueueBytes: 31_071_039}
+		Expect(fleetInputLength(sq, nil)).To(BeNumerically("~", 31_071_039.0/681/BytesPerToken, 1e-6))
+
+		// The same cycle one phase earlier: 692 requests, 4,039,809 bytes,
+		// the 1000-token prompt. The two are 7.8x apart, which is the step
+		// the tracker sees.
+		was := fleetInputLength(&domain.SchedulerQueueMetrics{QueueSize: 692, QueueBytes: 4_039_809}, nil)
+		Expect(fleetInputLength(sq, nil) / was).To(BeNumerically("~", 7.8, 0.1))
+	})
+
+	It("falls back to the replicas, weighted by rate, when the queue is empty", func() {
+		// 141 of the run's 171 cycles had an empty queue.
+		rms := []domain.ReplicaMetrics{
+			{VariantName: "d", AvgInputTokens: 8000, RequestRate: 1.0},
+			{VariantName: "d", AvgInputTokens: 8000, RequestRate: 1.0},
+			{VariantName: "d", AvgInputTokens: 1000, RequestRate: 0.1},
+		}
+		got := fleetInputLength(nil, rms)
+		Expect(got).To(BeNumerically("~", (2*1.0*8000+0.1*1000)/(2*1.0+0.1), 1e-9))
+		Expect(got).To(BeNumerically(">", 7000), "the replica still draining the old shape must not drag it down")
+
+		By("the plain mean when no replica reports a rate")
+		Expect(fleetInputLength(nil, []domain.ReplicaMetrics{
+			{VariantName: "d", AvgInputTokens: 1000}, {VariantName: "d", AvgInputTokens: 3000},
+		})).To(Equal(2000.0))
+
+		By("and nothing at all when there is nothing to read")
+		Expect(fleetInputLength(nil, nil)).To(Equal(0.0))
+		Expect(fleetInputLength(&domain.SchedulerQueueMetrics{}, nil)).To(Equal(0.0))
+	})
+
+	It("ignores a warm-pool bridge, whose prompts are not this variant's", func() {
+		rms := []domain.ReplicaMetrics{
+			{VariantName: "d", AvgInputTokens: 1000, RequestRate: 1.0},
+			{VariantName: "d", AvgInputTokens: 60000, RequestRate: 1.0, FromWarmPool: true},
+		}
+		Expect(fleetInputLength(nil, rms)).To(Equal(1000.0))
+	})
+})
+
+var _ = Describe("the fleet-shape change, through Analyze", func() {
+	const (
+		decodeV  = "decode-v"
+		prefillV = "prefill-v"
+		kvCap    = int64(1_162_240)
+	)
+	var (
+		analyzer *SaturationAnalyzer
+		ctx      context.Context
+		clock    time.Time
+	)
+	BeforeEach(func() {
+		analyzer = NewSaturationAnalyzer(capacity.NewStore())
+		clock = time.Date(2026, 9, 21, 20, 59, 38, 0, time.UTC)
+		analyzer.now = func() time.Time { return clock }
+		ctx = context.Background()
+	})
+
+	states := func(decodeN int) []domain.VariantReplicaState {
+		return []domain.VariantReplicaState{
+			{VariantName: decodeV, Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: decodeN, GPUsPerReplica: 1},
+			{VariantName: prefillV, Role: domain.RolePrefill, AcceleratorName: "H200", CurrentReplicas: 1, GPUsPerReplica: 1},
+		}
+	}
+	// A cycle of the run: `n` decode replicas each holding `tokens`, the
+	// given arriving prompt length, and the shape their completions average.
+	cycle := func(n int, tokens int64, queue int, in, out float64, sq *domain.SchedulerQueueMetrics) *domain.AnalyzerResult {
+		rms := make([]domain.ReplicaMetrics, 0, n+1)
+		for i := 0; i < n; i++ {
+			rm := makeReplicaMetrics(fmt.Sprintf("d%d", i), decodeV, tokens, kvCap, queue, in, out)
+			rm.RequestRate = 0.6
+			rm.Ready = true
+			rms = append(rms, rm)
+		}
+		p := makeReplicaMetrics("p0", prefillV, 8_065, 1_149_312, 0, in, 1)
+		p.RequestRate = 6
+		p.Ready = true
+		rms = append(rms, p)
+
+		input := makeAnalyzerInput(rms, states(n))
+		input.ArrivalRate = 5.68
+		input.SchedulerQueue = sq
+		out2, err := analyzer.Analyze(ctx, input)
+		Expect(err).NotTo(HaveOccurred())
+		return out2
+	}
+
+	It("does not release the fleet on the shape it has just left", func() {
+		// Phase 1 of run biran-20260921-235843-225: 1000-token prompts,
+		// 6000-token generations, ten decode replicas carrying it.
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+
+		// 18.7 min: the trace switched at 18.3 and the queue is the first
+		// thing to say so -- 20 requests, 912,037 bytes, 7811 tokens each.
+		// The generations in flight are still the old shape's; only the
+		// prompt has moved, which is exactly the I-up case the proposal
+		// names as the one the analyzer reads late.
+		swap := cycle(10, 900_000, 0, 8000, 6000,
+			&domain.SchedulerQueueMetrics{QueueSize: 20, QueueBytes: 912_037})
+		clock = clock.Add(15 * time.Second)
+
+		// The switch's batch drains: the 6000-token generations finish, the
+		// 1000-token ones that replace them hold almost nothing, and
+		// occupancy collapses. On the run the fleet went to 8-21 running
+		// requests across 11 replicas. Occupancy alone would release here.
+		drained := cycle(10, 17_282, 0, 8000, 1000, nil)
+
+		var decodeSupply float64
+		for _, vc := range drained.VariantCapacities {
+			if vc.VariantName == decodeV {
+				decodeSupply = float64(vc.ReplicaCount) * vc.PerReplicaCapacity
+			}
+		}
+		Expect(decodeSupply).To(BeNumerically(">", 0))
+		// scaleDown is 0.70 in makeAnalyzerInput: the bottom of the band
+		// where the engine neither orders nor releases.
+		Expect(drained.RoleDemand[domain.RoleDecode]).To(BeNumerically(">=", 0.70*decodeSupply),
+			"a fleet whose shape has just changed is not released on the old shape's occupancy")
+		Expect(swap).NotTo(BeNil())
+	})
+
+	It("releases the fleet once the new shape has a reading of its own", func() {
+		// The same three cycles, then the fleet saturates under the new
+		// shape: a replica full and queued records a throughput window of
+		// its OWN, which is what the hold was waiting for.
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 900_000, 0, 8000, 6000, &domain.SchedulerQueueMetrics{QueueSize: 20, QueueBytes: 912_037})
+		clock = clock.Add(15 * time.Second)
+		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeTrue())
+
+		// Two saturated cycles a window apart under the new shape.
+		for _, rate := range []float64{5.3, 5.4} {
+			rms := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 10, 8000, 1000)
+			rms.RequestRate = rate
+			rms.Ready = true
+			input := makeAnalyzerInput([]domain.ReplicaMetrics{rms}, states(1))
+			input.ArrivalRate = 5.68
+			_, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		}
+		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeFalse(),
+			"a replica reading its own window under the new shape settles the hold")
+	})
+
+	It("releases the fleet after the backstop when it never saturates again", func() {
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 900_000, 0, 8000, 6000, &domain.SchedulerQueueMetrics{QueueSize: 20, QueueBytes: 912_037})
+		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeTrue())
+
+		// The generations turn over to the new shape a minute later, which is
+		// a second change on the output axis -- the I-up event and the O-down
+		// event are distinct on this trace, and the hold spans both.
+		clock = clock.Add(time.Minute)
+		cycle(10, 17_282, 0, 8000, 1000, nil)
+		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeTrue())
+
+		// The run's phase 2 from here: idle at eleven replicas, nothing
+		// queued, the shape steady, so no window is ever recorded under it.
+		// Without the backstop the hold would stand for the rest of the run.
+		clock = clock.Add(ShapeChangeHoldMax + time.Second)
+		cycle(10, 17_282, 0, 8000, 1000, nil)
+		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeFalse(),
+			"ShapeChangeHoldMax releases a fleet that will never measure itself")
+	})
+
+	It("raises nothing while the shape holds still", func() {
+		// The negative control for the whole mechanism: the same load, cycle
+		// after cycle, must never raise an event or hold anything.
+		for i := 0; i < 5; i++ {
+			cycle(10, 17_282, 0, 1000, 6000, nil)
+			Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeFalse(),
+				"a fleet serving one shape has nothing to hold for")
+			clock = clock.Add(15 * time.Second)
+		}
+	})
+})
