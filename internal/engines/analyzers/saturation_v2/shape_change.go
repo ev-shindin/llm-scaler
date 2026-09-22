@@ -181,6 +181,25 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 	}
 	was, hadShape := memo.tracker.Current()
 	now := a.now()
+	// An axis reading zero is a fleet that has nothing to report on it yet,
+	// not a workload of zero-length generations, and Within treats any
+	// non-zero value as outside a stored zero. So the first cycle whose
+	// completions give an output length would otherwise read as a change away
+	// from a shape that was never measured. Observed on the 2026-09-22 rerun:
+	// `outputTokensWas: 0, outputTokensNow: 6000` at 19:20:37, 70 s into the
+	// run, one cycle after the first replica completed anything. It cost
+	// nothing there -- the fleet was ramping, so its demand was above the
+	// no-release floor and no hold applied -- but it would fire on every
+	// controller restart, and a restart during a steady phase is exactly when
+	// a spurious hold would suppress a real scale-down.
+	//
+	// Reset rather than suppress: the stored shape is half-measured, and the
+	// tracker's own contract for a first reading (set it, report no change) is
+	// what this cycle actually is.
+	if hadShape && ((was.AvgOutputTokens == 0 && out > 0) || (was.AvgInputTokens == 0 && in > 0)) {
+		memo.tracker.Reset()
+		hadShape = false
+	}
 	next, changed := memo.tracker.Observe(in, out, 0)
 	// The arriving prompt is the early half, and the only one that moves
 	// before anything completes. Compared against the last reading from

@@ -251,6 +251,33 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		}
 	})
 
+	It("does not read the first measurable output length as a change", func() {
+		// Observed on the 2026-09-22 rerun at 19:20:37, 70 s in: before any
+		// request completes fleetOutputLength is 0, and Within treats any
+		// non-zero value as outside a stored zero, so the first completions
+		// read as `outputTokensWas: 0, outputTokensNow: 6000`. Harmless
+		// during a ramp, wrong on a controller restart in a steady phase.
+		rm := makeReplicaMetrics("d0", decodeV, 17_282, kvCap, 0, 1000, 0)
+		rm.RequestRate = 0.6
+		rm.Ready = true
+		input := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(1))
+		input.ArrivalRate = 5.68
+		_, err := analyzer.Analyze(ctx, input)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeFalse())
+		clock = clock.Add(15 * time.Second)
+
+		// The first completions land: an output length becomes measurable.
+		cycle(1, 17_282, 0, 1000, 6000, nil)
+		Expect(outstanding()).To(BeFalse(),
+			"learning an axis for the first time is not the workload changing")
+
+		// And a genuine change after that is still caught.
+		clock = clock.Add(15 * time.Second)
+		cycle(1, 8000, 0, 8000, 1000, nil)
+		Expect(outstanding()).To(BeTrue(), "a real shape change must still raise")
+	})
+
 	It("raises nothing while the shape holds still", func() {
 		// The negative control for the whole mechanism: the same load, cycle
 		// after cycle, must never raise an event or hold anything.
