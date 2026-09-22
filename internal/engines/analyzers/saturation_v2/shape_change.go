@@ -148,6 +148,61 @@ func servedPromptLength(replicas []domain.ReplicaMetrics) float64 {
 	return 0
 }
 
+// saturatedCompletionRate is what one replica completes per second while
+// saturated. For a role that generates, it is priced from the tokens it is
+// GENERATING rather than the requests it is finishing.
+//
+// RequestRate is rate(vllm:request_generation_tokens_count), a count of
+// COMPLETIONS, and completions are bursty in exactly the way that breaks a max
+// window. Sequences admitted together finish together, so when a batch drains
+// the completion rate spikes far above anything the replica sustains, the
+// queue gate is a one-minute max and is still up while the burst is fresh, and
+// the window -- which keeps a max and never lowers a reading -- carries the
+// burst for the rest of the phase. throughput_floor.go's own header records
+// this as open and names this fix.
+//
+// Measured on the 2026-09-22 A/B, phase 1 (1000/6000 at 6 req/s). The window
+// settled on 1.7 req/s per replica; the fleet sustained 6 req/s across 6.7
+// replicas, which is 0.9. Sized on 1.7 the floor asked for 3.5 replicas where
+// the shape needs about 8, and the decode queue ran at a mean of 16.2 against
+// a threshold of 5 for the whole phase -- sustained saturation. The run before
+// it, whose mu alternated across a bucket boundary, happened to substitute
+// 0.82 on half its cycles and so kept a large enough fleet by accident; that
+// accident is what removing the boundary flip took away.
+//
+// Generated tokens do not burst on a drain: a replica emits them at the rate
+// its batch allows whether or not any sequence happens to finish. Tokens per
+// second over the shape's output length is therefore the same figure the
+// completion rate is trying to be, measured where it is steady:
+//
+//	mu_req = GenerationTokenRate / O
+//
+// O is the FLEET's output length, the same figure the window is keyed by, so
+// the rate and the key describe one shape.
+//
+// Returns false when either term is missing, and the caller records nothing:
+// a window holding one definition of mu and then another would take the max of
+// the two, which is the burst again. A role with no window gets no floor and
+// answers to occupancy, which is the documented behaviour for a fleet that has
+// never been seen saturated.
+func saturatedCompletionRate(rm domain.ReplicaMetrics, role string, fleetOutput float64) (float64, bool) {
+	// Prefill emits about one token per request -- its work is the prompt, not
+	// the generation -- so tokens over an output length is not its completion
+	// rate and would read three orders of magnitude low. It keeps the
+	// completion rate, which is also where the burst this replaces does not
+	// arise: a drain burst is a batch of long GENERATIONS finishing together,
+	// and prefill holds nothing that long. Prefill's own counterpart is prompt
+	// tokens per second, from prompt_tokens_total keyed by input length, which
+	// the collector does not gather today (item 1 of the proposal).
+	if canonicalRole(role) == domain.RolePrefill {
+		return rm.RequestRate, rm.RequestRate > 0
+	}
+	if rm.GenerationTokenRate <= 0 || fleetOutput <= 0 {
+		return 0, false
+	}
+	return rm.GenerationTokenRate / fleetOutput, true
+}
+
 // noteFleetShape folds this cycle's (I, O) into the model's tracker and
 // reports whether a change is outstanding: raised on this cycle or an earlier
 // one and not yet settled by settleFleetShape.

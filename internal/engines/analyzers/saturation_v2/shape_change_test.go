@@ -101,11 +101,13 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		for i := 0; i < n; i++ {
 			rm := makeReplicaMetrics(fmt.Sprintf("d%d", i), decodeV, tokens, kvCap, queue, in, out)
 			rm.RequestRate = 0.6
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			rms = append(rms, rm)
 		}
 		p := makeReplicaMetrics("p0", prefillV, 8_065, 1_149_312, 0, in, 1)
 		p.RequestRate = 6
+		p.GenerationTokenRate = p.RequestRate * p.AvgOutputTokens
 		p.Ready = true
 		rms = append(rms, p)
 
@@ -166,6 +168,7 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		for _, rate := range []float64{5.3, 5.4} {
 			rms := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 10, 8000, 1000)
 			rms.RequestRate = rate
+			rms.GenerationTokenRate = rms.RequestRate * rms.AvgOutputTokens
 			rms.Ready = true
 			input := makeAnalyzerInput([]domain.ReplicaMetrics{rms}, states(1))
 			input.ArrivalRate = 5.68
@@ -214,6 +217,7 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		for i, out := range []float64{6000, 5990, 6010, 5995, 6005, 6000} {
 			rm := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 10, 1000, out)
 			rm.RequestRate = 5.4 - 0.01*float64(i)
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			input := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(1))
 			input.ArrivalRate = 5.68
@@ -259,6 +263,7 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		// during a ramp, wrong on a controller restart in a steady phase.
 		rm := makeReplicaMetrics("d0", decodeV, 17_282, kvCap, 0, 1000, 0)
 		rm.RequestRate = 0.6
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		input := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(1))
 		input.ArrivalRate = 5.68
@@ -276,6 +281,57 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		clock = clock.Add(15 * time.Second)
 		cycle(1, 8000, 0, 8000, 1000, nil)
 		Expect(outstanding()).To(BeTrue(), "a real shape change must still raise")
+	})
+
+	It("does not take a drain burst as the fleet's throughput", func() {
+		// throughput_floor.go's header records this as the open failure of a
+		// completion-rate mu: sequences admitted together finish together, so
+		// when a batch drains the completion rate spikes far above anything
+		// the replica sustains, the queue gate is a one-minute max and is
+		// still up while the burst is fresh, and the window -- which keeps a
+		// max and never lowers a reading -- carries the burst for the rest of
+		// the phase. Measured on the cold pass of 2026-09-19: 6.67 req/s on
+		// the last saturated cycle against ~5.0 sustained.
+		//
+		// Generated tokens do not burst on a drain, so pricing mu from them
+		// leaves the window on the sustained figure.
+		const (
+			out       = 1000.0
+			sustained = 5.0
+			burst     = 6.67
+		)
+		saturated := func(completions, genTokens float64) {
+			rm := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 10, 1000, out)
+			rm.RequestRate = completions
+			rm.GenerationTokenRate = genTokens
+			rm.Ready = true
+			input := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(1))
+			input.ArrivalRate = 5.68
+			_, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		}
+
+		// Two sustained cycles a window apart: the fleet is completing 5.0/s
+		// and generating 5000 tokens/s to do it.
+		saturated(sustained-0.1, (sustained-0.1)*out)
+		saturated(sustained, sustained*out)
+
+		// The drain: the batch finishes together, so completions spike while
+		// the token rate does not -- there are no more tokens to emit than
+		// the batch was already emitting.
+		saturated(burst, sustained*out)
+
+		var mu float64
+		for key, window := range analyzer.saturatedThroughput {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+				mu = window.Max()
+			}
+		}
+		Expect(mu).To(BeNumerically("~", sustained, 0.05),
+			"the window must hold what the replica sustains, not the drain's burst")
+		Expect(mu).To(BeNumerically("<", burst*0.95),
+			"a burst of %v must not become the fleet's mu", burst)
 	})
 
 	It("raises nothing while the shape holds still", func() {

@@ -209,12 +209,14 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	decode := func(pod string, tokensInUse int64, queue int, rate float64) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, decodeVariant, tokensInUse, runKvCapacity, queue, 6000, 1000)
 		rm.RequestRate = rate
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
 	prefill := func(pod string, tokensInUse int64) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, "prefill-v", tokensInUse, 1_149_312, 0, 6000, 1)
 		rm.RequestRate = runLambda
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
@@ -304,12 +306,14 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		long := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 900)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
 		xxlong := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 5500)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
@@ -346,8 +350,24 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			}
 		}
 		Expect(decodeP).To(BeNumerically(">", 0))
-		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/1.40, 0.05),
+		// mu is priced from generated tokens over the fleet's output length
+		// (saturatedCompletionRate), so the figure the window holds is not the
+		// 1.40 req/s the saturated pair completes but what that token rate is
+		// worth in requests of the size the FLEET is serving:
+		//
+		//   tokens/s  = 1.40 x 5500                              = 7700
+		//   fleet O   = (2 x 1.40 x 5500 + 3 x 0.2 x 900) / 3.4  = 4688
+		//   mu        = 7700 / 4688                              = 1.6425
+		//
+		// The claim is the one this spec has always made: the fleet's shape
+		// prices the role. Priced on each replica's own bucket instead, the
+		// three `long` readings would carry it to 3.08 and the floor to 1.95
+		// replicas, which is the release this spec exists to prevent.
+		const xxlongMu = 7700.0 / 4688.0
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/xxlongMu, 0.05),
 			"the fleet serves ~5500-token outputs: the floor is lambda over the xxlong mu, whatever each replica's own recent completions average")
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically(">", runLambda/3.08*1.5),
+			"and nowhere near the figure the wrong bucket would have given")
 		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).NotTo(BeNumerically("~", runLambda/3.08, 0.3),
 			"and not lambda over the 1000-token shape's mu")
 	})
@@ -450,6 +470,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		row := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 4000)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
@@ -610,6 +631,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		satP := prefill("prefill-0", 900_000)
 		satP.QueueLength = 10
 		satP.RequestRate = 30
+		satP.GenerationTokenRate = satP.RequestRate * satP.AvgOutputTokens
 		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 300_000, 0, runMu), satP}, states(1, 1))
 		in2.ArrivalRate = runLambda
 		_, err = analyzer.Analyze(ctx, in2)
@@ -771,6 +793,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		both := func(pod string, tokensInUse int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, "v", tokensInUse, runKvCapacity, queue, 6000, 1000)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
@@ -781,6 +804,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		in.ReplicaMetrics[0].RequestRate = runMu - 0.01 // a second reading, a rate window later
+		in.ReplicaMetrics[0].GenerationTokenRate = in.ReplicaMetrics[0].RequestRate * in.ReplicaMetrics[0].AvgOutputTokens
 		clock = clock.Add(ThroughputSampleSpacing)
 		_, err = analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred(), "the second saturated cycle, so the window may order")

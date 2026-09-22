@@ -482,7 +482,9 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	throughputKey := a.historyKey(modelID, namespace, rm.VariantName, accelerator, gpuCount, role,
 		fleetOutput, config.QueueLengthThreshold)
 	if k2Priority == capacity.K2SrcObserved && rm.Ready && !rm.FromWarmPool {
-		a.recordSaturatedThroughput(throughputKey, rm.RequestRate)
+		if mu, ok := saturatedCompletionRate(rm, role, fleetOutput); ok {
+			a.recordSaturatedThroughput(throughputKey, mu)
+		}
 	}
 	reading := a.saturatedThroughputReading(throughputKey)
 	saturatedThroughput, throughputBucket := reading.rate, reading.bucket

@@ -54,6 +54,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 	decode := func(pod string, tokensInUse int64, queue int) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, decodeVariant, tokensInUse, runKvCapacity, queue, 6000, 1000)
 		rm.RequestRate = 4.73
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
@@ -61,6 +62,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 	prefill := func() domain.ReplicaMetrics {
 		rm := makeReplicaMetrics("prefill-0", prefillVariant, 357_800, prefillKv, 30, 6000, 1)
 		rm.RequestRate = 4.77
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
@@ -193,6 +195,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 			clock = clock.Add(ThroughputSampleSpacing) // two readings, a rate window apart
 			slow := prefill()
 			slow.RequestRate = 4 - 0.01*float64(i)
+			slow.GenerationTokenRate = slow.RequestRate * slow.AvgOutputTokens
 			in := makeAnalyzerInput([]domain.ReplicaMetrics{
 				decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 0), slow}, states)
 			in.ArrivalRate = runLambda

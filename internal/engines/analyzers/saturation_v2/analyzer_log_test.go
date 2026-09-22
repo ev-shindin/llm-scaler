@@ -437,6 +437,7 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	// on record for the bucket (MinThroughputSamplesToOrder).
 	sat := makeReplicaMetrics("pod-1", "variant-a", 500_000, 600_000, 10, 4000, 1000)
 	sat.RequestRate = 5
+	sat.GenerationTokenRate = sat.RequestRate * sat.AvgOutputTokens
 	sat.Ready = true
 	input := makeAnalyzerInput([]domain.ReplicaMetrics{sat}, states)
 	input.ArrivalRate = 14
@@ -449,6 +450,7 @@ func TestLogContract_ThroughputFloorBinds(t *testing.T) {
 	// unchanged. The floor binds and says so.
 	idle := makeReplicaMetrics("pod-1", "variant-a", 10_000, 600_000, 0, 4000, 1000)
 	idle.RequestRate = 5
+	idle.GenerationTokenRate = idle.RequestRate * idle.AvgOutputTokens
 	idle.Ready = true
 	states[0].CurrentReplicas = 4
 	input = makeAnalyzerInput([]domain.ReplicaMetrics{idle, idle, idle, idle}, states)
