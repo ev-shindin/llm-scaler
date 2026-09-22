@@ -8,6 +8,17 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
 )
 
+// ParseEngineArgs parses a scale target's container args using the parser
+// appropriate for the given inference engine, returning the shared
+// EngineParams. It dispatches to ParseSGLangArgs for SGLang and ParseVLLMArgs
+// otherwise (the default), so existing vLLM behavior is unchanged.
+func ParseEngineArgs(engine inferenceengine.Engine, scaleTarget scaletarget.ScaleTargetAccessor) EngineParams {
+	if engine == inferenceengine.EngineSGLang {
+		return ParseSGLangArgs(scaleTarget)
+	}
+	return ParseVLLMArgs(scaleTarget)
+}
+
 // EngineParams holds inference-engine configuration parameters parsed from a
 // Deployment/LWS's container args and environment variables. These are used
 // to derive compute-bound capacity (k2) when no live metrics are available.

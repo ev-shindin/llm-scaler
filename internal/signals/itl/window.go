@@ -13,9 +13,10 @@ const (
 	DefaultWindowMaxSize = 20
 
 	// DefaultObservationMaxAge is the maximum age of an observation in the
-	// window. Observations older than this are pruned regardless of window
-	// fullness, ensuring that stale data from a previous load pattern does
-	// not contaminate the current fit.
+	// window. Observations older than this are dropped by Prune, which the
+	// owner calls once per cycle before asking Ready -- nothing in Add,
+	// Ready or Observations prunes -- so that stale data from a previous
+	// load pattern does not contaminate the current fit.
 	DefaultObservationMaxAge = 30 * time.Minute
 
 	// DefaultMinSamples is the minimum number of valid observations required
@@ -36,7 +37,8 @@ const (
 
 	// DefaultMaxObservableK is the upper bound on KV utilization for accepted
 	// observations. Above this threshold the system approaches saturation and
-	// the linear ITL model may no longer hold.
+	// the linear ITL model may no longer hold. It equals DefaultKSat: the
+	// window's ceiling is the point ValidModel evaluates a fit at.
 	DefaultMaxObservableK = 0.85
 )
 
@@ -56,8 +58,10 @@ type Observation struct {
 // cycles to calibrate the linear ITL model: ITL(k) = A·k + B.
 //
 // The caller clears the window when the workload shape changes (see the
-// throughput analyzer and shape.Tracker).
+// throughput analyzer and shape.Tracker) and prunes it by age (Prune).
 // Observations outside the valid k range [minK, maxK] are silently ignored.
+//
+// Not safe for concurrent use: the owner serialises access.
 type Window struct {
 	observations []Observation
 	maxSize      int

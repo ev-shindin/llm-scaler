@@ -7,6 +7,8 @@ package shape
 // The shape is characterised by the variant-average (IL, OL) across all replicas.
 // A shape change is declared when either IL or OL deviates from the stored shape
 // by more than the configured tolerance fraction.
+//
+// Not safe for concurrent use: the owner serialises access.
 type Tracker struct {
 	current   Shape
 	hasShape  bool

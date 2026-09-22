@@ -1645,8 +1645,8 @@ func k2SourceLabel(replicas []ReplicaCapacity) string {
 //
 // Averages the central pair on an even count: this blends learned
 // per-replica capacities, where every reading is trusted and the midpoint is
-// the better estimate. floor.Median follows the same convention for the same
-// reason.
+// the better estimate. The floor's median follows the same convention for
+// the same reason.
 func median(values []int64) int64 {
 	n := len(values)
 	if n == 0 {

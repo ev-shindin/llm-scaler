@@ -41,7 +41,10 @@ type Shape struct {
 }
 
 // New constructs a Shape and computes the derived fields.
-// hitRate values outside [0, 1] are clamped; NaN is treated as 0.0.
+// hitRate values outside [0, 1] are clamped; NaN is treated as 0.0. il and
+// ol are taken as given: a NaN in either is never Within any shape, so a
+// tracker fed one reports a change every cycle -- the caller's sanity check
+// keeps them out.
 func New(il, ol, hitRate float64) Shape {
 	if math.IsNaN(hitRate) || hitRate < 0 {
 		hitRate = 0
