@@ -408,7 +408,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	//
 	// Ready pods only. A pod that is still failing its readiness probe can
 	// report completions -- the collector drops its timing for exactly that
-	// reason (replica_metrics.go) but leaves its completion rate, which other
+	// reason (collector/attribute.go) but leaves its completion rate, which other
 	// consumers sum as real work. A per-replica RATE from such a pod is not a
 	// capacity, and the floor divides by it.
 	//

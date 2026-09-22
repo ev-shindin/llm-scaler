@@ -12,8 +12,9 @@ import (
 )
 
 // freshnessSeverity orders freshness statuses from best to worst, so both the
-// per-instance rollup in collectReplicaMetrics and the pod merge above can pick
-// the single worst status across a set of metrics.
+// per-instance rollup (worstFreshnessStatus, below) and the per-Pod merge
+// (mergeMetadata in pod_collapse.go) can pick the single worst status across
+// a set of metrics.
 var freshnessSeverity = map[string]int{"fresh": 0, "stale": 1, "unavailable": 2, "missing": 3}
 
 // classifyTimestamp reports the freshness status of a single metric timestamp,

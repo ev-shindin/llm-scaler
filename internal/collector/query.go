@@ -155,14 +155,14 @@ func (c *ReplicaMetricsCollector) queryReplicaSeries(
 	}
 
 	// Re-key engine-specific results under their logical query names so the per-pod
-	// processing below is engine-agnostic. For SGLang-only models this renames the
+	// processing (extractPodMetrics) is engine-agnostic. For SGLang-only models this renames the
 	// "sglang/<query>" results to "<query>"; for mixed-engine models it concatenates
 	// the per-engine series. The structural cache-config difference is handled by a
-	// dedicated SGLang pass after the vLLM cache-config block.
+	// dedicated SGLang pass after the vLLM cache-config block, in extractPodMetrics.
 	mergeEngineResults(results, engines, engineSpecificReplicaQueries)
 
-	// Take this model's slice of the namespace-wide series. Everything below
-	// operates on model-scoped results, as it did when the model was a PromQL
+	// Take this model's slice of the namespace-wide series. Everything from here
+	// on operates on model-scoped results, as it did when the model was a PromQL
 	// matcher.
 	filterResultsToModel(results, engineSpecificReplicaQueries, modelID)
 
@@ -237,6 +237,12 @@ func (c *ReplicaMetricsCollector) CollectSchedulerQueueMetrics(
 		QueueBytes: queueBytes,
 	}
 }
+
+// CollectModelArrivalRate collects the model-level request arrival rate (req/s)
+// from the llm-d inference scheduler. It sums the source metric across the whole
+// model with no pod_name/port labels to reconcile against vLLM's per-instance
+// metrics — which is exactly why the per-instance form of this query no longer
+// exists. Returns 0 (not an error) when the metric is unavailable.
 func (c *ReplicaMetricsCollector) CollectModelArrivalRate(
 	ctx context.Context,
 	modelID, namespace string,

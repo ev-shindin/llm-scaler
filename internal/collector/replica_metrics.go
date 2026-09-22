@@ -127,12 +127,6 @@ func (c *ReplicaMetricsCollector) SetBridgeResolver(r BridgeResolver) {
 	c.bridges = r
 }
 
-// bridgeFor asks the resolver, if there is one, whether pod is a lent bridge.
-// CollectModelArrivalRate collects the model-level request arrival rate (req/s)
-// from the llm-d inference scheduler. It sums the source metric across the whole
-// model with no pod_name/port labels to reconcile against vLLM's per-instance
-// metrics — which is exactly why the per-instance form of this query no longer
-// exists. Returns 0 (not an error) when the metric is unavailable.
 // warmPoolLendingMaxAge is how old the pool's lending map may be before a Pod in
 // it stops being treated as a bridge.
 //
@@ -142,6 +136,7 @@ func (c *ReplicaMetricsCollector) SetBridgeResolver(r BridgeResolver) {
 // keep adding it for as long as the controller ran.
 const warmPoolLendingMaxAge = 2 * time.Minute
 
+// bridgeFor asks the resolver, if there is one, whether pod is a lent bridge.
 func (c *ReplicaMetricsCollector) bridgeFor(namespace, pod string) (string, bool) {
 	if c.bridges == nil {
 		return "", false
@@ -409,7 +404,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	instanceCount := len(replicaMetrics)
 	replicaMetrics = collapseToPods(replicaMetrics)
 
-	// Only set this after all pods have been processed, making sure not to include pods without metrics (which are skipped above).
+	// Only set this after all pods have been processed, making sure not to include pods without metrics (which attributeInstance skips).
 	// This ensures that the discovered pod count reflects only those pods that produced replica metrics.
 	metrics.SetMetricsPodsDiscovered(namespace, len(replicaMetrics))
 	logger.V(logging.DEBUG).Info("Collected replica metrics",
