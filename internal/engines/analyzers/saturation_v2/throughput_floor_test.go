@@ -10,6 +10,8 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 )
 
 // Figures from the shape-swap P/D run (biran-20260915-102548-571), H200,
@@ -34,7 +36,7 @@ var _ = Describe("the saturated-throughput window", func() {
 		// a sample (inside the spacing the fold would make them one, and
 		// the max of one is its mean). The mean would be 4.07 and imply
 		// 1.47 replicas; the replica was demonstrably completing 5.4.
-		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a := NewSaturationAnalyzer(capacity.NewStore())
 		now := time.Date(2026, 9, 17, 10, 50, 20, 0, time.UTC)
 		a.now = func() time.Time { return now }
 		k := "m|H200|1|decode|long|q5"
@@ -58,7 +60,7 @@ var _ = Describe("the saturated-throughput window", func() {
 		// 1000-token shape's 4.8. Without the borrow the floor vanished on the
 		// first cycle of the new shape and a three-replica fleet was sized to
 		// one from 400k tokens of occupancy.
-		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a := NewSaturationAnalyzer(capacity.NewStore())
 		a.recordSaturatedThroughput("m|H200|1|decode|long|q5", 4.8)
 		mu, bucket := a.saturatedThroughputFor("m|H200|1|decode|xxlong|q5")
 		Expect(mu).To(Equal(4.8))
@@ -94,7 +96,7 @@ var _ = Describe("the saturated-throughput window", func() {
 		// four consecutive cycles, 3.43 req/s each time. Four samples would
 		// clear MinThroughputSamplesToOrder and let the floor order at
 		// lambda / 3.43 = 1.75 replicas' worth on one under-read.
-		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a := NewSaturationAnalyzer(capacity.NewStore())
 		t0 := time.Date(2026, 9, 19, 7, 44, 41, 0, time.UTC)
 		now := t0
 		a.now = func() time.Time { return now }
@@ -145,7 +147,7 @@ var _ = Describe("the saturated-throughput window", func() {
 	})
 
 	It("ignores a non-positive reading and is evicted with the k2 history", func() {
-		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a := NewSaturationAnalyzer(capacity.NewStore())
 		a.recordSaturatedThroughput("k", 0)
 		Expect(a.saturatedThroughput).To(BeEmpty())
 		a.recordSaturatedThroughput("k", 2)
@@ -167,7 +169,7 @@ var _ = Describe("the saturated-throughput window", func() {
 
 		// A key with fewer than two separators has no bucket field to find.
 		// Both the borrow and bucketOf must say so rather than guess.
-		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		a := NewSaturationAnalyzer(capacity.NewStore())
 		a.recordSaturatedThroughput("m|H200|1|decode|long|q5", 5.4)
 		for _, bad := range []string{"", "no-separators", "one|separator"} {
 			_, _, _, ok := splitHistoryKey(bad)
@@ -194,7 +196,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		clock    time.Time
 	)
 	BeforeEach(func() {
-		analyzer = NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer = NewSaturationAnalyzer(capacity.NewStore())
 		// The saturating cycles below are decode full and queued, which
 		// the analyzer remembers for DecodeSaturationMemory and holds
 		// prefill's demand through (holdPrefillDemand); the specs here are
@@ -241,7 +243,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	// The first is the under-read, the last is runMu, which the max keeps.
 	// The last step also moves the clock past DecodeSaturationMemory.
 	saturate := func() {
-		for i := MinThroughputSamplesToOrder - 1; i >= 0; i-- {
+		for i := floor.MinThroughputSamplesToOrder - 1; i >= 0; i-- {
 			saturateOnce(runMu - 0.01*float64(i))
 			clock = clock.Add(ThroughputSampleSpacing + time.Second)
 		}
@@ -281,7 +283,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 
 		// Negative control, on the same fixtures: an analyzer that never saw
 		// the saturation has no mu and reports occupancy, one tenth of that.
-		fresh := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		fresh := NewSaturationAnalyzer(capacity.NewStore())
 		bare, err := fresh.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(bare.RoleDemand[domain.RoleDecode]).To(BeNumerically("<", want/5))
@@ -517,7 +519,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 
 		// Negative control: without the saturation on record the same input
 		// is priced at its occupancy, and a fleet of one is not asked to grow.
-		fresh := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		fresh := NewSaturationAnalyzer(capacity.NewStore())
 		bare, err := fresh.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(bare.RoleDemand[domain.RoleDecode] / 0.85).To(BeNumerically("<", decodeP))
@@ -543,7 +545,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 				decodeP = vc.PerReplicaCapacity
 			}
 		}
-		want := (runLambda + 380.0/BacklogDrainSeconds) / runMu * decodeP
+		want := (runLambda + 380.0/floor.BacklogDrainSeconds) / runMu * decodeP
 		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
 		Expect(result.RoleDemand[domain.RoleDecode] / decodeP).To(BeNumerically("~", 2.28, 0.01))
 		Expect(result.TotalDemand).To(BeNumerically("~", result.RoleDemand[domain.RoleDecode]+result.RoleDemand[domain.RolePrefill], 1),
@@ -554,7 +556,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		// replicas. A saturated replica records its mu in the cycle its queue
 		// appears, so the control is one whose completion rate is not
 		// reported (no rate, no reading) rather than a fresh analyzer.
-		fresh := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		fresh := NewSaturationAnalyzer(capacity.NewStore())
 		ctl := makeAnalyzerInput(
 			[]domain.ReplicaMetrics{decode("decode-0", 1_158_912, 180, 0), prefill("prefill-0", 66_183)},
 			states(1, 1))
@@ -620,7 +622,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 				prefillP = vc.PerReplicaCapacity
 			}
 		}
-		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", (runLambda+200.0/BacklogDrainSeconds)/30*prefillP, 1),
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", (runLambda+200.0/floor.BacklogDrainSeconds)/30*prefillP, 1),
 			"the 200 queued prompts are 3.3 extra req/s against a prefill mu of 30")
 	})
 
@@ -666,14 +668,14 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		// Reachable only if a residency charge outlives the demand it was
 		// folded into; the arithmetic must not hand the engine a negative
 		// demand. Exercised at the function level with an inconsistent pair.
-		rcs := []ReplicaCapacity{{VariantName: decodeVariant, SaturatedThroughput: runMu,
-			SaturatedThroughputSamples: MinThroughputSamplesToOrder, QueueLength: 10, LocalQueueDemand: 500_000}}
+		rcs := []capacity.ReplicaCapacity{{VariantName: decodeVariant, SaturatedThroughput: runMu,
+			SaturatedThroughputSamples: floor.MinThroughputSamplesToOrder, QueueLength: 10, LocalQueueDemand: 500_000}}
 		vcs := []domain.VariantCapacity{{VariantName: decodeVariant, Role: domain.RoleDecode, ReplicaCount: 1, PerReplicaCapacity: float64(runK1)}}
 		roleDemand := map[string]float64{domain.RoleDecode: 100_000}
 		in := makeAnalyzerInput(nil, states(1, 1))
 		in.ArrivalRate = runLambda
 		total := analyzer.applyThroughputFloor(in, in.Config.(*config.ScalingPolicy), rcs, vcs, 100_000, roleDemand, nil, 0, GinkgoLogr)
-		want := (runLambda + 10.0/BacklogDrainSeconds) / runMu * float64(runK1)
+		want := (runLambda + 10.0/floor.BacklogDrainSeconds) / runMu * float64(runK1)
 		Expect(roleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
 		Expect(total).To(BeNumerically("~", want, 1))
 		Expect(total).To(BeNumerically(">", 0))
@@ -803,7 +805,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		result, err = analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 		P := result.VariantCapacities[0].PerReplicaCapacity
-		Expect(result.TotalDemand).To(BeNumerically("~", (runLambda+100.0/BacklogDrainSeconds)/runMu*P, 1))
+		Expect(result.TotalDemand).To(BeNumerically("~", (runLambda+100.0/floor.BacklogDrainSeconds)/runMu*P, 1))
 		Expect(result.TotalDemand / P).To(BeNumerically("~", 1.42, 0.01))
 	})
 })

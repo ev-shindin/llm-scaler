@@ -305,7 +305,7 @@ by the benchmark scorecard on the two shape-swap traces (runs 16 and 18 of
 2026-09-20 are the fixed references: any stage that moves their windowed
 p95 or target path has changed behaviour and stops).
 
-1. **`signals`** -- extract, do not rewrite. Move `ShapeTracker`,
+1. **`signals`** -- done in PR #89, the shims removed after it. Move `ShapeTracker`,
    `ObservationWindow` and `ITLModel` out of `throughput`, and
    `rollingAverage`, the capacity store (k1/k2, history, eviction) and the
    floor's arithmetic (`estimateThroughputDemand`, `medianFloat`,
@@ -317,7 +317,13 @@ p95 or target path has changed behaviour and stops).
    directory first would turn stage 4's rebase into a conflict; the check
    already ranks it at the signals layer, the moved code keeps importing it
    at its current path, and it moves under `signals` after stage 4.
-   Analyzers keep working unchanged, importing the moved code.
+   Analyzers keep working unchanged, importing the moved code. What
+   landed: `signals/shape`, `signals/itl`, `signals/capacity` (the store,
+   its window, the engine-arg parsers, `ReplicaCapacity` and `K2Source`)
+   and `signals/floor`; the analyzers name them by package, and the one
+   alias left is `saturation_v2.CapacityKnowledgeStore` with its
+   constructor, which `steadystate/engine.go` reads until stage 3 touches
+   that file.
 2. **Cut the upward edge, and make the direction a rule** -- done in
    PR #88. `ReasonError` and `ReasonNoData` are `domain` constants,
    aliased under their old names in `allocation` (`ResultIsInformative`

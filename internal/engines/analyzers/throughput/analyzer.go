@@ -29,8 +29,8 @@ type ThroughputAnalyzer struct {
 
 // variantState holds the cross-cycle calibration state for a single variant.
 type variantState struct {
-	shapeTracker      *ShapeTracker
-	observationWindow *ObservationWindow
+	shapeTracker      *shape.Tracker
+	observationWindow *itl.Window
 	// role is the P/D disaggregation role ("prefill", "decode", "both", "").
 	// Updated from VariantStates at the start of each Analyze call.
 	role             string
@@ -48,7 +48,7 @@ type variantState struct {
 	// observationWindow.Clear() so it is bound to the current window's lifetime.
 	consecutiveGPSMismatches int
 	// set by Analyze() for VariantState() snapshots
-	lastITLModel         ITLModel
+	lastITLModel         itl.Model
 	lastPerReplicaSupply float64
 	lastTotalSupply      float64
 	lastDemand           float64
@@ -159,7 +159,7 @@ func (a *ThroughputAnalyzer) Observe(
 	// max age. Prevents stale entries from deleted/recreated VAs from
 	// accumulating in memory and causing false shape-change signals on recreate.
 	for key, state := range a.variantStates {
-		if now.Sub(state.lastObservedAt) > 2*DefaultObservationMaxAge {
+		if now.Sub(state.lastObservedAt) > 2*itl.DefaultObservationMaxAge {
 			delete(a.variantStates, key)
 		}
 	}
@@ -321,7 +321,7 @@ func (a *ThroughputAnalyzer) Analyze(
 			continue
 		}
 
-		itlSat := model.ITLAt(DefaultKSat)
+		itlSat := model.ITLAt(itl.DefaultKSat)
 		if itlSat <= 0 {
 			continue
 		}
@@ -521,14 +521,14 @@ func (a *ThroughputAnalyzer) getOrCreateVariantState(key string) *variantState {
 		return state
 	}
 	state := &variantState{
-		shapeTracker: shape.NewTracker(DefaultShapeChangeTolerance),
+		shapeTracker: shape.NewTracker(shape.DefaultChangeTolerance),
 		observationWindow: itl.NewWindow(
-			DefaultWindowMaxSize,
-			DefaultObservationMaxAge,
-			DefaultMinSamples,
-			DefaultMinKSpread,
-			DefaultMinObservableK,
-			DefaultMaxObservableK,
+			itl.DefaultWindowMaxSize,
+			itl.DefaultObservationMaxAge,
+			itl.DefaultMinSamples,
+			itl.DefaultMinKSpread,
+			itl.DefaultMinObservableK,
+			itl.DefaultMaxObservableK,
 		),
 	}
 	a.variantStates[key] = state
@@ -549,7 +549,7 @@ func (a *ThroughputAnalyzer) getOrCreateVariantState(key string) *variantState {
 // is extended to iterate variants with state but no current replica metrics.
 //
 // Must be called with a.mu held.
-func (a *ThroughputAnalyzer) resolveITLModel(ctx context.Context, state *variantState, metrics []domain.ReplicaMetrics, namespace, modelID, variantName string) (ITLModel, string, bool) {
+func (a *ThroughputAnalyzer) resolveITLModel(ctx context.Context, state *variantState, metrics []domain.ReplicaMetrics, namespace, modelID, variantName string) (itl.Model, string, bool) {
 	// Tier 1: OLS fit.
 	if state.observationWindow.Ready() {
 		obs := state.observationWindow.Observations()
@@ -595,10 +595,10 @@ func (a *ThroughputAnalyzer) resolveITLModel(ctx context.Context, state *variant
 				"namespace", namespace, "modelID", modelID, "variant", variantName,
 				"A", A, "B", baselineB, "replicas", int(n),
 			)
-			return ITLModel{A: A, B: baselineB}, tier2Label, true
+			return itl.Model{A: A, B: baselineB}, tier2Label, true
 		}
 	}
-	return ITLModel{}, itlReasonT2Failed, false
+	return itl.Model{}, itlReasonT2Failed, false
 }
 
 // computeDemand aggregates λ_dec (decode token demand in tokens/sec) across
@@ -640,7 +640,7 @@ func computeDemand(metrics []domain.ReplicaMetrics) float64 {
 // KV_max = 0 are excluded (no meaningful signal at idle).
 // This path is scale-up only: k*-based demand may undercount arriving load
 // without EPP. The engine post-step determines SC from the published totals.
-func computeLocalDemand(metrics []domain.ReplicaMetrics, shape WorkloadShape, model ITLModel) float64 {
+func computeLocalDemand(metrics []domain.ReplicaMetrics, shape shape.Shape, model itl.Model) float64 {
 	if shape.KVreq <= 0 || shape.AvgOutputTokens <= DefaultMinDecodeOLForLocalDemand {
 		return 0
 	}
@@ -684,7 +684,7 @@ func estimateQueueDemand(sq *domain.SchedulerQueueMetrics, itlSat, drainFactor f
 // Per replica: N_dec_sat = DefaultKSat × KV_max / KVreq; μ_dec_sat = N_dec_sat / itlSat.
 // Returns (totalSupply Σμ_dec_sat, perReplicaSupply mean(μ_dec_sat), nKV count of
 // KV-capable replicas). All are zero when no replica has KV capacity data.
-func computeVariantSupply(metrics []domain.ReplicaMetrics, shape WorkloadShape, itlSat float64) (total, perReplica float64, nKV int) {
+func computeVariantSupply(metrics []domain.ReplicaMetrics, shape shape.Shape, itlSat float64) (total, perReplica float64, nKV int) {
 	var sum float64
 	var n int
 	for _, m := range metrics {
@@ -692,7 +692,7 @@ func computeVariantSupply(metrics []domain.ReplicaMetrics, shape WorkloadShape, 
 			continue
 		}
 		kvMax := float64(m.TotalKvCapacityTokens)
-		nSat := DefaultKSat * kvMax / shape.KVreq
+		nSat := itl.DefaultKSat * kvMax / shape.KVreq
 		sum += nSat / itlSat
 		n++
 	}
@@ -794,8 +794,8 @@ func safeDivide(num, denom float64) float64 {
 func checkVariantGPSMismatch(
 	ctx context.Context,
 	metrics []domain.ReplicaMetrics,
-	shape WorkloadShape,
-	model ITLModel,
+	shape shape.Shape,
+	model itl.Model,
 	namespace, modelID, variantName string,
 ) bool {
 	if shape.KVreq <= 0 {
@@ -835,7 +835,7 @@ func checkVariantGPSMismatch(
 		)
 
 		// Near k_sat: run deeper diagnostics to identify root cause.
-		if m.KvUsageInstant < DefaultKSat-DefaultNearKSatMargin || m.AvgITL <= 0 {
+		if m.KvUsageInstant < itl.DefaultKSat-DefaultNearKSatMargin || m.AvgITL <= 0 {
 			continue
 		}
 		itlResidual := math.Abs(m.AvgITL-itlAtK) / m.AvgITL

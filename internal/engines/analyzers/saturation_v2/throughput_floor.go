@@ -102,8 +102,8 @@ func (a *SaturationAnalyzer) recordSaturatedThroughput(key string, rate float64)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ra, ok := a.saturatedThroughput[key]
-	if !ok || ra.Stale(HistoryEvictionTimeout) {
-		ra = capacity.NewRollingAverage(RollingAverageWindowSize)
+	if !ok || ra.Stale(capacity.HistoryEvictionTimeout) {
+		ra = capacity.NewRollingAverage(capacity.RollingAverageWindowSize)
 		a.saturatedThroughput[key] = ra
 		delete(a.throughputSampledAt, key)
 		delete(a.throughputLastRead, key)
@@ -258,7 +258,7 @@ func bucketOf(key string) string {
 func (a *SaturationAnalyzer) applyThroughputFloor(
 	input domain.AnalyzerInput,
 	cfg *config.ScalingPolicy,
-	replicas []ReplicaCapacity,
+	replicas []capacity.ReplicaCapacity,
 	variants []domain.VariantCapacity,
 	totalDemand float64,
 	roleDemand map[string]float64,
@@ -294,7 +294,7 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	// a cap drawn at the policy-level figure while the engine divides by a
 	// per-analyzer override would leave a gap that orders a replica.
 	scaleUp, _ := cfg.AnalyzerThresholds(domain.SaturationAnalyzerName)
-	tf := floor.Estimate(offeredArrivalRate(input), replicas, variants, backlog, BacklogDrainSeconds, scaleUp)
+	tf := floor.Estimate(offeredArrivalRate(input), replicas, variants, backlog, floor.BacklogDrainSeconds, scaleUp)
 
 	// Prefill with no mu: the scheduler queue's prompts are not resident work
 	// for prefill (file header). Only the disaggregated case has a prefill

@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 )
 
 // The cycle this replays is 15:01:33Z on the shape-swap P/D benchmark's cold
@@ -28,7 +30,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		clock    time.Time
 	)
 	BeforeEach(func() {
-		analyzer = NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer = NewSaturationAnalyzer(capacity.NewStore())
 		clock = time.Date(2026, 9, 18, 15, 1, 33, 0, time.UTC)
 		analyzer.now = func() time.Time { return clock }
 		ctx = context.Background()
@@ -153,7 +155,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		p1 := prefill()
 		p1.PodName = "prefill-1"
 		p1.TokensInUse, p1.QueueLength = 0, 0
-		fresh := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		fresh := NewSaturationAnalyzer(capacity.NewStore())
 		fresh.now = analyzer.now
 		result, err = fresh.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{
 			decode("decode-0", 970_475, 36), decode("decode-1", 1_039_474, 81), prefill(), p1}, two))
@@ -187,7 +189,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		// 6 req/s offered is 1.5 replicas of one; against the one replica's
 		// P that is an order every cycle -- and this is the shape a mu
 		// learned under decode's metering has, below the offered rate.
-		for i := 0; i < MinThroughputSamplesToOrder; i++ {
+		for i := 0; i < floor.MinThroughputSamplesToOrder; i++ {
 			clock = clock.Add(ThroughputSampleSpacing) // two readings, a rate window apart
 			slow := prefill()
 			slow.RequestRate = 4 - 0.01*float64(i)
@@ -197,7 +199,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 			_, err := analyzer.Analyze(ctx, in)
 			Expect(err).NotTo(HaveOccurred())
 		}
-		Expect(analyzer.saturatedThroughput[prefillMuKey].Len()).To(Equal(MinThroughputSamplesToOrder))
+		Expect(analyzer.saturatedThroughput[prefillMuKey].Len()).To(Equal(floor.MinThroughputSamplesToOrder))
 
 		By("the floor ordering on it while decode is not saturated")
 		idle := prefill()
@@ -379,7 +381,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		Expect(analyzer.computeCapacityHistory).NotTo(HaveKey(prefillKey))
 
 		By("a 'both' replica has no downstream, and records as before")
-		both := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		both := NewSaturationAnalyzer(capacity.NewStore())
 		rm := makeReplicaMetrics("both-0", "both-v", 900_000, runKvCapacity, 40, 6000, 1000)
 		rm.Ready = true
 		_, err = both.Analyze(ctx, makeAnalyzerInput([]domain.ReplicaMetrics{rm},
@@ -484,7 +486,7 @@ var _ = Describe("roleSaturated", func() {
 // why a saturated prefill replica stayed at P4-k1.
 func TestLogContract_PrefillSaturationUnderDecodeIsLabelled(t *testing.T) {
 	ctx, logs := observedCtx(t)
-	analyzer := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+	analyzer := NewSaturationAnalyzer(capacity.NewStore())
 
 	prefill := makeReplicaMetrics("pod-p", "variant-p", 357_800, 1_149_312, 30, 6000, 1)
 	decode := makeReplicaMetrics("pod-d", "variant-d", 1_039_474, 1_162_240, 81, 6000, 1000)

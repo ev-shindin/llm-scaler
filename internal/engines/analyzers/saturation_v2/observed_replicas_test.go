@@ -7,6 +7,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 // ObservedReplicas is the count of rows the analyzer attributed to a variant
@@ -22,7 +23,7 @@ var _ = Describe("ObservedReplicas", func() {
 	)
 
 	BeforeEach(func() {
-		analyzer = NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer = NewSaturationAnalyzer(capacity.NewStore())
 		ctx = context.Background()
 	})
 

@@ -261,15 +261,16 @@ internal/signals/itl/
 └── model.go                   Model{A,B}, Fit (OLS), ValidModel, ITLAt(k), DefaultKSat
 internal/engines/analyzers/throughput/
 ├── constants.go               thresholds, tuning defaults
-├── signals.go                 the analyzer's names for the signal types and their defaults
 ├── types.go                   SanityIssue, SanityReport, ThroughputVariantState
 ├── sanity.go                  CheckModelMetrics: 6 SanityIssue types
 └── analyzer.go                ThroughputAnalyzer: Observe() + full Analyze()
 ```
 
 The shape and ITL signals moved to `internal/signals` (engine-structure
-proposal, stage 1); the analyzer refers to them by the names below through
-type aliases in `signals.go`.
+proposal, stage 1) and the analyzer names them by their packages:
+`shape.Shape`, `shape.Tracker`, `itl.Window`, `itl.Model`. The prose below
+keeps the analyzer's own vocabulary (ShapeTracker, ObservationWindow,
+ITLModel) for the concepts.
 
 ### Components
 

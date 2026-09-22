@@ -13,17 +13,18 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 var _ = Describe("SaturationAnalyzer", func() {
 	var (
 		analyzer *SaturationAnalyzer
-		store    *CapacityKnowledgeStore
+		store    *capacity.Store
 		ctx      context.Context
 	)
 
 	BeforeEach(func() {
-		store = NewCapacityKnowledgeStore()
+		store = capacity.NewStore()
 		analyzer = NewSaturationAnalyzer(store)
 		ctx = context.Background()
 	})
@@ -173,7 +174,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			// fall-through returns the same 7500. Only the reason distinguishes
 			// them, and the reason is the sole observable difference between the
 			// two paths now that both return the same average.
-			Expect(result.VariantCapacities[0].Reason).To(Equal(k2Labels[k2SrcObserved]))
+			Expect(result.VariantCapacities[0].Reason).To(Equal(capacity.K2SrcObserved.String()))
 		})
 
 		It("should converge on a sustained shift once the window turns over", func() {
@@ -199,13 +200,13 @@ var _ = Describe("SaturationAnalyzer", func() {
 			}
 
 			// Fill the window at 8000.
-			for i := 0; i < RollingAverageWindowSize; i++ {
+			for i := 0; i < capacity.RollingAverageWindowSize; i++ {
 				steady(8000)
 			}
 
 			// Step down to 3000 and hold. Each cycle replaces one 8000 with a
 			// 3000, so the average walks down 500 per cycle: 7500, 7000, ...
-			for i := 1; i < RollingAverageWindowSize; i++ {
+			for i := 1; i < capacity.RollingAverageWindowSize; i++ {
 				steady(3000)
 			}
 
@@ -225,7 +226,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			// The window is now entirely 3000: the shift has fully propagated,
 			// and it took a full window to do it.
 			Expect(result.VariantCapacities[0].PerReplicaCapacity).To(Equal(float64(3000)))
-			Expect(result.VariantCapacities[0].Reason).To(Equal(k2Labels[k2SrcObserved]))
+			Expect(result.VariantCapacities[0].Reason).To(Equal(capacity.K2SrcObserved.String()))
 		})
 
 		It("should not dilute a fresh observation against a stale window", func() {
@@ -249,7 +250,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				return res
 			}
 
-			for i := 0; i < RollingAverageWindowSize; i++ {
+			for i := 0; i < capacity.RollingAverageWindowSize; i++ {
 				steady(8000)
 			}
 
@@ -257,7 +258,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			analyzer.mu.Lock()
 			Expect(analyzer.computeCapacityHistory).NotTo(BeEmpty())
 			for _, ra := range analyzer.computeCapacityHistory {
-				ra.TouchAt(time.Now().Add(-2 * HistoryEvictionTimeout))
+				ra.TouchAt(time.Now().Add(-2 * capacity.HistoryEvictionTimeout))
 			}
 			analyzer.mu.Unlock()
 
@@ -265,7 +266,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			// than being blended to (9*8000 + 3000)/10 = 7500.
 			result := steady(3000)
 			Expect(result.VariantCapacities[0].PerReplicaCapacity).To(Equal(float64(3000)))
-			Expect(result.VariantCapacities[0].Reason).To(Equal(k2Labels[k2SrcObserved]))
+			Expect(result.VariantCapacities[0].Reason).To(Equal(capacity.K2SrcObserved.String()))
 		})
 
 		It("should keep an observation between k1 and the physical KV ceiling", func() {
@@ -530,9 +531,9 @@ var _ = Describe("SaturationAnalyzer", func() {
 	Describe("k2 derivation from deployment params", func() {
 		It("should derive k2 from chunked prefill params", func() {
 			// Pre-populate store with deployment params for this variant
-			store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 				GpuCount: 1,
-				EngineParams: &EngineParams{
+				EngineParams: &capacity.EngineParams{
 					EffectiveMaxBatchedTokens: 2048,
 					MaxNumSeqs:                256,
 					ChunkedPrefillEnabled:     true,
@@ -580,9 +581,9 @@ var _ = Describe("SaturationAnalyzer", func() {
 		})
 
 		It("should use the derived k2 for a decode-role variant when it is below k1", func() {
-			store.Update("test-ns", "test-model", "variant-d", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-d", capacity.Record{
 				GpuCount: 1,
-				EngineParams: &EngineParams{
+				EngineParams: &capacity.EngineParams{
 					EffectiveMaxBatchedTokens: 2048,
 					MaxNumSeqs:                10,
 					ChunkedPrefillEnabled:     true,
@@ -632,9 +633,9 @@ var _ = Describe("SaturationAnalyzer", func() {
 			// demand snapshots in the hundreds of thousands. k1 over-states
 			// capacity in the other direction, but at least it bounds
 			// something real (the KV cache this replica actually has).
-			store.Update("test-ns", "test-model", "variant-p", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-p", capacity.Record{
 				GpuCount: 1,
-				EngineParams: &EngineParams{
+				EngineParams: &capacity.EngineParams{
 					EffectiveMaxBatchedTokens: 2048,
 					MaxNumSeqs:                10,
 					ChunkedPrefillEnabled:     true,
@@ -752,7 +753,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 
 	Describe("Zero-replica variants", func() {
 		It("should use stored live capacity directly when variant has zero replicas", func() {
-			store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 				GpuCount:          1,
 				EffectiveCapacity: 12000,
 				LearnedFrom:       "live",
@@ -774,10 +775,10 @@ var _ = Describe("SaturationAnalyzer", func() {
 
 		It("should derive capacity from params + workload for deployment-derived records", func() {
 			// Zero-replica variant with deployment-derived params only
-			store.Update("test-ns", "test-model", "variant-b", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-b", capacity.Record{
 				GpuCount:          1,
 				EffectiveCapacity: 8192, // conservative fallback from LoadFromDeployment
-				EngineParams: &EngineParams{
+				EngineParams: &capacity.EngineParams{
 					EffectiveMaxBatchedTokens: 8192,
 					MaxNumSeqs:                256,
 				},
@@ -812,7 +813,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 
 		It("should bound k2 estimate by compatible variant's live EffectiveCapacity", func() {
 			// variant-b is a new deployment on the same H100 hardware as variant-a
-			defaultParams := &EngineParams{
+			defaultParams := &capacity.EngineParams{
 				GpuMemoryUtilization:      0.9,
 				BlockSize:                 16,
 				KvCacheDtype:              "auto",
@@ -820,7 +821,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				MaxNumSeqs:                256,
 				EffectiveMaxBatchedTokens: 8192,
 			}
-			store.Update("test-ns", "test-model", "variant-b", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-b", capacity.Record{
 				GpuCount:          1,
 				EffectiveCapacity: 8192,
 				EngineParams:      defaultParams,
@@ -828,7 +829,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			})
 
 			// variant-a has a compatible live record (same accel, GPU count, params)
-			store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 				GpuCount:              1,
 				TotalKvCapacityTokens: 50000,
 				EffectiveCapacity:     40000, // observed min(k1, k2) = 40000
@@ -859,11 +860,11 @@ var _ = Describe("SaturationAnalyzer", func() {
 		})
 
 		It("should bound k2 estimate by own k1 when TotalKvCapacityTokens is known", func() {
-			store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 				GpuCount:              1,
 				EffectiveCapacity:     8192,
 				TotalKvCapacityTokens: 30000, // from num_gpu_blocks_override
-				EngineParams: &EngineParams{
+				EngineParams: &capacity.EngineParams{
 					EffectiveMaxBatchedTokens: 8192,
 					MaxNumSeqs:                256,
 					NumGpuBlocksOverride:      1875,
@@ -900,10 +901,10 @@ var _ = Describe("SaturationAnalyzer", func() {
 
 		It("should use EffectiveMaxBatchedTokens fallback when no workload data exists", func() {
 			// Zero-replica variant with deployment-derived params, no other live pods
-			store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 				GpuCount:          1,
 				EffectiveCapacity: 8192,
-				EngineParams: &EngineParams{
+				EngineParams: &capacity.EngineParams{
 					EffectiveMaxBatchedTokens: 8192,
 					MaxNumSeqs:                256,
 				},
@@ -927,7 +928,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 
 	Describe("estimateCapacityFromParams", func() {
 		It("should compute k2 from B, S, I, O", func() {
-			params := &EngineParams{
+			params := &capacity.EngineParams{
 				EffectiveMaxBatchedTokens: 4096,
 				MaxNumSeqs:                256,
 			}
@@ -938,7 +939,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 		})
 
 		It("should cap N_steady at MaxNumSeqs", func() {
-			params := &EngineParams{
+			params := &capacity.EngineParams{
 				EffectiveMaxBatchedTokens: 8192,
 				MaxNumSeqs:                64,
 			}
@@ -949,7 +950,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 		})
 
 		It("should return 0 when avgOutput is 0", func() {
-			params := &EngineParams{
+			params := &capacity.EngineParams{
 				EffectiveMaxBatchedTokens: 8192,
 				MaxNumSeqs:                256,
 			}
@@ -1325,7 +1326,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				},
 			}
 
-			store := NewCapacityKnowledgeStore()
+			store := capacity.NewStore()
 			a := NewSaturationAnalyzer(store)
 			result, err := a.Analyze(ctx, input)
 			Expect(err).NotTo(HaveOccurred())
@@ -1455,7 +1456,7 @@ var _ = Describe("aggregateRoleDemand", func() {
 	var analyzer *SaturationAnalyzer
 
 	BeforeEach(func() {
-		store := NewCapacityKnowledgeStore()
+		store := capacity.NewStore()
 		analyzer = NewSaturationAnalyzer(store)
 	})
 
@@ -1573,12 +1574,12 @@ var _ = Describe("aggregateRoleDemand", func() {
 var _ = Describe("computeReplicaCapacityFallback", func() {
 	var (
 		analyzer *SaturationAnalyzer
-		store    *CapacityKnowledgeStore
+		store    *capacity.Store
 		cfg      *config.ScalingPolicy
 	)
 
 	BeforeEach(func() {
-		store = NewCapacityKnowledgeStore()
+		store = capacity.NewStore()
 		analyzer = NewSaturationAnalyzer(store)
 		cfg = &config.ScalingPolicy{
 			KvCacheThreshold:     0.8,
@@ -1594,7 +1595,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 		// so the threshold cancelled and utilization equalled KvCacheUsage no matter
 		// how it was configured — the knob had no effect on the scaling decision.
 		// Tightening the ceiling must raise utilization for identical KV occupancy.
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1623,7 +1624,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 		// 0, and the zero-guard then discarded the replica entirely — the variant
 		// reported no capacity at all, so the engine could see a shortfall it had no
 		// per-replica capacity to divide by and never acted on it.
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10, // 10 * 0.05 = 0.5 -> truncates to 0
 			LearnedFrom:       "deployment",
 		})
@@ -1642,7 +1643,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 
 	It("still returns nil when the stored capacity is genuinely zero", func() {
 		// The floor must not resurrect a record that carries no capacity at all.
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 0,
 			LearnedFrom:       "deployment",
 		})
@@ -1667,7 +1668,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	})
 
 	It("should return nil when capacity store record has zero effective capacity", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 0,
 			LearnedFrom:       "deployment",
 		})
@@ -1684,7 +1685,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 
 	It("should apply KvCacheThreshold to stored capacity (consistent with main path)", func() {
 		// Store raw capacity of 10000
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1708,7 +1709,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	})
 
 	It("should detect saturation at KvCacheUsage >= KvCacheThreshold", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1729,7 +1730,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	It("should detect saturation when KvCacheUsage exceeds threshold (matching main path behavior)", func() {
 		// This verifies the fix from the review: at 90% KV usage with 0.8 threshold,
 		// the fallback should report saturation, matching the main path behavior.
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1754,7 +1755,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	})
 
 	It("should add queue-based demand when avg input tokens available", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1776,7 +1777,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	})
 
 	It("should not add queue demand when token metrics are unavailable", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1798,7 +1799,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	})
 
 	It("should charge queue demand by role", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1831,7 +1832,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 		// path inherits. Raising the per-request charge moves the point where
 		// that mismatch invents saturation, so pin the safe end: a mostly-idle
 		// replica with a few queued requests must not read as saturated.
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 8192,
 			LearnedFrom:       "deployment",
 		})
@@ -1855,7 +1856,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 	})
 
 	It("should populate all ReplicaCapacity fields correctly", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			EffectiveCapacity: 10000,
 			LearnedFrom:       "deployment",
 		})
@@ -1975,13 +1976,13 @@ var _ = Describe("waitingQueueDemand", func() {
 var _ = Describe("Analyze per-replica waiting-queue demand by role", func() {
 	var (
 		analyzer *SaturationAnalyzer
-		store    *CapacityKnowledgeStore
+		store    *capacity.Store
 		ctx      context.Context
 		satCfg   *config.ScalingPolicy
 	)
 
 	BeforeEach(func() {
-		store = NewCapacityKnowledgeStore()
+		store = capacity.NewStore()
 		analyzer = NewSaturationAnalyzer(store)
 		ctx = context.Background()
 		satCfg = &config.ScalingPolicy{
@@ -2046,7 +2047,7 @@ var _ = Describe("Analyze per-replica waiting-queue demand by role", func() {
 	// helper — hardcoding a role at that hand-off would otherwise go unnoticed.
 	Context("on the fallback path (no cache_config_info)", func() {
 		fallbackDemandFor := func(role string) float64 {
-			store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+			store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 				EffectiveCapacity: 10000,
 				LearnedFrom:       "deployment",
 			})
@@ -2124,18 +2125,18 @@ var _ = Describe("Analyze per-replica waiting-queue demand by role", func() {
 var _ = Describe("Analyze with fallback (no cache_config_info)", func() {
 	var (
 		analyzer *SaturationAnalyzer
-		store    *CapacityKnowledgeStore
+		store    *capacity.Store
 		ctx      context.Context
 	)
 
 	BeforeEach(func() {
-		store = NewCapacityKnowledgeStore()
+		store = capacity.NewStore()
 		analyzer = NewSaturationAnalyzer(store)
 		ctx = context.Background()
 	})
 
 	It("should produce valid result using fallback when cache_config_info is absent", func() {
-		store.Update("test-ns", "test-model", "variant-a", CapacityRecord{
+		store.Update("test-ns", "test-model", "variant-a", capacity.Record{
 			GpuCount:          1,
 			EffectiveCapacity: 8192,
 			LearnedFrom:       "deployment",
@@ -2275,10 +2276,10 @@ var _ = Describe("ScalingPolicy ApplyDefaults before Validate", func() {
 
 var _ = Describe("aggregateByVariant capacity Reason", func() {
 	It("sets Reason to P0-store when no live replicas but a capacity store record exists", func() {
-		store := NewCapacityKnowledgeStore()
-		store.Update("ns", "m", "v1", CapacityRecord{
+		store := capacity.NewStore()
+		store.Update("ns", "m", "v1", capacity.Record{
 			EffectiveCapacity: 50000,
-			LearnedFrom:       learnedFromLive,
+			LearnedFrom:       capacity.LearnedFromLive,
 		})
 		a := NewSaturationAnalyzer(store)
 
@@ -2299,7 +2300,7 @@ var _ = Describe("aggregateByVariant capacity Reason", func() {
 	})
 
 	It("sets Reason to no-data when variant has zero replicas and no store or compatible record", func() {
-		store := NewCapacityKnowledgeStore()
+		store := capacity.NewStore()
 		a := NewSaturationAnalyzer(store)
 
 		input := domain.AnalyzerInput{
@@ -2320,7 +2321,7 @@ var _ = Describe("aggregateByVariant capacity Reason", func() {
 
 var _ = Describe("k2SourceLabel", func() {
 	It("returns error when K2Priority is not in the known set", func() {
-		replicas := []ReplicaCapacity{{K2Priority: 0, EffectiveCapacity: 100}}
+		replicas := []capacity.ReplicaCapacity{{K2Priority: 0, EffectiveCapacity: 100}}
 		Expect(k2SourceLabel(replicas)).To(Equal("error"))
 	})
 
@@ -2336,7 +2337,7 @@ var _ = Describe("aggregateByVariant DP>1 with pending replicas", func() {
 	)
 
 	BeforeEach(func() {
-		analyzer = NewSaturationAnalyzer(NewCapacityKnowledgeStore())
+		analyzer = NewSaturationAnalyzer(capacity.NewStore())
 		ctx = context.Background()
 	})
 

@@ -5,6 +5,7 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
 const (
@@ -111,7 +112,7 @@ type Term struct {
 // 11:45:22-11:47:22; the target then swung 10 <-> 4 for ten minutes.
 func Estimate(
 	lambda float64,
-	replicas []ReplicaCapacity,
+	replicas []capacity.ReplicaCapacity,
 	variants []domain.VariantCapacity,
 	backlog map[string]float64,
 	drainSeconds float64,

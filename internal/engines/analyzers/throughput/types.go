@@ -1,5 +1,10 @@
 package throughput
 
+import (
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
+)
+
 // SanityIssue is a diagnostic tag describing a metric quality problem detected
 // during a reconcile cycle.
 type SanityIssue string
@@ -57,7 +62,7 @@ func (r SanityReport) Has(issue SanityIssue) bool {
 // Returned by ThroughputAnalyzer.VariantState for tests and logging.
 type ThroughputVariantState struct {
 	// Shape is the current workload shape bucket for this variant.
-	Shape WorkloadShape
+	Shape shape.Shape
 	// ObservationReady is true when the window has enough data for OLS fitting.
 	ObservationReady bool
 	// KSpread is max_k - min_k over current observations (0 when window is empty).
@@ -69,7 +74,7 @@ type ThroughputVariantState struct {
 
 	// ITLModel is the ITL model last resolved during Analyze for this variant
 	// (tier-1 OLS or tier-2 constrained OLS). IsZero() when no model has been resolved yet.
-	ITLModel ITLModel
+	ITLModel itl.Model
 	// PerReplicaSupply is mean(μ_dec_sat) across replicas from the last Analyze call
 	// in tokens/sec. Zero when no supply could be computed.
 	PerReplicaSupply float64
