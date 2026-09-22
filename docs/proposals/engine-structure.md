@@ -326,14 +326,16 @@ p95 or target path has changed behaviour and stops).
    `signals/floor` (`estimateThroughputDemand` is `floor.Estimate`,
    `throughputFloor` and its terms are `floor.Floor` and `floor.Term`).
    #91 removed the transitional aliases, `steadystate/engine.go`
-   included: no alias is left.
+   included: nothing aliases a `signals` type any more. (Stage 2's two
+   reason strings keep their `allocation` names, below.)
 
    Two things stage 3 inherits. The per-replica row `capacity.ReplicaCapacity`
    is the input the proposal's plugin table says the builder hands every
    analyzer -- but `AnalyzerInput` lives in `domain`, the bottom layer, so
    stage 3 either moves the row (and `capacity.Record`) into `domain` or
-   moves `AnalyzerInput` up into `analyze`; the check forbids the third
-   option. And `floor.Estimate` reads five of that row's sixteen fields
+   moves `AnalyzerInput` up into `analyze`. The third option -- `domain`
+   importing `signals/capacity` -- is the upward edge the check exists to
+   refuse. And `floor.Estimate` reads five of that row's sixteen fields
    and none of its capacity fields, so a five-field reading projected by
    the analyzer would remove `floor`'s dependency on `capacity`
    altogether.
