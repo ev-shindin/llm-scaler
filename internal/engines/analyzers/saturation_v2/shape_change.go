@@ -52,6 +52,29 @@ import (
 // change. The tracker is not safe for concurrent use; a.mu serialises it.
 type shapeMemo struct {
 	tracker *shape.Tracker
+	// stable is the shape the throughput keys are built from. It follows the
+	// tracker only when the tracker reports a CHANGE, which is what keeps a
+	// fleet off a bucket boundary.
+	//
+	// Measured on the rerun of the 1000/6000 -> 8000/1000 trace (2026-09-22,
+	// biran-pd, on the build that carries #85): phase 1 generates exactly
+	// 6000-token outputs, which is the xxlong/huge boundary, and the fleet's
+	// rate-weighted average wobbled either side of it. The whole fleet shares
+	// one throughput key since #85, so the wobble moved all of it at once --
+	// mu alternated 2.36 and 0.82 req/s cycle to cycle, a 2.9x swing, and the
+	// decode target with it, 10 -> 4 -> 10 -> 4 every 30-45 s for the length
+	// of the phase. Only KEDA's scale-down stabilization window kept the
+	// fleet itself from following. Before #85 the replicas straddled the
+	// boundary independently and the median smoothed it; one key per fleet
+	// made the edge total, which is the cost of that fix and this is its
+	// other half.
+	//
+	// A tolerance, not hysteresis on the boundary: the tracker already says
+	// when the shape has genuinely moved, and any shape that has not moved by
+	// DefaultChangeTolerance keeps the key it was learned under, wherever the
+	// boundaries happen to fall. Item 1 of the proposal removes the
+	// boundaries; until then this removes their edge.
+	stable shape.Shape
 	// changedAt is when the outstanding change was raised, zero when none is.
 	changedAt time.Time
 }
@@ -116,9 +139,13 @@ func fleetInputLength(sq *domain.SchedulerQueueMetrics, replicas []domain.Replic
 // Logged once per change, at INFO: the event is rare and it explains every
 // held decision that follows, which is the first thing a reader of those
 // decisions will ask.
-func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out float64, logger logr.Logger) bool {
+func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out float64, logger logr.Logger) (float64, bool) {
 	if !(in > 0) && !(out > 0) {
-		return a.shapeChangeOutstanding(namespace, modelID)
+		stable, outstanding := a.fleetShapeState(namespace, modelID)
+		if stable <= 0 {
+			stable = out
+		}
+		return stable, outstanding
 	}
 	key := namespace + "|" + modelID
 
@@ -132,6 +159,15 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 	was, hadShape := memo.tracker.Current()
 	now := a.now()
 	next, changed := memo.tracker.Observe(in, out, 0)
+	// The keys move only on a change, so a shape that merely wobbles keeps
+	// the window it was learned under.
+	if changed || memo.stable.IsZero() {
+		memo.stable = next
+	}
+	stableOut := memo.stable.AvgOutputTokens
+	if stableOut <= 0 {
+		stableOut = out
+	}
 
 	switch {
 	case changed:
@@ -147,7 +183,7 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 		memo.changedAt = time.Time{}
 	}
 	if !changed {
-		return !memo.changedAt.IsZero()
+		return stableOut, !memo.changedAt.IsZero()
 	}
 	logger.Info("fleet-shape-change",
 		"modelID", modelID, "namespace", namespace,
@@ -155,7 +191,7 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 		"outputTokensWas", was.AvgOutputTokens, "outputTokensNow", next.AvgOutputTokens,
 		"hadShape", hadShape, "tolerance", shape.DefaultChangeTolerance,
 		"reason", "the shape the capacity figures were learned under is no longer the one arriving; the fleet is not released until the new shape has a reading of its own")
-	return true
+	return stableOut, true
 }
 
 // settleFleetShape clears an outstanding change once the fleet has a
@@ -173,12 +209,16 @@ func (a *SaturationAnalyzer) settleFleetShape(namespace, modelID string, ownRead
 	}
 }
 
-// shapeChangeOutstanding reports whether a raised change is still unsettled.
-func (a *SaturationAnalyzer) shapeChangeOutstanding(namespace, modelID string) bool {
+// fleetShapeState reports the stable output length the keys are built from
+// and whether a change is outstanding, without observing anything.
+func (a *SaturationAnalyzer) fleetShapeState(namespace, modelID string) (float64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	memo, ok := a.fleetShape[namespace+"|"+modelID]
-	return ok && !memo.changedAt.IsZero()
+	if !ok {
+		return 0, false
+	}
+	return memo.stable.AvgOutputTokens, !memo.changedAt.IsZero()
 }
 
 // holdFleetFloor raises every role's demand to the bottom of the band where

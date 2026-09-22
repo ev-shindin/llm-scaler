@@ -223,7 +223,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// completion; a change on either says the learned figures describe a
 	// workload that is no longer running (shape_change.go).
 	fleetInput := fleetInputLength(input.SchedulerQueue, input.ReplicaMetrics)
-	shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID, fleetInput, fleetOutput, logger)
+	stableOutput, shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID, fleetInput, fleetOutput, logger)
 
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]capacity.ReplicaCapacity, 0, len(input.ReplicaMetrics))
@@ -237,7 +237,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		role := rolesByVariant[rm.VariantName]
 		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			role, accelByVariant[rm.VariantName], fleetOutput, downstreamSaturated, logger)
+			role, accelByVariant[rm.VariantName], stableOutput, downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}

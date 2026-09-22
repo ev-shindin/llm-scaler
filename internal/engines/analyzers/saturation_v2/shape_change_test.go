@@ -3,6 +3,7 @@ package saturation_v2
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -76,6 +77,11 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		ctx = context.Background()
 	})
 
+	// The hold's state, read the way the production path reads it.
+	outstanding := func() bool {
+		_, held := analyzer.fleetShapeState("test-ns", "test-model")
+		return held
+	}
 	states := func(decodeN int) []domain.VariantReplicaState {
 		return []domain.VariantReplicaState{
 			{VariantName: decodeV, Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: decodeN, GPUsPerReplica: 1},
@@ -148,7 +154,7 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		clock = clock.Add(15 * time.Second)
 		cycle(10, 900_000, 0, 8000, 6000, &domain.SchedulerQueueMetrics{QueueSize: 20, QueueBytes: 912_037})
 		clock = clock.Add(15 * time.Second)
-		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeTrue())
+		Expect(outstanding()).To(BeTrue())
 
 		// Two saturated cycles a window apart under the new shape.
 		for _, rate := range []float64{5.3, 5.4} {
@@ -161,7 +167,7 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 			Expect(err).NotTo(HaveOccurred())
 			clock = clock.Add(ThroughputSampleSpacing + time.Second)
 		}
-		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeFalse(),
+		Expect(outstanding()).To(BeFalse(),
 			"a replica reading its own window under the new shape settles the hold")
 	})
 
@@ -169,22 +175,57 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		cycle(10, 900_000, 0, 1000, 6000, nil)
 		clock = clock.Add(15 * time.Second)
 		cycle(10, 900_000, 0, 8000, 6000, &domain.SchedulerQueueMetrics{QueueSize: 20, QueueBytes: 912_037})
-		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeTrue())
+		Expect(outstanding()).To(BeTrue())
 
 		// The generations turn over to the new shape a minute later, which is
 		// a second change on the output axis -- the I-up event and the O-down
 		// event are distinct on this trace, and the hold spans both.
 		clock = clock.Add(time.Minute)
 		cycle(10, 17_282, 0, 8000, 1000, nil)
-		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeTrue())
+		Expect(outstanding()).To(BeTrue())
 
 		// The run's phase 2 from here: idle at eleven replicas, nothing
 		// queued, the shape steady, so no window is ever recorded under it.
 		// Without the backstop the hold would stand for the rest of the run.
 		clock = clock.Add(ShapeChangeHoldMax + time.Second)
 		cycle(10, 17_282, 0, 8000, 1000, nil)
-		Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeFalse(),
+		Expect(outstanding()).To(BeFalse(),
 			"ShapeChangeHoldMax releases a fleet that will never measure itself")
+	})
+
+	It("keeps one throughput window when the shape sits on a bucket boundary", func() {
+		// Measured on the rerun of 2026-09-22 (biran-pd, the build carrying
+		// #85): phase 1 generates exactly 6000-token outputs, which is the
+		// xxlong/huge boundary, so the fleet's rate-weighted average wobbled
+		// either side of it. Every replica shares one throughput key since
+		// #85, so the wobble moved all of them together -- the bucket read
+		// `huge` at 2.36 req/s on one cycle and `xxlong` at 0.82 on the next,
+		// and the decode target went 10 -> 4 -> 10 -> 4 every 30-45 s under a
+		// shape that never actually changed.
+		//
+		// The keys follow the TRACKED shape, which does not move until the
+		// tolerance is exceeded, so a wobble of a few tokens keeps one window.
+		for i, out := range []float64{6000, 5990, 6010, 5995, 6005, 6000} {
+			rm := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 10, 1000, out)
+			rm.RequestRate = 5.4 - 0.01*float64(i)
+			rm.Ready = true
+			input := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(1))
+			input.ArrivalRate = 5.68
+			_, err := analyzer.Analyze(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		}
+
+		decodeKeys := make([]string, 0, 2)
+		for key := range analyzer.saturatedThroughput {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+				decodeKeys = append(decodeKeys, key)
+			}
+		}
+		Expect(decodeKeys).To(HaveLen(1),
+			"a shape that wobbles across a boundary must not split the fleet's window in two: %v", decodeKeys)
+		Expect(outstanding()).To(BeFalse(),
+			"and it is not a shape change either")
 	})
 
 	It("raises nothing while the shape holds still", func() {
@@ -192,7 +233,7 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		// after cycle, must never raise an event or hold anything.
 		for i := 0; i < 5; i++ {
 			cycle(10, 17_282, 0, 1000, 6000, nil)
-			Expect(analyzer.shapeChangeOutstanding("test-ns", "test-model")).To(BeFalse(),
+			Expect(outstanding()).To(BeFalse(),
 				"a fleet serving one shape has nothing to hold for")
 			clock = clock.Add(15 * time.Second)
 		}
