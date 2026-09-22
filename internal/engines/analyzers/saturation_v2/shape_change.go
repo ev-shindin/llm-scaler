@@ -75,11 +75,24 @@ type shapeMemo struct {
 	// boundaries happen to fall. Item 1 of the proposal removes the
 	// boundaries; until then this removes their edge.
 	stable shape.Shape
+	// lastArriving is the previous queue-derived prompt length, kept so that
+	// reading is compared against itself rather than against the replicas'.
+	lastArriving float64
 	// changedAt is when the outstanding change was raised, zero when none is.
 	changedAt time.Time
 }
 
-// fleetInputLength is the prompt length, in tokens, of what is ARRIVING.
+// arrivingPromptLength is the prompt length, in tokens, of what is
+// ARRIVING, from the scheduler queue; ok is false when the queue is empty,
+// which it is on most cycles of a fleet that is keeping up (141 of the
+// run's 171).
+//
+// It is NOT on the same scale as servedPromptLength below: BytesPerToken is
+// 4 and the run measured ~5.8 bytes per prompt token, so this reads about
+// 46 % high -- 1459 tokens for the trace's 1000. The two are therefore each
+// compared against their own previous value and never against each other;
+// feeding one tracker from whichever was available made the queue merely
+// emptying look like a shape change, and held the fleet for it.
 //
 // The scheduler's queue is the early source: the EPP reports the queue's size
 // and its bytes, and bytes / size is the prompt length of what has not been
@@ -100,10 +113,19 @@ type shapeMemo struct {
 // against the previous cycle's figure through a fractional tolerance, so a
 // constant bias cancels; correcting the constant would move the demand
 // estimates that also divide by it, and is not this change's business.
-func fleetInputLength(sq *domain.SchedulerQueueMetrics, replicas []domain.ReplicaMetrics) float64 {
-	if sq != nil && sq.QueueSize > 0 && sq.QueueBytes > 0 {
-		return float64(sq.QueueBytes) / float64(sq.QueueSize) / BytesPerToken
+func arrivingPromptLength(sq *domain.SchedulerQueueMetrics) (float64, bool) {
+	if sq == nil || sq.QueueSize <= 0 || sq.QueueBytes <= 0 {
+		return 0, false
 	}
+	return float64(sq.QueueBytes) / float64(sq.QueueSize) / BytesPerToken, true
+}
+
+// servedPromptLength is the prompt length of what the replicas have been
+// SERVING, rate-weighted exactly as fleetOutputLength weights the output half
+// so a fresh replica with a handful of completions barely moves it. It lags --
+// it is an average over completed requests -- and it is on the engines' scale,
+// not the queue's.
+func servedPromptLength(replicas []domain.ReplicaMetrics) float64 {
 	var weighted, weights, plain float64
 	var n int
 	for _, rm := range replicas {
@@ -139,8 +161,9 @@ func fleetInputLength(sq *domain.SchedulerQueueMetrics, replicas []domain.Replic
 // Logged once per change, at INFO: the event is rare and it explains every
 // held decision that follows, which is the first thing a reader of those
 // decisions will ask.
-func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out float64, logger logr.Logger) (float64, bool) {
-	if !(in > 0) && !(out > 0) {
+func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out float64,
+	arriving float64, arrivingOK bool, logger logr.Logger) (float64, bool) {
+	if !(in > 0) && !(out > 0) && !arrivingOK {
 		stable, outstanding := a.fleetShapeState(namespace, modelID)
 		if stable <= 0 {
 			stable = out
@@ -159,6 +182,18 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 	was, hadShape := memo.tracker.Current()
 	now := a.now()
 	next, changed := memo.tracker.Observe(in, out, 0)
+	// The arriving prompt is the early half, and the only one that moves
+	// before anything completes. Compared against the last reading from
+	// the SAME source, so the scale difference cannot raise anything.
+	if arrivingOK {
+		if prev := memo.lastArriving; prev > 0 {
+			if delta := arriving - prev; delta > prev*shape.DefaultChangeTolerance ||
+				-delta > prev*shape.DefaultChangeTolerance {
+				changed = true
+			}
+		}
+		memo.lastArriving = arriving
+	}
 	// The keys move only on a change, so a shape that merely wobbles keeps
 	// the window it was learned under.
 	if changed || memo.stable.IsZero() {
@@ -189,6 +224,7 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 		"modelID", modelID, "namespace", namespace,
 		"inputTokensWas", was.AvgInputTokens, "inputTokensNow", next.AvgInputTokens,
 		"outputTokensWas", was.AvgOutputTokens, "outputTokensNow", next.AvgOutputTokens,
+		"arrivingPromptTokens", arriving, "arrivingRead", arrivingOK,
 		"hadShape", hadShape, "tolerance", shape.DefaultChangeTolerance,
 		"reason", "the shape the capacity figures were learned under is no longer the one arriving; the fleet is not released until the new shape has a reading of its own")
 	return stableOut, true

@@ -13,41 +13,47 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 )
 
-var _ = Describe("the arriving prompt length", func() {
-	It("reads the scheduler queue when there is one", func() {
+var _ = Describe("the two prompt-length sources", func() {
+	It("reads the scheduler queue, and says when there is none", func() {
 		// Run biran-20260921-235843-225, cycle at 20.7 min: 681 requests
-		// queued, 31,071,039 bytes. The trace's phase-2 prompt is 8000
-		// tokens; BytesPerToken is 4 against the ~5.8 the run measured, so
-		// the figure reads high and is compared as a ratio (shape_change.go).
+		// queued, 31,071,039 bytes, the trace's 8000-token phase-2 prompt.
 		sq := &domain.SchedulerQueueMetrics{QueueSize: 681, QueueBytes: 31_071_039}
-		Expect(fleetInputLength(sq, nil)).To(BeNumerically("~", 31_071_039.0/681/BytesPerToken, 1e-6))
+		got, ok := arrivingPromptLength(sq)
+		Expect(ok).To(BeTrue())
+		Expect(got).To(BeNumerically("~", 31_071_039.0/681/BytesPerToken, 1e-6))
 
-		// The same cycle one phase earlier: 692 requests, 4,039,809 bytes,
-		// the 1000-token prompt. The two are 7.8x apart, which is the step
-		// the tracker sees.
-		was := fleetInputLength(&domain.SchedulerQueueMetrics{QueueSize: 692, QueueBytes: 4_039_809}, nil)
-		Expect(fleetInputLength(sq, nil) / was).To(BeNumerically("~", 7.8, 0.1))
+		// One phase earlier: 692 requests, 4,039,809 bytes, the 1000-token
+		// prompt. The two are 7.8x apart, which is the step that raises the
+		// event; the absolute scale never matters because this reading is
+		// only ever compared against another of its own.
+		was, ok := arrivingPromptLength(&domain.SchedulerQueueMetrics{QueueSize: 692, QueueBytes: 4_039_809})
+		Expect(ok).To(BeTrue())
+		Expect(got / was).To(BeNumerically("~", 7.8, 0.1))
+
+		By("reporting no reading when the queue is empty, which it is on 141 of the run's 171 cycles")
+		_, ok = arrivingPromptLength(nil)
+		Expect(ok).To(BeFalse())
+		_, ok = arrivingPromptLength(&domain.SchedulerQueueMetrics{})
+		Expect(ok).To(BeFalse())
 	})
 
-	It("falls back to the replicas, weighted by rate, when the queue is empty", func() {
-		// 141 of the run's 171 cycles had an empty queue.
+	It("reads the replicas weighted by rate", func() {
 		rms := []domain.ReplicaMetrics{
 			{VariantName: "d", AvgInputTokens: 8000, RequestRate: 1.0},
 			{VariantName: "d", AvgInputTokens: 8000, RequestRate: 1.0},
 			{VariantName: "d", AvgInputTokens: 1000, RequestRate: 0.1},
 		}
-		got := fleetInputLength(nil, rms)
+		got := servedPromptLength(rms)
 		Expect(got).To(BeNumerically("~", (2*1.0*8000+0.1*1000)/(2*1.0+0.1), 1e-9))
 		Expect(got).To(BeNumerically(">", 7000), "the replica still draining the old shape must not drag it down")
 
 		By("the plain mean when no replica reports a rate")
-		Expect(fleetInputLength(nil, []domain.ReplicaMetrics{
+		Expect(servedPromptLength([]domain.ReplicaMetrics{
 			{VariantName: "d", AvgInputTokens: 1000}, {VariantName: "d", AvgInputTokens: 3000},
 		})).To(Equal(2000.0))
 
 		By("and nothing at all when there is nothing to read")
-		Expect(fleetInputLength(nil, nil)).To(Equal(0.0))
-		Expect(fleetInputLength(&domain.SchedulerQueueMetrics{}, nil)).To(Equal(0.0))
+		Expect(servedPromptLength(nil)).To(Equal(0.0))
 	})
 
 	It("ignores a warm-pool bridge, whose prompts are not this variant's", func() {
@@ -55,7 +61,7 @@ var _ = Describe("the arriving prompt length", func() {
 			{VariantName: "d", AvgInputTokens: 1000, RequestRate: 1.0},
 			{VariantName: "d", AvgInputTokens: 60000, RequestRate: 1.0, FromWarmPool: true},
 		}
-		Expect(fleetInputLength(nil, rms)).To(Equal(1000.0))
+		Expect(servedPromptLength(rms)).To(Equal(1000.0))
 	})
 })
 
@@ -226,6 +232,23 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 			"a shape that wobbles across a boundary must not split the fleet's window in two: %v", decodeKeys)
 		Expect(outstanding()).To(BeFalse(),
 			"and it is not a shape change either")
+	})
+
+	It("does not read the queue merely emptying as a change of shape", func() {
+		// The two sources are on different scales: BytesPerToken is 4 and the
+		// run measures ~5.8 bytes per prompt token, so the queue reads 1459
+		// tokens for the same 1000-token prompt the replicas report. Fed to
+		// one tracker from whichever source happened to be available, that
+		// 46 % step raised a change every time the queue filled or emptied --
+		// and held the fleet for five minutes on each. The run's queue is
+		// empty on 141 of 171 cycles, so this is the common case, not an edge.
+		queued := &domain.SchedulerQueueMetrics{QueueSize: 692, QueueBytes: 4_039_809}
+		for i, sq := range []*domain.SchedulerQueueMetrics{queued, nil, queued, nil, nil, queued} {
+			cycle(10, 17_282, 0, 1000, 6000, sq)
+			Expect(outstanding()).To(BeFalse(),
+				"cycle %d: the queue coming and going is not the workload changing", i)
+			clock = clock.Add(15 * time.Second)
+		}
 	})
 
 	It("raises nothing while the shape holds still", func() {

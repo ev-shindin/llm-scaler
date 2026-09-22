@@ -222,8 +222,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// switch within a scrape of it, where the output half waits for a
 	// completion; a change on either says the learned figures describe a
 	// workload that is no longer running (shape_change.go).
-	fleetInput := fleetInputLength(input.SchedulerQueue, input.ReplicaMetrics)
-	stableOutput, shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID, fleetInput, fleetOutput, logger)
+	fleetInput := servedPromptLength(input.ReplicaMetrics)
+	arriving, arrivingOK := arrivingPromptLength(input.SchedulerQueue)
+	stableOutput, shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID,
+		fleetInput, fleetOutput, arriving, arrivingOK, logger)
 
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]capacity.ReplicaCapacity, 0, len(input.ReplicaMetrics))
