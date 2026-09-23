@@ -23,7 +23,8 @@ Measured on this fleet, two models behind one gateway on 8×H200:
 | --- | ---: |
 | p95 TTFT during a cold rise, 8B model | **5.1 – 8.8 s** |
 | the same rise with a warm replica available | **0.11 – 0.83 s** |
-| GLM-5.2-FP8 start, warm node, weights read | **192 s** |
+| 8B model server, not running → first request served | **~41 s** |
+| GLM-5.2-FP8 (744B MoE) start, warm node, weights read | **192 s** |
 | ...of which the weights are | **40 s** |
 | ...the same start with a cold JIT cache | **463 s** |
 

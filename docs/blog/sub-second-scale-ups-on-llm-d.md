@@ -3,7 +3,7 @@
 *Measurements on CoreWeave H200s, September 2026.*
 
 Traffic triples. The autoscaler notices, asks for a second replica, and
-Kubernetes schedules it in about a second. Then the pod spends the next ninety
+Kubernetes schedules it in about a second. Then the pod spends the next forty
 seconds loading model weights and compiling kernels, and every request that
 arrived in the meantime is queued behind a replica that is running but cannot
 serve. By the time it can, the spike is half over.
@@ -18,10 +18,16 @@ multi-model autoscaler for llm-d, with warm capacity and scale-to-zero on top. I
 decides the replica count; KEDA and the HPA actuate it. It began as a fork of
 llm-d's Workload Variant Autoscaler and has diverged substantially since.
 
-## Why a scale-up takes minutes, and not for the reason people assume
+## Why a scale-up is slow, and not for the reason people assume
 
-The instinct is that weights are the problem, so put them on faster storage. We
-measured GLM-5.2-FP8 starting on a warm 8×H200 node:
+The models in that benchmark are 8B — deliberately, because they are the *cheap*
+case. A model server that is not already running takes **~41 s** to serve its
+first request (33–37 s on this cluster). That is the gap those rises are paying,
+and it is already long enough to ruin a spike.
+
+It gets worse with model size, and the instinct — weights are the problem, so put
+them on faster storage — gets less right as it does. We measured GLM-5.2-FP8,
+a 744B mixture-of-experts, starting on a warm 8×H200 node:
 
 | | |
 | --- | ---: |
@@ -35,7 +41,9 @@ take that start from 192 s to about 152 s. The rest is process spawn, imports,
 memory profiling, kernel warmup and CUDA-graph capture — none of which a faster
 disk, a bigger page cache or a peer transfer touches.
 
-So a cold start cannot be made fast. It can only be *not paid*. That is what a
+So at 8B a cold start costs ~40 s, at GLM scale it costs three to eight minutes,
+and in neither case is it mostly the weights. A cold start cannot be made fast.
+It can only be *not paid*. That is what a
 warm pool is: a Pod holding an accelerator with models already resident, lent to
 a model that is scaling up so it serves while its own replica starts. On a pool
 Pod serving real gateway traffic we measured a **437 ms model switch against a
