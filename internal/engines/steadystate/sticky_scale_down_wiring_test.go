@@ -21,7 +21,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/decision"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/policy"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/scalingpolicy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/variant"
 )
@@ -77,7 +77,7 @@ func wiringEngine(t *testing.T, objs ...client.Object) *Engine {
 		client:         c,
 		Config:         stickyConfig(t, true),
 		metricsEmitter: metrics.NewMetricsEmitter(),
-		policies:       policy.NewChangeReporter(),
+		policies:       scalingpolicy.NewChangeReporter(),
 	}
 }
 

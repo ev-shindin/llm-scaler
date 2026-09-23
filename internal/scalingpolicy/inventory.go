@@ -1,4 +1,4 @@
-package policy
+package scalingpolicy
 
 import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"

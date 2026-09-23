@@ -9,7 +9,7 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/policy"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/scalingpolicy"
 )
 
 // The numbers are the two-model benchmark's, sparse shape, nopool arm, Qwen
@@ -51,9 +51,9 @@ func TestPruneLastDecided_DropsWhatCannotBeTrusted(t *testing.T) {
 	now := time.Now()
 	e := &Engine{lastDecided: map[string]decidedMark{
 		"ns/fresh": {at: now.Add(-time.Minute), uid: "a"},
-		"ns/stale": {at: now.Add(-policy.DefaultMaxAge - time.Minute), uid: "b"},
+		"ns/stale": {at: now.Add(-scalingpolicy.DefaultMaxAge - time.Minute), uid: "b"},
 	}}
-	e.pruneLastDecided(policy.DefaultMaxAge, now)
+	e.pruneLastDecided(scalingpolicy.DefaultMaxAge, now)
 	assert.Contains(t, e.lastDecided, "ns/fresh")
 	assert.NotContains(t, e.lastDecided, "ns/stale")
 }
@@ -81,10 +81,10 @@ func TestPublishedValueIsTrustedForOneIncarnationOnly(t *testing.T) {
 
 func TestStickyAge_FollowsALongOptimizeInterval(t *testing.T) {
 	e := &Engine{}
-	assert.Equal(t, policy.DefaultMaxAge, e.stickyAge(), "no config: the floor")
+	assert.Equal(t, scalingpolicy.DefaultMaxAge, e.stickyAge(), "no config: the floor")
 	e.Config = config.NewTestConfig()
 	config.SetOptimizationIntervalForTest(e.Config, 2*time.Minute)
 	assert.Equal(t, stickyAgeCycles*2*time.Minute, e.stickyAge(), "four cycles of a 2 m loop outrun the floor")
 	config.SetOptimizationIntervalForTest(e.Config, 15*time.Second)
-	assert.Equal(t, policy.DefaultMaxAge, e.stickyAge(), "four cycles of a 15 s loop do not")
+	assert.Equal(t, scalingpolicy.DefaultMaxAge, e.stickyAge(), "four cycles of a 15 s loop do not")
 }

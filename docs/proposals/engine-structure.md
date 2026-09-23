@@ -350,7 +350,9 @@ p95 or target path has changed behaviour and stops).
 3. **Split the engine by concern**, and the analyzer surface with it.
    `sticky_scale_down.go`, `inventory_gate.go`, `scaling_blocked.go`,
    `policy_report.go` and the hold/gate logic now inside `engine.go` become
-   `internal/policy`; `engine.go` + `engine_v2.go` become one `engine.go`
+   `internal/scalingpolicy` (the module already has an
+   `internal/warmpool/policy`, and two packages importing bare as `policy`
+   would have to be aliased apart); `engine.go` + `engine_v2.go` become one `engine.go`
    that only sequences the steps; one registry; the input builder before
    `Analyze` (retiring the phase-3 overlay and the composite's D1);
    `scalefromzero` becomes the second driver beside it. The largest single

@@ -31,7 +31,7 @@ command -v go >/dev/null 2>&1 || { echo "FATAL: go is required to run this check
 layer_of() {
     case "$1" in
         internal/engines/steadystate|internal/engines/scalefromzero) echo 7 ;;
-        internal/policy) echo 6 ;;
+        internal/scalingpolicy) echo 6 ;;
         internal/engines/allocation|internal/engines/allocation/*) echo 5 ;;
         internal/engines/analyzers/*|internal/engines/executor|internal/engines/variantmeta) echo 4 ;;
         internal/engines/aggregation|internal/engines/common|internal/signals/*) echo 3 ;;

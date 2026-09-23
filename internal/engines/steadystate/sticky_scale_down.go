@@ -3,7 +3,7 @@ package steadystate
 import (
 	"time"
 
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/policy"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/scalingpolicy"
 
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -34,10 +34,10 @@ func (e *Engine) pruneLastDecided(maxAge time.Duration, now time.Time) {
 // stale by the next cycle and the switch would silently do nothing.
 const stickyAgeCycles = 4
 
-// stickyAge is the age bound in force: policy.DefaultMaxAge, or stickyAgeCycles
+// stickyAge is the age bound in force: scalingpolicy.DefaultMaxAge, or stickyAgeCycles
 // optimize intervals when those are longer.
 func (e *Engine) stickyAge() time.Duration {
-	age := policy.DefaultMaxAge
+	age := scalingpolicy.DefaultMaxAge
 	if e.Config != nil {
 		if byInterval := stickyAgeCycles * e.Config.OptimizationInterval(); byInterval > age {
 			age = byInterval

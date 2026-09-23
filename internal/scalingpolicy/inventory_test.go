@@ -1,4 +1,4 @@
-package policy
+package scalingpolicy
 
 import (
 	. "github.com/onsi/ginkgo/v2"

@@ -1,4 +1,4 @@
-// Package policy is what happens between a plan and an order.
+// Package scalingpolicy is what happens between a plan and an order.
 //
 // The optimizer says how many replicas the load implies; these are the rules
 // that decide what is actually published: a scale-down held against the
@@ -6,12 +6,9 @@
 // scaled to zero, whether a cluster-wide inventory read is worth its cost,
 // and the throttling of the policy lines an operator reads. Each is a
 // function of its inputs, with no engine state behind it, so each can be
-// read and tested on its own.
-//
-// Not to be confused with internal/warmpool/policy, which decides what the
-// warm pool does with the Pods it holds. This package is the scaling
-// pipeline's; a file that needs both imports one under an alias.
-package policy
+// read and tested on its own. It is the scaling pipeline's policy; the warm
+// pool has its own, in internal/warmpool/policy.
+package scalingpolicy
 
 import (
 	"fmt"
