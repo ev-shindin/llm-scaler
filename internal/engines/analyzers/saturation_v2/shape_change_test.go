@@ -260,6 +260,89 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		Expect(outstanding()).To(BeFalse())
 	})
 
+	It("runs the backstop on a cycle that also declares a change", func() {
+		// These two were a switch, and its cases were mutually exclusive only
+		// while the arm fired on every change, which kept the elapsed time at
+		// zero. Once the clock stopped being restarted, a cycle could both
+		// declare a change and be past the backstop, and the switch took the
+		// first case and skipped the clear -- holding the fleet past
+		// ShapeChangeHoldMax for as long as changes kept arriving.
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 900_000, 0, 8000, 6000, nil)
+		Expect(outstanding()).To(BeTrue())
+
+		// Past the backstop, and a change on the very same cycle.
+		clock = clock.Add(ShapeChangeHoldMax + time.Second)
+		cycle(10, 17_282, 0, 8000, 1000, nil)
+		Expect(outstanding()).To(BeFalse(),
+			"the backstop is not behind another condition; a change arriving on "+
+				"the cycle it expires must not keep the hold alive")
+	})
+
+	It("does not chain one hold onto the next for a fleet that never settles", func() {
+		// A workload that drifts without ever settling crosses the band every
+		// few cycles. One fresh hold per crossing is a fleet that is never
+		// released at all -- worse than the stale figures the hold guards
+		// against, because those at least let it scale.
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 900_000, 0, 8000, 6000, nil)
+		Expect(outstanding()).To(BeTrue())
+
+		clock = clock.Add(ShapeChangeHoldMax + time.Second)
+		cycle(10, 17_282, 0, 8000, 5000, nil)
+		Expect(outstanding()).To(BeFalse(), "the backstop gives up on the first hold")
+
+		// The slide continues, declaring a change every 90 s and never
+		// saturating, so nothing ever settles. Through the cooldown the fleet
+		// stays released even though every one of those cycles declares.
+		gaveUp := clock
+		for _, out := range []float64{4000, 3200, 2500} {
+			clock = clock.Add(90 * time.Second)
+			cycle(10, 17_282, 0, 8000, out, nil)
+			Expect(clock.Sub(gaveUp)).To(BeNumerically("<", ShapeChangeHoldMax),
+				"these cycles have to fall inside the cooldown or this proves nothing")
+			Expect(outstanding()).To(BeFalse(),
+				"a hold given up on is not re-raised by the next crossing of the same slide")
+		}
+
+		// Past the cooldown it may hold again -- the bound is a duty cycle, not
+		// a permanent disarm, so a drift that genuinely continues still gets
+		// looked at, and a fleet is released for at least half of it.
+		clock = clock.Add(ShapeChangeHoldMax)
+		cycle(10, 17_282, 0, 8000, 1800, nil)
+		Expect(outstanding()).To(BeTrue())
+	})
+
+	It("declares a drift in the arriving prompt length, not just a jump", func() {
+		// The queue-derived length is the early axis -- it moves before
+		// anything completes -- so it is the one that most needs to notice a
+		// drift. It was compared against the previous reading, where a few
+		// percent a cycle never crosses the tolerance.
+		q := func(tokens float64) *domain.SchedulerQueueMetrics {
+			return &domain.SchedulerQueueMetrics{
+				QueueSize: 20, QueueBytes: int64(tokens * 20 * BytesPerToken),
+			}
+		}
+		// The replicas' own shape is held still, so only the arriving axis can
+		// declare anything.
+		cycle(10, 17_282, 0, 8000, 1000, q(1000))
+		Expect(outstanding()).To(BeFalse())
+
+		declared := false
+		for tokens := 1000.0; tokens < 2600; tokens *= 1.05 {
+			clock = clock.Add(15 * time.Second)
+			cycle(10, 17_282, 0, 8000, 1000, q(tokens))
+			if outstanding() {
+				declared = true
+				break
+			}
+		}
+		Expect(declared).To(BeTrue(),
+			"a prompt length that doubles 5% at a time is a shape change")
+	})
+
 	It("keeps one throughput window when the shape sits on a bucket boundary", func() {
 		// Measured on the rerun of 2026-09-22 (biran-pd, the build carrying
 		// #85): phase 1 generates exactly 6000-token outputs, which is the
