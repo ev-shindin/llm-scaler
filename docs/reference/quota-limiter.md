@@ -586,12 +586,12 @@ When the effective limiter mode is quota:
   is Kueue API traffic, not Node API traffic.)
 - `collector.CollectInventoryK8S` (called from the saturation engine's
   per-cycle `optimize` when `WVA_LIMITED_MODE=true`) is **also** gated on
-  the effective limiter mode via `scalingpolicy.ShouldCollectClusterInventory` — it only runs
-  when `EffectiveLimiterMode() == inventory`. This keeps the "no Node API access
-  in quota mode" contract intact even if an operator combines quota mode with
-  `WVA_LIMITED_MODE=true`. When that combination is detected at startup,
-  `main.go` emits an informational log so the operator sees that their inventory
-  logging is intentionally suppressed.
+  the effective limiter mode via `scalingpolicy.ShouldCollectClusterInventory`
+  — it only runs when `EffectiveLimiterMode() == inventory`. This keeps the
+  "no Node API access in quota mode" contract intact even if an operator
+  combines quota mode with `WVA_LIMITED_MODE=true`. When that combination is
+  detected at startup, `main.go` emits an informational log so the operator
+  sees that their inventory logging is intentionally suppressed.
 
 Combination matrix — **limiter-path** Node API access (limiter mode is the
 effective mode from the ConfigMap):

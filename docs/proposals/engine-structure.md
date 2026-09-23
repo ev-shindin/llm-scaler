@@ -352,9 +352,10 @@ p95 or target path has changed behaviour and stops).
    `policy_report.go` and the hold/gate logic now inside `engine.go` become
    `internal/scalingpolicy` (the module already has an
    `internal/warmpool/policy`, and two packages importing bare as `policy`
-   would have to be aliased apart); `engine.go` + `engine_v2.go` become one `engine.go`
-   that only sequences the steps; one registry; the input builder before
-   `Analyze` (retiring the phase-3 overlay and the composite's D1);
+   would have to be aliased apart); `engine.go` + `engine_v2.go` become one
+   `engine.go` that only sequences the steps; one registry; the input
+   builder before `Analyze` (retiring the phase-3 overlay and the
+   composite's D1);
    `scalefromzero` becomes the second driver beside it. The largest single
    diff of the plan, and pure movement except for the two decisions marked
    above.
