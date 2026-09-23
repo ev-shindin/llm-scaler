@@ -21,14 +21,13 @@
 **An analytical scaling manager for llm-d inference: multi-model, variant- and
 P/D-aware — scaling, warm capacity and placement under one GPU budget.**
 
-
 llm-scaling-manager is a Kubernetes-based global scaling manager for inference model servers serving LLMs. It works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments — it decides, KEDA and the HPA actuate. The high-level details of the algorithms are documented [here](https://llm-d.ai/docs/architecture/advanced/autoscaling). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
 
 ### What is a Variant?
 
 llm-scaling-manager keeps WVA's concept of **variants** — multiple model servers in an InferencePool that all serve the same base model but differ in hardware configuration (e.g., GPU type), serving configuration (e.g., tensor parallelism, max batch size, quantization), or both.
 
-Concretely, **a variant is a scaling entity: one KEDA ScaledObject and the workload it scales.** That is the unit WVA discovers, decides for, and reports on — a Pod's variant is the managed scaler its `ownerReferences` lead to, not a label anyone stamps. Variants whose triggers name the same `modelID` are variants of one model, and WVA scales the group rather than each ScaledObject alone. Creating a variant therefore means creating a ScaledObject; there is no other registration.
+Concretely, **a variant is a scaling entity: one KEDA ScaledObject and the workload it scales.** That is the unit llm-scaling-manager discovers, decides for, and reports on — a Pod's variant is the managed scaler its `ownerReferences` lead to, not a label anyone stamps. Variants whose triggers name the same `modelID` are variants of one model, and it scales the group rather than each ScaledObject alone. Creating a variant therefore means creating a ScaledObject; there is no other registration.
 
 Use cases include:
 
@@ -51,7 +50,7 @@ make check-prereqs                    # read-only: tools, namespace, Prometheus
 make setup-prereqs                    # ONCE per namespace, by a cluster admin
 make deploy-wva                       # the controller — no cluster-scoped rights
 make scaledobjects-plan               # list your model servers; nothing is applied
-make scaledobjects-apply              # register them — this is what makes WVA scale
+make scaledobjects-apply              # register them — this is what makes it scale
 ```
 
 The install is split across two people, because it is split across two levels of
@@ -62,13 +61,13 @@ are both, `make deploy-wva` does the two in one command.
 Prometheus and KEDA are found on the cluster, or installed if it has neither.
 
 The last two steps are not optional. A **KEDA ScaledObject** is how a workload
-registers with WVA: the controller has no watch and no listing, so until one exists
+registers with llm-scaling-manager: the controller has no watch and no listing, so until one exists
 it is running and idle.
 
 | Then | |
 | --- | --- |
 | Full install guide | [deploy/](deploy/) |
-| Installing WVA | [docs/guides/](docs/guides/) — pick a path |
+| Installing it | [docs/guides/](docs/guides/) — pick a path |
 | Running it day to day | [operations.md](docs/reference/operations.md) |
 | Watching what it decides | [monitoring.md](docs/reference/monitoring.md) |
 | Making a workload scalable | [workload-preparation.md](docs/reference/workload-preparation.md) |
@@ -85,9 +84,9 @@ See the [docs](docs/) directory for design docs, developer guide, and more.
 
 **Prerequisites:** deploy llm-d infrastructure (model servers), have Prometheus
 scraping them, and create a **KEDA ScaledObject** per workload whose trigger points
-at WVA's external scaler.
+at llm-scaling-manager's external scaler.
 
-**WVA then:**
+**llm-scaling-manager then:**
 
 1. Learns which workloads it manages **from the KEDA calls themselves** — there is
    no watch, no listing and no opt-in annotation. Being called is being managed,
@@ -97,7 +96,7 @@ at WVA's external scaler.
    to decide the replica count each model needs, across all its variants at once
    and within the GPU budget any declared limiter allows.
 4. Returns that decision to KEDA over the external-scaler gRPC contract. KEDA owns
-   the HPA and actuates it; WVA never writes the scale subresource.
+   the HPA and actuates it; llm-scaling-manager never writes the scale subresource.
 
 ## Example
 
@@ -116,7 +115,7 @@ spec:
   minReplicaCount: 1        # 0 to allow scale-to-zero (alpha)
   maxReplicaCount: 10
   triggers:
-  - type: external-push     # push: WVA wakes a parked workload immediately
+  - type: external-push     # push: wakes a parked workload immediately
     name: wva-external-scaler
     metadata:
       scalerAddress: wva-external-scaler.workload-variant-autoscaler-system.svc.cluster.local:9090
