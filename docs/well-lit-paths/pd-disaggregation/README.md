@@ -127,32 +127,53 @@ copies fine. And a cluster whose kueue pod-webhook is unhealthy denies every
 Deployment pod with `Deployment.apps ... not found` -- nothing in this recipe
 causes it, so check `kubectl create deployment` works in your namespace first.
 
+One more, if you run several passes in a row: `make benchmark-run` starts a
+log tail and a replica sampler that write to fixed paths under `/tmp`, and a
+pass that ends badly can leave them running. Two of them writing at once
+produced an empty controller log for one run and a replica-sample file
+holding two concatenated JSON documents for another -- the workload data was
+never affected, but the target path, the ordering times and the dashed line
+in the pipeline graph all come from that log. `pkill -f tail_wva_logs.sh`
+between passes, and check the captured files are non-empty before you trust
+a report built from them.
+
 ## Measured
 
 The scenario, trace, policy and HPA behaviour above, on CoreWeave 8 x H200
-nodes (k1 = 929,894 tokens per decode replica), against the controller image
-built from this tree, on 2026-09-17 (run `guidellm-1789645863-l32fnc_1`).
-The controller had served one pass of the same trace before this one, so the
-saturated throughput of both shapes was on record; the pass before it, on a
-controller that had seen nothing, is the second column where it differs. The
+nodes (k1 = 930,508 tokens per decode replica), against the controller image
+built from this tree at `f5f98761`, on 2026-09-23. Two passes back to back:
+the headline column is the second, taken with the saturated throughput of
+both shapes on record from the first; the first, on a controller restarted
+so that it had seen nothing, is the second column (runs
+`guidellm-1790147333-mnjvnc_1` and `guidellm-1790144180-oz7fvy_1`). The
 graphs and tables are the ones `post_run_analyze.sh` writes.
 
-| | this run | the cold pass before it |
+| | this run (warm) | the cold pass before it |
 |---|---|---|
-| decode replicas ordered | 1 → 3 (first ramp) → 2 → 3 → 4, held | 1 → 3 → 2 → 3 → 4, held |
-| second decode replica ordered | +62 s after load start | +81 s |
+| decode replicas ordered | 1 → 2, held through the first phase → 3 at the shape change, held | 1 → 2 → 3 (first ramp) → 2 → 3 → 4 → 3 |
+| second decode replica ordered | +53 s after load start | +56 s |
+| third decode replica ordered | +1344 s, four minutes into the second phase | +131 s, released at +206 s; again at +1392 s |
 | prefill replicas | 1 throughout | 1 throughout |
-| decode replicas, mean / max | 2.59 / 4 | 2.73 / 4 |
-| TTFT p50 / p95 / p99 | 100 ms / **213 ms** / 11.7 s | 99 ms / 7.0 s / 24.7 s |
-| ITL p50 / p95 | 5.4 / 21.7 ms | 4.1 / 23.0 ms |
-| request latency p50 / p95 | 14.6 / 79.2 s | 14.2 / 84.5 s |
-| decode GPU-minutes | 100.0 | 105.3 |
-| requests / errors | 13,288 / 0 | 13,288 / 0 |
+| decode replicas, mean / max | 2.34 / 3 | 2.47 / 4 |
+| TTFT p50 / p95 / p99 | 99 ms / **155 ms** / 229 ms | 99 ms / 204 ms / 3.9 s |
+| ITL p50 / p95 | 5.6 / 20.7 ms | 5.3 / 22.1 ms |
+| request latency p50 / p95 | 17.2 / 76.8 s | 14.4 / 82.3 s |
+| decode GPU-minutes | 90.2 | 95.4 |
+| requests / errors | 13,288 / 0 | 13,287 / 0 |
 
 Where the tail is, by five-minute window (p95 TTFT from the engines' own
-histograms): **1.8 s in minutes 0-5**, then 0.08 s for the rest of the first
-phase; **0.22 s in minutes 20-25**, then 0.04-0.05 s for the rest of the
-second. On the cold pass the same two windows read 7.0 s and 3.3 s.
+histograms, over the decode pods -- every request also leaves a ~0.4 s
+prefill sample, and a fleet-wide figure halves against this one):
+**0.23 s in minutes 0-5**, then 0.08 s for the rest of the first phase;
+**0.23 s in minutes 20-25**, then 0.04-0.07 s for the rest of the second. On
+the cold pass the same two windows read 0.25 s and 4.2 s.
+
+The pair was run twice, a day apart, on the same build. The repeat landed
+within a tenth of every figure above -- warm p95 167 ms against 155 ms, cold
+227 ms against 204 ms, the same replica paths -- except in the cold pass's
+first five minutes, where one replica tipping into preemption a cycle
+earlier or later moves that one window between 0.25 s and 5.6 s. Read the
+cold ramp as a range, not a number.
 
 ![pipeline: replicas, demand vs capacity, KV, running, waiting, EPP queue](shape-swap-rps6-pipeline.png)
 
@@ -162,14 +183,15 @@ How to read it.
 
 **The first ramp** (minutes 0-5). One decode replica serves 6 req/s until the
 second is Ready. The analyzer knows what one replica of this shape completes
-when saturated, and the arrival rate over that is 0.85-0.91 of a replica from
-the first cycle the rate is measured, so it orders the second replica at
-+62 s -- from the load, not from the queue, and before the first replica
-tips into preemption. The second lands at +160 s; a queue of ~110 forms in
-the last minute of the wait and is priced as work to drain within 60 s
-(`backlogRequests` on the `throughput-demand-floor` line), which is one more
-replica, not five: the target peaks at 3, the queue is gone in a minute, and
-the third replica is released at +6 min. Prefill is never ordered: prompts
+when saturated -- 5.66 req/s, priced from +38 s -- and the arrival rate over
+that is 1.06 replicas' worth, so it orders the second at +53 s: from the
+load, not from a queue, and before the first replica tips into preemption.
+Two replicas then carry the whole first phase. The largest backlog the floor
+ever prices is 4 requests (`backlogRequests` on the `throughput-demand-floor`
+line), and the gateway queue is flat after one spike in the first seconds.
+The cold pass, with nothing on record, is sized by occupancy for its first
+cycles instead: it orders a third replica at +131 s and releases it at
++206 s, once the fleet's own reading arrives. Prefill is never ordered: prompts
 waiting at the scheduler are no longer charged to it as resident KV. (A
 later cold pass ordered one by a second path -- a prefill saturation
 recorded while decode was saturated -- which the analyzer now declines, and
@@ -186,17 +208,16 @@ one. The dashed target holds at two because the analyzer floors each role's
 demand at what the load requires in throughput: the arrival rate over the
 completion rate one replica sustained when it was last seen saturated.
 
-**The shape change** (minute 18 on). The 4000-token shape's throughput is on
-record (2.67 req/s), so as the replicas' output length crosses into its
-bucket the floor becomes 6 / 2.67 = 2.25 replicas' worth and orders the
-third at +4 min into the phase -- no queue forms at all (the waiting panel is
-flat through the whole second phase), the batch peaks at 63% KV and relaxes.
-The fourth, at minute 31, is one noisy arrival-rate sample (6.7 req/s for a
-cycle against a steady 5.4-6.0) tipping 2.5 replicas' worth over the
-three-replica boundary; the analyzer asked for three again 90 s later and the
-HPA's 180 s window kept the fourth to the end. One spare replica for six
-minutes was the cost of that jitter before the sticky scale-down
-(`WVA_STICKY_SCALE_DOWN`, on by default), which holds the published three
+**The shape change** (minute 18 on). The third replica is ordered at
++1344 s -- the same cycle in which the 4000-token shape's completion rate
+first comes on record (3.46 req/s), as the replicas' output length crosses
+into its bucket. No queue forms at all: the waiting panel is flat through
+the whole second phase, and the batch peaks at 62% KV and relaxes. The warm
+pass never asks for a fourth replica. The cold pass does, at +1512 s, on one
+noisy arrival-rate sample tipping the figure over the three-replica
+boundary, and asks for three again 75 s later; the HPA's 180 s window is
+what decides how long that spare is kept, and the sticky scale-down
+(`WVA_STICKY_SCALE_DOWN`, on by default) is what holds the published three
 against the creep unless demand at three reaches the scale-up threshold.
 
 What still moves: a controller that has never seen a shape saturated has no
