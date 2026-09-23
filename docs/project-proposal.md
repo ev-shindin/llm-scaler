@@ -3,9 +3,9 @@
 An analytical scaling manager for llm-d inference: multi-model, variant- and
 P/D-aware — scaling, warm capacity and placement under one GPU budget.
 
-It began as a fork of the llm-d
-[Workload Variant Autoscaler](https://github.com/llm-d-incubation/ig-wva) and has
-diverged substantially since.
+It began as a fork of llm-d's Workload Variant Autoscaler
+(`llm-d/llm-d-workload-variant-autoscaler`, the path still in this tree's
+`go.mod`) and has diverged substantially since.
 
 ## 1. The problem
 
