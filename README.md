@@ -17,6 +17,10 @@
 > check suites** that run the deploy shell against recorded pod specs in CI.
 >
 > Developed independently. Not affiliated with, nor endorsed by, the llm-d project.
+>
+> The rename is brand-level only: the Kubernetes objects, make targets and
+> metrics keep their `wva-` / `wva_` names, so dashboards, alerts and existing
+> installs are unaffected.
 
 **An analytical scaling manager for llm-d inference: multi-model, variant- and
 P/D-aware — scaling, warm capacity and placement under one GPU budget.**
@@ -61,8 +65,8 @@ are both, `make deploy-wva` does the two in one command.
 Prometheus and KEDA are found on the cluster, or installed if it has neither.
 
 The last two steps are not optional. A **KEDA ScaledObject** is how a workload
-registers with llm-scaling-manager: the controller has no watch and no listing, so until one exists
-it is running and idle.
+registers with llm-scaling-manager: the controller has no watch and no
+listing, so until one exists it is running and idle.
 
 | Then | |
 | --- | --- |
