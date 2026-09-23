@@ -23,8 +23,8 @@ This document covers **WVA-specific** development setup and workflows.
 1. **Fork and clone the repository:**
 
    ```bash
-   git clone https://github.com/<your-username>/workload-variant-autoscaler.git
-   cd workload-variant-autoscaler
+   git clone https://github.com/<your-username>/llm-scaling-manager.git
+   cd llm-scaling-manager
    ```
 
 2. **Add upstream remote:**
@@ -66,7 +66,7 @@ Learn more in the [Developer Guide](docs/developer-guide/development.md).
 ## WVA Project Structure
 
 ```text
-workload-variant-autoscaler/
+llm-scaling-manager/
 ├── api/v1alpha1/         # CRD definitions and types
 ├── cmd/                  # Main application entry point
 ├── config/               # Kubernetes manifests

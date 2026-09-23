@@ -546,7 +546,7 @@ helm uninstall keda -n keda-system
 helm uninstall kube-prometheus-stack -n workload-variant-autoscaler-monitoring
 
 # Delete WVA
-cd /path/to/workload-variant-autoscaler
+cd /path/to/llm-scaling-manager
 kubectl delete -k config/overlays/cluster-scoped/kubernetes
 
 # Delete namespaces
