@@ -308,10 +308,23 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 	return stableOut, true
 }
 
-// settleFleetShape clears an outstanding change once the fleet has a
-// throughput reading taken under the NEW shape. One replica reading its own
-// bucket rather than borrowing a neighbour's is the whole condition, and
-// floor.Estimate already distinguishes the two, so nothing here scans windows.
+// settleFleetShape clears an outstanding change once the fleet has MEASURED
+// itself under the new shape.
+//
+// One replica reading its own bucket was the whole condition and it was too
+// weak: computeReplicaCapacity records a sample and reads the window back in
+// the same call, so the first saturated cycle after a switch both wrote the
+// new bucket's first sample and satisfied the test -- the hold lasted one
+// cycle. Worse, that first sample is the one most likely to be wrong: on an
+// O-down switch the replicas are still draining generations of the OLD length
+// while the new, shorter O is already the divisor, so the reading is inflated
+// by the ratio of the two. The hold existed to reject exactly that reading and
+// was being cleared by it.
+//
+// The condition is now the one the floor itself uses to trust a window with an
+// order: MinThroughputSamplesToOrder readings of its own, which are a
+// ThroughputSampleSpacing apart by construction, so the second cannot come
+// from the same drain as the first.
 func (a *SaturationAnalyzer) settleFleetShape(namespace, modelID string, ownReading bool) {
 	if !ownReading {
 		return

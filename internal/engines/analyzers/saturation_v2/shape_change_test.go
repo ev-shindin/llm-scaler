@@ -361,11 +361,173 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		Expect(outstanding()).To(BeFalse(),
 			"an axis nobody reported this cycle is missing, not zero")
 
+		// The same on the other axis. Only the output half was driven above,
+		// so the input carry-forward was never exercised: a scrape that keeps
+		// the output field and loses the input one is just as ordinary.
+		clock = clock.Add(15 * time.Second)
+		lostInput := makeReplicaMetrics("d0", decodeV, 17_282, kvCap, 0, 0, 6000)
+		lostInput.RequestRate = 0.6
+		lostInput.GenerationTokenRate = lostInput.RequestRate * 6000
+		lostInput.Ready = true
+		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{lostInput}, states(10))
+		in2.ArrivalRate = 5.68
+		_, err = analyzer.Analyze(ctx, in2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeFalse(),
+			"the input axis is carried forward too")
+
+		// And both at once, with a queue reading present so the cycle is not
+		// simply skipped as unmeasurable.
+		clock = clock.Add(15 * time.Second)
+		bothGone := makeReplicaMetrics("d0", decodeV, 17_282, kvCap, 0, 0, 0)
+		bothGone.RequestRate = 0.6
+		bothGone.GenerationTokenRate = bothGone.RequestRate * 6000
+		bothGone.Ready = true
+		in3 := makeAnalyzerInput([]domain.ReplicaMetrics{bothGone}, states(10))
+		in3.ArrivalRate = 5.68
+		in3.SchedulerQueue = &domain.SchedulerQueueMetrics{QueueSize: 692, QueueBytes: 4_039_809}
+		_, err = analyzer.Analyze(ctx, in3)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeFalse(),
+			"and a cycle that lost both axes is still not a change of shape")
+
 		// And the shape is still the one it was, so the axis coming back is
 		// not a change either.
 		clock = clock.Add(15 * time.Second)
 		cycle(10, 17_282, 0, 1000, 6000, nil)
 		Expect(outstanding()).To(BeFalse(), "nor is it a change when the reading returns")
+	})
+
+	It("composes with the prefill hold over the same demand map", func() {
+		// analyzer.go applies holdPrefillDemand and then holdFleetFloor, and
+		// both write the same roleDemand entries and the same variant figures.
+		// They are asserted here rather than through Analyze because they
+		// cannot in fact both apply in one cycle: a saturated decode replica
+		// records a window under the new shape's key in that same cycle, the
+		// reading is its own rather than borrowed, and settleFleetShape clears
+		// the change before holdFleetFloor is reached. The composition still
+		// has to be right -- the order is unconditional in the engine, and a
+		// future settle rule could let both through.
+		const p = 900_000.0
+		vcs := []domain.VariantCapacity{
+			{VariantName: "d", Role: domain.RoleDecode, ReplicaCount: 4, PerReplicaCapacity: p},
+			{VariantName: "p", Role: domain.RolePrefill, ReplicaCount: 2, PerReplicaCapacity: p},
+		}
+		demand := map[string]float64{
+			domain.RoleDecode:  100_000,
+			domain.RolePrefill: 50_000,
+		}
+
+		// The prefill hold first, as the engine runs it: it clamps prefill
+		// into the band, which raises it off 50_000.
+		_, held := holdPrefillDemand(demand, vcs, 0.85, 0.70)
+		Expect(held).To(BeTrue())
+		afterPrefill := demand[domain.RolePrefill]
+		Expect(afterPrefill).To(BeNumerically(">", 50_000))
+
+		// Then the shape hold. It must raise decode, which is far below its
+		// band, and must not undo what the prefill hold just decided.
+		moved, raised := holdFleetFloor(demand, vcs, 0.70)
+		Expect(raised).To(HaveKey(domain.RoleDecode))
+		Expect(demand[domain.RoleDecode]).To(BeNumerically("~", 0.70*4*p, 1e-6))
+		Expect(demand[domain.RolePrefill]).To(BeNumerically("~", afterPrefill, 1e-6),
+			"prefill keeps the figure the prefill hold left it at")
+		Expect(moved).To(BeNumerically("~", 0.70*4*p-100_000, 1e-6),
+			"and the model total moves only by what this hold changed")
+
+		for _, vc := range vcs {
+			Expect(vc.TotalDemand).To(BeNumerically(">=", 0), "%s", vc.VariantName)
+			Expect(vc.Utilization).To(BeNumerically(">=", 0), "%s", vc.VariantName)
+		}
+	})
+
+	It("is not settled by the first sample taken under the new shape", func() {
+		// computeReplicaCapacity records a sample and reads the window back in
+		// the same call, so one saturated cycle after a switch used to both
+		// write the new bucket's first sample and satisfy the settle test --
+		// the hold lasted a single cycle. That first sample is also the one
+		// most likely to be wrong: the replicas are still draining generations
+		// of the OLD length while the new, shorter O is already the divisor.
+		cycle(4, 17_282, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+
+		// The switch, and a replica saturated in the very same cycle.
+		saturated := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 20, 8000, 1000)
+		saturated.RequestRate = 0.6
+		saturated.GenerationTokenRate = saturated.RequestRate * 1000
+		saturated.Ready = true
+		in := makeAnalyzerInput([]domain.ReplicaMetrics{saturated}, states(4))
+		in.ArrivalRate = 5.68
+		_, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeTrue(),
+			"one sample is the drain, not a measurement of the new shape")
+
+		// A second reading a window later is: it cannot have come from the
+		// same drain as the first.
+		clock = clock.Add(ThroughputSampleSpacing + time.Second)
+		saturated.RequestRate = 0.7
+		saturated.GenerationTokenRate = saturated.RequestRate * 1000
+		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{saturated}, states(4))
+		in2.ArrivalRate = 5.68
+		_, err = analyzer.Analyze(ctx, in2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeFalse(), "two spaced readings settle it")
+	})
+
+	It("prices mu against the output length the fleet is serving now", func() {
+		// The bucket LABEL is hysteretic so it does not flip on a wobble; the
+		// DIVISOR must not be, because it is a physical quantity. Freezing
+		// both meant that under a drift too slow to trip the tracker -- a
+		// percent a cycle, an hour to double -- mu was divided by a stale O
+		// for the whole drift and the floor silently stopped binding.
+		//
+		// Here the fleet's output length drifts 1000 -> 1180 in steps of 6%,
+		// none of which trips the 20% tolerance, so the tracked shape never
+		// moves. mu must still follow the live figure.
+		record := func(out float64) float64 {
+			rm := makeReplicaMetrics("d0", decodeV, 1_100_000, kvCap, 20, 1000, out)
+			rm.RequestRate = 1.0
+			rm.GenerationTokenRate = 6000 // held constant: only O moves
+			rm.Ready = true
+			in := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(1))
+			in.ArrivalRate = 5.68
+			_, err := analyzer.Analyze(ctx, in)
+			Expect(err).NotTo(HaveOccurred())
+			clock = clock.Add(ThroughputSampleSpacing + time.Second)
+			var mu float64
+			for key, w := range analyzer.saturatedThroughput {
+				if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+					mu = w.Max() // the largest reading the window has taken
+				}
+			}
+			return mu
+		}
+		record(1000)
+		Expect(outstanding()).To(BeFalse(), "the drift never trips the tracker")
+		last := record(1180)
+		Expect(outstanding()).To(BeFalse())
+
+		// 6000 tokens/s over 1000 is 6.0; over 1180 it is 5.08. A frozen
+		// divisor would have recorded 6.0 twice and the window's max would
+		// still be 6.0.
+		Expect(last).To(BeNumerically("~", 6.0, 0.001),
+			"the first reading, at O = 1000")
+		var readings int
+		for key, w := range analyzer.saturatedThroughput {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+				readings = w.Len()
+			}
+		}
+		Expect(readings).To(Equal(2), "both cycles recorded into the one bucket")
+		var lowest float64
+		for key, w := range analyzer.saturatedThroughput {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+				lowest = w.Median()
+			}
+		}
+		Expect(lowest).To(BeNumerically("~", 6000.0/1180.0, 0.01),
+			"and the second was priced against the length the fleet had drifted to")
 	})
 
 	It("raises nothing while the shape holds still", func() {

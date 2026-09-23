@@ -3,6 +3,7 @@ package saturation_v2
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 )
 
 // SaturationAnalyzer implements the domain.Analyzer interface using a
@@ -163,11 +165,13 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 	// stabilise the capacity figures, so it goes when they do. Without this it
 	// is the one map on this struct that grows without bound as models and
 	// namespaces come and go.
-	for key, memo := range a.fleetShape {
-		if time.Since(memo.lastSeen) > timeout {
-			delete(a.fleetShape, key)
-		}
-	}
+	//
+	// maps.DeleteFunc rather than the hand-rolled loops above: those predate
+	// it and two of them cannot use it anyway, one because it counts what it
+	// evicts and one because it deletes from three maps on the same key.
+	maps.DeleteFunc(a.fleetShape, func(_ string, memo *shapeMemo) bool {
+		return time.Since(memo.lastSeen) > timeout
+	})
 	return evicted
 }
 
@@ -248,7 +252,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		role := rolesByVariant[rm.VariantName]
 		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			role, accelByVariant[rm.VariantName], stableOutput, downstreamSaturated, logger)
+			role, accelByVariant[rm.VariantName], stableOutput, fleetOutput, downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -261,7 +265,8 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	if shapeChanged {
 		ownReading := false
 		for _, rc := range replicaCapacities {
-			if rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed {
+			if rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed &&
+				rc.SaturatedThroughputSamples >= floor.MinThroughputSamplesToOrder {
 				ownReading = true
 				break
 			}
@@ -408,6 +413,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	gpuCount int,
 	role string,
 	accelerator string,
+	// shapeKeyOutput is the TRACKED output length: hysteretic, so the window's
+	// bucket does not flip when the fleet's average wobbles across a boundary.
+	shapeKeyOutput float64,
+	// fleetOutput is the output length the fleet is serving RIGHT NOW. A
+	// bucket label wants hysteresis; a physical quantity does not, and mu is
+	// divided by this one.
 	fleetOutput float64,
 	downstreamSaturated bool,
 	logger logr.Logger,
@@ -489,7 +500,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// so a fresh replica barely moves it (fleetOutputLength) -- gives every
 	// replica of the role the same shape, and the median a meaning.
 	throughputKey := a.historyKey(modelID, namespace, rm.VariantName, accelerator, gpuCount, role,
-		fleetOutput, config.QueueLengthThreshold)
+		shapeKeyOutput, config.QueueLengthThreshold)
 	if k2Priority == capacity.K2SrcObserved && rm.Ready && !rm.FromWarmPool {
 		if mu, ok := saturatedCompletionRate(rm, role, fleetOutput); ok {
 			a.recordSaturatedThroughput(throughputKey, mu)
