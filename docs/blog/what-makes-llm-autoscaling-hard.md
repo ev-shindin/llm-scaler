@@ -2,15 +2,17 @@
 
 *Draft. Measurements from CoreWeave H200s and OpenShift, September 2026.*
 
-Naina Singh's [Autoscaling in llm-d: The Production Problem Space](https://docs.google.com/document/d/13oqOGsM1PP9qVg0Rs67BE3vYsvk8xnCnKHAdI7oRfR4/edit?tab=t.0)
-sets out nine structural properties that make autoscaling LLM inference a
-different problem from autoscaling a web service, and orders the user stories by
-when operators actually hit them. It is the clearest statement of the problem we
-have seen, and we agree with essentially all of it.
+The llm-d community's problem-space analysis — *Autoscaling in llm-d: The
+Production Problem Space*, by Naina Singh — sets out nine structural properties
+that make autoscaling LLM inference a different problem from autoscaling a web
+service, and orders the user stories by when operators actually hit them. It is
+the clearest statement of the problem we have seen, and we agree with essentially
+all of it.
 
 This is our answer to it: for each hard part, what we built, what we measured,
 and — for the parts we have not solved — what we know that is worth knowing
-anyway.
+anyway. The property-by-property version, with the sources, is in our
+[project proposal](../project-proposal.md).
 
 We are [llm-scaling-manager](https://github.com/ev-shindin/llm-scaling-manager).
 It publishes a replica decision; KEDA and the HPA actuate it. It began as a fork
