@@ -1,8 +1,8 @@
-# Workload-Variant-Autoscaler (WVA)
+# llm-scaling-manager
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![CI](https://github.com/ev-shindin/llm-scaler/actions/workflows/ci-pr-checks.yaml/badge.svg?branch=main)](https://github.com/ev-shindin/llm-scaler/actions/workflows/ci-pr-checks.yaml)
-[![Go](https://img.shields.io/github/go-mod/go-version/ev-shindin/llm-scaler)](go.mod)
+[![CI](https://github.com/ev-shindin/llm-scaling-manager/actions/workflows/ci-pr-checks.yaml/badge.svg?branch=main)](https://github.com/ev-shindin/llm-scaling-manager/actions/workflows/ci-pr-checks.yaml)
+[![Go](https://img.shields.io/github/go-mod/go-version/ev-shindin/llm-scaling-manager)](go.mod)
 
 > **An advanced fork of [llm-d/llm-d-workload-variant-autoscaler](https://github.com/llm-d/llm-d-workload-variant-autoscaler).**
 >
@@ -18,12 +18,15 @@
 >
 > Developed independently. Not affiliated with, nor endorsed by, the llm-d project.
 
+**An analytical scaling manager for llm-d inference: multi-model, variant- and
+P/D-aware — scaling, warm capacity and placement under one GPU budget.**
 
-The Workload Variant Autoscaler (WVA) is a Kubernetes-based global autoscaler for inference model servers serving LLMs. WVA works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments. The high-level details of the algorithms are documented [here](https://llm-d.ai/docs/architecture/advanced/autoscaling). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
+
+llm-scaling-manager is a Kubernetes-based global scaling manager for inference model servers serving LLMs. It works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments — it decides, KEDA and the HPA actuate. The high-level details of the algorithms are documented [here](https://llm-d.ai/docs/architecture/advanced/autoscaling). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
 
 ### What is a Variant?
 
-WVA introduces the concept of **variants** — multiple model servers in an InferencePool that all serve the same base model but differ in hardware configuration (e.g., GPU type), serving configuration (e.g., tensor parallelism, max batch size, quantization), or both.
+llm-scaling-manager keeps WVA's concept of **variants** — multiple model servers in an InferencePool that all serve the same base model but differ in hardware configuration (e.g., GPU type), serving configuration (e.g., tensor parallelism, max batch size, quantization), or both.
 
 Concretely, **a variant is a scaling entity: one KEDA ScaledObject and the workload it scales.** That is the unit WVA discovers, decides for, and reports on — a Pod's variant is the managed scaler its `ownerReferences` lead to, not a label anyone stamps. Variants whose triggers name the same `modelID` are variants of one model, and WVA scales the group rather than each ScaledObject alone. Creating a variant therefore means creating a ScaledObject; there is no other registration.
 

@@ -8,10 +8,10 @@ IMAGE_TAG_BASE ?= ghcr.io/ev-shindin
 # commit and multi-arch, unlike a tag pushed by hand from a laptop. Rebuilt
 # automatically, so it cannot silently go stale the way a personal tag does.
 IMG_TAG ?= main
-IMG ?= $(IMAGE_TAG_BASE)/llm-scaler:$(IMG_TAG)
+IMG ?= $(IMAGE_TAG_BASE)/llm-scaling-manager:$(IMG_TAG)
 # The warm-pool proxy ships as its own image because it runs in the pool's Pod,
 # not the controller's. Pin a digest in the manifest; this tag is for building.
-WARMPOOL_PROXY_IMG ?= $(IMAGE_TAG_BASE)/llm-scaler/warmpool-proxy:$(IMG_TAG)
+WARMPOOL_PROXY_IMG ?= $(IMAGE_TAG_BASE)/llm-scaling-manager/warmpool-proxy:$(IMG_TAG)
 KIND_ARGS ?= -t mix -n 3 -g 2   # Default: 3 nodes, 2 GPUs per node, mixed vendors
 CLUSTER_GPU_TYPE ?= nvidia-mix
 CLUSTER_NODES ?= 3
