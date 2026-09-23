@@ -49,8 +49,16 @@ WVA_NS=${WVA_NS:-"workload-variant-autoscaler-system"}
 PROMETHEUS_SECRET_NS=${PROMETHEUS_SECRET_NS:-$MONITORING_NAMESPACE}
 
 # WVA Configuration (required when DEPLOY_WVA=true)
-WVA_IMAGE_REPO=${WVA_IMAGE_REPO:-"ghcr.io/llm-d/llm-d-workload-variant-autoscaler"}
-WVA_IMAGE_TAG=${WVA_IMAGE_TAG:-"latest"}
+# This tree's manifests pass --external-scaler-bind-address, a flag no
+# RELEASED upstream image has: ghcr.io/llm-d/...:latest crash-loops on it with
+# "unknown flag" and the install has nothing to run. The default therefore
+# points at a build of THIS repository, matching the Makefile's IMG.
+#
+# :main, not :latest -- built by ci-main-image on every push to main, so it
+# cannot silently go stale. Both tags select the Always pull policy in
+# infra_wva.sh, so this changes what is pulled, not how.
+WVA_IMAGE_REPO=${WVA_IMAGE_REPO:-"ghcr.io/ev-shindin/llm-scaling-manager"}
+WVA_IMAGE_TAG=${WVA_IMAGE_TAG:-"main"}
 WVA_IMAGE_PULL_POLICY=${WVA_IMAGE_PULL_POLICY:-"Always"}
 # An existing docker-registry Secret in WVA_NS, for an image in a private
 # registry. Named rather than created here: a script that built the secret would

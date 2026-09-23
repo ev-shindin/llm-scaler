@@ -25,7 +25,7 @@
 **An analytical scaling manager for llm-d inference: multi-model, variant- and
 P/D-aware — scaling, warm capacity and placement under one GPU budget.**
 
-llm-scaling-manager is a Kubernetes-based global scaling manager for inference model servers serving LLMs. It works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments — it decides, KEDA and the HPA actuate. The high-level details of the algorithms are documented [here](https://llm-d.ai/docs/architecture/advanced/autoscaling). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
+llm-scaling-manager is a Kubernetes-based global scaling manager for inference model servers serving LLMs. It works alongside the standard Kubernetes HPA and external autoscalers like KEDA to drive the scale subresource of inference deployments — it decides, KEDA and the HPA actuate. The algorithms are documented in [docs/concepts/](docs/concepts/). It determines optimal replica counts for a given request traffic load by considering constraints such as GPU availability, energy budget, and performance budget (latency/throughput).
 
 ### What is a Variant?
 
@@ -80,7 +80,8 @@ listing, so until one exists it is running and idle.
 
 ## Documentation
 
-See the [architecture and autoscaling design](https://llm-d.ai/docs/architecture/advanced/autoscaling) docs for high-level algorithm details.
+See [docs/concepts/](docs/concepts/) for how a measurement becomes a replica
+count, the queueing model, and what the GPU budget actually counts.
 
 See the [docs](docs/) directory for design docs, developer guide, and more.
 

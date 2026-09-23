@@ -17,8 +17,8 @@ Guide for developers contributing to Workload-Variant-Autoscaler.
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/llm-d/llm-d-workload-variant-autoscaler.git 
-   cd llm-d-workload-variant-autoscaler
+   git clone https://github.com/ev-shindin/llm-scaling-manager.git
+   cd llm-scaling-manager
    ```
 
 2. **Install dependencies:**
@@ -38,7 +38,7 @@ Guide for developers contributing to Workload-Variant-Autoscaler.
 ## Project Structure
 
 ```bash
-workload-variant-autoscaler/
+llm-scaling-manager/
 ├── api/v1alpha1/          # CRD definitions
 ├── cmd/                   # Main application entry points
 ├── config/                # Kubernetes manifests

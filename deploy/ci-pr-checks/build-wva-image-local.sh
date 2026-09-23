@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Generate unique image tag for this PR run (local image, no registry needed)
-IMAGE_NAME="llm-d-workload-variant-autoscaler"
+IMAGE_NAME="llm-scaling-manager"
 IMAGE_TAG="pr-${GITHUB_RUN_ID}-${CHECKOUT_SHA:0:7}"
 # Use localhost prefix for local-only image (Kind will load it directly)
 FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"

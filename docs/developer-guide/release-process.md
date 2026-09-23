@@ -19,7 +19,7 @@ A full release typically involves:
 
 1. **This repo (WVA)**  
    - A version tag (e.g. `v0.5.2`).  
-   - A container image built and pushed to `ghcr.io/llm-d/llm-d-workload-variant-autoscaler:<tag>`.  
+   - A container image built and pushed to `ghcr.io/ev-shindin/llm-scaling-manager:<tag>`.  
 
 2. **llm-d repo and guides (required)**  
    - Once the release is out, the [workload-autoscaling](https://github.com/llm-d/llm-d/tree/main/guides/workload-autoscaling) guide in [llm-d/llm-d](https://github.com/llm-d/llm-d) must be updated to the new WVA version so users get consistent instructions and correct CRD/sample URLs.
@@ -64,7 +64,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-- Pushing a tag matching `v*` triggers [`.github/workflows/ci-release.yaml`](../../.github/workflows/ci-release.yaml), which builds and pushes the Docker image to `ghcr.io/llm-d/llm-d-workload-variant-autoscaler:<tag>`.
+- Pushing a tag matching `v*` triggers [`.github/workflows/ci-release.yaml`](../../.github/workflows/ci-release.yaml), which builds and pushes the Docker image to `ghcr.io/ev-shindin/llm-scaling-manager:<tag>`.
 
 ### 2. Create the GitHub Release
 
@@ -83,8 +83,8 @@ The [llm-d](https://github.com/llm-d/llm-d) repo hosts a **workload-autoscaling 
    - In `guides/workload-autoscaling/README.md`, update the "Version Compatibility" callout to state the new WVA version (e.g. "tested and validated with **WVA vX.Y.Z**").
 
 2. **URLs that embed the version tag**  
-   - **CRD install:** Any URLs that embed the release tag (e.g. `.../workload-variant-autoscaler/vX.Y.Z/...`) — replace the version segment with the new release tag.
-   - **Prometheus Adapter values:** All `curl`/download URLs that point at `.../workload-variant-autoscaler/vX.Y.Z/config/samples/...` (e.g. `prometheus-adapter-values.yaml`, `prometheus-adapter-values-ocp.yaml`).
+   - **CRD install:** Any URLs that embed the release tag (e.g. `.../llm-scaling-manager/vX.Y.Z/...`) — replace the version segment with the new release tag.
+   - **Prometheus Adapter values:** All `curl`/download URLs that point at `.../llm-scaling-manager/vX.Y.Z/config/samples/...` (e.g. `prometheus-adapter-values.yaml`, `prometheus-adapter-values-ocp.yaml`).
    - **Upgrading section:** Any CRD or sample URLs in the "Upgrading" section that include the version tag.
 
 3. **Breaking changes and upgrading text**  

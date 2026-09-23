@@ -103,8 +103,8 @@ All other configuration is passed directly to the deploy/test commands in later 
 Clone the WVA repository and enter the directory:
 
 ```bash
-git clone https://github.com/llm-d/llm-d-workload-variant-autoscaler.git
-cd llm-d-workload-variant-autoscaler
+git clone https://github.com/ev-shindin/llm-scaling-manager.git
+cd llm-scaling-manager
 ```
 
 Make sure you're on the correct branch:
@@ -129,7 +129,7 @@ make benchmark-install
 After this, your workspace will look like:
 
 ```text
-llm-d-workload-variant-autoscaler/
+llm-scaling-manager/
 ├── llm-d-benchmark/          ← cloned by make benchmark-install
 ├── test/benchmark/scenarios/
 │   ├── prefill_heavy.yaml.in   ← pass the bare name: BENCHMARK_WORKLOAD=prefill_heavy

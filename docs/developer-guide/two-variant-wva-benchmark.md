@@ -97,7 +97,7 @@ The benchmark only works end-to-end when **all** of these are in place.
 
 `make benchmark-standup` installs WVA from this repo's `deploy/` — but with
 `IMG` pointing at whatever you give it, defaulting to the published
-`ghcr.io/llm-d/llm-d-workload-variant-autoscaler:latest`. **Pass `IMG=<your
+`ghcr.io/ev-shindin/llm-scaling-manager:main`. **Pass `IMG=<your
 build>` or you are benchmarking a registry image, not your changes.**
 
 ```bash
