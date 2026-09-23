@@ -134,6 +134,22 @@ var _ = Describe("Tracker", func() {
 			Expect(declared).To(BeNumerically("<=", 1))
 		})
 
+		It("reports the latest reading from Current, not the band's centre", func() {
+			// The anchor and the latest reading are separate fields now, and
+			// only a reading INSIDE the band tells them apart: on a declared
+			// change Observe writes the same value to both. The throughput
+			// analyzer asks Current what the fleet is serving, so it has to be
+			// the measurement.
+			tracker.Observe(5000, 200, 0.0)
+
+			_, changed := tracker.Observe(5750, 200, 0.0) // +15%, inside the band
+			Expect(changed).To(BeFalse())
+
+			shape, hasShape := tracker.Current()
+			Expect(hasShape).To(BeTrue())
+			Expect(shape.AvgInputTokens).To(Equal(5750.0))
+		})
+
 		It("does not re-declare while the workload holds its new shape", func() {
 			tracker.Observe(1000, 5900, 0.0)
 			tracker.Observe(1000, 1000, 0.0) // the change

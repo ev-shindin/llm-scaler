@@ -233,6 +233,33 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 				"step of the same slide must not extend it")
 	})
 
+	It("re-arms once the hold has cleared", func() {
+		// The clock starting only when it is not already running is the whole
+		// of the change above, and the risk it carries is the opposite one:
+		// a clock that is never rearmed. A fleet whose shape moves again --
+		// hours later, or back to where it started -- must be held for the
+		// second transition as it was for the first.
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 900_000, 0, 8000, 6000, nil)
+		Expect(outstanding()).To(BeTrue())
+
+		clock = clock.Add(ShapeChangeHoldMax + time.Second)
+		cycle(10, 17_282, 0, 8000, 6000, nil)
+		Expect(outstanding()).To(BeFalse(), "the backstop clears the first hold")
+
+		// A genuinely new transition, well after the first has been let go.
+		clock = clock.Add(10 * time.Minute)
+		cycle(10, 17_282, 0, 1000, 1000, nil)
+		Expect(outstanding()).To(BeTrue(),
+			"a change arriving after the hold cleared raises a hold of its own")
+
+		// And it is bounded like any other, from its own first change.
+		clock = clock.Add(ShapeChangeHoldMax + time.Second)
+		cycle(10, 17_282, 0, 1000, 1000, nil)
+		Expect(outstanding()).To(BeFalse())
+	})
+
 	It("keeps one throughput window when the shape sits on a bucket boundary", func() {
 		// Measured on the rerun of 2026-09-22 (biran-pd, the build carrying
 		// #85): phase 1 generates exactly 6000-token outputs, which is the
