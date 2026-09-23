@@ -54,6 +54,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 	decode := func(pod string, tokensInUse int64, queue int) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, decodeVariant, tokensInUse, runKvCapacity, queue, 6000, 1000)
 		rm.RequestRate = 4.73
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
@@ -61,6 +62,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 	prefill := func() domain.ReplicaMetrics {
 		rm := makeReplicaMetrics("prefill-0", prefillVariant, 357_800, prefillKv, 30, 6000, 1)
 		rm.RequestRate = 4.77
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
@@ -193,6 +195,7 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 			clock = clock.Add(ThroughputSampleSpacing) // two readings, a rate window apart
 			slow := prefill()
 			slow.RequestRate = 4 - 0.01*float64(i)
+			slow.GenerationTokenRate = slow.RequestRate * slow.AvgOutputTokens
 			in := makeAnalyzerInput([]domain.ReplicaMetrics{
 				decode("decode-0", 300_000, 0), decode("decode-1", 280_000, 0), slow}, states)
 			in.ArrivalRate = runLambda
@@ -210,7 +213,12 @@ var _ = Describe("a prefill saturation under a saturated decode", func() {
 		result, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 		p := prefillP(result)
-		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", runLambda/4*p, 1),
+		// The fixture feeds 3.99 and 4.00 a window apart, so the window's
+		// median -- the lower of two middle values -- is 3.99 where its max was
+		// 4.00. Prefill still prices mu from its completion rate, since it
+		// generates about one token per request and has no token rate to speak
+		// of; the read moved with the window for every role at once.
+		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically("~", runLambda/3.99*p, 1),
 			"lambda / mu x P, uncapped: 1.5 replicas of demand on a fleet of one")
 		Expect(result.RoleDemand[domain.RolePrefill]).To(BeNumerically(">", 0.85*p))
 

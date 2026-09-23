@@ -3,6 +3,7 @@ package saturation_v2
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"sync"
@@ -79,6 +80,10 @@ type SaturationAnalyzer struct {
 	// (rememberDecodeSaturation); swept by EvictStaleHistory beside the
 	// history, one time.Time per model that ever saturated.
 	decodeSaturatedAt map[string]time.Time
+	// fleetShape is the (I, O) bucket pair last seen per namespace|model,
+	// and when a change of either was raised and not yet settled. See
+	// shape_change.go for what the event is for.
+	fleetShape map[string]*shapeMemo
 	// now is the clock the memory reads; tests set it.
 	now func() time.Time
 }
@@ -102,6 +107,7 @@ func NewSaturationAnalyzer(store *capacity.Store) *SaturationAnalyzer {
 		throughputLastRead:     make(map[string]float64),
 		capacityStore:          store,
 		decodeSaturatedAt:      make(map[string]time.Time),
+		fleetShape:             make(map[string]*shapeMemo),
 		now:                    time.Now,
 	}
 }
@@ -154,6 +160,17 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 			delete(a.decodeSaturatedAt, key)
 		}
 	}
+	// The fleet-shape memo is per namespace|model and exists only to key and
+	// stabilise the capacity figures, so it goes when they do. Without this it
+	// is the one map on this struct that grows without bound as models and
+	// namespaces come and go.
+	//
+	// maps.DeleteFunc rather than the hand-rolled loops above: those predate
+	// it and two of them cannot use it anyway, one because it counts what it
+	// evicts and one because it deletes from three maps on the same key.
+	maps.DeleteFunc(a.fleetShape, func(_ string, memo *shapeMemo) bool {
+		return time.Since(memo.lastSeen) > timeout
+	})
 	return evicted
 }
 
@@ -213,6 +230,15 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// replica's throughput key (computeReplicaCapacity says why the key is
 	// the fleet's shape and not the replica's).
 	fleetOutput := fleetOutputLength(input.ReplicaMetrics, rolesByVariant)
+	// The other axis, and the event. The prompt length arriving reads the
+	// switch within a scrape of it, where the output half waits for a
+	// completion; a change on either says the learned figures describe a
+	// workload that is no longer running (shape_change.go).
+	fleetInput := servedPromptLength(input.ReplicaMetrics)
+	arriving, arrivingOK := arrivingPromptLength(input.SchedulerQueue)
+	holdFor, _ := satConfig.ShapeChangeHold(ShapeChangeHoldMax)
+	stableOutput, shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID,
+		fleetInput, fleetOutput, arriving, arrivingOK, holdFor, logger)
 
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]capacity.ReplicaCapacity, 0, len(input.ReplicaMetrics))
@@ -226,10 +252,20 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		role := rolesByVariant[rm.VariantName]
 		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			role, accelByVariant[rm.VariantName], fleetOutput, downstreamSaturated, logger)
+			role, accelByVariant[rm.VariantName], stableOutput, fleetOutput, downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
+	}
+
+	// A replica reading a throughput window of its OWN, rather than a
+	// neighbouring bucket's, is the fleet having measured itself under the
+	// shape now arriving -- which is what an outstanding shape change was
+	// waiting for (shape_change.go).
+	if shapeChanged {
+		measured := fleetHasMeasuredItself(replicaCapacities)
+		a.settleFleetShape(input.Namespace, input.ModelID, measured)
+		shapeChanged = !measured
 	}
 
 	// Phase 2: Per-variant aggregation
@@ -293,7 +329,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		eppQueued = float64(input.SchedulerQueue.QueueSize)
 	}
 	totalDemand = a.applyThroughputFloor(input, satConfig, replicaCapacities, variantCapacities,
-		totalDemand, roleDemand, queueDemand.byRole, eppQueued, logger)
+		totalDemand, roleDemand, queueDemand.byRole, eppQueued, shapeChanged, logger)
 
 	// While decode is saturated, prefill's DEMAND is not a reading of prefill
 	// either: the KV it holds and the queue behind it are decode's backlog
@@ -331,6 +367,17 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		}
 	}
 
+	// The fleet is not released on figures the switch made stale. A floor,
+	// not a clamp: an I-up switch genuinely needs more capacity, and
+	// occupancy and the throughput floor still order (shape_change.go).
+	if shapeChanged && roleDemand != nil {
+		_, scaleDown := satConfig.AnalyzerThresholds(domain.SaturationAnalyzerName)
+		if moved, raised := holdFleetFloor(roleDemand, variantCapacities, scaleDown); moved > 0 {
+			totalDemand += moved
+			logShapeHold(logger, input.ModelID, input.Namespace, moved, raised)
+		}
+	}
+
 	result := &domain.AnalyzerResult{
 		AnalyzerName:      a.Name(),
 		ModelID:           input.ModelID,
@@ -359,6 +406,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	gpuCount int,
 	role string,
 	accelerator string,
+	// shapeKeyOutput is the TRACKED output length: hysteretic, so the window's
+	// bucket does not flip when the fleet's average wobbles across a boundary.
+	shapeKeyOutput float64,
+	// fleetOutput is the output length the fleet is serving RIGHT NOW. A
+	// bucket label wants hysteresis; a physical quantity does not, and mu is
+	// divided by this one.
 	fleetOutput float64,
 	downstreamSaturated bool,
 	logger logr.Logger,
@@ -440,9 +493,30 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// so a fresh replica barely moves it (fleetOutputLength) -- gives every
 	// replica of the role the same shape, and the median a meaning.
 	throughputKey := a.historyKey(modelID, namespace, rm.VariantName, accelerator, gpuCount, role,
-		fleetOutput, config.QueueLengthThreshold)
+		shapeKeyOutput, config.QueueLengthThreshold)
 	if k2Priority == capacity.K2SrcObserved && rm.Ready && !rm.FromWarmPool {
-		a.recordSaturatedThroughput(throughputKey, rm.RequestRate)
+		if mu, ok := saturatedCompletionRate(rm, role, fleetOutput); ok {
+			a.recordSaturatedThroughput(throughputKey, mu)
+		} else {
+			// The replica is full and queued -- the one moment its throughput can
+			// be learned -- and nothing can price it. Every cycle that reaches
+			// here is a cycle the demand floor will not have a mu for, and a role
+			// with no mu gets no floor at all.
+			//
+			// Said out loud because the failure is otherwise invisible: on
+			// 2026-09-22 a build whose GenerationTokenRate was never collected
+			// (the query was registered only by the opt-in throughput analyzer)
+			// ran a whole 40-minute benchmark with no floor for any role, and the
+			// only trace in the log was an empty string where a bucket name
+			// should have been. The same shape of bug had already been found once
+			// for the arrival rate. A line here would have named it in seconds.
+			logger.V(logging.DEFAULT).Info("saturated-throughput-not-priced",
+				"modelID", modelID, "namespace", namespace, "variant", rm.VariantName,
+				"pod", rm.PodName, "role", role,
+				"generationTokenRate", rm.GenerationTokenRate, "requestRate", rm.RequestRate,
+				"fleetOutputTokens", fleetOutput,
+				"reason", "saturated, but no throughput could be priced: the role's demand floor has no mu and will not bind")
+		}
 	}
 	reading := a.saturatedThroughputReading(throughputKey)
 	saturatedThroughput, throughputBucket := reading.rate, reading.bucket
@@ -1260,24 +1334,33 @@ func computeModelWorkloadAverages(replicaMetrics []domain.ReplicaMetrics, rolesB
 	return avgInput, avgOutput, avgHitRate
 }
 
-// fleetOutputLength is the output length the fleet is serving this cycle: the
-// generating replicas' average output tokens, weighted by their request rate.
-// A fresh replica whose first completions are the short requests (they finish
-// first) reports a short average at a low rate and barely moves it; a replica
-// with no completions yet reports nothing and does not move it at all. With
-// no rate reported anywhere it is the plain mean, as computeModelWorkloadAverages
-// takes it. Zero when no replica reports an output length.
-func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[string]string) float64 {
+// fleetAverage is the rate-weighted mean of value over the replicas include
+// selects: the figure the fleet is actually serving, rather than the mean of
+// what its replicas happen to report.
+//
+// Weighting by request rate is what makes it robust to a fleet that is
+// changing size. A fresh replica whose first completions are the short
+// requests (they finish first) reports a short average at a low rate and
+// barely moves it; a replica with no completions yet reports nothing and does
+// not move it at all. With no rate reported anywhere it is the plain mean, as
+// computeModelWorkloadAverages takes it, and zero when nothing reports the
+// value at all.
+//
+// Both axes of the fleet's shape are this computation (fleetOutputLength,
+// servedPromptLength). The throughput analyzer's averageShapeMetrics is a
+// third instance of it in another package, left alone here.
+func fleetAverage(replicas []domain.ReplicaMetrics, value func(domain.ReplicaMetrics) float64, include func(domain.ReplicaMetrics) bool) float64 {
 	var weighted, weights, plain float64
 	var n int
 	for _, rm := range replicas {
-		if rm.AvgOutputTokens <= 0 || !generatesOutput(rm, rolesByVariant) {
+		v := value(rm)
+		if v <= 0 || !include(rm) {
 			continue
 		}
-		plain += rm.AvgOutputTokens
+		plain += v
 		n++
 		if rm.RequestRate > 0 {
-			weighted += rm.AvgOutputTokens * rm.RequestRate
+			weighted += v * rm.RequestRate
 			weights += rm.RequestRate
 		}
 	}
@@ -1288,6 +1371,15 @@ func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[stri
 		return plain / float64(n)
 	}
 	return 0
+}
+
+// fleetOutputLength is the output length the fleet is serving this cycle: the
+// generating replicas' average output tokens, weighted by their request rate
+// (fleetAverage).
+func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[string]string) float64 {
+	return fleetAverage(replicas,
+		func(rm domain.ReplicaMetrics) float64 { return rm.AvgOutputTokens },
+		func(rm domain.ReplicaMetrics) bool { return generatesOutput(rm, rolesByVariant) })
 }
 
 // rolesFromStates builds the variant-name -> role lookup the per-role helpers

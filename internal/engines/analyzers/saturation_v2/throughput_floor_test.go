@@ -2,6 +2,7 @@ package saturation_v2
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -33,9 +34,20 @@ var _ = Describe("the saturated-throughput window", func() {
 		// The readings a saturated decode replica produced on the run, in
 		// order: 5.4 (a full minute saturated), then 3.3 and 3.5 under KV
 		// pressure with preemptions, each a rate window apart so each is
-		// a sample (inside the spacing the fold would make them one, and
-		// the max of one is its mean). The mean would be 4.07 and imply
-		// 1.47 replicas; the replica was demonstrably completing 5.4.
+		// a sample (inside the spacing the fold would make them one).
+		//
+		// The window reads its MEDIAN, and this spec used to assert its max.
+		// That is a deliberate reversal, and the reason is that what the window
+		// holds changed: a saturated COMPLETION rate errs one way -- it
+		// under-reads while a replica is filling -- so the largest reading was
+		// the best estimate of what the replica sustains. A generation-token
+		// rate, which is what the window holds now, errs the other way: it
+		// bursts. Measured on the 2026-09-22 rerun, phase 1, one shape
+		// throughout: the per-replica rate ran 4028 min, 7548 median, 11663
+		// max, the fleet's own total sat at 33,175 tokens/s against a demanded
+		// 36,000, and read with the max the window ratcheted 0.92 -> 3.60 req/s
+		// and left the floor asking for 1.6 replicas where about 8 were needed.
+		// The middle reading is the typical replica; the peak is a burst.
 		a := NewSaturationAnalyzer(capacity.NewStore())
 		now := time.Date(2026, 9, 17, 10, 50, 20, 0, time.UTC)
 		a.now = func() time.Time { return now }
@@ -46,8 +58,9 @@ var _ = Describe("the saturated-throughput window", func() {
 		}
 		Expect(a.saturatedThroughput[k].Len()).To(Equal(3))
 		Expect(a.saturatedThroughput[k].Average()).To(BeNumerically("~", 4.07, 0.01), "the mean the window does not use")
+		Expect(a.saturatedThroughput[k].Max()).To(Equal(5.4), "nor the max it used to")
 		mu, bucket := a.saturatedThroughputFor(k)
-		Expect(mu).To(Equal(5.4))
+		Expect(mu).To(Equal(3.5), "the middle reading of 3.3, 3.5, 5.4")
 		Expect(bucket).To(Equal("long"))
 		mu, bucket = a.saturatedThroughputFor("other|H200|1|decode|long|q5")
 		Expect(mu).To(BeZero())
@@ -209,12 +222,14 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	decode := func(pod string, tokensInUse int64, queue int, rate float64) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, decodeVariant, tokensInUse, runKvCapacity, queue, 6000, 1000)
 		rm.RequestRate = rate
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
 	prefill := func(pod string, tokensInUse int64) domain.ReplicaMetrics {
 		rm := makeReplicaMetrics(pod, "prefill-v", tokensInUse, 1_149_312, 0, 6000, 1)
 		rm.RequestRate = runLambda
+		rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 		rm.Ready = true
 		return rm
 	}
@@ -240,11 +255,15 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 	// Each cycle a reading of its own, a rate window apart: the window counts
 	// a reading as a sample only when it is a new value that lands
 	// ThroughputSampleSpacing after the last one (recordSaturatedThroughput).
-	// The first is the under-read, the last is runMu, which the max keeps.
+	// The readings straddle runMu so the window's MEDIAN is runMu: with an
+	// even count the lower of the two middle values is taken, so the lowest
+	// reading fed is the one the specs below divide by. The window read its
+	// max until the 2026-09-22 rerun showed a token rate ratcheting on its
+	// bursts (RollingAverage.Median).
 	// The last step also moves the clock past DecodeSaturationMemory.
 	saturate := func() {
 		for i := floor.MinThroughputSamplesToOrder - 1; i >= 0; i-- {
-			saturateOnce(runMu - 0.01*float64(i))
+			saturateOnce(runMu + 0.01*float64(i))
 			clock = clock.Add(ThroughputSampleSpacing + time.Second)
 		}
 	}
@@ -304,12 +323,14 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		long := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 900)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
 		xxlong := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 5500)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
@@ -346,10 +367,37 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			}
 		}
 		Expect(decodeP).To(BeNumerically(">", 0))
-		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/1.40, 0.05),
-			"the fleet serves ~5500-token outputs: the floor is lambda over the xxlong mu, whatever each replica's own recent completions average")
-		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).NotTo(BeNumerically("~", runLambda/3.08, 0.3),
-			"and not lambda over the 1000-token shape's mu")
+		// The figure is read off the window the analyzer actually holds rather
+		// than re-derived here. A hand derivation was tried and was wrong in
+		// two ways at once, each too small for a loose tolerance to catch:
+		// mu is priced over the TRACKED shape, which is frozen until the
+		// tracker reports a change, not the raw per-cycle average; and the
+		// median of an even-sized window is the LOWER of the two middle
+		// values, not the later one. Asserting against the window makes the
+		// spec's arithmetic the code's arithmetic by construction.
+		// Named by bucket, not by whichever decode key map iteration yields
+		// last: the fleet has more than one window open here and Go randomises
+		// that order, so the earlier form asserted against a different figure
+		// from run to run.
+		var mu float64
+		for key, window := range analyzer.saturatedThroughput {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|xxlong|") {
+				mu = window.Median()
+			}
+		}
+		Expect(mu).To(BeNumerically(">", 0), "the fleet's own shape must have a window")
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/mu, 0.01),
+			"the floor is lambda over the mu the fleet's own shape priced")
+
+		// And the claim this spec exists for: that mu belongs to the shape the
+		// FLEET is serving, ~5500-token outputs, not to the `long` bucket the
+		// three fresh replicas' own recent completions would have chosen. The
+		// two are far apart -- the wrong one would price the drained fleet at
+		// about two replicas and release it.
+		Expect(mu).To(BeNumerically("<", 2.5),
+			"a mu from the fleet's 5500-token shape, not the 3.08 the 900-token one carried")
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically(">", 3),
+			"so the floor holds more than the two replicas the wrong bucket implies")
 	})
 
 	It("does not order on one saturated sample, however many cycles the row shows it", func() {
@@ -397,8 +445,13 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		Expect(err).NotTo(HaveOccurred())
 		result, err = analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", runLambda/3.5*decodeP, 1),
-			"lambda / mu, uncapped: 1.71 replicas' worth, the second replica through the headroom")
+		// The window holds the two replayed readings, 103/30 and 105/30, and
+		// reads their median -- the lower of two middle values -- so the floor
+		// divides by 3.4333 where it divided by the max, 3.5. The claim this
+		// spec makes is the sample COUNT, not the figure: one reading holds the
+		// fleet, a second orders.
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", runLambda/3.433333333333333*decodeP, 1),
+			"lambda / mu, uncapped: 1.74 replicas' worth, the second replica through the headroom")
 	})
 
 	It("counts two replicas saturated in one cycle as one reading of one moment", func() {
@@ -450,6 +503,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		row := func(pod string, tokens int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, decodeVariant, tokens, runKvCapacity, queue, 1000, 4000)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
@@ -479,7 +533,8 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		// After ONE saturated cycle the window holds a single reading and the
 		// floor holds the fleet where it is (RC = 0 exactly); after the second
 		// -- a reading of its own, a rate window later -- it orders.
-		saturateOnce(runMu - 0.01)
+		// Straddles runMu so the pair's median is runMu (RollingAverage.Median).
+		saturateOnce(runMu + 0.01)
 		in0 := makeAnalyzerInput(
 			[]domain.ReplicaMetrics{decode("decode-0", 200_000, 0, runLambda), prefill("prefill-0", 0)},
 			states(1, 1))
@@ -610,6 +665,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		satP := prefill("prefill-0", 900_000)
 		satP.QueueLength = 10
 		satP.RequestRate = 30
+		satP.GenerationTokenRate = satP.RequestRate * satP.AvgOutputTokens
 		in2 := makeAnalyzerInput([]domain.ReplicaMetrics{decode("decode-0", 300_000, 0, runMu), satP}, states(1, 1))
 		in2.ArrivalRate = runLambda
 		_, err = analyzer.Analyze(ctx, in2)
@@ -674,7 +730,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		roleDemand := map[string]float64{domain.RoleDecode: 100_000}
 		in := makeAnalyzerInput(nil, states(1, 1))
 		in.ArrivalRate = runLambda
-		total := analyzer.applyThroughputFloor(in, in.Config.(*config.ScalingPolicy), rcs, vcs, 100_000, roleDemand, nil, 0, GinkgoLogr)
+		total := analyzer.applyThroughputFloor(in, in.Config.(*config.ScalingPolicy), rcs, vcs, 100_000, roleDemand, nil, 0, false, GinkgoLogr)
 		want := (runLambda + 10.0/floor.BacklogDrainSeconds) / runMu * float64(runK1)
 		Expect(roleDemand[domain.RoleDecode]).To(BeNumerically("~", want, 1))
 		Expect(total).To(BeNumerically("~", want, 1))
@@ -771,6 +827,7 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		both := func(pod string, tokensInUse int64, queue int, rate float64) domain.ReplicaMetrics {
 			rm := makeReplicaMetrics(pod, "v", tokensInUse, runKvCapacity, queue, 6000, 1000)
 			rm.RequestRate = rate
+			rm.GenerationTokenRate = rm.RequestRate * rm.AvgOutputTokens
 			rm.Ready = true
 			return rm
 		}
@@ -780,7 +837,8 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		_, err := analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred())
 
-		in.ReplicaMetrics[0].RequestRate = runMu - 0.01 // a second reading, a rate window later
+		in.ReplicaMetrics[0].RequestRate = runMu + 0.01 // a second reading, a rate window later
+		in.ReplicaMetrics[0].GenerationTokenRate = in.ReplicaMetrics[0].RequestRate * in.ReplicaMetrics[0].AvgOutputTokens
 		clock = clock.Add(ThroughputSampleSpacing)
 		_, err = analyzer.Analyze(ctx, in)
 		Expect(err).NotTo(HaveOccurred(), "the second saturated cycle, so the window may order")

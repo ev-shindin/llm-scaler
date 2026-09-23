@@ -30,6 +30,16 @@ const (
 	// Used with VLLMRequestGenerationTokensSum to calculate average output tokens.
 	VLLMRequestGenerationTokensCount = "vllm:request_generation_tokens_count"
 
+	// VLLMGenerationTokensTotal is a counter of generation tokens, incremented as
+	// each token is produced.
+	//
+	// Not interchangeable with VLLMRequestGenerationTokensSum, which carries the
+	// same running total but is a HISTOGRAM observed when a request finishes: its
+	// rate is zero while a long generation runs and jumps by the whole request at
+	// completion. Anything measuring how fast a replica is working needs this one;
+	// anything measuring per-request size needs the histogram.
+	VLLMGenerationTokensTotal = "vllm:generation_tokens_total"
+
 	// VLLMTimeToFirstTokenSecondsSum tracks the sum of TTFT (Time To First Token) across all requests.
 	// Used with VLLMTimeToFirstTokenSecondsCount to calculate TTFT.
 	VLLMTimeToFirstTokenSecondsSum = "vllm:time_to_first_token_seconds_sum"

@@ -117,6 +117,10 @@ func Estimate(
 	backlog map[string]float64,
 	drainSeconds float64,
 	scaleUpThreshold float64,
+	// staleShape forces every role onto the hold path: the caller has seen
+	// the fleet's shape change, so no window on record was taken under the
+	// shape now arriving, however many readings it holds.
+	staleShape bool,
 ) Floor {
 	out := Floor{Lambda: lambda, DrainSeconds: drainSeconds}
 	if lambda <= 0 || len(replicas) == 0 || len(variants) == 0 {
@@ -165,7 +169,7 @@ func Estimate(
 		costs[role] = append(costs[role], p/rc.SaturatedThroughput)
 		mus[role] = append(mus[role], rc.SaturatedThroughput)
 		borrowedOnly[role] = false
-		if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder {
+		if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder && !staleShape {
 			mayOrder[role] = true
 		}
 	}
@@ -212,6 +216,9 @@ func Estimate(
 				term.HeldWhy = "single-sample"
 				if borrowedOnly[role] {
 					term.HeldWhy = "borrowed"
+				}
+				if staleShape {
+					term.HeldWhy = "shape-change"
 				}
 			}
 		}

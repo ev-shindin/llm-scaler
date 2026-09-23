@@ -124,16 +124,10 @@ func RegisterThroughputAnalyzerQueries(sourceRegistry *source.SourceRegistry) {
 	}
 	registry := metricsSource.QueryList()
 
-	// Per-pod observed generation (decode) token rate (tokens/sec).
-	// Computed as the rate of the _sum histogram counter over 1m.
-	// Grouping key and namespace scoping: see the note above RegisterSaturationQueries
-	registry.MustRegister(source.QueryTemplate{
-		Name:        QueryGenerationTokenRate,
-		Type:        source.QueryTypePromQL,
-		Template:    `sum by (model_name, instance, pod) (rate(vllm:request_generation_tokens_sum{namespace="{{.namespace}}"}[1m]))`,
-		Params:      []string{source.ParamNamespace},
-		Description: "Observed generation (decode) token rate per pod (tokens/sec), proxy for μ_dec^obs",
-	})
+	// The generation-token rate moved to RegisterArrivalRateQueries, which
+	// runs whether or not this analyzer is enabled: the saturation analyzer's
+	// demand floor prices mu from it. Registering it here as well would panic
+	// on the duplicate the moment this analyzer is turned on.
 
 	// Per-pod instantaneous KV cache utilization (0.0–1.0).
 	// Does NOT use max_over_time: the throughput analyzer needs the current
@@ -196,6 +190,37 @@ func RegisterArrivalRateQueries(sourceRegistry *source.SourceRegistry) {
 		Description: "Model-level request arrival rate (requests/sec) from scheduler, summed across the whole model with no per-pod labels to reconcile",
 	})
 
+	// Per-pod observed generation (decode) token rate (tokens/sec), the rate of
+	// the generation-token COUNTER over 1m.
+	//
+	// Not the _sum of vllm:request_generation_tokens, which carries the same
+	// running total but is a histogram observed when a request FINISHES: its rate
+	// is zero while a long generation runs and jumps by the whole request at
+	// completion, so it bursts on a drain exactly as the _count does. Measured on
+	// the 2026-09-22 rerun, which took mu from the histogram sum: the window
+	// ratcheted 0.92 -> 1.14 -> 1.42 -> 1.92 -> 2.26 -> 3.00 -> 3.60 req/s across
+	// one phase of a workload whose shape never changed, and at 3.60 the floor
+	// asked for 1.6 replicas where the fleet needed about 8. The counter does not
+	// burst: tokens accrue as they are produced.
+	//
+	// Unconditional for the same reason as the two above, and discovered the
+	// same way. The saturation analyzer's demand floor prices a replica's
+	// saturated throughput as this rate over the shape's output length --
+	// completions burst when a batch drains and a max window then carries the
+	// burst, where generated tokens do not. Left registered only with the
+	// throughput analyzer, which is opt-in and off by default, the field was
+	// structurally zero and the floor recorded nothing at all: measured on the
+	// 2026-09-22 rerun as 21 saturated cycles that produced no window and no
+	// floor for the whole run.
+	// Grouping key and namespace scoping: see the note above RegisterSaturationQueries
+	registry.MustRegister(source.QueryTemplate{
+		Name:        QueryGenerationTokenRate,
+		Type:        source.QueryTypePromQL,
+		Template:    `sum by (model_name, instance, pod) (rate(vllm:generation_tokens_total{namespace="{{.namespace}}"}[1m]))`,
+		Params:      []string{source.ParamNamespace},
+		Description: "Observed generation (decode) token rate per pod (tokens/sec), proxy for μ_dec^obs",
+	})
+
 	registerSGLangArrivalRateQueries(registry)
 }
 
@@ -210,20 +235,41 @@ func registerSGLangArrivalRateQueries(registry *source.QueryList) {
 		Params:      []string{source.ParamNamespace},
 		Description: "SGLang request completion rate per pod (req/s); fallback for λ when EPP metrics are unavailable",
 	})
+
+	// Per-pod observed generation token rate, unconditional for the reason given
+	// on the vLLM template above.
+	//
+	// The counter where it exists, the histogram sum where it does not.
+	//
+	// SGLang exposes _total counters for its other token series
+	// (sglang:prompt_tokens_total, sglang:cached_tokens_total), so
+	// sglang:generation_tokens_total very probably exists and is the right
+	// source for the reason the vLLM template above gives. It has not been read
+	// off a live SGLang engine here, and naming a series that does not exist
+	// fails the way this whole area fails -- silently, to zero, taking the
+	// demand floor with it.
+	//
+	// PromQL's `or` resolves that without having to know: it yields the
+	// left-hand vector's series, plus the right-hand series that have no match
+	// on the left. So an engine exposing the counter is priced from the
+	// counter, and one exposing only the histogram keeps exactly the behaviour
+	// it has today. The vLLM side needs no such hedge; its counter was read off
+	// a running pod.
+	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{
+		Name:        QueryGenerationTokenRate,
+		Type:        source.QueryTypePromQL,
+		Template:    `sum by (model_name, instance, pod) (rate(sglang:generation_tokens_total{namespace="{{.namespace}}"}[1m]) or rate(sglang:generation_tokens_histogram_sum{namespace="{{.namespace}}"}[1m]))`,
+		Params:      []string{source.ParamNamespace},
+		Description: "Observed generation (decode) token rate per pod (tokens/sec), proxy for μ_dec^obs (SGLang)",
+	})
 }
 
 // registerSGLangThroughputAnalyzerQueries registers the SGLang variants of the
 // throughput-analyzer queries. SGLang exposes generation tokens via the
 // generation_tokens_histogram series and KV utilization via token_usage.
 func registerSGLangThroughputAnalyzerQueries(registry *source.QueryList) {
-	// Per-pod observed generation (decode) token rate (tokens/sec), 1m rate.
-	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{
-		Name:        QueryGenerationTokenRate,
-		Type:        source.QueryTypePromQL,
-		Template:    `sum by (model_name, instance, pod) (rate(sglang:generation_tokens_histogram_sum{namespace="{{.namespace}}"}[1m]))`,
-		Params:      []string{source.ParamNamespace},
-		Description: "Observed generation (decode) token rate per pod (tokens/sec), proxy for μ_dec^obs (SGLang)",
-	})
+	// The SGLang generation-token rate moved to registerSGLangArrivalRateQueries,
+	// for the reason given in RegisterThroughputAnalyzerQueries.
 
 	// Per-pod instantaneous KV cache utilization (0.0-1.0), no max_over_time.
 	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{

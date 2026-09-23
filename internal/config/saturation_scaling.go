@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"slices"
+	"time"
 )
 
 // DefaultPriority is the default model priority multiplier.
@@ -51,6 +52,30 @@ type ScalingPolicy struct {
 	// override entries and has no effect unless a same-scope GPU budget exists
 	// (see docs/plans/engine/rescale-alpha.md).
 	EnableRescale bool `yaml:"enableRescale,omitempty"`
+
+	// DisableShapeChangeHold turns off the fleet-shape-change hold: the
+	// analyzer still tracks the workload's shape, and still keys its
+	// throughput windows by it, but a change no longer withholds release or
+	// stops the demand floor ordering on an existing reading.
+	//
+	// The hold is on by default because releasing a fleet on figures a shape
+	// change has invalidated is the failure it exists to prevent. It is a
+	// switch because it is the one mechanism here that can hold capacity for
+	// minutes on its own judgement, and an operator who sees it misbehave
+	// needs a way to stop it that does not involve a new image.
+	DisableShapeChangeHold bool `yaml:"disableShapeChangeHold,omitempty"`
+
+	// ShapeChangeHoldSeconds overrides how long the fleet is withheld from
+	// release after its shape changes, when nothing settles the hold sooner.
+	// Zero takes the default.
+	//
+	// The default is calibrated on a benchmark whose longest generation is
+	// 6000 tokens: long enough for one of those plus the rate window that
+	// would record it. A deployment serving materially longer generations --
+	// long-context or long chain-of-thought -- has a longer "one generation
+	// plus a window" than the default allows for, and should raise this
+	// rather than inherit a figure measured somewhere else.
+	ShapeChangeHoldSeconds int `yaml:"shapeChangeHoldSeconds,omitempty"`
 
 	// AnalyzerName names the saturation analyzer. "saturation" is the only
 	// built-in value and selects the token-based analyzer, which is also what an
@@ -664,4 +689,20 @@ func (c ScalingPolicy) AnalyzerEnabled(analyzerName string) bool {
 		}
 	}
 	return false // absent → opt-in: does not participate
+}
+
+// ShapeChangeHold returns how long a fleet-shape change withholds release
+// before the backstop expires it, and whether the hold is enabled at all.
+//
+// The duration is ShapeChangeHoldSeconds when set and the caller's default
+// otherwise, so the default lives beside the analyzer that justifies it rather
+// than here.
+func (p ScalingPolicy) ShapeChangeHold(defaultHold time.Duration) (time.Duration, bool) {
+	if p.DisableShapeChangeHold {
+		return 0, false
+	}
+	if p.ShapeChangeHoldSeconds > 0 {
+		return time.Duration(p.ShapeChangeHoldSeconds) * time.Second, true
+	}
+	return defaultHold, true
 }

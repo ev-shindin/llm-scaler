@@ -1,6 +1,8 @@
 package config
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -463,5 +465,28 @@ var _ = Describe("AnalyzerScoreConfig", func() {
 		}
 		Expect(a.EffectiveScaleUpThreshold(0.85)).To(Equal(0.95))
 		Expect(a.EffectiveScaleDownBoundary(0.70)).To(Equal(0.70))
+	})
+})
+
+var _ = Describe("ScalingPolicy.ShapeChangeHold", func() {
+	const fallback = 5 * time.Minute
+
+	It("takes the caller's default when nothing is set", func() {
+		d, on := ScalingPolicy{}.ShapeChangeHold(fallback)
+		Expect(on).To(BeTrue(), "the hold is on unless it is turned off")
+		Expect(d).To(Equal(fallback))
+	})
+
+	It("takes the override when one is set", func() {
+		d, on := ScalingPolicy{ShapeChangeHoldSeconds: 90}.ShapeChangeHold(fallback)
+		Expect(on).To(BeTrue())
+		Expect(d).To(Equal(90*time.Second),
+			"a deployment whose generations are longer than the benchmark's can say so")
+	})
+
+	It("reports off when disabled, whatever the override says", func() {
+		d, on := ScalingPolicy{DisableShapeChangeHold: true, ShapeChangeHoldSeconds: 90}.ShapeChangeHold(fallback)
+		Expect(on).To(BeFalse())
+		Expect(d).To(BeZero())
 	})
 })
