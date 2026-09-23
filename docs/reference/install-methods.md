@@ -60,7 +60,7 @@ The script accepts both command-line flags and environment variables:
 bash install.sh [OPTIONS]
 
 Options:
-  -i, --wva-image IMAGE    WVA container image (default: ghcr.io/llm-d/llm-d-workload-variant-autoscaler:latest)
+  -i, --wva-image IMAGE    WVA container image (default: ghcr.io/ev-shindin/llm-scaling-manager:main)
   -c, --check              Run the prerequisite and permission checks, then exit
   -p, --phase PHASE        prereqs | wva | all (default: all) — see deploy/README.md
   -u, --undeploy           Undeploy WVA, monitoring, and scaler (not llm-d)
@@ -94,7 +94,7 @@ LLM_D_ROUTER_VERSION=v0.9.0 GAIE_VERSION=v1.5.0 NAMESPACE=llm-d-optimized-baseli
 ##### Example 2: E2E-style stack (same as `make deploy-e2e-infra`)
 
 ```bash
-make deploy-e2e-infra ENVIRONMENT=kind-emulator IMG=localhost/llm-d-workload-variant-autoscaler:dev
+make deploy-e2e-infra ENVIRONMENT=kind-emulator IMG=localhost/llm-scaling-manager:dev
 ```
 
 ##### Example 3: WVA + monitoring only (no llm-d)
@@ -138,7 +138,7 @@ yourself, or when a GitOps tool owns the manifests. Otherwise prefer Method 1.
 ```bash
 # Set the controller image
 cd config/base/manager
-kustomize edit set image controller=ghcr.io/llm-d/llm-d-workload-variant-autoscaler:v0.7.0
+kustomize edit set image controller=ghcr.io/ev-shindin/llm-scaling-manager:v0.7.0
 
 # Apply the overlay for your scope and platform
 kubectl apply -k ../../overlays/cluster-scoped/kubernetes

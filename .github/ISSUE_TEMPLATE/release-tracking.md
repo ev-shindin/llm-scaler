@@ -11,15 +11,14 @@ assignees: ''
 - [Prerequisites](#prerequisites)
 - [Release Process](#release-process)
 - [Announce the Release](#announce-the-release)
-- [After the llm-d Release](#after-the-llm-d-release)
 
 ## Introduction
 
-This document defines the process for releasing llm-d-workload-variant-autoscaler.
+This document defines the process for releasing llm-scaling-manager.
 
 ## Prerequisites
 
-1. Permissions to push to the llm-d-workload-variant-autoscaler repository.
+1. Permissions to push to the llm-scaling-manager repository.
 
 1. Choose whether you are releasing a release candidate or an official release, and set the environment variables accordingly:
 
@@ -38,10 +37,10 @@ This document defines the process for releasing llm-d-workload-variant-autoscale
      export FORK_REMOTE=origin
      ```
 
-1. If needed, clone the llm-d-workload-variant-autoscaler [repo].
+1. If needed, clone the llm-scaling-manager [repo].
 
    ```shell
-   git clone -o ${REMOTE} git@github.com:llm-d/llm-d-workload-variant-autoscaler.git
+   git clone -o ${REMOTE} git@github.com:ev-shindin/llm-scaling-manager.git
    ```
 
 ## Release Process
@@ -80,7 +79,7 @@ This document defines the process for releasing llm-d-workload-variant-autoscale
      git checkout release-${BRANCH_VERSION} ${REMOTE}/release-${BRANCH_VERSION}
      ```
 
-1. Push your release branch to the llm-d-workload-variant-autoscaler remote.
+1. Push your release branch to the llm-scaling-manager remote.
 
     ```shell
     git push ${REMOTE} release-${BRANCH_VERSION}
@@ -91,16 +90,16 @@ This document defines the process for releasing llm-d-workload-variant-autoscale
 1. Tag the head of your release branch with the version:
 
      ```shell
-     git tag -s -a ${VERSION} -m "llm-d-workload-variant-autoscaler ${VERSION} Release"
+     git tag -s -a ${VERSION} -m "llm-scaling-manager ${VERSION} Release"
      ```
 
-1. Push the tag to the llm-d-workload-variant-autoscaler repo:
+1. Push the tag to the llm-scaling-manager repo:
 
      ```shell
      git push ${REMOTE} ${VERSION}
      ```
 
-1. Pushing the tag triggers CI action to build and publish the llm-d-workload-variant-autoscaler image (`ghcr.io/llm-d/llm-d-workload-variant-autoscaler`) to the [ghcr registry].
+1. Pushing the tag triggers CI action to build and publish the llm-scaling-manager image (`ghcr.io/ev-shindin/llm-scaling-manager`) to the [ghcr registry].
 1. Verify the [CI release workflow] completed successfully before proceeding.
 1. Test the steps in the tagged quickstart guide after the PR merges.
 
@@ -125,35 +124,16 @@ This document defines the process for releasing llm-d-workload-variant-autoscale
 1. If you find any bugs in this process, create an [issue].
 
 
-### After the Release
+## After the Release
 
-## Update the autoscaling guides to reference the new release version.
+Unpin any dependencies that were pinned for the release, and update the
+release tracking issue with the final release link.
 
-1. Clone the llm-d repo if you haven't already, ensure it's up-to-date and your local branch is clean.
-
-1. Create a new branch in your fork from the `main` branch and name it `update-autoscaling-guides-${BRANCH_VERSION}` (e.g., `update-autoscaling-guides-0.9`):
-
-   ```shell
-   git checkout -b update-autoscaling-guides-${BRANCH_VERSION}
-   ```
-
-1. Update the version references in the following files:
-   - https://github.com/llm-d/llm-d/blob/main/guides/workload-autoscaling/wva-config/platform/k8s/kustomization.yaml
-   - https://github.com/llm-d/llm-d/blob/main/guides/workload-autoscaling/wva-config/platform/ocp/kustomization.yaml
-
-1. Commit and push the changes to your fork:
-
-   ```shell
-   git add .
-   git commit -m "Update autoscaling guides for release ${VERSION}" -s -S
-   git push ${FORK_REMOTE} update-autoscaling-guides-${BRANCH_VERSION}
-   ```
-
-1. Create a pull request from your fork to the `main` branch of the llm-d repo, and request a review from the llm-d team.
-
-## After the llm-d Release
-
-Unpin all dependencies that were pinned for the release in the llm-d-workload-variant-autoscaler and llm-d repos, and update the release tracking issue with the final release link.
+> Upstream's template also opened a pull request against `llm-d/llm-d` to
+> update the autoscaling guides for the new version. That step is not
+> available here and has been removed: this is an independent fork with no
+> push access to that repository, and it publishes its own guides under
+> `docs/guides/`.
 
 ## Announce the Release
 
@@ -163,28 +143,31 @@ Use the following steps to announce the release.
 
    ```shell
    cat <<EOF
-   Subject: [ANNOUNCE] llm-d-workload-variant-autoscaler ${VERSION} is released
+   Subject: [ANNOUNCE] llm-scaling-manager ${VERSION} is released
 
    Hi all,
 
-   We are pleased to announce the release of llm-d-workload-variant-autoscaler ${VERSION}!
+   We are pleased to announce the release of llm-scaling-manager ${VERSION}!
 
    ### Container Images
-   * WVA controller: ghcr.io/llm-d/llm-d-workload-variant-autoscaler:${VERSION}
+   * Controller: ghcr.io/ev-shindin/llm-scaling-manager:${VERSION}
 
       ### Release Notes
-   For more details, please see the GitHub release notes: https://github.com/llm-d/llm-d-workload-variant-autoscaler/releases/tag/${VERSION}
+   For more details, please see the GitHub release notes: https://github.com/ev-shindin/llm-scaling-manager/releases/tag/${VERSION}
    EOF
    ```
 
-1. Copy the generated subject and body, and send an email to `llm-d-contributors@googlegroups.com`.
+1. Copy the generated subject and body and send it wherever this project
+   announces releases. (Upstream's template mailed
+   `llm-d-contributors@googlegroups.com`; that is their list, not this
+   project's, so it is not the default here.)
 
 1. Add a link to the final release in this issue.
 
 1. Close this issue.
 
-[repo]: https://github.com/llm-d/llm-d-workload-variant-autoscaler
-[ghcr registry]: https://github.com/orgs/llm-d/packages?repo_name=llm-d-workload-variant-autoscaler
-[new release]: https://github.com/llm-d/llm-d-workload-variant-autoscaler/releases/new
-[issue]: https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues/new/choose
-[CI release workflow]: https://github.com/llm-d/llm-d-workload-variant-autoscaler/actions/workflows/ci-release.yaml
+[repo]: https://github.com/ev-shindin/llm-scaling-manager
+[ghcr registry]: https://github.com/users/ev-shindin/packages?repo_name=llm-scaling-manager
+[new release]: https://github.com/ev-shindin/llm-scaling-manager/releases/new
+[issue]: https://github.com/ev-shindin/llm-scaling-manager/issues/new/choose
+[CI release workflow]: https://github.com/ev-shindin/llm-scaling-manager/actions/workflows/ci-release.yaml

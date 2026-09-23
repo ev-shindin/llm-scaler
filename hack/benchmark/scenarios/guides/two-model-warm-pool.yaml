@@ -596,7 +596,7 @@ scenario:
       wellLitPath: optimized-baseline
       namespace: ""
       image:
-        repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
+        repository: ghcr.io/ev-shindin/llm-scaling-manager
         tag: v0.8.0
       replicaCount: 1
       controller:
@@ -687,7 +687,7 @@ scenario:
       wellLitPath: optimized-baseline
       namespace: ""
       image:
-        repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
+        repository: ghcr.io/ev-shindin/llm-scaling-manager
         tag: v0.8.0
       replicaCount: 1
       controller:

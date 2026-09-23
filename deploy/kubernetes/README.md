@@ -64,7 +64,7 @@ This script automates the complete deployment process on kubernetes cluster incl
 export HF_TOKEN="your-hf-token-here"
 
 # Optional
-export WVA_IMAGE_REPO="ghcr.io/llm-d/llm-d-workload-variant-autoscaler"   # Default
+export WVA_IMAGE_REPO="ghcr.io/ev-shindin/llm-scaling-manager"   # Default
 export WVA_IMAGE_TAG="latest"                                             # Default
 export WVA_NS="workload-variant-autoscaler-system"                        # Default
 export WVA_SCOPE="cluster"                                                # cluster | namespace
@@ -175,7 +175,7 @@ make deploy-wva-on-k8s
 
 ```bash
 export HF_TOKEN="hf_xxxxx"
-export IMG="ghcr.io/yourorg/llm-d-workload-variant-autoscaler:latest"
+export IMG="ghcr.io/yourorg/llm-scaling-manager:latest"
 make deploy-wva-on-k8s
 ```
 
@@ -631,7 +631,7 @@ kubectl set env deployment/controller-manager \
 ### Update WVA Image
 
 ```bash
-export IMG="ghcr.io/yourorg/llm-d-workload-variant-autoscaler:custom-tag"
+export IMG="ghcr.io/yourorg/llm-scaling-manager:custom-tag"
 export DEPLOY_PROMETHEUS=false
 make deploy-wva-on-k8s   # WVA + monitoring + scaler + LWS; llm-d is managed separately
 ```

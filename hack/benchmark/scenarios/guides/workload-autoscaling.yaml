@@ -469,11 +469,11 @@ scenario:
       # overlay (see wva.repoRef), not a helm chart -- there is no separate
       # `chartVersions.wva` to keep in sync.
       # Available version tags can be listed with:
-      #   curl -sL "https://ghcr.io/token?scope=repository:llm-d/llm-d-workload-variant-autoscaler:pull" \
+      #   curl -sL "https://ghcr.io/token?scope=repository:ev-shindin/llm-scaling-manager:pull" \
       #     | jq -r .token | xargs -I{} curl -sH "Authorization: Bearer {}" \
-      #       https://ghcr.io/v2/llm-d/llm-d-workload-variant-autoscaler/tags/list
+      #       https://ghcr.io/v2/ev-shindin/llm-scaling-manager/tags/list
       image:
-        repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
+        repository: ghcr.io/ev-shindin/llm-scaling-manager
         tag: v0.8.0
       replicaCount: 1 # WVA controller pod replicas (1 is the chart default)
       # Disable to skip installing the controller but still render the VA

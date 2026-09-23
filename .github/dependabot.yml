@@ -1,4 +1,4 @@
-# Dependabot configuration for llm-d-workload-variant-autoscaler
+# Dependabot configuration for llm-scaling-manager
 # Based on canonical config from llm-d/llm-d-infra
 
 version: 2
