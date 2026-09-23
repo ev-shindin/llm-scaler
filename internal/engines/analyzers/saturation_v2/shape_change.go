@@ -44,9 +44,13 @@ import (
 // The detector is signals/shape's Tracker, which the throughput analyzer
 // already drives over its own (IL, OL): a fractional tolerance on either axis,
 // not a bucket crossing, so it does not inherit the bucket table that item 1
-// of docs/proposals/shape-shift-treatment.md removes. This is item 2 of that
+// of the traffic shape-shift proposal removes. This is item 2 of that
 // proposal, less the per-role split -- the hold is the fleet's, as the
 // proposal states it, and fleetOutputLength is already model-level.
+//
+// That proposal is not on main yet; it is under review, and the path is left
+// out here deliberately so hack/check-doc-links.py does not report a mention
+// of a file the tree does not have.
 
 // shapeMemo is one model's shape tracker and the state of its outstanding
 // change. The tracker is not safe for concurrent use; a.mu serialises it.
