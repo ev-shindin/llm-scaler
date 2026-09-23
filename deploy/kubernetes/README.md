@@ -65,7 +65,7 @@ export HF_TOKEN="your-hf-token-here"
 
 # Optional
 export WVA_IMAGE_REPO="ghcr.io/ev-shindin/llm-scaling-manager"   # Default
-export WVA_IMAGE_TAG="latest"                                             # Default
+export WVA_IMAGE_TAG="main"                                               # Default
 export WVA_NS="workload-variant-autoscaler-system"                        # Default
 export WVA_SCOPE="cluster"                                                # cluster | namespace
 ```
@@ -100,7 +100,7 @@ For a complete list of environment variables and configuration options, see the 
 export HF_TOKEN="hf_xxxxx"                  # Required: HuggingFace token
 export MODEL_ID="unsloth/Meta-Llama-3.1-8B" # Model to deploy
 export ACCELERATOR_TYPE="H100"              # GPU type
-export WVA_IMAGE_TAG="latest"               # WVA version
+export WVA_IMAGE_TAG="main"                 # controller version
 # HPA stabilization: configure on the HPA resource directly, not install.sh
 
 # Performance tuning (optional; set in llm-d ModelService manifest)

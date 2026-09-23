@@ -29,7 +29,7 @@ Every option `deploy/install.sh` reads. Verified against the script: each entry 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WVA_IMAGE_REPO` | controller image repository | `ghcr.io/ev-shindin/llm-scaling-manager` |
-| `WVA_IMAGE_TAG` | WVA image tag | `latest` |
+| `WVA_IMAGE_TAG` | controller image tag | `main` |
 | `WVA_IMAGE_PULL_POLICY` | Image pull policy | `Always` |
 
 ## Namespaces
