@@ -505,13 +505,13 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 		}
 		record(1000)
 		Expect(outstanding()).To(BeFalse(), "the drift never trips the tracker")
-		last := record(1180)
+		windowMax := record(1180)
 		Expect(outstanding()).To(BeFalse())
 
 		// 6000 tokens/s over 1000 is 6.0; over 1180 it is 5.08. A frozen
 		// divisor would have recorded 6.0 twice and the window's max would
 		// still be 6.0.
-		Expect(last).To(BeNumerically("~", 6.0, 0.001),
+		Expect(windowMax).To(BeNumerically("~", 6.0, 0.001),
 			"the first reading, at O = 1000")
 		var readings int
 		for key, w := range analyzer.saturatedThroughput {
