@@ -304,7 +304,7 @@ func (c *Config) ScaleToZeroEnabled() bool {
 
 // StickyScaleDownEnabled reports whether a published scale-down is held
 // against demand noise until the scale-UP threshold says otherwise
-// (WVA_STICKY_SCALE_DOWN, default on; see steadystate.holdPublishedScaleDown).
+// (WVA_STICKY_SCALE_DOWN, default on; see policy.HoldPublishedScaleDown).
 // The switch exists to turn the hold OFF for a comparison, not to turn it
 // on: off, a model idling near the scale-down boundary keeps a replica for
 // as long as its demand noise lasts. Thread-safe.

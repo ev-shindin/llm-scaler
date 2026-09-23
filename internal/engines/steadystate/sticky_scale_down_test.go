@@ -23,7 +23,6 @@ import (
 const (
 	qwenCapacity = 28482.0
 	scaleUp      = 0.85
-	scaleDown    = 0.70
 )
 
 // decisionFor builds the decision a cycle would carry at this demand: the

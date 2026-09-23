@@ -13,13 +13,21 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 )
 
-// ChangeReporter reports a policy line only when what it says has changed.
+// ChangeReporter is the reporting for named policy tiers.
 //
-// The effective policy, an unknown policy name, a conflict between two
-// variants of one model and an unresolved accelerator are all conditions
-// that hold for as long as the configuration does, so reporting them every
-// cycle would bury the cycle a reader is looking for. Each is keyed by what
-// it describes and reported again only when the summary differs.
+// Layered configuration is undebuggable without a "which value won" readout, and
+// two of the ways it goes wrong are silent by construction:
+//
+//   - a policy name that resolves to nothing falls back to the default entry, so a
+//     typo produces a working-looking configuration that quietly ignores the tier;
+//   - variants of one model resolving to DIFFERENT tiers leaves the optimizer
+//     distributing replicas across them under conflicting thresholds. WVA scales
+//     the model, not the variant, so there is one right answer per model and this
+//     is a configuration error rather than a merge to perform.
+//
+// Both are reported once per change rather than once per cycle: the optimize loop
+// runs every 15s and a condition that persists for a day would otherwise produce
+// 5,760 identical lines, which is how a real signal becomes noise.
 //
 // Safe for concurrent use: the reporter holds its own lock.
 type ChangeReporter struct {

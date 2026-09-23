@@ -860,26 +860,26 @@ func (e *Engine) resolveModelPolicy(
 	modelID, namespace string,
 	vas []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 ) config.ScalingPolicy {
-	policy, conflicting := modelPolicy(vas)
+	tier, conflicting := modelPolicy(vas)
 	if len(conflicting) > 1 {
-		e.policies.ReportPolicyConflict(ctx, namespace, modelID, conflicting, policy)
+		e.policies.ReportPolicyConflict(ctx, namespace, modelID, conflicting, tier)
 	}
 
 	// A named-but-absent tier resolves to the default entry, which is the right
 	// outcome and the wrong silence — report it against the variants that asked.
-	if policy != "" {
-		if entry, ok := configMap[policy]; !ok || !config.PolicyEntryKey(policy, entry) {
+	if tier != "" {
+		if entry, ok := configMap[tier]; !ok || !config.PolicyEntryKey(tier, entry) {
 			known := slices.Sorted(maps.Keys(config.NamedPolicies(configMap)))
 			for i := range vas {
-				if vas[i].Spec.ScalingPolicy == policy {
-					e.policies.ReportUnknownPolicy(ctx, namespace, vas[i].Name, policy, known)
+				if vas[i].Spec.ScalingPolicy == tier {
+					e.policies.ReportUnknownPolicy(ctx, namespace, vas[i].Name, tier, known)
 				}
 			}
 		}
 	}
 
-	resolved := config.ResolveScalingPolicyForTier(configMap, modelID, namespace, policy)
-	e.policies.ReportEffectivePolicy(ctx, namespace, modelID, policy, resolved)
+	resolved := config.ResolveScalingPolicyForTier(configMap, modelID, namespace, tier)
+	e.policies.ReportEffectivePolicy(ctx, namespace, modelID, tier, resolved)
 	return resolved
 }
 

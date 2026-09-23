@@ -21,7 +21,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
 )
 
-// scaleToZeroBlockReasons is unit-tested directly and the metric is unit-tested
+// policy.ScaleToZeroBlockReasons is unit-tested directly and the metric is unit-tested
 // directly; what neither covers is that applyScaleToZeroEnforcement actually
 // CALLS them, with the right owned set, on every path that returns early. Those
 // early returns are the whole risk: the first implementation emitted below the

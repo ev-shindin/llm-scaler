@@ -22,10 +22,11 @@ import (
 
 // DefaultMaxAge is the floor on how long ago the cycle that DECIDED a
 // published value may have run for the value still to be held or carried;
-// Engine.stickyAge raises it with the optimize interval. A carry that
+// the engine's stickyAge raises it with the optimize interval. A carry that
 // republishes through a metrics outage must stop somewhere, or an operator's
 // manual scale-up during the outage would be undone by the HPA when its
-// window closed. The age is the last deciding cycle's (Engine.lastDecided),
+// window closed. The age is the last deciding cycle's (the engine's
+// lastDecided),
 // not the store's write time, which the carry itself refreshes. Past this,
 // the no-decision path publishes the running count as it always did.
 const DefaultMaxAge = 5 * time.Minute
@@ -120,7 +121,7 @@ const stickyReason = "held the published scale-down: the fresh target crept back
 // a comparison, since off is the behaviour this replaces.
 //
 // Reports whether it changed the decision. Inert without a published value,
-// with one older than maxAge (Engine.stickyAge) or below the variant's own
+// with one older than maxAge (the engine's stickyAge) or below the variant's own
 // floor, without a descent in flight, or when the decision carries no
 // capacity (a path that did not go through the optimizer's decision builder).
 func HoldPublishedScaleDown(d domain.VariantDecision, published int, publishedAt time.Time, havePublished bool, maxAge time.Duration, now time.Time) (domain.VariantDecision, bool) {
