@@ -26,9 +26,9 @@ import (
 // republishes through a metrics outage must stop somewhere, or an operator's
 // manual scale-up during the outage would be undone by the HPA when its
 // window closed. The age is the last deciding cycle's (the engine's
-// lastDecided),
-// not the store's write time, which the carry itself refreshes. Past this,
-// the no-decision path publishes the running count as it always did.
+// lastDecided), not the store's write time, which the carry itself
+// refreshes. Past this, the no-decision path publishes the running count as
+// it always did.
 const DefaultMaxAge = 5 * time.Minute
 
 // stickyStepName is the pipeline step HoldPublishedScaleDown records.

@@ -13,7 +13,8 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 )
 
-// ChangeReporter is the reporting for named policy tiers.
+// ChangeReporter reports which named policy tier each model resolved to, and
+// the two ways that resolution goes wrong silently.
 //
 // Layered configuration is undebuggable without a "which value won" readout, and
 // two of the ways it goes wrong are silent by construction:
