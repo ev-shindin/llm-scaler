@@ -47,6 +47,35 @@ var _ = Describe("Estimate", func() {
 		Expect(f.Terms[domain.RoleDecode].Backlog).To(BeZero())
 	})
 
+	It("holds a role whose shape has changed, however many readings it has", func() {
+		// The gate this covers is the one a shape change adds, and it only
+		// shows on readings that would otherwise ORDER: the role's own bucket,
+		// with enough samples. Without staleShape a fleet of one orders its second replica;
+		// with it the same readings may hold what it has and no
+		// more, because every reading on record was taken under a shape the
+		// fleet has left.
+		ordering := Estimate(runLambda, replicas(1), variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85, false)
+		Expect(ordering.Terms[domain.RoleDecode].Held).To(BeFalse(),
+			"the same readings order when the shape is steady")
+
+		held := Estimate(runLambda, replicas(1), variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0.85, true)
+		Expect(held.Terms[domain.RoleDecode].Held).To(BeTrue())
+		Expect(held.Terms[domain.RoleDecode].HeldWhy).To(Equal("shape-change"),
+			"named for the reason, not for the sample count it would otherwise report")
+		Expect(held.ByRole[domain.RoleDecode]).To(BeNumerically("<=", ordering.ByRole[domain.RoleDecode]),
+			"a hold never asks for more than the order it replaces")
+		Expect(held.Terms[domain.RoleDecode].Replicas).To(Equal(ordering.Terms[domain.RoleDecode].Replicas),
+			"the uncapped figure is still reported, as it is for the other holds")
+	})
+
+	It("does not label a term shape-change when nothing was capped", func() {
+		// A fleet whose floor is already under the hold cap is not held at
+		// all, and must not be labelled as though it were.
+		f := Estimate(runLambda, replicas(60), variants(domain.RoleDecode, 60), nil, BacklogDrainSeconds, 0.85, true)
+		Expect(f.Terms[domain.RoleDecode].Held).To(BeFalse())
+		Expect(f.Terms[domain.RoleDecode].HeldWhy).To(BeEmpty())
+	})
+
 	It("does not move when replicas are added or removed", func() {
 		// The property the arrival floor was supposed to have and did not:
 		// mu is a per-replica constant, so the floor is the same at one

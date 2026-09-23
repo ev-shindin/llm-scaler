@@ -2,6 +2,7 @@ package saturation_v2
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -366,26 +367,33 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 			}
 		}
 		Expect(decodeP).To(BeNumerically(">", 0))
-		// mu is priced from generated tokens over the fleet's output length
-		// (saturatedCompletionRate), so the figure the window holds is not the
-		// 1.40 req/s the saturated pair completes but what that token rate is
-		// worth in requests of the size the FLEET is serving:
-		//
-		//   tokens/s  = 1.40 x 5500                              = 7700
-		//   fleet O   = (2 x 1.40 x 5500 + 3 x 0.2 x 900) / 3.4  = 4688
-		//   mu        = 7700 / 4688                              = 1.6425
-		//
-		// The claim is the one this spec has always made: the fleet's shape
-		// prices the role. Priced on each replica's own bucket instead, the
-		// three `long` readings would carry it to 3.08 and the floor to 1.95
-		// replicas, which is the release this spec exists to prevent.
-		const xxlongMu = 7700.0 / 4688.0
-		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/xxlongMu, 0.05),
-			"the fleet serves ~5500-token outputs: the floor is lambda over the xxlong mu, whatever each replica's own recent completions average")
-		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically(">", runLambda/3.08*1.5),
-			"and nowhere near the figure the wrong bucket would have given")
-		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).NotTo(BeNumerically("~", runLambda/3.08, 0.3),
-			"and not lambda over the 1000-token shape's mu")
+		// The figure is read off the window the analyzer actually holds rather
+		// than re-derived here. A hand derivation was tried and was wrong in
+		// two ways at once, each too small for a loose tolerance to catch:
+		// mu is priced over the TRACKED shape, which is frozen until the
+		// tracker reports a change, not the raw per-cycle average; and the
+		// median of an even-sized window is the LOWER of the two middle
+		// values, not the later one. Asserting against the window makes the
+		// spec's arithmetic the code's arithmetic by construction.
+		var mu float64
+		for key, window := range analyzer.saturatedThroughput {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+				mu = window.Median()
+			}
+		}
+		Expect(mu).To(BeNumerically(">", 0), "the role must have a window at all")
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/mu, 0.01),
+			"the floor is lambda over the mu the fleet's own shape priced")
+
+		// And the claim this spec exists for: that mu belongs to the shape the
+		// FLEET is serving, ~5500-token outputs, not to the `long` bucket the
+		// three fresh replicas' own recent completions would have chosen. The
+		// two are far apart -- the wrong one would price the drained fleet at
+		// about two replicas and release it.
+		Expect(mu).To(BeNumerically("<", 2.5),
+			"a mu from the fleet's 5500-token shape, not the 3.08 the 900-token one carried")
+		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically(">", 3),
+			"so the floor holds more than the two replicas the wrong bucket implies")
 	})
 
 	It("does not order on one saturated sample, however many cycles the row shows it", func() {

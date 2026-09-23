@@ -22,8 +22,8 @@ const (
 // RollingAverage maintains a fixed-size sliding window of float64 values.
 // The saturation analyzer keeps one per history key for two readings: the
 // compute-bound capacity (k2), read through Average, and the saturated
-// completion rate (mu) the throughput floor prices from, read through Max
-// (see Max for why the two differ).
+// throughput (mu) the demand floor prices from, read through Median. Each
+// read's own doc says why it is the right one for what that window holds.
 //
 // Not safe for concurrent use: the owner serialises access (the saturation
 // analyzer holds its own mutex around every window).

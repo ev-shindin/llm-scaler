@@ -159,6 +159,15 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 			delete(a.decodeSaturatedAt, key)
 		}
 	}
+	// The fleet-shape memo is per namespace|model and exists only to key and
+	// stabilise the capacity figures, so it goes when they do. Without this it
+	// is the one map on this struct that grows without bound as models and
+	// namespaces come and go.
+	for key, memo := range a.fleetShape {
+		if time.Since(memo.lastSeen) > timeout {
+			delete(a.fleetShape, key)
+		}
+	}
 	return evicted
 }
 
@@ -1321,24 +1330,33 @@ func computeModelWorkloadAverages(replicaMetrics []domain.ReplicaMetrics, rolesB
 	return avgInput, avgOutput, avgHitRate
 }
 
-// fleetOutputLength is the output length the fleet is serving this cycle: the
-// generating replicas' average output tokens, weighted by their request rate.
-// A fresh replica whose first completions are the short requests (they finish
-// first) reports a short average at a low rate and barely moves it; a replica
-// with no completions yet reports nothing and does not move it at all. With
-// no rate reported anywhere it is the plain mean, as computeModelWorkloadAverages
-// takes it. Zero when no replica reports an output length.
-func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[string]string) float64 {
+// fleetAverage is the rate-weighted mean of value over the replicas include
+// selects: the figure the fleet is actually serving, rather than the mean of
+// what its replicas happen to report.
+//
+// Weighting by request rate is what makes it robust to a fleet that is
+// changing size. A fresh replica whose first completions are the short
+// requests (they finish first) reports a short average at a low rate and
+// barely moves it; a replica with no completions yet reports nothing and does
+// not move it at all. With no rate reported anywhere it is the plain mean, as
+// computeModelWorkloadAverages takes it, and zero when nothing reports the
+// value at all.
+//
+// Both axes of the fleet's shape are this computation (fleetOutputLength,
+// servedPromptLength). The throughput analyzer's averageShapeMetrics is a
+// third instance of it in another package, left alone here.
+func fleetAverage(replicas []domain.ReplicaMetrics, value func(domain.ReplicaMetrics) float64, include func(domain.ReplicaMetrics) bool) float64 {
 	var weighted, weights, plain float64
 	var n int
 	for _, rm := range replicas {
-		if rm.AvgOutputTokens <= 0 || !generatesOutput(rm, rolesByVariant) {
+		v := value(rm)
+		if v <= 0 || !include(rm) {
 			continue
 		}
-		plain += rm.AvgOutputTokens
+		plain += v
 		n++
 		if rm.RequestRate > 0 {
-			weighted += rm.AvgOutputTokens * rm.RequestRate
+			weighted += v * rm.RequestRate
 			weights += rm.RequestRate
 		}
 	}
@@ -1349,6 +1367,15 @@ func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[stri
 		return plain / float64(n)
 	}
 	return 0
+}
+
+// fleetOutputLength is the output length the fleet is serving this cycle: the
+// generating replicas' average output tokens, weighted by their request rate
+// (fleetAverage).
+func fleetOutputLength(replicas []domain.ReplicaMetrics, rolesByVariant map[string]string) float64 {
+	return fleetAverage(replicas,
+		func(rm domain.ReplicaMetrics) float64 { return rm.AvgOutputTokens },
+		func(rm domain.ReplicaMetrics) bool { return generatesOutput(rm, rolesByVariant) })
 }
 
 // rolesFromStates builds the variant-name -> role lookup the per-role helpers

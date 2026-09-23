@@ -80,6 +80,9 @@ type shapeMemo struct {
 	lastArriving float64
 	// changedAt is when the outstanding change was raised, zero when none is.
 	changedAt time.Time
+	// lastSeen is when this model was last analyzed, so the memo can be swept
+	// with the rest of the analyzer's per-model state (EvictStaleHistory).
+	lastSeen time.Time
 }
 
 // arrivingPromptLength is the prompt length, in tokens, of what is
@@ -121,31 +124,13 @@ func arrivingPromptLength(sq *domain.SchedulerQueueMetrics) (float64, bool) {
 }
 
 // servedPromptLength is the prompt length of what the replicas have been
-// SERVING, rate-weighted exactly as fleetOutputLength weights the output half
-// so a fresh replica with a handful of completions barely moves it. It lags --
-// it is an average over completed requests -- and it is on the engines' scale,
-// not the queue's.
+// SERVING: the other axis of fleetAverage, so a fresh replica with a handful
+// of completions barely moves it. It lags -- it is an average over completed
+// requests -- and it is on the engines' scale, not the queue's.
 func servedPromptLength(replicas []domain.ReplicaMetrics) float64 {
-	var weighted, weights, plain float64
-	var n int
-	for _, rm := range replicas {
-		if rm.AvgInputTokens <= 0 || rm.FromWarmPool {
-			continue
-		}
-		plain += rm.AvgInputTokens
-		n++
-		if rm.RequestRate > 0 {
-			weighted += rm.AvgInputTokens * rm.RequestRate
-			weights += rm.RequestRate
-		}
-	}
-	if weights > 0 {
-		return weighted / weights
-	}
-	if n > 0 {
-		return plain / float64(n)
-	}
-	return 0
+	return fleetAverage(replicas,
+		func(rm domain.ReplicaMetrics) float64 { return rm.AvgInputTokens },
+		func(rm domain.ReplicaMetrics) bool { return !rm.FromWarmPool })
 }
 
 // saturatedCompletionRate is what one replica completes per second while
@@ -236,6 +221,25 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 	}
 	was, hadShape := memo.tracker.Current()
 	now := a.now()
+	memo.lastSeen = now
+	// An axis nobody reported this cycle is MISSING, not zero, and Within
+	// measures any stored non-zero value against a zero as a change of a
+	// hundred per cent. A scrape gap, a rolling restart, or simply a cycle in
+	// which no ready replica has completed anything would otherwise raise a
+	// change and hold the fleet from release for ShapeChangeHoldMax on a
+	// workload that never moved. Carrying the last known value forward says
+	// "no new information on this axis", which is what the cycle actually is.
+	//
+	// The reset below handles the other direction, an axis being learned for
+	// the first time; between them every transition through zero is covered.
+	if hadShape {
+		if out <= 0 && was.AvgOutputTokens > 0 {
+			out = was.AvgOutputTokens
+		}
+		if in <= 0 && was.AvgInputTokens > 0 {
+			in = was.AvgInputTokens
+		}
+	}
 	// An axis reading zero is a fleet that has nothing to report on it yet,
 	// not a workload of zero-length generations, and Within treats any
 	// non-zero value as outside a stored zero. So the first cycle whose

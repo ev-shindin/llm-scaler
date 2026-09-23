@@ -334,6 +334,40 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 			"a burst of %v must not become the fleet's mu", burst)
 	})
 
+	It("does not read a metric gap as a change of shape", func() {
+		// The mirror of the spec above, and the case its guard missed. Once an
+		// axis has been learned, a cycle in which no replica reports it -- a
+		// scrape gap, a rolling restart, a moment when no ready replica has
+		// completed anything -- reads as an average of 0, and Within measures
+		// any non-zero stored value against it as a change of 100%. The fleet
+		// would then be held from release for ShapeChangeHoldMax on a workload
+		// that never moved.
+		cycle(10, 17_282, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 17_282, 0, 1000, 6000, nil)
+		Expect(outstanding()).To(BeFalse())
+		clock = clock.Add(15 * time.Second)
+
+		// The gap: the replicas are there and serving, but none reports an
+		// output length this cycle.
+		gap := makeReplicaMetrics("d0", decodeV, 17_282, kvCap, 0, 1000, 0)
+		gap.RequestRate = 0.6
+		gap.GenerationTokenRate = gap.RequestRate * 6000
+		gap.Ready = true
+		input := makeAnalyzerInput([]domain.ReplicaMetrics{gap}, states(10))
+		input.ArrivalRate = 5.68
+		_, err := analyzer.Analyze(ctx, input)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeFalse(),
+			"an axis nobody reported this cycle is missing, not zero")
+
+		// And the shape is still the one it was, so the axis coming back is
+		// not a change either.
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 17_282, 0, 1000, 6000, nil)
+		Expect(outstanding()).To(BeFalse(), "nor is it a change when the reading returns")
+	})
+
 	It("raises nothing while the shape holds still", func() {
 		// The negative control for the whole mechanism: the same load, cycle
 		// after cycle, must never raise an event or hold anything.
@@ -343,5 +377,110 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 				"a fleet serving one shape has nothing to hold for")
 			clock = clock.Add(15 * time.Second)
 		}
+	})
+})
+
+var _ = Describe("holdFleetFloor", func() {
+	const p = 900_000.0
+	variants := func(spec ...[2]int) []domain.VariantCapacity {
+		out := make([]domain.VariantCapacity, 0, len(spec))
+		for i, s := range spec {
+			role := domain.RoleDecode
+			if s[1] == 1 {
+				role = domain.RolePrefill
+			}
+			out = append(out, domain.VariantCapacity{
+				VariantName: fmt.Sprintf("v%d", i), Role: role,
+				ReplicaCount: s[0], PerReplicaCapacity: p,
+			})
+		}
+		return out
+	}
+
+	It("raises a role below the band and leaves one above it alone", func() {
+		// The function's own claim: each role is floored against its OWN
+		// supply, so a fleet short in one role and comfortable in another is
+		// left correct in both.
+		vcs := variants([2]int{4, 0}, [2]int{2, 1})
+		demand := map[string]float64{
+			domain.RoleDecode:  100_000,     // far below 0.7 x 4p
+			domain.RolePrefill: 0.9 * 2 * p, // already above 0.7 x 2p
+		}
+		moved, raised := holdFleetFloor(demand, vcs, 0.70)
+
+		Expect(raised).To(HaveKey(domain.RoleDecode))
+		Expect(raised).NotTo(HaveKey(domain.RolePrefill), "a role already above the band is not touched")
+		Expect(demand[domain.RoleDecode]).To(BeNumerically("~", 0.70*4*p, 1e-6))
+		Expect(demand[domain.RolePrefill]).To(BeNumerically("~", 0.9*2*p, 1e-6))
+		Expect(moved).To(BeNumerically("~", 0.70*4*p-100_000, 1e-6),
+			"the model total moves by exactly what the roles did")
+	})
+
+	It("shares a raised role across its variants by supply", func() {
+		// The optimizer prices each variant by its share of the role demand,
+		// so the variant figures have to follow the role's or the hold does
+		// not survive the split.
+		vcs := variants([2]int{3, 0}, [2]int{1, 0})
+		demand := map[string]float64{domain.RoleDecode: 10_000}
+		_, raised := holdFleetFloor(demand, vcs, 0.70)
+		Expect(raised).To(HaveKey(domain.RoleDecode))
+
+		held := 0.70 * 4 * p
+		Expect(vcs[0].TotalDemand).To(BeNumerically("~", held*3/4, 1e-6), "three quarters of the supply")
+		Expect(vcs[1].TotalDemand).To(BeNumerically("~", held*1/4, 1e-6), "one quarter")
+		Expect(vcs[0].TotalDemand + vcs[1].TotalDemand).To(BeNumerically("~", held, 1e-6))
+		Expect(vcs[0].Utilization).To(BeNumerically("~", 0.70, 1e-6),
+			"and utilization follows, since the warm pool reads it")
+	})
+
+	It("does nothing without a demand map, a threshold, or any supply", func() {
+		vcs := variants([2]int{2, 0})
+		moved, raised := holdFleetFloor(nil, vcs, 0.70)
+		Expect(moved).To(BeZero())
+		Expect(raised).To(BeNil())
+
+		moved, raised = holdFleetFloor(map[string]float64{domain.RoleDecode: 1}, vcs, 0)
+		Expect(moved).To(BeZero())
+		Expect(raised).To(BeNil())
+
+		idle := []domain.VariantCapacity{{VariantName: "v", Role: domain.RoleDecode, ReplicaCount: 0, PerReplicaCapacity: p}}
+		moved, raised = holdFleetFloor(map[string]float64{domain.RoleDecode: 1}, idle, 0.70)
+		Expect(moved).To(BeZero(), "a role with no supply has no band to be held in")
+		Expect(raised).To(BeNil())
+	})
+})
+
+var _ = Describe("a saturated replica that cannot be priced", func() {
+	It("records no window, so the role gets no floor", func() {
+		// The failure this guards is the one that cost a whole benchmark run
+		// on 2026-09-22: the generation-token rate was not being collected,
+		// saturatedCompletionRate returned false on every cycle, and the
+		// demand floor silently had no mu for any role. The contract is that
+		// nothing is recorded -- a half-priced window would take the max of
+		// two different definitions of mu.
+		analyzer := NewSaturationAnalyzer(capacity.NewStore())
+		clock := time.Date(2026, 9, 22, 21, 0, 0, 0, time.UTC)
+		analyzer.now = func() time.Time { return clock }
+
+		rm := makeReplicaMetrics("d0", "decode-v", 1_100_000, 1_162_240, 10, 1000, 6000)
+		rm.RequestRate = 5.4
+		rm.GenerationTokenRate = 0 // the metric nobody was collecting
+		rm.Ready = true
+		in := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, []domain.VariantReplicaState{
+			{VariantName: "decode-v", Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: 1, GPUsPerReplica: 1},
+		})
+		in.ArrivalRate = 5.68
+		result, err := analyzer.Analyze(context.Background(), in)
+		Expect(err).NotTo(HaveOccurred())
+
+		for key := range analyzer.saturatedThroughput {
+			Expect(key).NotTo(ContainSubstring("|"+domain.RoleDecode+"|"),
+				"a rate that cannot be priced must not be recorded under some other definition")
+		}
+		// With no window there is no floor, so the demand is occupancy and
+		// nothing else: the resident KV plus the queue priced at its own
+		// per-request footprint, 1,100,000 + 10 x (1000 + 6000).
+		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 1_100_000+10*7000, 1),
+			"with no window the role answers to occupancy, not to a floor")
 	})
 })
