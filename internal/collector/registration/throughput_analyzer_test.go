@@ -73,7 +73,21 @@ var _ = Describe("RegisterThroughputAnalyzerQueries", func() {
 			Expect(rendered).To(ContainSubstring(`sum by (model_name,`))
 			Expect(rendered).NotTo(ContainSubstring(`model_name="`), "the model is partitioned in the collector, not matched in PromQL")
 			Expect(rendered).To(ContainSubstring(`[1m]`))
-			Expect(rendered).To(ContainSubstring(`vllm:request_generation_tokens_sum`))
+
+			// From the COUNTER, not the histogram sum. The two carry the same
+			// running total and picking the wrong one is invisible until a fleet
+			// is under load: vllm:request_generation_tokens is a histogram observed
+			// when a request FINISHES, so its _sum rate is zero while a long
+			// generation runs and jumps by the whole request at completion. The
+			// saturation analyzer prices mu from this rate and keeps a max, so one
+			// drain burst becomes the fleet's throughput for the rest of the phase
+			// -- measured 2026-09-22 as a ratchet from 0.92 to 3.60 req/s under a
+			// workload whose shape never changed, leaving the floor asking for 1.6
+			// replicas where about 8 were needed.
+			Expect(rendered).To(ContainSubstring(`vllm:generation_tokens_total`),
+				"tokens must be counted as they are produced")
+			Expect(rendered).NotTo(ContainSubstring(`request_generation_tokens_sum`),
+				"the histogram sum reports a request's tokens only once it has finished")
 		})
 
 		It("should build QueryKvUsageInstant without max_over_time", func() {

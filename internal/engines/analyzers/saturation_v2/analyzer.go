@@ -484,6 +484,25 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	if k2Priority == capacity.K2SrcObserved && rm.Ready && !rm.FromWarmPool {
 		if mu, ok := saturatedCompletionRate(rm, role, fleetOutput); ok {
 			a.recordSaturatedThroughput(throughputKey, mu)
+		} else {
+			// The replica is full and queued -- the one moment its throughput can
+			// be learned -- and nothing can price it. Every cycle that reaches
+			// here is a cycle the demand floor will not have a mu for, and a role
+			// with no mu gets no floor at all.
+			//
+			// Said out loud because the failure is otherwise invisible: on
+			// 2026-09-22 a build whose GenerationTokenRate was never collected
+			// (the query was registered only by the opt-in throughput analyzer)
+			// ran a whole 40-minute benchmark with no floor for any role, and the
+			// only trace in the log was an empty string where a bucket name
+			// should have been. The same shape of bug had already been found once
+			// for the arrival rate. A line here would have named it in seconds.
+			logger.V(logging.DEFAULT).Info("saturated-throughput-not-priced",
+				"modelID", modelID, "namespace", namespace, "variant", rm.VariantName,
+				"pod", rm.PodName, "role", role,
+				"generationTokenRate", rm.GenerationTokenRate, "requestRate", rm.RequestRate,
+				"fleetOutputTokens", fleetOutput,
+				"reason", "saturated, but no throughput could be priced: the role's demand floor has no mu and will not bind")
 		}
 	}
 	reading := a.saturatedThroughputReading(throughputKey)

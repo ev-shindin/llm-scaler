@@ -191,7 +191,17 @@ func RegisterArrivalRateQueries(sourceRegistry *source.SourceRegistry) {
 	})
 
 	// Per-pod observed generation (decode) token rate (tokens/sec), the rate of
-	// the _sum histogram counter over 1m.
+	// the generation-token COUNTER over 1m.
+	//
+	// Not the _sum of vllm:request_generation_tokens, which carries the same
+	// running total but is a histogram observed when a request FINISHES: its rate
+	// is zero while a long generation runs and jumps by the whole request at
+	// completion, so it bursts on a drain exactly as the _count does. Measured on
+	// the 2026-09-22 rerun, which took mu from the histogram sum: the window
+	// ratcheted 0.92 -> 1.14 -> 1.42 -> 1.92 -> 2.26 -> 3.00 -> 3.60 req/s across
+	// one phase of a workload whose shape never changed, and at 3.60 the floor
+	// asked for 1.6 replicas where the fleet needed about 8. The counter does not
+	// burst: tokens accrue as they are produced.
 	//
 	// Unconditional for the same reason as the two above, and discovered the
 	// same way. The saturation analyzer's demand floor prices a replica's
@@ -206,7 +216,7 @@ func RegisterArrivalRateQueries(sourceRegistry *source.SourceRegistry) {
 	registry.MustRegister(source.QueryTemplate{
 		Name:        QueryGenerationTokenRate,
 		Type:        source.QueryTypePromQL,
-		Template:    `sum by (model_name, instance, pod) (rate(vllm:request_generation_tokens_sum{namespace="{{.namespace}}"}[1m]))`,
+		Template:    `sum by (model_name, instance, pod) (rate(vllm:generation_tokens_total{namespace="{{.namespace}}"}[1m]))`,
 		Params:      []string{source.ParamNamespace},
 		Description: "Observed generation (decode) token rate per pod (tokens/sec), proxy for μ_dec^obs",
 	})
@@ -228,6 +238,15 @@ func registerSGLangArrivalRateQueries(registry *source.QueryList) {
 
 	// Per-pod observed generation token rate, unconditional for the reason given
 	// on the vLLM template above.
+	//
+	// STILL THE HISTOGRAM SUM, and so still subject to the drain burst the vLLM
+	// template above describes. SGLang exposes _total counters for its other
+	// token series (sglang:prompt_tokens_total, sglang:cached_tokens_total), so a
+	// sglang:generation_tokens_total very probably exists and is the right source
+	// -- but it has not been confirmed against a live SGLang engine, and a query
+	// naming a series that does not exist fails the way this whole area fails:
+	// silently, to zero, taking the demand floor with it. Left as it is until
+	// someone can read an SGLang /metrics endpoint.
 	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{
 		Name:        QueryGenerationTokenRate,
 		Type:        source.QueryTypePromQL,
