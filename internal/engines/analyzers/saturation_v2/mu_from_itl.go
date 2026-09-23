@@ -149,10 +149,24 @@ func (a *SaturationAnalyzer) noteITL(key string, replicas []domain.ReplicaMetric
 	// mean something (DefaultMinSamples, DefaultMinKSpread). The throughput
 	// analyzer gates on it for the same reason, and a derived mu overrides
 	// the measured one, so it has to clear a higher bar than two readings.
-	if !w.Ready() {
-		return itl.Model{}
+	obs := w.Observations()
+	if w.Ready() {
+		if model, ok := itl.Fit(obs); ok {
+			return model
+		}
 	}
-	model, ok := itl.Fit(w.Observations())
+	// The fleet's replicas are at nearly the same load, so there is no spread
+	// in k to fit a slope and an intercept from. That is the NORMAL case, not
+	// a degenerate one: the router balances, so it balances k too, and a run
+	// on 2026-09-24 sat at queue 0 on every replica but one with the window
+	// never once Ready. Requiring the full fit would have left the derivation
+	// inert on every fleet that is actually working.
+	//
+	// So B is pinned to the hardware floor and only A is fitted, which is what
+	// the throughput analyzer does for the same reason. It is the weaker
+	// answer, and it is still an answer about the shape arriving now, which
+	// the measured window it replaces is not.
+	model, ok := itl.FitPinnedB(obs, itl.DefaultBaselineSec)
 	if !ok {
 		return itl.Model{}
 	}

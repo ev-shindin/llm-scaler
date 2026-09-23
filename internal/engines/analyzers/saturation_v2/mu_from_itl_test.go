@@ -220,6 +220,24 @@ var _ = Describe("noteITL", func() {
 		}),
 	)
 
+	It("fits a balanced fleet, which is the fleet a router produces", func() {
+		// Every replica at the same load and the same latency: no spread in k,
+		// so the window is never Ready and the two-parameter fit has nothing to
+		// work with. This is not a corner case -- it is what a run on a working
+		// fleet looks like, and requiring the full fit left the derivation
+		// inert on 2026-09-24 with every replica at queue 0.
+		rms := make([]domain.ReplicaMetrics, 0, 6)
+		for i := 0; i < 6; i++ {
+			rms = append(rms, reading(fmt.Sprintf("d%d", i), 0.62, 0.0272))
+		}
+		got := fit(rms)
+		Expect(got.IsZero()).To(BeFalse(),
+			"a balanced fleet still gets a model, with B pinned")
+		Expect(got.B).To(Equal(itl.DefaultBaselineSec))
+		Expect(got.ITLAt(0.62)).To(BeNumerically("~", 0.0272, 1e-9),
+			"and it passes through the load the fleet is actually at")
+	})
+
 	It("keeps the good readings when only some are excluded", func() {
 		rms := line()
 		rms = append(rms, reading("warm", 0.5, 0.02))
