@@ -10,6 +10,7 @@ assignees: ''
 - [Introduction](#introduction)
 - [Prerequisites](#prerequisites)
 - [Release Process](#release-process)
+- [After the Release](#after-the-release)
 - [Announce the Release](#announce-the-release)
 
 ## Introduction

@@ -474,7 +474,7 @@ scenario:
       #       https://ghcr.io/v2/ev-shindin/llm-scaling-manager/tags/list
       image:
         repository: ghcr.io/ev-shindin/llm-scaling-manager
-        tag: v0.8.0
+        tag: main
       replicaCount: 1 # WVA controller pod replicas (1 is the chart default)
       # Disable to skip installing the controller but still render the VA
       # + HPA (rare; useful when you reuse a cluster-wide controller

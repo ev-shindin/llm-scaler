@@ -597,7 +597,7 @@ scenario:
       namespace: ""
       image:
         repository: ghcr.io/ev-shindin/llm-scaling-manager
-        tag: v0.8.0
+        tag: main
       replicaCount: 1
       controller:
         enabled: true
@@ -688,7 +688,7 @@ scenario:
       namespace: ""
       image:
         repository: ghcr.io/ev-shindin/llm-scaling-manager
-        tag: v0.8.0
+        tag: main
       replicaCount: 1
       controller:
         enabled: true

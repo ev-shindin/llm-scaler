@@ -138,7 +138,7 @@ yourself, or when a GitOps tool owns the manifests. Otherwise prefer Method 1.
 ```bash
 # Set the controller image
 cd config/base/manager
-kustomize edit set image controller=ghcr.io/ev-shindin/llm-scaling-manager:v0.7.0
+kustomize edit set image controller=ghcr.io/ev-shindin/llm-scaling-manager:main
 
 # Apply the overlay for your scope and platform
 kubectl apply -k ../../overlays/cluster-scoped/kubernetes
