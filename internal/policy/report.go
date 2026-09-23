@@ -1,4 +1,4 @@
-package steadystate
+package policy
 
 import (
 	"context"
@@ -13,28 +13,13 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 )
 
-// Reporting for named policy tiers.
-//
-// Layered configuration is undebuggable without a "which value won" readout, and
-// two of the ways it goes wrong are silent by construction:
-//
-//   - a policy name that resolves to nothing falls back to the default entry, so a
-//     typo produces a working-looking configuration that quietly ignores the tier;
-//   - variants of one model resolving to DIFFERENT tiers leaves the optimizer
-//     distributing replicas across them under conflicting thresholds. WVA scales
-//     the model, not the variant, so there is one right answer per model and this
-//     is a configuration error rather than a merge to perform.
-//
-// Both are reported once per change rather than once per cycle: the optimize loop
-// runs every 15s and a condition that persists for a day would otherwise produce
-// 5,760 identical lines, which is how a real signal becomes noise.
-type policyReporter struct {
+type ChangeReporter struct {
 	mu   sync.Mutex
 	seen map[string]string
 }
 
-func newPolicyReporter() *policyReporter {
-	return &policyReporter{seen: make(map[string]string)}
+func NewChangeReporter() *ChangeReporter {
+	return &ChangeReporter{seen: make(map[string]string)}
 }
 
 // changed reports whether what was last said about key differs from summary,
@@ -43,7 +28,7 @@ func newPolicyReporter() *policyReporter {
 // A nil reporter reports nothing, which is what makes it safe to leave uninjected
 // in tests that construct an Engine directly — the same posture UsageRefresher
 // takes. Production builds one in NewEngine.
-func (p *policyReporter) changed(key, summary string) bool {
+func (p *ChangeReporter) changed(key, summary string) bool {
 	if p == nil {
 		return false
 	}
@@ -56,14 +41,14 @@ func (p *policyReporter) changed(key, summary string) bool {
 	return true
 }
 
-// reportUnknownPolicy warns that a variant named a policy tier that does not
+// ReportUnknownPolicy warns that a variant named a policy tier that does not
 // exist, so it is scaling under the default entry instead.
 //
 // Falling back is the right behaviour — refusing to scale a workload because its
 // policy name is misspelled would turn a config typo into an outage — but doing it
 // quietly is not: the ScaledObject reads as tiered and nothing about the outcome
 // says otherwise.
-func (p *policyReporter) reportUnknownPolicy(ctx context.Context, namespace, variant, policy string, known []string) {
+func (p *ChangeReporter) ReportUnknownPolicy(ctx context.Context, namespace, variant, policy string, known []string) {
 	if !p.changed(namespace+"/"+variant, "unknown|"+policy) {
 		return
 	}
@@ -75,7 +60,7 @@ func (p *policyReporter) reportUnknownPolicy(ctx context.Context, namespace, var
 		"scalingPolicy", policy, "knownPolicies", known)
 }
 
-// reportPolicyConflict warns that one model's variants named different policy
+// ReportPolicyConflict warns that one model's variants named different policy
 // tiers.
 //
 // WVA scales a MODEL — the optimizer distributes replicas across that model's
@@ -83,7 +68,7 @@ func (p *policyReporter) reportUnknownPolicy(ctx context.Context, namespace, var
 // policy. Two tiers means the optimizer is balancing variants that disagree about
 // what saturated means, which produces a stable-looking allocation that is wrong
 // for at least one of them.
-func (p *policyReporter) reportPolicyConflict(ctx context.Context, namespace, modelID string, policies []string, chosen string) {
+func (p *ChangeReporter) ReportPolicyConflict(ctx context.Context, namespace, modelID string, policies []string, chosen string) {
 	if !p.changed(namespace+"|"+modelID, "conflict|"+chosen+"|"+joinSorted(policies)) {
 		return
 	}
@@ -96,11 +81,11 @@ func (p *policyReporter) reportPolicyConflict(ctx context.Context, namespace, mo
 		"policies", policies, "using", chosen)
 }
 
-// reportEffectivePolicy records which tier a model ended up scaling under, once
+// ReportEffectivePolicy records which tier a model ended up scaling under, once
 // per change. This is the "which value won" readout: with a default entry, a tier
 // and a per-model override all contributing, the resolved thresholds are not
 // derivable from any single one of them.
-func (p *policyReporter) reportEffectivePolicy(ctx context.Context, namespace, modelID, policy string, cfg config.ScalingPolicy) {
+func (p *ChangeReporter) ReportEffectivePolicy(ctx context.Context, namespace, modelID, policy string, cfg config.ScalingPolicy) {
 	name := policy
 	if name == "" {
 		name = "(default entry)"
@@ -130,7 +115,7 @@ func joinSorted(values []string) string {
 	return strings.Join(sorted, ",")
 }
 
-// reportUnresolvedAccelerator warns that a variant's accelerator could not be
+// ReportUnresolvedAccelerator warns that a variant's accelerator could not be
 // resolved, and says what that actually costs under the current configuration.
 //
 // This is a LOG line as well as a Kubernetes event. It was written when the event
@@ -158,7 +143,7 @@ func joinSorted(values []string) string {
 //
 // Reported once per change per variant, so a persistent misconfiguration does not
 // print every cycle.
-func (p *policyReporter) reportUnresolvedAccelerator(ctx context.Context, namespace, variant, limiterMode string) {
+func (p *ChangeReporter) ReportUnresolvedAccelerator(ctx context.Context, namespace, variant, limiterMode string) {
 	limited := limiterMode != "" && limiterMode != string(config.LimiterTypeNone)
 	if !p.changed("accel|"+namespace+"/"+variant, strconv.FormatBool(limited)) {
 		return

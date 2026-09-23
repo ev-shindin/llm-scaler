@@ -1,4 +1,4 @@
-package steadystate
+package policy
 
 import (
 	. "github.com/onsi/ginkgo/v2"
@@ -7,7 +7,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 )
 
-var _ = Describe("shouldCollectClusterInventory", func() {
+var _ = Describe("ShouldCollectClusterInventory", func() {
 	// withLimiters returns a test Config whose global "default" saturation entry
 	// declares the given inline limiters.
 	withLimiters := func(limiters ...config.QuotaLimiterConfig) *config.Config {
@@ -22,12 +22,12 @@ var _ = Describe("shouldCollectClusterInventory", func() {
 	// physical-capacity path to log for either — and no reason to list Nodes. This
 	// used to collect, because an undeclared list implied an inventory limiter.
 	It("skips inventory collection when no limiters are configured", func() {
-		Expect(shouldCollectClusterInventory(config.NewTestConfig())).To(BeFalse())
+		Expect(ShouldCollectClusterInventory(config.NewTestConfig())).To(BeFalse())
 	})
 
 	It("collects inventory when a gpu-inventory limiter is configured", func() {
 		cfg := withLimiters(config.QuotaLimiterConfig{Type: "gpu-inventory"})
-		Expect(shouldCollectClusterInventory(cfg)).To(BeTrue())
+		Expect(ShouldCollectClusterInventory(cfg)).To(BeTrue())
 	})
 
 	It("skips inventory collection when an inline quota limiter is configured", func() {
@@ -35,6 +35,6 @@ var _ = Describe("shouldCollectClusterInventory", func() {
 			Type: "quota", Name: "cluster", Scope: config.QuotaScopeCluster,
 			ClusterQuotas: map[string]int{"H100": 8},
 		})
-		Expect(shouldCollectClusterInventory(cfg)).To(BeFalse())
+		Expect(ShouldCollectClusterInventory(cfg)).To(BeFalse())
 	})
 })

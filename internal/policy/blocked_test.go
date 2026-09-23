@@ -1,4 +1,4 @@
-package steadystate
+package policy
 
 import (
 	"testing"
@@ -155,7 +155,7 @@ func TestScaleToZeroBlockReasons(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scaleToZeroBlockReasons(tc.scaleToZero, tc.engineSupported, tc.recentlyWoken, tc.states)
+			got := ScaleToZeroBlockReasons(tc.scaleToZero, tc.engineSupported, tc.recentlyWoken, tc.states)
 			assert.Equal(t, tc.want, got)
 		})
 	}
