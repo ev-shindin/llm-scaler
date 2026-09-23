@@ -2,6 +2,7 @@ package registration
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -62,6 +63,26 @@ var _ = Describe("RegisterThroughputAnalyzerQueries", func() {
 				Expect(q.Name).To(Equal(name))
 				Expect(q.Type).To(Equal(source.QueryTypePromQL))
 			}
+		})
+
+		It("builds the SGLang generation-token rate from the counter, falling back to the histogram", func() {
+			// The counter has not been read off a live SGLang engine, and a
+			// query naming a series that does not exist fails silently to zero
+			// and takes the demand floor with it. PromQL's `or` yields the
+			// left vector plus any right-hand series with no match on the
+			// left, so an engine with the counter is priced from it and one
+			// without keeps the behaviour it has today.
+			rendered, err := queryList.Build(EngineQuery(inferenceengine.EngineSGLang, QueryGenerationTokenRate),
+				map[string]string{source.ParamNamespace: "test-ns"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rendered).To(ContainSubstring(`sglang:generation_tokens_total`),
+				"the counter is preferred")
+			Expect(rendered).To(ContainSubstring(` or `),
+				"and the histogram remains as a fallback rather than a replacement")
+			Expect(rendered).To(ContainSubstring(`sglang:generation_tokens_histogram_sum`))
+			Expect(strings.Index(rendered, "generation_tokens_total")).To(BeNumerically("<",
+				strings.Index(rendered, "generation_tokens_histogram_sum")),
+				"the counter is the left-hand side, which is the one `or` prefers")
 		})
 
 		It("should build QueryGenerationTokenRate scoped to the namespace, grouped by model", func() {

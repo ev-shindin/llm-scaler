@@ -375,13 +375,17 @@ var _ = Describe("the throughput floor, through Analyze", func() {
 		// median of an even-sized window is the LOWER of the two middle
 		// values, not the later one. Asserting against the window makes the
 		// spec's arithmetic the code's arithmetic by construction.
+		// Named by bucket, not by whichever decode key map iteration yields
+		// last: the fleet has more than one window open here and Go randomises
+		// that order, so the earlier form asserted against a different figure
+		// from run to run.
 		var mu float64
 		for key, window := range analyzer.saturatedThroughput {
-			if strings.Contains(key, "|"+domain.RoleDecode+"|") {
+			if strings.Contains(key, "|"+domain.RoleDecode+"|xxlong|") {
 				mu = window.Median()
 			}
 		}
-		Expect(mu).To(BeNumerically(">", 0), "the role must have a window at all")
+		Expect(mu).To(BeNumerically(">", 0), "the fleet's own shape must have a window")
 		Expect(result.RoleDemand[domain.RoleDecode]/decodeP).To(BeNumerically("~", runLambda/mu, 0.01),
 			"the floor is lambda over the mu the fleet's own shape priced")
 

@@ -18,7 +18,6 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 )
 
 // SaturationAnalyzer implements the domain.Analyzer interface using a
@@ -237,8 +236,9 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// workload that is no longer running (shape_change.go).
 	fleetInput := servedPromptLength(input.ReplicaMetrics)
 	arriving, arrivingOK := arrivingPromptLength(input.SchedulerQueue)
+	holdFor, _ := satConfig.ShapeChangeHold(ShapeChangeHoldMax)
 	stableOutput, shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID,
-		fleetInput, fleetOutput, arriving, arrivingOK, logger)
+		fleetInput, fleetOutput, arriving, arrivingOK, holdFor, logger)
 
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]capacity.ReplicaCapacity, 0, len(input.ReplicaMetrics))
@@ -263,16 +263,9 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// shape now arriving -- which is what an outstanding shape change was
 	// waiting for (shape_change.go).
 	if shapeChanged {
-		ownReading := false
-		for _, rc := range replicaCapacities {
-			if rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed &&
-				rc.SaturatedThroughputSamples >= floor.MinThroughputSamplesToOrder {
-				ownReading = true
-				break
-			}
-		}
-		a.settleFleetShape(input.Namespace, input.ModelID, ownReading)
-		shapeChanged = !ownReading
+		measured := fleetHasMeasuredItself(replicaCapacities)
+		a.settleFleetShape(input.Namespace, input.ModelID, measured)
+		shapeChanged = !measured
 	}
 
 	// Phase 2: Per-variant aggregation

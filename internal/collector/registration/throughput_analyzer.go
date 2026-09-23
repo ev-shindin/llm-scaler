@@ -239,18 +239,26 @@ func registerSGLangArrivalRateQueries(registry *source.QueryList) {
 	// Per-pod observed generation token rate, unconditional for the reason given
 	// on the vLLM template above.
 	//
-	// STILL THE HISTOGRAM SUM, and so still subject to the drain burst the vLLM
-	// template above describes. SGLang exposes _total counters for its other
-	// token series (sglang:prompt_tokens_total, sglang:cached_tokens_total), so a
-	// sglang:generation_tokens_total very probably exists and is the right source
-	// -- but it has not been confirmed against a live SGLang engine, and a query
-	// naming a series that does not exist fails the way this whole area fails:
-	// silently, to zero, taking the demand floor with it. Left as it is until
-	// someone can read an SGLang /metrics endpoint.
+	// The counter where it exists, the histogram sum where it does not.
+	//
+	// SGLang exposes _total counters for its other token series
+	// (sglang:prompt_tokens_total, sglang:cached_tokens_total), so
+	// sglang:generation_tokens_total very probably exists and is the right
+	// source for the reason the vLLM template above gives. It has not been read
+	// off a live SGLang engine here, and naming a series that does not exist
+	// fails the way this whole area fails -- silently, to zero, taking the
+	// demand floor with it.
+	//
+	// PromQL's `or` resolves that without having to know: it yields the
+	// left-hand vector's series, plus the right-hand series that have no match
+	// on the left. So an engine exposing the counter is priced from the
+	// counter, and one exposing only the histogram keeps exactly the behaviour
+	// it has today. The vLLM side needs no such hedge; its counter was read off
+	// a running pod.
 	registerForEngine(registry, inferenceengine.EngineSGLang, source.QueryTemplate{
 		Name:        QueryGenerationTokenRate,
 		Type:        source.QueryTypePromQL,
-		Template:    `sum by (model_name, instance, pod) (rate(sglang:generation_tokens_histogram_sum{namespace="{{.namespace}}"}[1m]))`,
+		Template:    `sum by (model_name, instance, pod) (rate(sglang:generation_tokens_total{namespace="{{.namespace}}"}[1m]) or rate(sglang:generation_tokens_histogram_sum{namespace="{{.namespace}}"}[1m]))`,
 		Params:      []string{source.ParamNamespace},
 		Description: "Observed generation (decode) token rate per pod (tokens/sec), proxy for μ_dec^obs (SGLang)",
 	})

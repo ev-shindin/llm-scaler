@@ -9,8 +9,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 )
 
 var _ = Describe("the two prompt-length sources", func() {
@@ -530,6 +532,26 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 			"and the second was priced against the length the fleet had drifted to")
 	})
 
+	It("raises no hold at all when the policy disables it", func() {
+		// The switch an operator reaches for when the hold misbehaves. The
+		// shape is still tracked -- the throughput keys still follow it -- but
+		// a change stops withholding release.
+		cycle(4, 17_282, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+
+		rm := makeReplicaMetrics("d0", decodeV, 17_282, kvCap, 0, 8000, 1000)
+		rm.RequestRate = 0.6
+		rm.GenerationTokenRate = rm.RequestRate * 1000
+		rm.Ready = true
+		in := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, states(4))
+		in.ArrivalRate = 5.68
+		in.Config.(*config.ScalingPolicy).DisableShapeChangeHold = true
+		_, err := analyzer.Analyze(ctx, in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(outstanding()).To(BeFalse(),
+			"the change is tracked but holds nothing")
+	})
+
 	It("raises nothing while the shape holds still", func() {
 		// The negative control for the whole mechanism: the same load, cycle
 		// after cycle, must never raise an event or hold anything.
@@ -644,5 +666,52 @@ var _ = Describe("a saturated replica that cannot be priced", func() {
 		// per-request footprint, 1,100,000 + 10 x (1000 + 6000).
 		Expect(result.RoleDemand[domain.RoleDecode]).To(BeNumerically("~", 1_100_000+10*7000, 1),
 			"with no window the role answers to occupancy, not to a floor")
+	})
+})
+
+var _ = Describe("fleetHasMeasuredItself", func() {
+	own := func(variant string) capacity.ReplicaCapacity {
+		return capacity.ReplicaCapacity{
+			VariantName: variant, SaturatedThroughput: 1.4,
+			SaturatedThroughputSamples: floor.MinThroughputSamplesToOrder,
+		}
+	}
+	borrowed := func(variant string) capacity.ReplicaCapacity {
+		rc := own(variant)
+		rc.SaturatedThroughputBorrowed = true
+		return rc
+	}
+	oneSample := func(variant string) capacity.ReplicaCapacity {
+		rc := own(variant)
+		rc.SaturatedThroughputSamples = floor.MinThroughputSamplesToOrder - 1
+		return rc
+	}
+
+	It("requires every variant, not the first one to qualify", func() {
+		// The blast radius this guards: windows are keyed per variant, so one
+		// variant's readings say nothing about another's, and the hold they
+		// would clear belongs to the whole model.
+		Expect(fleetHasMeasuredItself([]capacity.ReplicaCapacity{
+			own("decode-a"), borrowed("decode-b"),
+		})).To(BeFalse(), "decode-b is still reading a neighbour's bucket")
+
+		Expect(fleetHasMeasuredItself([]capacity.ReplicaCapacity{
+			own("decode-a"), oneSample("decode-b"),
+		})).To(BeFalse(), "one reading is the drain, not a measurement")
+
+		Expect(fleetHasMeasuredItself([]capacity.ReplicaCapacity{
+			own("decode-a"), own("decode-b"),
+		})).To(BeTrue(), "both measured under the new shape")
+	})
+
+	It("counts a variant measured when any of its replicas is", func() {
+		Expect(fleetHasMeasuredItself([]capacity.ReplicaCapacity{
+			borrowed("decode-a"), own("decode-a"),
+		})).To(BeTrue(), "one replica speaks for its variant's window")
+	})
+
+	It("is false for a fleet with nothing in it", func() {
+		Expect(fleetHasMeasuredItself(nil)).To(BeFalse())
+		Expect(fleetHasMeasuredItself([]capacity.ReplicaCapacity{})).To(BeFalse())
 	})
 })

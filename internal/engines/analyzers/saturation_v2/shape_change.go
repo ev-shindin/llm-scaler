@@ -8,6 +8,8 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/floor"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
 )
 
@@ -206,7 +208,7 @@ func saturatedCompletionRate(rm domain.ReplicaMetrics, role string, fleetOutput 
 // held decision that follows, which is the first thing a reader of those
 // decisions will ask.
 func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out float64,
-	arriving float64, arrivingOK bool, logger logr.Logger) (float64, bool) {
+	arriving float64, arrivingOK bool, holdFor time.Duration, logger logr.Logger) (float64, bool) {
 	if !(in > 0) && !(out > 0) && !arrivingOK {
 		stable, outstanding := a.fleetShapeState(namespace, modelID)
 		if stable <= 0 {
@@ -288,8 +290,13 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 
 	switch {
 	case changed:
-		memo.changedAt = now
-	case !memo.changedAt.IsZero() && now.Sub(memo.changedAt) >= ShapeChangeHoldMax:
+		// A hold of zero is the policy switch: the change is still tracked and
+		// still logged -- the keys follow the shape either way -- but nothing
+		// is outstanding, so nothing withholds release.
+		if holdFor > 0 {
+			memo.changedAt = now
+		}
+	case !memo.changedAt.IsZero() && now.Sub(memo.changedAt) >= holdFor:
 		// The backstop. A fleet that is over-provisioned for the new shape
 		// never saturates under it, so it never records the reading that
 		// settles the hold: on the run above, phase 2 ran 8-21 requests
@@ -310,6 +317,42 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 		"hadShape", hadShape, "tolerance", shape.DefaultChangeTolerance,
 		"reason", "the shape the capacity figures were learned under is no longer the one arriving; the fleet is not released until the new shape has a reading of its own")
 	return stableOut, true
+}
+
+// fleetHasMeasuredItself reports whether every variant with a replica has a
+// throughput window of its OWN under the shape now arriving -- the condition
+// that settles an outstanding shape change.
+//
+// EVERY variant, not the first one to qualify. Windows are keyed per variant,
+// accelerator, GPU count and role, so one variant reaching
+// MinThroughputSamplesToOrder own readings says nothing about the others --
+// and the hold it would clear belongs to the whole model. On a fleet whose
+// decode variants sit on different accelerators, or whose prefill saturates
+// later than its decode, the quickest to settle would release the hold that is
+// protecting the slowest. The benchmark this was built on has one variant per
+// role and could never have shown it.
+//
+// The sample count is the floor's own gate for trusting a window with an
+// order, and two readings are a ThroughputSampleSpacing apart by construction,
+// so they cannot both come from one drain.
+//
+// A fleet with no replicas at all has measured nothing.
+func fleetHasMeasuredItself(replicas []capacity.ReplicaCapacity) bool {
+	if len(replicas) == 0 {
+		return false
+	}
+	measured := make(map[string]bool, len(replicas))
+	for _, rc := range replicas {
+		own := rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed &&
+			rc.SaturatedThroughputSamples >= floor.MinThroughputSamplesToOrder
+		measured[rc.VariantName] = measured[rc.VariantName] || own
+	}
+	for _, ok := range measured {
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // settleFleetShape clears an outstanding change once the fleet has MEASURED
