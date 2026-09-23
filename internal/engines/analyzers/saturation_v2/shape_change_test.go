@@ -204,6 +204,35 @@ var _ = Describe("the fleet-shape change, through Analyze", func() {
 			"ShapeChangeHoldMax releases a fleet that will never measure itself")
 	})
 
+	It("bounds the hold by the transition, not by each step of it", func() {
+		// A shape swap is not one change event. Generations already in flight
+		// keep the fleet average high, so the served output length walks down
+		// over minutes, and the tracker declares a change each time the walk
+		// has covered a further tolerance. Restarting the clock on each of
+		// those would hold the fleet for the whole of a slide TOWARDS shorter
+		// work -- the transition that needs fewer replicas, not more.
+		cycle(10, 900_000, 0, 1000, 6000, nil)
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 900_000, 0, 8000, 6000, nil)
+		Expect(outstanding()).To(BeTrue())
+		raisedAt := clock
+
+		// The walk down, a declaration roughly every 90 s, never settling: no
+		// cycle saturates, so nothing ever measures the new shape.
+		for _, out := range []float64{4500, 3300, 2400, 1700, 1200} {
+			clock = clock.Add(90 * time.Second)
+			cycle(10, 17_282, 0, 8000, out, nil)
+		}
+		Expect(clock.Sub(raisedAt)).To(BeNumerically(">", ShapeChangeHoldMax),
+			"the walk has to outlast the backstop or this proves nothing")
+
+		clock = clock.Add(15 * time.Second)
+		cycle(10, 17_282, 0, 8000, 1000, nil)
+		Expect(outstanding()).To(BeFalse(),
+			"the backstop runs from the first change of the transition; a later "+
+				"step of the same slide must not extend it")
+	})
+
 	It("keeps one throughput window when the shape sits on a bucket boundary", func() {
 		// Measured on the rerun of 2026-09-22 (biran-pd, the build carrying
 		// #85): phase 1 generates exactly 6000-token outputs, which is the

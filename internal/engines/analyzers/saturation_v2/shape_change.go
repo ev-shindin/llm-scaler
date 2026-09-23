@@ -293,7 +293,18 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 		// A hold of zero is the policy switch: the change is still tracked and
 		// still logged -- the keys follow the shape either way -- but nothing
 		// is outstanding, so nothing withholds release.
-		if holdFor > 0 {
+		//
+		// The clock starts on the FIRST change of a run and is not restarted by
+		// the ones that follow. One workload transition is not one change event:
+		// a fleet sliding from 6000-token outputs to 1000 crosses the tolerance
+		// band repeatedly on the way down (that is the tracker's anchor doing
+		// its job), and restarting the clock on each crossing would extend the
+		// hold for the whole of a slide -- withholding release for precisely
+		// the transition, to shorter work needing fewer replicas, where release
+		// is what the fleet needs. ShapeChangeHoldMax bounds the transition,
+		// not each step of it. The clock is cleared by the backstop below or by
+		// settleFleetShape, and a change arriving after either starts a new one.
+		if holdFor > 0 && memo.changedAt.IsZero() {
 			memo.changedAt = now
 		}
 	case !memo.changedAt.IsZero() && now.Sub(memo.changedAt) >= holdFor:
