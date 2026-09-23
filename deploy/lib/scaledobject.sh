@@ -1598,7 +1598,7 @@ metadata:
   name: ${claim}
   namespace: ${ns}
   labels:
-    app.kubernetes.io/managed-by: workload-variant-autoscaler
+    app.kubernetes.io/managed-by: llm-scaling-manager
     app.kubernetes.io/component: model-cache
 spec:
   accessModes:
@@ -3125,7 +3125,7 @@ metadata:
   name: ${target}-wva
   namespace: ${ns}
   labels:
-    app.kubernetes.io/managed-by: workload-variant-autoscaler
+    app.kubernetes.io/managed-by: llm-scaling-manager
     app.kubernetes.io/component: default-scaledobject
   annotations:
     llm-d.ai/created-by: "deploy/lib/scaledobject.sh"

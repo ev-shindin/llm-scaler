@@ -165,10 +165,17 @@ EOF
     # or hand-tuned, and deleting it would take a workload's autoscaling away
     # entirely rather than just taking WVA out of it. So the split is by who made
     # the object, not by who it currently calls.
+    # The managed-by value moved from workload-variant-autoscaler to
+    # llm-scaling-manager with the rename, so this selector accepts BOTH:
+    # a ScaledObject created by an earlier install still carries the old
+    # value, and matching only the new one would classify it as hand-written
+    # and silently leave it behind on uninstall. Set-based rather than two
+    # queries so the result stays one sorted list. The old value can be
+    # dropped once no install older than the rename is in the field.
     local orphans ours theirs
     orphans=$(wva_scaledobjects_calling_us)
     ours=$(wva_scaledobjects_calling_us \
-        -l 'app.kubernetes.io/managed-by=workload-variant-autoscaler,app.kubernetes.io/component=default-scaledobject')
+        -l 'app.kubernetes.io/managed-by in (llm-scaling-manager,workload-variant-autoscaler),app.kubernetes.io/component=default-scaledobject')
     theirs=$(comm -13 <(printf '%s\n' $ours | sort -u) <(printf '%s\n' $orphans | sort -u) | grep -v '^$' || true)
 
     if [ -n "$ours" ] && [ "${UNDEPLOY_SCALEDOBJECTS:-true}" = "true" ]; then

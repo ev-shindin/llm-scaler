@@ -289,7 +289,7 @@ kubectl logs -n workload-variant-autoscaler-system \
 kubectl get crd variantautoscalings.llmd.ai
 
 # Check RBAC
-kubectl get clusterrole,clusterrolebinding -l app=workload-variant-autoscaler
+kubectl get clusterrole,clusterrolebinding -l app.kubernetes.io/name=workload-variant-autoscaler
 ```
 
 ### GPUs Not Appearing
