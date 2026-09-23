@@ -98,4 +98,4 @@ stack](guides/testing-with-llm-d/) · [benchmark WVA](guides/benchmarking/)
 ## Need help?
 
 - [Troubleshooting](reference/troubleshooting.md) first, then [after the install](reference/operations.md)
-- [Open an issue](https://github.com/ev-shindin/llm-scaler/issues)
+- [Open an issue](https://github.com/ev-shindin/llm-scaling-manager/issues)

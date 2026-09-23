@@ -34,7 +34,7 @@ export REPO_ROOT
 # CI) so two readers running the same guide a week apart get the same build.
 # Left as a comment, not a behavior change: not yet, while the image is still a
 # moving target on purpose.
-export IMG="${IMG:-ghcr.io/ev-shindin/llm-scaler:main}"
+export IMG="${IMG:-ghcr.io/ev-shindin/llm-scaling-manager:main}"
 
 # The namespace WVA installs into.
 #
