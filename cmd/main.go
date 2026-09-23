@@ -670,7 +670,6 @@ func main() {
 		// was disabled -- which is the default.
 		registration.RegisterArrivalRateQueries(sourceRegistry)
 		if taRegistered {
-			registration.RegisterThroughputAnalyzerQueries(sourceRegistry)
 			if err := engine.RegisterAnalyzer(throughput.AnalyzerName, throughput.NewThroughputAnalyzer()); err != nil {
 				return err
 			}
