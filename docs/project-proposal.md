@@ -1,7 +1,8 @@
 # llm-scaling-manager: project proposal
 
-An analytical scaling manager for llm-d inference: multi-model, variant- and
-P/D-aware — scaling, warm capacity and placement under one GPU budget.
+An analytical autoscaler for llm-d inference: **multi-model** — one GPU budget,
+every model and variant, one joint decision — with **warm capacity**,
+**scale-to-zero** and **P/D-aware** scaling on top.
 
 It began as a fork of llm-d's Workload Variant Autoscaler
 (`llm-d/llm-d-workload-variant-autoscaler`, the path still in this tree's
@@ -44,10 +45,12 @@ whatever GPU budget a declared limiter allows. Not a forecaster and not a
 threshold ladder — a model that can be read, argued with, and checked against the
 numbers it produced.
 
-**Publishes, rather than actuates.** It implements the KEDA external-scaler gRPC
-contract; KEDA owns the HPA and writes the scale subresource. That is why this is
-a *scaling manager* and not an autoscaler: the decision is ours, the actuation is
-Kubernetes'.
+**Decides; Kubernetes actuates.** It implements the KEDA external-scaler gRPC
+contract, and KEDA owns the HPA that writes the scale subresource. That split is
+deliberate — an autoscaler for this workload has to reason across models before it
+can pick a replica count, and the actuation is the part Kubernetes already does
+well. It is why the name says *manager*: the name declines to claim the half we
+do not perform.
 
 **Manages capacity, not only replica counts.** A shared warm pool holds
 accelerators with models resident and lends them to bridge a scale-up;

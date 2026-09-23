@@ -14,9 +14,10 @@ and — for the parts we have not solved — what we know that is worth knowing
 anyway. The property-by-property version, with the sources, is in our
 [project proposal](../project-proposal.md).
 
-We are [llm-scaling-manager](https://github.com/ev-shindin/llm-scaling-manager).
-It publishes a replica decision; KEDA and the HPA actuate it. It began as a fork
-of llm-d's Workload Variant Autoscaler and has diverged substantially since.
+We are [llm-scaling-manager](https://github.com/ev-shindin/llm-scaling-manager): a
+multi-model autoscaler for llm-d, with warm capacity and scale-to-zero on top. It
+decides the replica count; KEDA and the HPA actuate it. It began as a fork of
+llm-d's Workload Variant Autoscaler and has diverged substantially since.
 
 ## The short version
 
