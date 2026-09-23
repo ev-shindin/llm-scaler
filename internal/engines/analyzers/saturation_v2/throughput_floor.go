@@ -150,7 +150,7 @@ func (a *SaturationAnalyzer) saturatedThroughputReading(key string) throughputRe
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if ra, ok := a.saturatedThroughput[key]; ok {
-		return throughputReading{rate: ra.Max(), bucket: bucketOf(key), samples: ra.Len()}
+		return throughputReading{rate: ra.Median(), bucket: bucketOf(key), samples: ra.Len()}
 	}
 	rate, bucket, samples := a.nearestSaturatedThroughput(key)
 	return throughputReading{rate: rate, bucket: bucket, samples: samples, borrowed: rate > 0}
@@ -195,7 +195,7 @@ func (a *SaturationAnalyzer) nearestSaturatedThroughput(key string) (float64, st
 				continue
 			}
 			if ra, found := a.saturatedThroughput[prefix+outputBuckets[i]+suffix]; found {
-				return ra.Max(), outputBuckets[i], ra.Len()
+				return ra.Median(), outputBuckets[i], ra.Len()
 			}
 		}
 	}

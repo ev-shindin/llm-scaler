@@ -99,16 +99,44 @@ func (r *RollingAverage) Len() int {
 	return len(r.values)
 }
 
-// Max returns the largest stored value, or 0 if empty. The saturated
-// throughput window reads this rather than Average: see the saturation
-// analyzer's recordSaturatedThroughput for why a completion rate under saturation
-// under-reads while the replica is full -- and for the drain at an
-// episode's end, which it does not.
+// Max returns the largest stored value, or 0 if empty.
+//
+// The saturated throughput window used to read this, on the argument that a
+// COMPLETION rate under saturation under-reads while the replica is full, so
+// the largest reading is the best estimate of what it sustains. That argument
+// held for a completion rate and did not survive the move to a token rate,
+// which bursts rather than under-reads; the window reads Median now, and the
+// measurements are on it.
 func (r *RollingAverage) Max() float64 {
 	if len(r.values) == 0 {
 		return 0
 	}
 	return slices.Max(r.values)
+}
+
+// Median returns the middle value of the window, the lower of the two middle
+// values on an even count, or 0 when the window is empty.
+//
+// Where Max is the right read for a figure whose error is one-sided -- a
+// saturated COMPLETION rate under-reads while a replica fills, so the largest
+// reading is the best estimate of what it sustains -- Median is the right read
+// for one that bursts. A generation-token rate is the latter. Measured over
+// the 2026-09-22 rerun, phase 1: the per-replica rate ran 4028 min, 7548
+// median, 11663 max, while the fleet's own total sat at 33,175 tokens/s
+// against a demanded 36,000 -- so the typical reading was the true one and the
+// peak was half again above it. Read with Max, the window ratcheted to a mu of
+// 3.6 req/s and the demand floor asked for 1.6 replicas where about 8 were
+// needed; the fleet's average per-replica rate over that window, 4,538
+// tokens/s, prices mu at 0.76, inside the 0.61-0.85 the fleet's own queueing
+// implies.
+func (r *RollingAverage) Median() float64 {
+	if len(r.values) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(r.values))
+	copy(sorted, r.values)
+	slices.Sort(sorted)
+	return sorted[(len(sorted)-1)/2]
 }
 
 // Stale reports whether nothing has touched the window within the timeout:
