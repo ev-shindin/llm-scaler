@@ -100,6 +100,41 @@ another feature.
 - **A weights PVC is not a latency fix.** 430 MB/s measured. It avoids
   re-downloads, not cold starts.
 
+## 4b. Against the llm-d problem space: what we are resolving now
+
+Naina Singh's
+[Autoscaling in llm-d: The Production Problem Space](https://docs.google.com/document/d/13oqOGsM1PP9qVg0Rs67BE3vYsvk8xnCnKHAdI7oRfR4/edit?tab=t.0)
+(August 2026) states the problem and orders the user stories by when operators
+hit them. We agree with it, and this is our position against each part — built,
+measured, or open.
+
+| Problem-space property | Status here | Evidence |
+| --- | --- | --- |
+| 3. Load is not request count | **Built** | Token throughput, KV-cache pressure, ITL fit, prefill/decode ratio |
+| 4. Scale-up takes minutes | **Built + measured** | Rises of 5.1–8.8 s p95 → 0.11–0.83 s; 437 ms model switch vs ~41 s cold |
+| 1. Replicas are deeply stateful | **Built** | Sleep/wake, resident models in a shared pool, scale-to-zero parking |
+| 6. Models compete for the same GPUs | **Built** | One joint decision across every model and variant, inside one GPU budget |
+| 5. Disaggregation splits the scaling unit | **Built** | P/D role is a variant, scaled on its own bottleneck |
+| 7. Self-service changes capacity unprompted | **Built** | Managed workloads learned from the KEDA calls themselves — no watch, listing or annotation |
+| 2. The margin for error is expensive | **Built** | Scale-down holding, which stops a single noisy sample pinning the fleet for the HPA's whole 300 s window |
+| P0: weights from a peer, not storage | **Measured, not shipped** | Byte-identical, ~9× faster than reloading from storage |
+| 8. Placement constraints | **Partial** | GPU-aware wake placement; geography and fabric constraints not modelled |
+| P1: low-priority workloads yield GPUs | **Designed, not built** | Replica reallocation across priorities |
+| 4. *Predicting* load at replica-ready time | **Not built** | Closed-form by choice; see non-goals |
+| P2: SLA-target-driven scaling | **Not built** | Named policy tiers only — nobody upstream has solved this |
+| 9. Maintenance pre-scaling, failure replacement | **Not built** | — |
+
+The three problems that document names, in its order: **N+1 scale-out** is what
+the warm pool and the capacity model address today, with numbers. **0→1 cold
+start** is addressed for small models (park and wake) and bounded for large ones
+by the 152 s construction floor in §1 — the snapshot that would have removed it
+does not work yet (§4). **SLA-target-driven scaling** is open, for us and for
+everyone.
+
+We also agree with its scope boundaries, and they are ours: node provisioning
+belongs to the cluster autoscaler, quota between models to Kueue, tenant quota to
+the gateway, and the actual scale operation to KEDA/HPA.
+
 ## 5. Scope and non-goals
 
 **In scope:** horizontal replica decisions across models, variants and P/D roles;
