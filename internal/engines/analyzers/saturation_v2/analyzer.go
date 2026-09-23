@@ -18,6 +18,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
 )
 
 // SaturationAnalyzer implements the domain.Analyzer interface using a
@@ -84,6 +85,12 @@ type SaturationAnalyzer struct {
 	// and when a change of either was raised and not yet settled. See
 	// shape_change.go for what the event is for.
 	fleetShape map[string]*shapeMemo
+
+	// itlWindows is one rolling window of (k, ITL) readings per variant, from
+	// which ITL(k) = A*k + B is fitted so mu can be derived for the shape the
+	// fleet is serving NOW rather than waiting for it to saturate under it
+	// (mu_from_itl.go). Keyed like the throughput windows and swept with them.
+	itlWindows map[string]*itl.Window
 	// now is the clock the memory reads; tests set it.
 	now func() time.Time
 }
@@ -108,6 +115,7 @@ func NewSaturationAnalyzer(store *capacity.Store) *SaturationAnalyzer {
 		capacityStore:          store,
 		decodeSaturatedAt:      make(map[string]time.Time),
 		fleetShape:             make(map[string]*shapeMemo),
+		itlWindows:             make(map[string]*itl.Window),
 		now:                    time.Now,
 	}
 }
@@ -240,6 +248,16 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	stableOutput, shapeChanged := a.noteFleetShape(input.Namespace, input.ModelID,
 		fleetInput, fleetOutput, arriving, arrivingOK, holdFor, logger)
 
+	// One ITL(k) fit per variant per cycle, from readings its replicas report
+	// at whatever load they are at. This is what lets mu be priced for the
+	// shape arriving now instead of the one the fleet last saturated under
+	// (mu_from_itl.go).
+	itlModels := make(map[string]itl.Model, len(gpusByVariant))
+	for variant := range gpusByVariant {
+		key := input.Namespace + "|" + input.ModelID + "|" + variant
+		itlModels[variant] = a.noteITL(key, input.ReplicaMetrics, variant, a.now())
+	}
+
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]capacity.ReplicaCapacity, 0, len(input.ReplicaMetrics))
 	for _, rm := range input.ReplicaMetrics {
@@ -252,7 +270,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		role := rolesByVariant[rm.VariantName]
 		downstreamSaturated := decodeSaturated && canonicalRole(role) == domain.RolePrefill
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
-			role, accelByVariant[rm.VariantName], stableOutput, fleetOutput, downstreamSaturated, logger)
+			role, accelByVariant[rm.VariantName], stableOutput, fleetOutput,
+			deriveMu(itlModels[rm.VariantName], engineParamsFor(a, input.Namespace, input.ModelID, rm.VariantName),
+				rm.TotalKvCapacityTokens, fleetInput, fleetOutput),
+			downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -413,6 +434,10 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// bucket label wants hysteresis; a physical quantity does not, and mu is
 	// divided by this one.
 	fleetOutput float64,
+	// derived is mu priced from this variant's fitted ITL model, which needs
+	// no saturated cycle and no bucket. It is preferred over the measured
+	// window when present (mu_from_itl.go).
+	derived derivedMu,
 	downstreamSaturated bool,
 	logger logr.Logger,
 ) *capacity.ReplicaCapacity {
@@ -520,6 +545,23 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	}
 	reading := a.saturatedThroughputReading(throughputKey)
 	saturatedThroughput, throughputBucket := reading.rate, reading.bucket
+	throughputSamples := reading.samples
+	throughputBorrowed := reading.borrowed
+	// The derived figure wins when there is one. The measured window can only
+	// speak for the shape it was recorded under, and on the shape swap of
+	// 2026-09-23 it spoke for a shape that had stopped arriving nineteen
+	// minutes earlier -- it is kept as the fallback for a fleet whose ITL
+	// model has not been fitted yet, not as the preferred answer.
+	if derived.ok {
+		saturatedThroughput = derived.rate
+		throughputBucket = "derived"
+		// Derived, so it is not one sample of anything: it is as good on the
+		// first cycle of a new shape as on the hundredth, which is the whole
+		// point, and the floor's own gate for trusting a window with an order
+		// is satisfied by construction.
+		throughputSamples = MinDerivedThroughputSamples
+		throughputBorrowed = false
+	}
 
 	effectiveCapacity := k1
 	bound := "k1-memory"
@@ -575,8 +617,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		ReplicaDemand:               replicaDemand,
 		FromWarmPool:                rm.FromWarmPool,
 		SaturatedThroughput:         saturatedThroughput,
-		SaturatedThroughputSamples:  reading.samples,
-		SaturatedThroughputBorrowed: reading.borrowed,
+		SaturatedThroughputSamples:  throughputSamples,
+		SaturatedThroughputBorrowed: throughputBorrowed,
 	}
 }
 
@@ -1753,4 +1795,13 @@ func median(values []int64) int64 {
 		return (sorted[n/2-1] + sorted[n/2]) / 2
 	}
 	return sorted[n/2]
+}
+
+// engineParamsFor is the engine configuration recorded for one variant, or
+// nil when the capacity store has not seen it yet.
+func engineParamsFor(a *SaturationAnalyzer, namespace, modelID, variantName string) *capacity.EngineParams {
+	if rec := a.capacityStore.Get(namespace, modelID, variantName); rec != nil {
+		return rec.EngineParams
+	}
+	return nil
 }

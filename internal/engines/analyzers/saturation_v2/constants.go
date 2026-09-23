@@ -82,3 +82,11 @@ const (
 	// output-length bucket; anything at or above it is "huge".
 	VeryLongOutputThreshold = 6000
 )
+
+// MinDerivedThroughputSamples is the sample count a mu derived from ITL(k)
+// reports. A derived figure is not a sample of anything -- it is as good on
+// the first cycle of a new shape as on the hundredth -- so it satisfies the
+// floor's gate for trusting a window with an order by construction. It equals
+// floor.MinThroughputSamplesToOrder; stated here rather than imported because
+// signals/floor imports this analyzer's own capacity types.
+const MinDerivedThroughputSamples = 2
