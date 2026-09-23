@@ -85,6 +85,11 @@ stack](guides/testing-with-llm-d/) · [benchmark WVA](guides/benchmarking/)
 - **[Benchmark internals](developer-guide/benchmark-guide.md)** · **[two-variant benchmark](developer-guide/two-variant-wva-benchmark.md)** · **[recorded results](developer-guide/benchmark-results.md)** · **[an example k2 decision report](developer-guide/benchmark-k2-decisions-example.md)**
 - **[Release process](developer-guide/release-process.md)** · **[Contributing](../CONTRIBUTING.md)**
 
+## What this project is
+
+- **[Project proposal](project-proposal.md)** — what it does, what is measured, what it does not cover, mapped against the llm-d autoscaling problem space
+- **[blog/](blog/)** — posts written for people outside the repository
+
 ## Design notes
 
 - **[proposals/](proposals/)** — work not built yet, or built and still moving. The warm pool's argument and implementation design live here, as does the [FMA post-mortem](proposals/fma-post-mortem.md) explaining what the pool inherited.

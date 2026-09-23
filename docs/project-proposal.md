@@ -8,6 +8,9 @@ It began as a fork of llm-d's Workload Variant Autoscaler
 (`llm-d/llm-d-workload-variant-autoscaler`, the path still in this tree's
 `go.mod`) and has diverged substantially since.
 
+A shorter version of the argument, written for people outside this
+repository: [Sub-second scale-ups on llm-d](blog/sub-second-scale-ups-on-llm-d.md).
+
 ## 1. The problem
 
 Autoscaling an LLM fleet is not autoscaling a web service, for one reason: **a
