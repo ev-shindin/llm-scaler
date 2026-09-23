@@ -131,18 +131,105 @@ var _ = Describe("the floor's mu, through Analyze", func() {
 			"a mu derived for the shape now arriving asks for one or two replicas")
 	})
 
-	It("still answers when it has no model to derive from", func() {
-		// No ITL readings at all: every replica reports a shape and a load but
-		// no inter-token latency, so nothing can be fitted and the measured
-		// window is all there is. The analyzer must still produce a result
-		// rather than lose the role's floor entirely.
+	It("carries the fit across a shape change instead of refitting", func() {
+		// The window is not cleared when the shape moves, and this is the spec
+		// that holds it to that: cycle 2 brings only three replicas, which on
+		// their own are short of DefaultMinSamples and of the k-spread, so a
+		// model can only exist here if cycle 1's readings are still in the
+		// window. ITL(k) describes the hardware, not the shape, so they are.
 		a := NewSaturationAnalyzer(capacity.NewStore())
-		in := fleet(3, 1000, 6000, 10, 900_000)
+		ctx := context.Background()
+
+		_, err := a.Analyze(ctx, fleet(10, 1000, 6000, 10, 900_000))
+		Expect(err).NotTo(HaveOccurred())
+
+		res, err := a.Analyze(ctx, fleet(3, 8000, 1000, 0, 17_282))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(impliedReplicas(res)).To(BeNumerically("<", 2.5),
+			"three fresh readings cannot fit a model; the carried-over ones can")
+	})
+
+	It("falls back to the measured window when no model can be fitted", func() {
+		// Ten replicas, so the sample count is not what stops it -- every one
+		// of them reports no inter-token latency, which is the exclusion under
+		// test. The floor must still bind, on the measured reading, rather than
+		// the role quietly losing its floor.
+		a := NewSaturationAnalyzer(capacity.NewStore())
+		in := fleet(10, 1000, 6000, 10, 900_000)
 		for i := range in.ReplicaMetrics {
 			in.ReplicaMetrics[i].AvgITL = 0
 		}
 		res, err := a.Analyze(context.Background(), in)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RoleDemand).To(HaveKey(domain.RoleDecode))
+
+		// The measured mu here is the fleet's own completion rate, 0.6 req/s
+		// against 6 arriving, so the floor asks for far more than the derived
+		// path would -- which is the point: this is the old answer, and it is
+		// still available when the new one is not.
+		Expect(impliedReplicas(res)).To(BeNumerically(">", 2.5),
+			"with no model the floor is back on the measured reading")
+	})
+})
+
+var _ = Describe("noteITL", func() {
+	const variant = "decode-v"
+
+	reading := func(pod string, k, avgITL float64) domain.ReplicaMetrics {
+		rm := makeReplicaMetrics(pod, variant, 900_000, tracedKv, 0, 1000, 6000)
+		rm.Ready = true
+		rm.KvUsageInstant = k
+		rm.AvgITL = avgITL
+		return rm
+	}
+	// Ten readings on the traced line, enough to fit it.
+	line := func() []domain.ReplicaMetrics {
+		out := make([]domain.ReplicaMetrics, 0, 10)
+		for i := 0; i < 10; i++ {
+			k := 0.20 + 0.06*float64(i)
+			out = append(out, reading(fmt.Sprintf("d%d", i), k, tracedModel.ITLAt(k)))
+		}
+		return out
+	}
+	fit := func(rms []domain.ReplicaMetrics) itl.Model {
+		a := NewSaturationAnalyzer(capacity.NewStore())
+		return a.noteITL("ns|model|"+variant, rms, variant, a.now())
+	}
+
+	It("fits the line its replicas are reporting", func() {
+		got := fit(line())
+		Expect(got.IsZero()).To(BeFalse())
+		Expect(got.A).To(BeNumerically("~", tracedModel.A, 1e-6))
+		Expect(got.B).To(BeNumerically("~", tracedModel.B, 1e-6))
+	})
+
+	DescribeTable("leaves out what is not a reading of this variant's own replicas",
+		func(spoil func(*domain.ReplicaMetrics)) {
+			rms := line()
+			for i := range rms {
+				spoil(&rms[i])
+			}
+			Expect(fit(rms).IsZero()).To(BeTrue())
+		},
+		Entry("another variant's", func(rm *domain.ReplicaMetrics) { rm.VariantName = "other-v" }),
+		Entry("a pod still failing readiness", func(rm *domain.ReplicaMetrics) { rm.Ready = false }),
+		Entry("a warm-pool bridge on the pool's own settings", func(rm *domain.ReplicaMetrics) { rm.FromWarmPool = true }),
+		Entry("no inter-token latency", func(rm *domain.ReplicaMetrics) { rm.AvgITL = 0 }),
+		Entry("no utilization to place it at", func(rm *domain.ReplicaMetrics) { rm.KvUsageInstant = 0 }),
+		Entry("a load above the band the line was fitted in", func(rm *domain.ReplicaMetrics) {
+			rm.KvUsageInstant = itl.DefaultMaxObservableK + 0.05
+		}),
+	)
+
+	It("keeps the good readings when only some are excluded", func() {
+		rms := line()
+		rms = append(rms, reading("warm", 0.5, 0.02))
+		rms[len(rms)-1].FromWarmPool = true
+		rms = append(rms, reading("other", 0.5, 0.02))
+		rms[len(rms)-1].VariantName = "other-v"
+
+		got := fit(rms)
+		Expect(got.IsZero()).To(BeFalse())
+		Expect(got.A).To(BeNumerically("~", tracedModel.A, 1e-6),
+			"the excluded readings are off the line and would drag the fit")
 	})
 })

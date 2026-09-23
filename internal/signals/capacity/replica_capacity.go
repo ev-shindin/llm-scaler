@@ -47,4 +47,11 @@ type ReplicaCapacity struct {
 	// anything less holds.
 	SaturatedThroughputSamples  int
 	SaturatedThroughputBorrowed bool
+	// SaturatedThroughputDerived is set when SaturatedThroughput was
+	// DERIVED from the variant's ITL(k) model rather than measured from a
+	// saturated cycle. A derived figure is priced for the shape arriving
+	// now, so it needs no sample count and is never borrowed from another
+	// shape's window -- the two fields above describe the measured window
+	// that was NOT used, and are left alone so they stay honest about it.
+	SaturatedThroughputDerived bool
 }

@@ -343,8 +343,16 @@ func fleetHasMeasuredItself(replicas []capacity.ReplicaCapacity) bool {
 	}
 	measured := make(map[string]bool, len(replicas))
 	for _, rc := range replicas {
-		own := rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed &&
-			rc.SaturatedThroughputSamples >= floor.MinThroughputSamplesToOrder
+		// A derived figure settles the hold on sight. The hold exists because a
+		// MEASURED reading can only speak for the shape it was recorded under,
+		// so the fleet had to be caught saturating again before anything could
+		// be trusted. A figure derived from ITL(k) is priced for the shape
+		// arriving now, on the cycle it arrives, so there is nothing left to
+		// wait for -- and waiting is what cost the 2026-09-23 run its fleet,
+		// since an over-provisioned fleet never saturates to be caught.
+		own := rc.SaturatedThroughputDerived ||
+			(rc.SaturatedThroughput > 0 && !rc.SaturatedThroughputBorrowed &&
+				rc.SaturatedThroughputSamples >= floor.MinThroughputSamplesToOrder)
 		measured[rc.VariantName] = measured[rc.VariantName] || own
 	}
 	for _, ok := range measured {

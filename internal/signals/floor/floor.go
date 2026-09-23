@@ -161,7 +161,12 @@ func Estimate(
 		if _, seen := borrowedOnly[role]; !seen {
 			borrowedOnly[role] = true
 		}
-		if rc.SaturatedThroughputBorrowed {
+		// A DERIVED figure is this role's own, whatever the measured window
+		// beside it is doing. It was priced for the shape arriving now from
+		// this variant's own ITL(k), so it is neither borrowed from another
+		// shape's bucket nor a count of samples -- the two fields below
+		// describe the measured window that was not used.
+		if rc.SaturatedThroughputBorrowed && !rc.SaturatedThroughputDerived {
 			borrowedCosts[role] = append(borrowedCosts[role], p/rc.SaturatedThroughput)
 			borrowedMus[role] = append(borrowedMus[role], rc.SaturatedThroughput)
 			continue
@@ -169,7 +174,12 @@ func Estimate(
 		costs[role] = append(costs[role], p/rc.SaturatedThroughput)
 		mus[role] = append(mus[role], rc.SaturatedThroughput)
 		borrowedOnly[role] = false
-		if rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder && !staleShape {
+		// Ordering on a derived figure does not wait for samples, and does
+		// not wait out a shape change either: it is priced for the shape
+		// that changed TO, which is the whole reason the hold exists and
+		// the reason it no longer has to.
+		if rc.SaturatedThroughputDerived ||
+			(rc.SaturatedThroughputSamples >= MinThroughputSamplesToOrder && !staleShape) {
 			mayOrder[role] = true
 		}
 	}

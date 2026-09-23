@@ -154,8 +154,18 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 			delete(a.lastAccelerator, key)
 		}
 	}
-	// The saturated-throughput windows live and die with the k2 windows they
-	// were recorded beside: same key, same observation, same timeout.
+	// An ITL window ages by its own observations rather than by a timestamp
+	// of its own: Prune drops readings past DefaultObservationMaxAge, so a
+	// window left empty by that belongs to a variant nothing has reported for
+	// at least that long. Without this the map keeps one window per variant
+	// that has EVER been seen, including deleted and renamed ones.
+	now := a.now()
+	for key, w := range a.itlWindows {
+		w.Prune(now)
+		if w.Len() == 0 {
+			delete(a.itlWindows, key)
+		}
+	}
 	for key, ra := range a.saturatedThroughput {
 		if ra.Stale(timeout) {
 			delete(a.saturatedThroughput, key)
@@ -254,7 +264,22 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	// (mu_from_itl.go).
 	itlModels := make(map[string]itl.Model, len(gpusByVariant))
 	for variant := range gpusByVariant {
-		key := input.Namespace + "|" + input.ModelID + "|" + variant
+		// Decode only. ITL is the latency between GENERATED tokens, and
+		// deriveMu divides a token rate by an output length; prefill emits
+		// about one token per request -- its work is the prompt -- so the
+		// same arithmetic would read three orders of magnitude low, which is
+		// why saturatedCompletionRate special-cases it on the measured path
+		// too (shape_change.go).
+		if canonicalRole(rolesByVariant[variant]) != domain.RoleDecode {
+			continue
+		}
+		// Keyed by what ITL(k) is a property of: the accelerator and how many
+		// of them a replica has. Pooling two GPU products under one key is the
+		// bug stableAccelerator exists to prevent for k2 (the k1<->k2
+		// oscillation of PR #40 on a heterogeneous cluster), and a blended
+		// ITL line is meaningless for either product.
+		key := a.itlWindowKey(input.Namespace, input.ModelID, variant,
+			accelByVariant[variant], gpusByVariant[variant])
 		itlModels[variant] = a.noteITL(key, input.ReplicaMetrics, variant, a.now())
 	}
 
@@ -545,8 +570,6 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	}
 	reading := a.saturatedThroughputReading(throughputKey)
 	saturatedThroughput, throughputBucket := reading.rate, reading.bucket
-	throughputSamples := reading.samples
-	throughputBorrowed := reading.borrowed
 	// The derived figure wins when there is one. The measured window can only
 	// speak for the shape it was recorded under, and on the shape swap of
 	// 2026-09-23 it spoke for a shape that had stopped arriving nineteen
@@ -559,8 +582,6 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		// first cycle of a new shape as on the hundredth, which is the whole
 		// point, and the floor's own gate for trusting a window with an order
 		// is satisfied by construction.
-		throughputSamples = MinDerivedThroughputSamples
-		throughputBorrowed = false
 	}
 
 	effectiveCapacity := k1
@@ -617,8 +638,9 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		ReplicaDemand:               replicaDemand,
 		FromWarmPool:                rm.FromWarmPool,
 		SaturatedThroughput:         saturatedThroughput,
-		SaturatedThroughputSamples:  throughputSamples,
-		SaturatedThroughputBorrowed: throughputBorrowed,
+		SaturatedThroughputSamples:  reading.samples,
+		SaturatedThroughputBorrowed: reading.borrowed,
+		SaturatedThroughputDerived:  derived.ok,
 	}
 }
 
@@ -1804,4 +1826,13 @@ func engineParamsFor(a *SaturationAnalyzer, namespace, modelID, variantName stri
 		return rec.EngineParams
 	}
 	return nil
+}
+
+// itlWindowKey names one ITL(k) window. ITL is a property of the
+// accelerator and the engine, so the key carries both the accelerator
+// (through stableAccelerator, which absorbs the flapping a heterogeneous
+// fleet reports) and the GPU count, and no shape dimension at all.
+func (a *SaturationAnalyzer) itlWindowKey(namespace, modelID, variantName, accelerator string, gpuCount int) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%d", namespace, modelID, variantName,
+		a.stableAccelerator(namespace, variantName, accelerator), gpuCount)
 }

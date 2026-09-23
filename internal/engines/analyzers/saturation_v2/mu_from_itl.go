@@ -142,6 +142,19 @@ func (a *SaturationAnalyzer) noteITL(key string, replicas []domain.ReplicaMetric
 		}
 		w.Add(rm.KvUsageInstant, rm.AvgITL, now)
 	}
-	model, _ := itl.Fit(w.Observations())
+	w.Prune(now)
+	// The window's own confidence gate, not itl.Fit's. Fit will draw a line
+	// through any two points that are not on top of each other; Ready is
+	// what says the points are enough of them and far enough apart in k to
+	// mean something (DefaultMinSamples, DefaultMinKSpread). The throughput
+	// analyzer gates on it for the same reason, and a derived mu overrides
+	// the measured one, so it has to clear a higher bar than two readings.
+	if !w.Ready() {
+		return itl.Model{}
+	}
+	model, ok := itl.Fit(w.Observations())
+	if !ok {
+		return itl.Model{}
+	}
 	return model
 }
