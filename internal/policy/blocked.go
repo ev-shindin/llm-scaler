@@ -93,12 +93,12 @@ func LogBlockedTransition(ctx context.Context, namespace, modelID string, reason
 		"modelID", modelID,
 		"namespace", namespace,
 		"reasons", strings.Join(reasons, ","),
-		"detail", BlockedDetail(reasons))
+		"detail", blockedDetail(reasons))
 }
 
-// BlockedDetail spells out what each reason means for this model, since the
+// blockedDetail spells out what each reason means for this model, since the
 // reason slugs are chosen for a metric label rather than for a reader.
-func BlockedDetail(reasons []string) string {
+func blockedDetail(reasons []string) string {
 	details := make([]string, 0, len(reasons))
 	for _, reason := range reasons {
 		switch reason {

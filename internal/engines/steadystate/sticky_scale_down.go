@@ -34,7 +34,7 @@ func (e *Engine) pruneLastDecided(maxAge time.Duration, now time.Time) {
 // stale by the next cycle and the switch would silently do nothing.
 const stickyAgeCycles = 4
 
-// stickyAge is the age bound in force: stickyMaxAge, or stickyAgeCycles
+// stickyAge is the age bound in force: policy.DefaultMaxAge, or stickyAgeCycles
 // optimize intervals when those are longer.
 func (e *Engine) stickyAge() time.Duration {
 	age := policy.DefaultMaxAge

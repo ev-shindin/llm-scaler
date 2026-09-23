@@ -7,6 +7,10 @@
 // and the throttling of the policy lines an operator reads. Each is a
 // function of its inputs, with no engine state behind it, so each can be
 // read and tested on its own.
+//
+// Not to be confused with internal/warmpool/policy, which decides what the
+// warm pool does with the Pods it holds. This package is the scaling
+// pipeline's; a file that needs both imports one under an alias.
 package policy
 
 import (

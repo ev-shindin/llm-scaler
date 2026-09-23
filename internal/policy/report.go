@@ -13,11 +13,21 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 )
 
+// ChangeReporter reports a policy line only when what it says has changed.
+//
+// The effective policy, an unknown policy name, a conflict between two
+// variants of one model and an unresolved accelerator are all conditions
+// that hold for as long as the configuration does, so reporting them every
+// cycle would bury the cycle a reader is looking for. Each is keyed by what
+// it describes and reported again only when the summary differs.
+//
+// Safe for concurrent use: the reporter holds its own lock.
 type ChangeReporter struct {
 	mu   sync.Mutex
 	seen map[string]string
 }
 
+// NewChangeReporter returns a reporter that has said nothing yet.
 func NewChangeReporter() *ChangeReporter {
 	return &ChangeReporter{seen: make(map[string]string)}
 }

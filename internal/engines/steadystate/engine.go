@@ -83,7 +83,8 @@ type Engine struct {
 
 	// policies reports which scaling policy tier each model resolved to, and the
 	// two ways that resolution goes wrong silently — an unknown tier name, and one
-	// model's variants naming different tiers. Change-throttled; see policy.Reporter.
+	// model's variants naming different tiers. Change-throttled; see
+	// policy.ChangeReporter.
 	policies *policy.ChangeReporter
 
 	Config *config.Config // Unified configuration (injected from main.go)
