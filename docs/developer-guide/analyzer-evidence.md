@@ -141,6 +141,56 @@ asked for 1.6 replicas where about 8 were needed. The fleet's average
 per-replica rate over that window, 4,538 tokens/s, prices mu at 0.76, inside
 the 0.61-0.85 the fleet's own queueing implies. The window reads `Median`.
 
+## The arrival rate
+
+### The arrival rate is a dispatch rate while the queue is building
+
+*2026-09-24, the 8k1000 -> 1k6000 shape-swap trace at a constant 6 req/s, both
+passes of run 23.*
+
+`QueryModelArrivalRate` read
+`rate(inference_extension_scheduler_attempts_total{status="success"}[1m])`.
+That counter increments when the scheduler PLACES a request on a pod, so while
+the fleet is saturated it measures what the fleet could take, not what the
+workload offered. Against the flow-control enqueue counter, which increments
+when a request is accepted, over the ramp of one pass:
+
+| t+ | placements (what sized the fleet) | enqueues (what arrived) |
+|---|---|---|
+| 120 s | 5.38 | 6.10 |
+| 180 s | 3.82 | 5.56 |
+| **240 s** | **1.66** | **6.16** |
+| 300 s | 4.88 | 5.90 |
+| 360 s | 5.22 | 5.38 |
+| 420 s | 6.50 | 6.50 |
+| 480 s | 5.80 | 5.80 |
+
+A **3.7x under-read at the worst moment**, with the scheduler queue at 356
+and growing -- and the two agree to the digit from 420 s. The queue itself
+drained earlier, at about 270 s; placements stay low for the two samples after
+that because the counter is still working through the drain burst, not because
+the queue is still full. The error is not noise:
+it is largest exactly when the fleet is furthest behind, which is when this
+figure orders capacity.
+
+What it cost on that run: the floor asked for 4.10 replicas where the true
+arrival rate implies 5.61. The fleet stalled at 5 decode replicas through
+minutes 3 and 4 while the scheduler queue climbed to 356 -- 605 counting the
+engines' own queues behind it, which is what the floor prices -- and the whole of the
+run's TTFT tail is those four minutes -- p95 44.7 s, p99 70.3 s, against a
+queue that is empty and a p50 of 112 ms for the remaining fifty-five.
+
+The sibling pass of the same run drew slightly better numbers, held 6 replicas
+instead of 5, peaked at 284 queued instead of 356, and landed p95 22.4 s. Same
+code, same trace, same hour; the difference is which side of a replica the
+under-read happened to fall on.
+
+`deriv(queue_size)` was tried as a correction -- placements plus queue growth
+should be arrivals -- and rejected. Measured against the enqueue counter it was
+wrong by up to 8.28 req/s and went NEGATIVE (-0.20, -2.38 req/s) at the two
+samples where the queue was draining fastest, which is worse than the
+under-read it was meant to repair.
+
 ## How to add to this file
 
 One section per decision, with the date, the run identifier and the numbers
