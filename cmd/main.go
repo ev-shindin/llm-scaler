@@ -628,7 +628,7 @@ func main() {
 
 		// Quota mode means "no physical-capacity discovery" — including the
 		// inventory-collection call in the saturation engine. We honor that
-		// at the call site (see steadystate.shouldCollectClusterInventory),
+		// at the call site (see scalingpolicy.ShouldCollectClusterInventory),
 		// but warn loudly here so an operator who explicitly enabled
 		// WVA_LIMITED_MODE sees that their inventory log will be suppressed.
 		if cfg.EffectiveLimiterMode() == config.LimiterTypeQuota && cfg.LimitedModeEnabled() {
