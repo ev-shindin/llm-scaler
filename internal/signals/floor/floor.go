@@ -13,23 +13,26 @@ const (
 	// that is not yet running: the throughput model prices a backlog of B
 	// requests as B / BacklogDrainSeconds extra arrivals per second, so the
 	// fleet it asks for clears the backlog in about this long while keeping up
-	// with the load. It should not be shorter than a replica's start time --
-	// capacity ordered to drain a backlog faster than it can start drains
-	// nothing -- and a replica on the benchmark clusters takes 60-100 s. Sixty
-	// keeps the order within one start.
+	// with the load.
+	//
+	// It must not be shorter than a replica's start, or it orders capacity
+	// that drains nothing. Sixty keeps the order within one start on the
+	// benchmark stands; see "A backlog is throughput, not residency" in
+	// docs/developer-guide/analyzer-evidence.md.
 	BacklogDrainSeconds = 60.0
 
 	// MinThroughputSamplesToOrder is how many saturated readings a role's own
 	// output-length bucket must hold before the throughput floor may ORDER a
-	// replica from it; with fewer it holds the fleet and no more. The first
-	// reading at a saturation under-reads (a 1m rate on a replica that has
-	// been full for 20 s counts a third of a minute's completions), and an
-	// order on an under-read over-provisions in a way that removes the
-	// saturation which would have corrected it. Measured on the shape-swap
-	// trace: 3.67, then 5.23, then 7.13 req/s on three consecutive saturated
-	// scrape pairs, 60-90 s apart. Two readings from two rate windows -- not
-	// the same window read twice (the saturation analyzer's
-	// recordSaturatedThroughput and ThroughputSampleSpacing).
+	// replica from it; with fewer it holds the fleet and no more.
+	//
+	// The first reading at a saturation under-reads -- a 1m rate on a replica
+	// that has been full for 20 s counts a third of a minute's completions --
+	// and an order on it over-provisions in a way that removes the saturation
+	// which would have corrected it. The two readings must come from two rate
+	// windows, not the same window read twice (the saturation analyzer's
+	// recordSaturatedThroughput and ThroughputSampleSpacing). See "Two
+	// readings, not one, before a reading may order" in
+	// docs/developer-guide/analyzer-evidence.md.
 	MinThroughputSamplesToOrder = 2
 )
 
@@ -97,19 +100,12 @@ type Term struct {
 // A borrowed reading never outvotes a replica's own. The median is taken over
 // the role's replicas that read their OWN bucket when any does, and over the
 // borrowed ones only when none does -- the rule the saturation analyzer's
-// nearestSaturatedThroughput states per key ("used only until the bucket has a reading of its own"),
-// applied to the role. Without it a shape switch flapped the fleet: a fresh
-// replica's first completions are the short requests (they finish first, and
-// a replica with none yet reads an output length of 0), so its key lands in
-// a short bucket that has no reading and borrows the previous shape's mu --
-// 4.38 req/s from 1000-token outputs -- while the replica that had been
-// saturated under the new 6000-token shape read 1.4-1.7 of its own. Two
-// fresh replicas out of three put the borrowed 4.38 at the median: the
-// backlog of 441 requests read as 2 replicas' worth instead of 5, the floor
-// fell from 10 M tokens to 3 M in one cycle, the target from 10 to 4, and
-// the backlog kept growing (256 -> 642) under the figure that said it would
-// not. Measured on the 1000/6000 shape-swap trace, 2026-09-20, cycles
-// 11:45:22-11:47:22; the target then swung 10 <-> 4 for ten minutes.
+// nearestSaturatedThroughput states per key ("used only until the bucket has
+// a reading of its own"), applied to the role. Without it a shape switch
+// flapped the fleet between two targets for ten minutes, because a fresh
+// replica reads a short bucket and borrows the previous shape's mu; see "A
+// borrowed reading never outvotes a replica's own" in
+// docs/developer-guide/analyzer-evidence.md.
 func Estimate(
 	lambda float64,
 	replicas []capacity.ReplicaCapacity,
@@ -197,20 +193,32 @@ func Estimate(
 		floor := rate * cost
 		term := Term{Mu: mu, PerReplica: cost * mu, Backlog: b, Replicas: rate / mu}
 		if !mayOrder[role] && scaleUpThreshold > 0 {
-			// A hold, not an order, on either. Letting a single reading order
-			// one replica was tried, twice: measured against the anticipated
-			// supply it ordered a fourth replica at a phase switch whose
-			// third was still starting; measured against the running supply
-			// it was a ratchet -- nothing remembered that the reading had
-			// already ordered, so once the ordered replica reported, the same
-			// reading ordered the next, up to the full figure one start at a
-			// time. Across four passes the one replica bought a single cycle
-			// over the plain hold (a third replica 30 s ahead of occupancy,
-			// on the under-read that then ran unneeded for 35 minutes), and
-			// the hold's own cost, replayed, is 15-45 s on the cold ramp's
-			// next replica: the second counted reading lands a window after
-			// the first, and occupancy orders in the meantime.
-			if hold := scaleUpThreshold * anticipated[role].TotalAnticipatedSupply; floor > hold {
+			// A hold, not an order, on either. Letting a single reading
+			// order one replica was tried twice and dropped: against the
+			// anticipated supply it ordered a replica at a phase switch
+			// whose predecessor was still starting, and against the running
+			// supply it was a ratchet, because nothing remembered that the
+			// reading had already ordered -- once the ordered replica
+			// reported, the same reading ordered the next, up to the full
+			// figure one start at a time. The hold's own cost is bounded:
+			// the second counted reading lands a window after the first, and
+			// occupancy orders in the meantime. See "Two readings, not one,
+			// before a reading may order" in
+			// docs/developer-guide/analyzer-evidence.md.
+			//
+			// The anticipated supply is floored at zero before it becomes a
+			// cap. It is (ReplicaCount + PendingReplicas) x P summed over the
+			// role, and a negative product would make the cap negative -- at
+			// which point every real floor is above it and this branch
+			// publishes the negative, inverting a package whose whole
+			// contract is that it only ever raises demand. Today every
+			// producer clamps PendingReplicas (variantmeta/discovery.go does
+			// it explicitly, and logs), so the guard costs nothing; it is
+			// here because this package cannot see that clamp, and the cost
+			// path above already skips a variant whose P is <= 0 while this
+			// one reads P again over every variant of the role.
+			hold := scaleUpThreshold * max(anticipated[role].TotalAnticipatedSupply, 0)
+			if floor > hold {
 				floor = hold
 				term.Held = true
 				term.HeldWhy = "single-sample"

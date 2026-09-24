@@ -104,9 +104,9 @@ func (r *RollingAverage) Len() int {
 // The saturated throughput window used to read this, on the argument that a
 // COMPLETION rate under saturation under-reads while the replica is full, so
 // the largest reading is the best estimate of what it sustains. That argument
-// held for a completion rate and did not survive the move to a token rate,
-// which bursts rather than under-reads; the window reads Median now, and the
-// measurements are on it.
+// did not survive the move to a token rate, which bursts rather than
+// under-reads; the window reads Median. See "The mu window reads the median,
+// not the maximum" in docs/developer-guide/analyzer-evidence.md.
 func (r *RollingAverage) Max() float64 {
 	if len(r.values) == 0 {
 		return 0
@@ -120,15 +120,10 @@ func (r *RollingAverage) Max() float64 {
 // Where Max is the right read for a figure whose error is one-sided -- a
 // saturated COMPLETION rate under-reads while a replica fills, so the largest
 // reading is the best estimate of what it sustains -- Median is the right read
-// for one that bursts. A generation-token rate is the latter. Measured over
-// the 2026-09-22 rerun, phase 1: the per-replica rate ran 4028 min, 7548
-// median, 11663 max, while the fleet's own total sat at 33,175 tokens/s
-// against a demanded 36,000 -- so the typical reading was the true one and the
-// peak was half again above it. Read with Max, the window ratcheted to a mu of
-// 3.6 req/s and the demand floor asked for 1.6 replicas where about 8 were
-// needed; the fleet's average per-replica rate over that window, 4,538
-// tokens/s, prices mu at 0.76, inside the 0.61-0.85 the fleet's own queueing
-// implies.
+// for one that bursts, and a generation-token rate is the latter. Read with
+// Max, the window ratcheted to a mu that asked for a fifth of the replicas the
+// fleet needed; see "The mu window reads the median, not the maximum" in
+// docs/developer-guide/analyzer-evidence.md.
 func (r *RollingAverage) Median() float64 {
 	if len(r.values) == 0 {
 		return 0
