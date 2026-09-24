@@ -123,6 +123,24 @@ var _ = Describe("Estimate", func() {
 		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda/2.67*float64(runK1), 1e-6))
 	})
 
+	It("never publishes a negative floor, whatever the anticipated supply says", func() {
+		// The hold cap is scaleUp x the role's anticipated supply, and that
+		// is (ReplicaCount + PendingReplicas) x P. Unguarded, a negative
+		// product caps a real floor BELOW zero -- every floor is above a
+		// negative hold, so the branch takes it -- and the package's one
+		// promise, that it only ever raises demand, inverts. Producers clamp
+		// PendingReplicas today; this package cannot see that they do.
+		one := []capacity.ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu, SaturatedThroughputSamples: 1}}
+		bad := []domain.VariantCapacity{{VariantName: "v", Role: domain.RoleDecode,
+			ReplicaCount: 1, PendingReplicas: -3, PerReplicaCapacity: float64(runK1)}}
+		f := Estimate(runLambda, one, bad, nil, BacklogDrainSeconds, 0.85, false)
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically(">=", 0),
+			"a negative anticipated supply must hold the floor at zero, not below it")
+		Expect(f.ByRole[domain.RoleDecode]).To(BeZero(),
+			"held at zero: the cap is what the engine's RC turns into nothing")
+		Expect(f.Terms[domain.RoleDecode].Held).To(BeTrue())
+	})
+
 	It("holds but does not order on a single reading", func() {
 		// The first reading at a saturation under-reads (3.67 against a true
 		// 7.13 on the run); an order on it over-provisions, and the
