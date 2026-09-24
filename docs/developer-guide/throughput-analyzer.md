@@ -505,11 +505,21 @@ avgOL               = Σ_v (nKV_v × shape_v.AvgOutputTokens) / Σ_v nKV_v
 arrivalDecodeDemand = AnalyzerInput.ArrivalRate × avgOL
 ```
 
-`AnalyzerInput.ArrivalRate` is collected from a single model-level
-`sum by (namespace) (rate(inference_extension_scheduler_attempts_total{...}))` query with no
-`pod`/`port`/`instance` labels — unlike the per-pod `ReplicaMetrics.ArrivalRate`
-(`QuerySchedulerDispatchRate`), it cannot partially mis-attribute: it either matches the model
-filter (correct) or returns zero (filter/EPP absent). No witness metric is needed.
+`AnalyzerInput.ArrivalRate` is collected from a single model-level query with no
+`pod`/`port`/`instance` labels, so unlike the per-pod `ReplicaMetrics.ArrivalRate`
+(`QuerySchedulerDispatchRate`) it cannot partially mis-attribute. No witness metric is needed.
+
+The query reads the flow-control **enqueue** counter, which increments when a request is
+accepted, and falls back to the scheduler's placement counter where flow control is not
+deployed. Placements are capacity-bound while the fleet is saturated, so a rate built from
+them under-reads the offered load by as much as 3.7x exactly while the scheduler queue is
+building — see `modelArrivalRateQuery` in
+`internal/collector/registration/throughput_analyzer.go` and
+`analyzer-evidence.md`.
+
+There are therefore three outcomes, not two: the accurate enqueue rate; the capacity-bound
+placement rate, on a fleet without flow control or on a pool serving several models; or zero,
+when no EPP is scraped at all. Nothing in the metric distinguishes the first two.
 
 `ReplicaMetrics.ArrivalRate` (per-pod) is **retained** — `internal/utils/allocation.go` still depends on it — but no longer drives TA's `TotalDemand`. The
 per-instance EPP↔vLLM key merge that previously fed it into TA's demand (and could orphan and

@@ -141,6 +141,67 @@ asked for 1.6 replicas where about 8 were needed. The fleet's average
 per-replica rate over that window, 4,538 tokens/s, prices mu at 0.76, inside
 the 0.61-0.85 the fleet's own queueing implies. The window reads `Median`.
 
+## The arrival rate
+
+### The arrival rate is a dispatch rate while the queue is building
+
+*2026-09-24, the 8k1000 -> 1k6000 shape-swap trace at a constant 6 req/s, both
+passes of run 23.*
+
+`QueryModelArrivalRate` read
+`rate(inference_extension_scheduler_attempts_total{status="success"}[1m])`.
+That counter increments when the scheduler PLACES a request on a pod, so while
+the fleet is saturated it measures what the fleet could take, not what the
+workload offered. Against the flow-control enqueue counter, which increments
+when a request is accepted, over the ramp of one pass:
+
+| t+ | placements (what sized the fleet) | enqueues (what arrived) |
+|---|---|---|
+| 120 s | 5.38 | 6.10 |
+| 180 s | 3.82 | 5.56 |
+| **240 s** | **1.66** | **6.16** |
+| 300 s | 4.88 | 5.90 |
+| 360 s | 5.22 | 5.38 |
+| 420 s | 6.50 | 6.50 |
+| 480 s | 5.80 | 5.80 |
+
+A **3.7x under-read at the worst moment**, with the scheduler queue at 234
+and climbing (it peaks at 356 one sample later) -- and the two agree to the digit from 420 s. The queue itself
+drained earlier, at about 270 s; placements stay low for the two samples after
+that because the counter is still working through the drain burst, not because
+the queue is still full. The error is not noise:
+it is largest exactly when the fleet is furthest behind, which is when this
+figure orders capacity.
+
+What it cost on that run, arithmetically: `replicasImplied` is
+`(arrivalRate + backlog / drainSeconds) / mu`, and at the 1.66 sample that is
+`(1.66 + 605/60) / 2.8651` = **4.10**, which is what the log says. Substituting
+the arrival rate that was really offered, 6.16, gives **5.67**.
+
+So the 3.7x under-read did not become a 3.7x under-order. The backlog term was
+supplying 10.08 req/s against the arrival term's 1.66 and had already absorbed
+most of the error; what the under-read cost was **1.6 replicas, one replica
+after the ceiling**. That is worth fixing -- one decode replica through a ramp
+is the difference the rest of this section describes -- but the floor is not
+blind while the queue is growing, because the queue itself is an input. The fleet stalled at 5 decode replicas through
+minutes 4 and 5 while the scheduler queue climbed to its peak of 356 at
+t+255 s; it was 3 by t+270 and 0 from t+285, so the queue is empty for the rest
+of the twenty-minute pass. The run's whole TTFT tail is those first four and a
+half minutes -- p95 44.7 s and p99 70.3 s over the pass, against a p50 of
+112 ms.
+
+The sibling pass of the same run drew slightly better numbers, held 6 replicas
+instead of 5 at the matched offset, peaked at 284 queued instead of 356, and
+landed p95 22.4 s. Both passes reached 7 eventually. Same
+code, same trace, same hour; the difference is which side of a replica the
+under-read happened to fall on.
+
+`deriv(queue_size)` was tried as a correction -- placements plus queue growth
+should be arrivals -- and rejected. Measured against the enqueue counter it was
+wrong by up to 8.28 req/s and went NEGATIVE (-0.20, -2.38 req/s) at the two
+samples where the queue was draining fastest, which is worse than the
+under-read it was meant to repair.
+
 ## How to add to this file
 
 One section per decision, with the date, the run identifier and the numbers
