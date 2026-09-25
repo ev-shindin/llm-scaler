@@ -106,6 +106,59 @@ replica bought a single cycle over the plain hold -- a third replica 30 s ahead
 of occupancy, on an under-read that then ran unneeded for 35 minutes -- and the
 hold's own cost, replayed, is 15-45 s on the cold ramp's next replica.
 
+### A single reading may order behind a standing queue
+
+*2026-09-25, run 24 pass B, the 8k1000 -> 1k6000 trace at 6 req/s, with the
+arrival rate already corrected.*
+
+`MinThroughputSamplesToOrder` held decode at 2 replicas from t+75 s to t+135 s
+while the scheduler queue went **32 to 217**. The floor's own figure through
+those four cycles was **2.51, 2.67, 2.73 and 3.06** replicas: it wanted a third
+and was not allowed to ask. The fleet reached 6 at t+225 and the queue peaked
+at 282; the run's whole TTFT tail is that window, p95 26.5 s against a p50 of
+114 ms.
+
+The hold's argument has two halves: an order on a first under-read
+over-provisions, **and** the over-provisioned fleet then never saturates again
+to record the second reading that would have corrected it. The second half
+fails while the scheduler is holding work -- the queue keeps the fleet
+saturated until it drains, so the correcting reading arrives either way.
+
+A first version also withheld the figure while any replica was starting, on
+the reasoning that the attempt above over-ordered "at a phase switch whose
+third was still starting". **Run 26 measured that version inert**: zero
+firings across a full pass, four single-sample holds in both arms, a queue peak
+of 359 against 380. Through every hold cycle the decode deployment had
+`spec=2` and `ready=1`, so `PendingReplicas` was 1 and the test blocked the
+rule -- a start outstanding is what a ramp is, so it excluded the case it was
+written for.
+
+It was redundant besides. A phase switch sets `staleShape`, which the first
+condition below already blocks. And the pacing it imitated exists a layer up:
+the engine computes `RC = max(0, TotalDemand / scaleUp - TotalAnticipatedSupply)`,
+subtracting the supply already on its way, so it cannot re-order what is in
+flight.
+
+What makes the climb safe is not pacing but invariance: `(lambda + backlog /
+drain) / mu` is fixed by the load and the queue, not by the fleet, so repeated
+firings converge on it instead of ratcheting past it -- the same property the
+floor's package comment rests on -- and the rule stops firing when the queue
+drains. Measured over five cycles with a replica driven pending to ready
+throughout: the floor reads 1,818,582 tokens every time, 1.95 replicas, and
+does not grow.
+
+Two conditions:
+
+  - **The SCHEDULER's queue, not the merged backlog, and worth more than
+    both a second of arrivals and one replica-second of service.** Against
+    `lambda` alone the test degenerates as the load falls -- at 0.1 req/s one
+    stray request is ten seconds of arrivals, which is jitter. vLLM counts a request waiting for its remote KV in
+    `num_requests_waiting`, so a large model over a slow link keeps six or more
+    there at all times while decode admits fine -- no further replica drains
+    those. A request in the scheduler's queue has not been dispatched to any
+    pod at all. The first version of this rule used the merged backlog and
+    broke the spec that pins exactly that case.
+
 ### A borrowed reading never outvotes a replica's own
 
 *2026-09-20, the 1000/6000 shape-swap trace, cycles 11:45:22-11:47:22.*
