@@ -299,7 +299,8 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	// a cap drawn at the policy-level figure while the engine divides by a
 	// per-analyzer override would leave a gap that orders a replica.
 	scaleUp, _ := cfg.AnalyzerThresholds(domain.SaturationAnalyzerName)
-	tf := floor.Estimate(offeredArrivalRate(input), replicas, variants, backlog, floor.BacklogDrainSeconds, scaleUp, staleShape)
+	tf := floor.Estimate(offeredArrivalRate(input), replicas, variants, backlog,
+		floor.BacklogDrainSeconds, scaleUp, staleShape, eppQueued)
 
 	// Prefill with no mu: the scheduler queue's prompts are not resident work
 	// for prefill (file header). Only the disaggregated case has a prefill
@@ -354,7 +355,8 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 			"demandBeforeFloor", measured, "residentDemand", resident, "flooredTo", want,
 			"arrivalRate", tf.Lambda, "backlogRequests", term.Backlog, "drainSeconds", tf.DrainSeconds,
 			"saturatedThroughput", term.Mu, "perReplicaCapacity", term.PerReplica,
-			"replicasImplied", term.Replicas, "heldAtFleet", term.Held, "heldWhy", term.HeldWhy)
+			"replicasImplied", term.Replicas, "heldAtFleet", term.Held, "heldWhy", term.HeldWhy,
+			"orderedBehindQueue", term.OrderedBehindQueue)
 		if roleDemand != nil {
 			roleDemand[role] = want
 		}
