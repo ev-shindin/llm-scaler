@@ -81,11 +81,19 @@ type shapeMemo struct {
 	// boundaries happen to fall. Item 1 of the proposal removes the
 	// boundaries; until then this removes their edge.
 	stable shape.Shape
-	// lastArriving is the previous queue-derived prompt length, kept so that
-	// reading is compared against itself rather than against the replicas'.
-	lastArriving float64
+	// arrivingAnchor is the queue-derived prompt length the tolerance for that
+	// axis is measured from, kept so that reading is compared against itself
+	// rather than against the replicas'. It is an anchor and not the previous
+	// reading for the reason signals/shape's Tracker gives: against the
+	// previous reading a drift is never declared at all.
+	arrivingAnchor float64
 	// changedAt is when the outstanding change was raised, zero when none is.
 	changedAt time.Time
+	// gaveUpAt is when the backstop last gave up on a hold, zero when none has
+	// been given up on since the fleet last measured itself. A new hold is not
+	// raised within holdFor of it, so a workload that drifts without settling
+	// cannot chain one hold onto the next and never release.
+	gaveUpAt time.Time
 	// lastSeen is when this model was last analyzed, so the memo can be swept
 	// with the rest of the analyzer's per-model state (EvictStaleHistory).
 	lastSeen time.Time
@@ -204,9 +212,12 @@ func saturatedCompletionRate(rm domain.ReplicaMetrics, role string, fleetOutput 
 // as zero because Within compares IL and OL only; nothing here reads the
 // derived ILeff or KVreq.
 //
-// Logged once per change, at INFO: the event is rare and it explains every
-// held decision that follows, which is the first thing a reader of those
-// decisions will ask.
+// Logged once per change, at INFO, because it explains every held decision
+// that follows, which is the first thing a reader of those decisions will ask.
+// Not once a run, though: a transition crosses the band several times on its
+// way to the new shape -- the 5900-to-1000 slide the tracker's doc describes
+// takes about eight -- so expect a short burst per transition rather than the
+// single line the previous wording promised.
 func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out float64,
 	arriving float64, arrivingOK bool, holdFor time.Duration, logger logr.Logger) (float64, bool) {
 	if !(in > 0) && !(out > 0) && !arrivingOK {
@@ -269,14 +280,23 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 	// The arriving prompt is the early half, and the only one that moves
 	// before anything completes. Compared against the last reading from
 	// the SAME source, so the scale difference cannot raise anything.
+	//
+	// Against an ANCHOR of that source, for the reason signals/shape gives:
+	// comparing against the previous reading makes the tolerance a limit on
+	// the rate of change, and a queue whose prompts lengthen a few percent a
+	// cycle then never crosses it. This axis is the early one -- it moves
+	// before anything completes -- so leaving it on the old comparison would
+	// have kept the fix from reaching the signal that reports first.
 	if arrivingOK {
-		if prev := memo.lastArriving; prev > 0 {
+		if prev := memo.arrivingAnchor; prev > 0 {
 			if delta := arriving - prev; delta > prev*shape.DefaultChangeTolerance ||
 				-delta > prev*shape.DefaultChangeTolerance {
 				changed = true
+				memo.arrivingAnchor = arriving
 			}
+		} else {
+			memo.arrivingAnchor = arriving
 		}
-		memo.lastArriving = arriving
 	}
 	// The keys move only on a change, so a shape that merely wobbles keeps
 	// the window it was learned under.
@@ -288,23 +308,55 @@ func (a *SaturationAnalyzer) noteFleetShape(namespace, modelID string, in, out f
 		stableOut = out
 	}
 
-	switch {
-	case changed:
+	// The backstop, evaluated BEFORE the arming below and independently of it.
+	//
+	// A fleet that is over-provisioned for the new shape never saturates under
+	// it, so it never records the reading that settles the hold: on the run
+	// above, phase 2 ran 8-21 requests across 11 replicas with nothing queued,
+	// and an unbounded hold would have pinned all 11 for its remaining 16
+	// minutes. After this the fleet answers to occupancy again, which by then
+	// is a reading of the new shape whether or not it ever saturated under it.
+	//
+	// These two were a switch, whose cases were mutually exclusive only because
+	// the arm used to fire on EVERY change and so kept the elapsed time at
+	// zero. Once the clock stopped being restarted, a cycle could both declare
+	// a change and be past the backstop -- and the switch would take the first
+	// case and skip the clear, holding the fleet past ShapeChangeHoldMax for as
+	// long as changes kept arriving. That is the outcome this whole section
+	// exists to prevent, so the backstop does not sit behind another condition.
+	if !memo.changedAt.IsZero() && now.Sub(memo.changedAt) >= holdFor {
+		memo.changedAt = time.Time{}
+		memo.gaveUpAt = now
+	}
+	if changed {
 		// A hold of zero is the policy switch: the change is still tracked and
 		// still logged -- the keys follow the shape either way -- but nothing
 		// is outstanding, so nothing withholds release.
-		if holdFor > 0 {
+		//
+		// The clock starts on the FIRST change of a run and is not restarted by
+		// the ones that follow. One workload transition is not one change event:
+		// a fleet sliding from 6000-token outputs to 1000 crosses the tolerance
+		// band repeatedly on the way down (that is the tracker's anchor doing
+		// its job), and restarting the clock on each crossing would extend the
+		// hold for the whole of a slide -- withholding release for precisely
+		// the transition, to shorter work needing fewer replicas, where release
+		// is what the fleet needs. ShapeChangeHoldMax bounds the transition,
+		// not each step of it.
+		//
+		// And not until a backstop's own span has passed either. A workload
+		// that drifts without ever settling crosses the band every four or five
+		// cycles at 5% a cycle, which is one fresh hold per crossing and a fleet
+		// that is never released at all -- strictly worse than the stale figures
+		// the hold exists to guard against, because those at least let it
+		// scale. A hold given up on is evidence the fleet will not measure
+		// itself under this shape any time soon; re-raising it on the next
+		// crossing repeats a wait already known not to finish. settleFleetShape
+		// clears this, so a fleet that DOES measure itself is free to hold
+		// again immediately for a genuinely new transition.
+		ready := memo.gaveUpAt.IsZero() || now.Sub(memo.gaveUpAt) >= holdFor
+		if holdFor > 0 && memo.changedAt.IsZero() && ready {
 			memo.changedAt = now
 		}
-	case !memo.changedAt.IsZero() && now.Sub(memo.changedAt) >= holdFor:
-		// The backstop. A fleet that is over-provisioned for the new shape
-		// never saturates under it, so it never records the reading that
-		// settles the hold: on the run above, phase 2 ran 8-21 requests
-		// across 11 replicas with nothing queued, and an unbounded hold would
-		// have pinned all 11 for its remaining 16 minutes. After this the
-		// fleet answers to occupancy again, which by then is a reading of the
-		// new shape whether or not it ever saturated under it.
-		memo.changedAt = time.Time{}
 	}
 	if !changed {
 		return stableOut, !memo.changedAt.IsZero()
@@ -380,6 +432,10 @@ func (a *SaturationAnalyzer) settleFleetShape(namespace, modelID string, ownRead
 	defer a.mu.Unlock()
 	if memo, ok := a.fleetShape[namespace+"|"+modelID]; ok {
 		memo.changedAt = time.Time{}
+		// The fleet has measured itself, so the reason a previous hold was
+		// given up on no longer applies and the next transition need not wait
+		// out its cooldown.
+		memo.gaveUpAt = time.Time{}
 	}
 }
 
