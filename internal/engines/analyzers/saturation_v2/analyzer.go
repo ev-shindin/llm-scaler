@@ -19,6 +19,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
 )
 
 // SaturationAnalyzer implements the domain.Analyzer interface using a
@@ -297,7 +298,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
 			role, accelByVariant[rm.VariantName], stableOutput, fleetOutput,
 			deriveMu(itlModels[rm.VariantName], engineParamsFor(a, input.Namespace, input.ModelID, rm.VariantName),
-				rm.TotalKvCapacityTokens, fleetInput, fleetOutput),
+				rm.TotalKvCapacityTokens, shape.New(fleetInput, fleetOutput, rm.PrefixCacheHitRate)),
 			downstreamSaturated, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)

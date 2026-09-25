@@ -6,6 +6,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
 )
 
 // The demand floor's mu is a request rate, and a request rate is not a property
@@ -71,16 +72,26 @@ type derivedMu struct {
 // analyzer's KV threshold, and itl.Sequences applies k itself, so passing k1
 // would apply a threshold twice.
 func deriveMu(model itl.Model, params *capacity.EngineParams,
-	totalKvTokens int64, avgInput, avgOutput float64) derivedMu {
-	if model.IsZero() || !(avgOutput > 0) || !(avgInput > 0) {
+	totalKvTokens int64, fleet shape.Shape) derivedMu {
+	avgOutput := fleet.AvgOutputTokens
+	if model.IsZero() || !(avgOutput > 0) || !(fleet.KVreq > 0) {
 		return derivedMu{}
 	}
 	capacityTokens := float64(totalKvTokens)
 	if params != nil && params.TotalKvTokensOverride > 0 {
 		capacityTokens = float64(params.TotalKvTokensOverride)
 	}
-	kvPerRequest := avgInput + avgOutput/2
-	seqs := itl.Sequences(itl.DefaultKSat, capacityTokens, kvPerRequest)
+	// The SHAPE's KVreq, not one re-derived here. shape.New computes
+	// ILeff = IL*(1 - prefixHitRate) and KVreq = ILeff + OL/2, so a fleet
+	// whose prompts are largely cache hits occupies far less than IL + OL/2
+	// and holds correspondingly more sequences. Re-deriving it dropped the
+	// hit-rate term, which on a caching workload under-states the resident
+	// count and over-orders replicas by the same factor. (It made no
+	// difference to the 2026-09-24 run -- those pods export no prefix-cache
+	// series at all, so the hit rate was 0 and the two agreed at 4000 -- but
+	// that is the workload being uninteresting, not the arithmetic being
+	// right.)
+	seqs := itl.Sequences(itl.DefaultKSat, capacityTokens, fleet.KVreq)
 	if seqs <= 0 {
 		return derivedMu{}
 	}

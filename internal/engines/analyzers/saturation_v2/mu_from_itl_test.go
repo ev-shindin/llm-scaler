@@ -10,6 +10,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/itl"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/shape"
 )
 
 // The fit the 2026-09-23 shape-swap runs were taken on, and the card they ran
@@ -25,7 +26,7 @@ var _ = Describe("deriveMu", func() {
 	It("reproduces the mu the fleet measured for itself under the first shape", func() {
 		// 1000-token prompts, 6000-token generations. Saturated, the fleet
 		// recorded 1.4292 and 1.5429 requests a second across the two runs.
-		got := deriveMu(tracedModel, tracedParams, tracedKv, 1000, 6000)
+		got := deriveMu(tracedModel, tracedParams, tracedKv, shape.New(1000, 6000, 0))
 		Expect(got.ok).To(BeTrue())
 		Expect(got.rate).To(BeNumerically("~", 1.49, 0.12),
 			"the model has to land where the hardware did, or it is not describing it")
@@ -36,35 +37,48 @@ var _ = Describe("deriveMu", func() {
 		// over-provisioned for this and never saturated under it, so no reading
 		// was ever taken -- the floor went on using the first shape's figure
 		// for the remaining nineteen minutes of the run.
-		got := deriveMu(tracedModel, tracedParams, tracedKv, 8000, 1000)
+		got := deriveMu(tracedModel, tracedParams, tracedKv, shape.New(8000, 1000, 0))
 		Expect(got.ok).To(BeTrue())
 		Expect(got.rate).To(BeNumerically(">", 3.0))
 		Expect(6.0/got.rate).To(BeNumerically("<", 2.5),
 			"the arrival rate over a shape-correct mu is a small fleet, not the seven that ran")
 	})
 
+	It("prices a fully cached workload, whose prompts occupy nothing", func() {
+		// ILeff = IL*(1 - hitRate), so a workload served entirely from the
+		// prefix cache has an effective prompt length of zero and a footprint
+		// of OL/2 alone. That is a real shape, not a missing one, and it holds
+		// more sequences per replica than the same workload uncached.
+		cached := deriveMu(tracedModel, tracedParams, tracedKv, shape.New(1000, 6000, 1.0))
+		plain := deriveMu(tracedModel, tracedParams, tracedKv, shape.New(1000, 6000, 0))
+		Expect(cached.ok).To(BeTrue())
+		Expect(cached.seqs).To(BeNumerically(">", plain.seqs),
+			"a cached prompt leaves room for more resident sequences")
+		Expect(cached.rate).To(BeNumerically(">", plain.rate))
+	})
+
 	It("is capped by max_num_seqs, which the trace's second phase sat on", func() {
 		// The cache alone would imply over 6,500 resident sequences for a
 		// short shape; the engine admits 256, and phase 2 ran at exactly that.
-		got := deriveMu(tracedModel, tracedParams, tracedKv, 100, 100)
+		got := deriveMu(tracedModel, tracedParams, tracedKv, shape.New(100, 100, 0))
 		Expect(got.ok).To(BeTrue())
 		Expect(got.seqs).To(Equal(float64(tracedParams.MaxNumSeqs)))
 
-		uncapped := deriveMu(tracedModel, &capacity.EngineParams{}, tracedKv, 100, 100)
+		uncapped := deriveMu(tracedModel, &capacity.EngineParams{}, tracedKv, shape.New(100, 100, 0))
 		Expect(uncapped.seqs).To(BeNumerically(">", 6000),
 			"and without the cap it is the number the engine will not admit")
 	})
 
 	It("declines rather than guessing", func() {
-		Expect(deriveMu(itl.Model{}, tracedParams, tracedKv, 1000, 6000).ok).To(BeFalse(),
+		Expect(deriveMu(itl.Model{}, tracedParams, tracedKv, shape.New(1000, 6000, 0)).ok).To(BeFalse(),
 			"no fitted model")
-		Expect(deriveMu(tracedModel, tracedParams, 0, 1000, 6000).ok).To(BeFalse(),
+		Expect(deriveMu(tracedModel, tracedParams, 0, shape.New(1000, 6000, 0)).ok).To(BeFalse(),
 			"no KV capacity")
-		Expect(deriveMu(tracedModel, tracedParams, tracedKv, 1000, 0).ok).To(BeFalse(),
+		Expect(deriveMu(tracedModel, tracedParams, tracedKv, shape.New(1000, 0, 0)).ok).To(BeFalse(),
 			"no generation length is not a decode shape")
-		Expect(deriveMu(tracedModel, tracedParams, tracedKv, 0, 6000).ok).To(BeFalse(),
-			"no prompt length is not a shape at all")
-		Expect(deriveMu(itl.Model{A: -1, B: 0.5}, tracedParams, tracedKv, 1000, 6000).ok).To(BeFalse(),
+		Expect(deriveMu(tracedModel, tracedParams, tracedKv, shape.Shape{}).ok).To(BeFalse(),
+			"an empty shape has no footprint to divide the cache by")
+		Expect(deriveMu(itl.Model{A: -1, B: 0.5}, tracedParams, tracedKv, shape.New(1000, 6000, 0)).ok).To(BeFalse(),
 			"a model whose reading at k_sat is not positive")
 	})
 })
