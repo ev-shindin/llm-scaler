@@ -235,10 +235,11 @@ func bucketOf(key string) string {
 //
 // On a disaggregated fleet each role is floored on its own: the scheduler's
 // arrival rate is every request, and every request passes through both
-// roles, so each must keep up with all of it. The model-level total is raised
-// by the same amount so RoleDemand and TotalDemand keep moving together. On a
-// non-disaggregated fleet there is no RoleDemand and the single "both" floor
-// lands on the total directly.
+// roles, so each must keep up with all of it. The model-level total moves
+// with them, by what each role CONTRIBUTES to it -- the role's own figure for
+// every role but prefill, whose scheduler-queue share the total never carried
+// (contributionToTotal). On a non-disaggregated fleet there is no RoleDemand
+// and the single "both" floor lands on the total directly.
 //
 // eppByRole is the residency charge estimateSchedulerQueueDemand put on the
 // scheduler queue per role, and eppQueued the requests in it. For a role with
@@ -324,6 +325,7 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 	}
 	// Roles in a stable order, so a two-role fleet logs the same way each cycle.
 	roles := slices.Sorted(maps.Keys(tf.ByRole))
+	modelTotalBefore := totalDemand
 
 	for _, role := range roles {
 		tokens := tf.ByRole[role]
@@ -356,9 +358,57 @@ func (a *SaturationAnalyzer) applyThroughputFloor(
 		if roleDemand != nil {
 			roleDemand[role] = want
 		}
-		totalDemand += want - measured
+		totalDemand += want - heldInModelTotal(role, measured, eppByRole)
+	}
+
+	// What the floor did to the MODEL total, which is otherwise emitted
+	// nowhere on a disaggregated fleet: wva_analyzer_demand carries the
+	// model level only when a result has no role capacities
+	// (steadystate.recordAnalyzerSeries), and a P/D fleet always has them.
+	// The per-role lines above do not add up to this figure -- that is the
+	// whole reason contributionToTotal exists -- so a reader checking the
+	// fleet's target against the floor has no way to derive it.
+	if totalDemand != modelTotalBefore {
+		logger.Info("throughput-demand-floor-total",
+			"modelID", input.ModelID, "namespace", input.Namespace,
+			"modelTotalBefore", modelTotalBefore, "modelTotalAfter", totalDemand,
+			"roles", roles)
 	}
 	return totalDemand
+}
+
+// heldInModelTotal is the part of a role's PRE-FLOOR demand that the model
+// total actually carries, which is not the same as the role's demand.
+//
+// estimateSchedulerQueueDemand charges the scheduler queue to prefill as its
+// input tokens and to decode as input + output, while the model total carries
+// the queue once, as input + output -- decode's share. Prefill's input-only
+// share was never in the total (the file header says so, and the
+// scheduler-queue-prefill-share-dropped branch above acts on it by adjusting
+// the role and deliberately not the total). So the per-role demands sum to
+// the total plus that input-token charge, and moving the total by a role's
+// full delta takes out tokens it never held: on a fleet where both roles'
+// demand falls -- the ordinary case once the residency charge comes out and a
+// smaller throughput floor replaces it -- the total goes below zero.
+//
+// PRE-floor only, and the distinction is the whole correctness of this file.
+// `measured` comes from aggregateRoleDemand as DemandByRole + the queue's
+// per-role charge, so the charge is still in it additively and can be taken
+// back out. The post-floor `want` is already free of it: `resident` has had
+// residency[role] removed, which includes this very eppByRole[role], and the
+// throughput floor is an independent (lambda + backlog / drain) x P / mu with
+// no queue term at all. Projecting `want` through here as well subtracts the
+// share a second time and the floor below then discards what is left -- which
+// under-sizes the fleet exactly as the double-count did, by a different route.
+//
+// Floored at zero because a role cannot contribute negative demand to the
+// total: the share can exceed what the role was carrying, and what the total
+// then holds for it is nothing, not a credit against the other role.
+func heldInModelTotal(role string, demand float64, eppByRole map[string]float64) float64 {
+	if role != domain.RolePrefill {
+		return demand
+	}
+	return max(demand-eppByRole[domain.RolePrefill], 0)
 }
 
 // offeredArrivalRate is the model-level arrival rate: the scheduler's, or the
