@@ -25,7 +25,7 @@ import (
 //	IL      (avg input tokens)        → AvgInputTokens         (QueryAvgInputTokens        / RegisterSaturationQueries)
 //	H%      (prefix cache hit rate)   → PrefixCacheHitRate     (QueryPrefixCacheHitRate    / RegisterSaturationQueries)
 //	λ_dec   (per-pod completion rate) → RequestRate            (QueryRequestRate           / RegisterArrivalRateQueries)
-//	Λ_req   (model-level arrival)     → AnalyzerInput.ArrivalRate (QueryModelArrivalRate   / RegisterThroughputAnalyzerQueries, this file)
+//	Λ_req   (model-level arrival)     → AnalyzerInput.ArrivalRate (QueryModelArrivalRate   / RegisterArrivalRateQueries, this file)
 //	         λ_dec = Λ_req × avgOL, combined with the queue-drain term (model level, see Commit 2)
 const (
 	// RequestRateWindow is the range the per-pod completion rate is taken
@@ -85,10 +85,94 @@ const (
 	// series, because the EPP reports the port it ROUTES to while every engine
 	// series is keyed on the port it is SCRAPED on.
 	//
+	// It reads the flow-control ENQUEUE counter, which increments when a
+	// request is accepted, and not the scheduler's success counter, which
+	// increments when one is placed on a pod. The difference is the whole
+	// point: while the fleet is saturated, placements are capacity-bound, so
+	// a rate built from them collapses exactly when the fleet is furthest
+	// behind and most needs the capacity this figure orders. Measured at
+	// 1.66 req/s against a true 6.16 with the scheduler queue at 234 and climbing to 356; the two agree
+	// to the digit once the queue drains. See "The arrival rate is a
+	// dispatch rate while the queue is building" in
+	// docs/developer-guide/analyzer-evidence.md.
+	//
 	// No model_name fallback: inference_extension_scheduler_attempts_total has
 	// never carried a model_name label on any EPP version examined (only
-	// target_model_name) — unlike the flow-control queue metric, which does.
+	// target_model_name) — unlike the flow-control queue metric, which carries
+	// both. target_model_name is what the join below borrows.
 	QueryModelArrivalRate = "model_arrival_rate"
+)
+
+// The model arrival rate, assembled so each clause can be read on its own:
+// enqueues × (the model label, borrowed), falling back to placements.
+//
+// The label has to be borrowed because the enqueue counter does not carry one:
+// it is per (job, fairness_id, priority, outcome). The flow-control queue gauge
+// does carry target_model_name and comes from the same EPP, so it is joined on
+// (namespace, job).
+//
+// Each `or` between a pair of metric names aggregates BEFORE the or, never
+// after. `or` compares whole label sets, so a label present on one name and
+// not the other makes the two series look unrelated and the union keeps both —
+// a silent doubling. That is not hypothetical: on the benchmark cluster
+// llm_d_epp_scheduler_attempts_total carries endpoint_name where
+// inference_extension_scheduler_attempts_total carries pod_name, and the naive
+// form reads 9.75 req/s against a true 4.88. Aggregating first drops the
+// offending label before the comparison.
+const (
+	// The two names for each flow-control metric. llm_d_epp_* is current and
+	// inference_extension_* the deprecated alias (constants/metrics.go), read
+	// in that order as the rest of the collector does.
+	arrivalEnqueueRate = `(sum by (namespace, job) (rate(llm_d_epp_flow_control_request_enqueue_duration_seconds_count{namespace="{{.namespace}}"}[1m]))` +
+		` or sum by (namespace, job) (rate(inference_extension_flow_control_request_enqueue_duration_seconds_count{namespace="{{.namespace}}"}[1m])))`
+
+	// target_model_name!="" is load-bearing, not hygiene. An EPP does export a
+	// second queue_size series with the label absent — measured on a
+	// benchmark-cluster namespace — and group_left needs the right-hand
+	// (namespace, job) to be unique.
+	//
+	// What goes wrong depends on what else is present. Without this matcher the
+	// guard below sees two series and drops the join, so the query silently
+	// falls through to the placement arm and the under-read this whole file
+	// exists to fix comes back with no signal that it did. Without the guard
+	// as well, the expression fails outright with "found duplicate series for
+	// the match group" — and a PromQL error is not something `or` can catch,
+	// so the collector reads no series, which it cannot tell from idle
+	// traffic. Both were reproduced.
+	arrivalQueueByModel = `max by (namespace, job, target_model_name) (` +
+		`llm_d_epp_flow_control_queue_size{namespace="{{.namespace}}",target_model_name!=""}` +
+		` or inference_extension_flow_control_queue_size{namespace="{{.namespace}}",target_model_name!=""})`
+
+	// ^ 0 is 1 for every finite value and for NaN, so it copies the label
+	// across and leaves the rate alone. The count == 1 guard drops the join
+	// entirely where one pool serves several models: the enqueue counter has
+	// no model label, so it cannot be split between them, and an arrival rate
+	// attributed to the wrong model is worse than the under-read below. Those
+	// fleets fall through to the placement arm, which attributes correctly.
+	arrivalModelLabel = `((` + arrivalQueueByModel + ` ^ 0) and on (namespace, job) ` +
+		`(count by (namespace, job) (` + arrivalQueueByModel + `) == 1))`
+
+	// Placements. Capacity-bound while the fleet is saturated — the whole
+	// reason for the arm above — but correct once it is not, and the only
+	// thing available on a fleet without flow control. This is the arm that
+	// carries a fleet the flow-control metrics do not describe, so it reads
+	// both names too, and it is the pair whose labels already disagree.
+	arrivalPlacementRate = `(sum by (namespace, target_model_name) (rate(llm_d_epp_scheduler_attempts_total{status="success",namespace="{{.namespace}}"}[1m]))` +
+		` or sum by (namespace, target_model_name) (rate(inference_extension_scheduler_attempts_total{status="success",namespace="{{.namespace}}"}[1m])))`
+
+	// `> 0` so that a present-but-zero enqueue series cannot mask a live
+	// placement rate: `or` keeps a right-hand series only where the left has
+	// no series at all, and a zero is a series. Its shape is a fleet whose
+	// flow controller is deployed but rarely queues.
+	//
+	// It is a presence test, not a plausibility one: an EPP that routed only
+	// part of its traffic through flow control would pass it with a rate well
+	// below the true one. No such fleet has been seen, and `max` of the two
+	// arms would cover that case as well — at the cost of reporting a drain
+	// rate as demand after traffic stops, which this form already does.
+	modelArrivalRateQuery = `sum by (namespace, target_model_name) (` +
+		arrivalEnqueueRate + ` * on (namespace, job) group_left(target_model_name) ` +
+		arrivalModelLabel + `) > 0 or ` + arrivalPlacementRate
 )
 
 // RegisterThroughputAnalyzerQueries registers the four TA-exclusive queries.
@@ -182,12 +266,15 @@ func RegisterArrivalRateQueries(sourceRegistry *source.SourceRegistry) {
 	//
 	// Namespace-scoped like the engine queries: the collector selects its model by
 	// target_model_name (see the note above RegisterSaturationQueries).
+	//
+	// The query and the reasoning for each clause are above, on
+	// modelArrivalRateQuery.
 	registry.MustRegister(source.QueryTemplate{
 		Name:        QueryModelArrivalRate,
 		Type:        source.QueryTypePromQL,
-		Template:    `sum by (namespace, target_model_name) (rate(inference_extension_scheduler_attempts_total{status="success",namespace="{{.namespace}}"}[1m]))`,
+		Template:    modelArrivalRateQuery,
 		Params:      []string{source.ParamNamespace},
-		Description: "Model-level request arrival rate (requests/sec) from scheduler, summed across the whole model with no per-pod labels to reconcile",
+		Description: "Model-level request arrival rate (requests/sec): flow-control enqueues, with the scheduler's placements as a fallback where flow control is absent",
 	})
 
 	// Per-pod observed generation (decode) token rate (tokens/sec), the rate of
