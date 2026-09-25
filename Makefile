@@ -2042,12 +2042,21 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@bash hack/benchmark/sample_replicas.sh start $(BENCHMARK_NAMESPACE) /tmp/wva_replica_samples.json || true
 	@rm -f /tmp/wva_controller_tail.log /tmp/wva_controller_tail.log.pid /tmp/wva_controller_tail.log.stderr
 	@bash hack/benchmark/tail_wva_logs.sh start $(BENCHMARK_NAMESPACE) /tmp/wva_controller_tail.log || true
+	@# --fast-collect streams the results tree out as a gzipped tar over
+	@# exec instead of copying it with kubectl cp. The harness ships both
+	@# and defaults to cp, which fails on a large results.json: four
+	@# consecutive runs lost their client-side latencies to it, three
+	@# truncated at ~525 MB mid-string and one with "error reading" and no
+	@# file at all, each time on a run that had otherwise succeeded. The
+	@# streaming path is retried five times by the harness itself.
+	@# BENCHMARK_FAST_COLLECT=false goes back to cp.
 	-$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) run \
 		-p $(BENCHMARK_NAMESPACE) \
 		-l $(BENCHMARK_HARNESS) \
 		-w $(BENCHMARK_WORKLOAD).yaml \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
 		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,) \
+		$(if $(filter false,$(BENCHMARK_FAST_COLLECT)),,--fast-collect) \
 		--wait-timeout $(BENCHMARK_WAIT_TIMEOUT)
 	@# Stopped and filed even when the run above failed -- a run that errored in a
 	@# post-processing step still produced measurements worth reading, and every
@@ -2247,6 +2256,7 @@ benchmark-run-bursty: ## Run bursty traffic benchmark using inference-perf multi
 		-U $(BENCHMARK_GATEWAY_URL) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
 		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,) \
+		$(if $(filter false,$(BENCHMARK_FAST_COLLECT)),,--fast-collect) \
 		--wait-timeout $(BENCHMARK_WAIT_TIMEOUT)
 
 .PHONY: benchmark-run-all
