@@ -1,0 +1,37 @@
+# Two-stage shape-swap experiment, the longer shapes taken in the other
+# order: same RPS throughout (6 req/s), request shape flips from
+# decode-heavy (1000/6000) to prefill-heavy (8000/1000) halfway through.
+# The mirror of shape_8k1000_1k6000_rps6_20m -- same seed, same rate, same
+# per-phase durations, phases exchanged -- so the pair isolates the
+# DIRECTION of the swap as the variable.
+#
+# This is the direction the floor reads worst. Run
+# biran-20260921-235843-225 (2026-09-21) took it on a build that predates
+# #85: the decode replicas kept their own output-length buckets across the
+# switch, the fleet split six `long` against four `xxlong`, and the floor
+# asked for 142 replicas against 5.68 req/s arriving. The regression spec
+# in throughput_floor_test.go replays those cycles; this file is what
+# reproduces them on a cluster.
+
+seed: 42
+arrival_distribution: poisson
+length_distribution: constant   # min=max per phase -- fixed lengths, no spread
+
+output:
+  path: shape_1k6000_8k1000_rps6_20m.jsonl
+  timestamp_column: timestamp
+  prompt_tokens_column: input_length
+  output_tokens_column: output_length
+
+phases:
+  - name: 1k6000-rps6
+    duration_s: 1100
+    rate_rps: 6
+    input_tokens:  { mean: 1000 }
+    output_tokens: { mean: 6000 }
+
+  - name: 8k1000-rps6
+    duration_s: 1100
+    rate_rps: 6
+    input_tokens:  { mean: 8000 }
+    output_tokens: { mean: 1000 }
