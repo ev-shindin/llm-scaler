@@ -1,6 +1,7 @@
 package floor
 
 import (
+	"math"
 	"slices"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
@@ -175,11 +176,11 @@ func Estimate(
 	mayOrder := make(map[string]bool)
 	borrowedOnly := make(map[string]bool)
 	for _, rc := range replicas {
-		if rc.FromWarmPool || rc.SaturatedThroughput <= 0 {
+		if rc.FromWarmPool || !priceable(rc.SaturatedThroughput) {
 			continue
 		}
 		p := perReplica[rc.VariantName]
-		if p <= 0 {
+		if !priceable(p) {
 			continue
 		}
 		role := roleOf[rc.VariantName]
@@ -277,7 +278,7 @@ func Estimate(
 			// never exceed one replica of any variant when it has several.
 			mayOrder[role] = true
 			term.OrderedBehindQueue = true
-			if step := scaleUpThreshold * (max(anticipated[role].TotalAnticipatedSupply, 0) + smallestP[role]); floor > step {
+			if step := scaleUpThreshold * (nonNegativeSupply(anticipated[role].TotalAnticipatedSupply) + smallestP[role]); floor > step {
 				floor = step
 			}
 		}
@@ -295,18 +296,22 @@ func Estimate(
 			// before a reading may order" in
 			// docs/developer-guide/analyzer-evidence.md.
 			//
-			// The anticipated supply is floored at zero before it becomes a
-			// cap. It is (ReplicaCount + PendingReplicas) x P summed over the
-			// role, and a negative product would make the cap negative -- at
-			// which point every real floor is above it and this branch
-			// publishes the negative, inverting a package whose whole
-			// contract is that it only ever raises demand. Today every
+			// The anticipated supply is floored at zero, and a non-finite
+			// supply is read as zero, before it becomes a cap. It is
+			// (ReplicaCount + PendingReplicas) x P summed over the role, and a
+			// negative product would make the cap negative -- at which point
+			// every real floor is above it and this branch publishes the
+			// negative, inverting a package whose whole contract is that it
+			// only ever raises demand. A NaN is worse than negative: the
+			// builtin max returns NaN for a NaN operand in either position, so
+			// `max(x, 0)` does NOT clamp one, and a NaN cap disables the
+			// comparison below entirely rather than binding it. Today every
 			// producer clamps PendingReplicas (variantmeta/discovery.go does
 			// it explicitly, and logs), so the guard costs nothing; it is
 			// here because this package cannot see that clamp, and the cost
 			// path above already skips a variant whose P is <= 0 while this
 			// one reads P again over every variant of the role.
-			hold := scaleUpThreshold * max(anticipated[role].TotalAnticipatedSupply, 0)
+			hold := scaleUpThreshold * nonNegativeSupply(anticipated[role].TotalAnticipatedSupply)
 			if floor > hold {
 				floor = hold
 				term.Held = true
@@ -329,6 +334,35 @@ func Estimate(
 // count: every value here is a learned per-replica figure, none is suspect,
 // and the midpoint is the better estimate -- the same convention as the saturation
 // analyzer's median() for capacities.
+// priceable reports whether a measured rate or per-replica capacity may be
+// priced into the floor.
+//
+// Written as `x > 0` rather than `!(x <= 0)` on purpose. Every comparison
+// against NaN is false, so `x <= 0` ADMITS a NaN, and a NaN floor then defeats
+// both caps below -- `floor > step` and `floor > hold` are both false, so the
+// role would publish a NaN with Held false, the exact inverse of this
+// package's contract. The ingest path that produces these readings already
+// uses this form (saturation_v2.recordSaturatedThroughput).
+//
+// +Inf is excluded explicitly because it passes `x > 0`: a replica of infinite
+// throughput prices capacity at zero cost, which is not a reading, and it also
+// makes cost*mu a NaN (0 x +Inf) in the Term this package publishes.
+func priceable(x float64) bool {
+	return x > 0 && !math.IsInf(x, 1)
+}
+
+// nonNegativeSupply floors an anticipated supply at zero for use as a cap,
+// reading a non-finite supply as zero. It exists because the builtin max does
+// not clamp a NaN -- max(NaN, 0) is NaN -- and this value caps a comparison
+// that a NaN would silently disable. Unlike the readings above, the supply is
+// aggregated over variants that priceable never saw, so it is guarded here.
+func nonNegativeSupply(x float64) float64 {
+	if math.IsNaN(x) || x < 0 {
+		return 0
+	}
+	return x
+}
+
 func median(values []float64) float64 {
 	n := len(values)
 	if n == 0 {

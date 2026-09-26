@@ -1,6 +1,8 @@
 package floor
 
 import (
+	"math"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -139,6 +141,86 @@ var _ = Describe("Estimate", func() {
 		Expect(f.ByRole[domain.RoleDecode]).To(BeZero(),
 			"held at zero: the cap is what the engine's RC turns into nothing")
 		Expect(f.Terms[domain.RoleDecode].Held).To(BeTrue())
+	})
+
+	It("never prices a non-finite reading, and never publishes one", func() {
+		// The filters were `SaturatedThroughput <= 0` and `p <= 0`. Every
+		// comparison against NaN is false, so both ADMITTED a NaN -- and a NaN
+		// floor then defeats BOTH caps, because `floor > step` and
+		// `floor > hold` are false too. The role published NaN with Held
+		// false: the inverse of this package's only promise. Measured before
+		// the fix by calling Estimate directly, and asserted here per input.
+		v := variants(domain.RoleDecode, 1)
+
+		By("a NaN rate is not a reading, so the role has no floor at all")
+		nanMu := []capacity.ReplicaCapacity{
+			{VariantName: "v", SaturatedThroughput: math.NaN(), SaturatedThroughputSamples: 3}}
+		f := Estimate(runLambda, nanMu, v, nil, BacklogDrainSeconds, 0.85, false, runLambda*10)
+		_, present := f.ByRole[domain.RoleDecode]
+		Expect(present).To(BeFalse(), "the same as no reading, not a NaN floor")
+
+		By("a NaN rate among finite ones is dropped, not averaged in")
+		// slices.Sort puts a NaN wherever it likes, so whether a NaN survived
+		// the median used to depend on how many readings there were. It must
+		// not be a question of parity.
+		mixed := []capacity.ReplicaCapacity{
+			{VariantName: "v", SaturatedThroughput: runMu, SaturatedThroughputSamples: 3},
+			{VariantName: "v", SaturatedThroughput: math.NaN(), SaturatedThroughputSamples: 3},
+			{VariantName: "v", SaturatedThroughput: runMu, SaturatedThroughputSamples: 3},
+		}
+		g := Estimate(runLambda, mixed, v, nil, BacklogDrainSeconds, 0.85, false, 0)
+		Expect(math.IsNaN(g.ByRole[domain.RoleDecode])).To(BeFalse())
+		Expect(g.Terms[domain.RoleDecode].Mu).To(BeNumerically("~", runMu, 1e-9),
+			"the two finite readings decide it between them")
+		Expect(g.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda*float64(runK1)/runMu, 1e-6))
+
+		By("a NaN per-replica capacity is not a capacity")
+		nanP := []capacity.ReplicaCapacity{
+			{VariantName: "v", SaturatedThroughput: runMu, SaturatedThroughputSamples: 3}}
+		badP := []domain.VariantCapacity{{VariantName: "v", Role: domain.RoleDecode,
+			ReplicaCount: 1, PerReplicaCapacity: math.NaN()}}
+		h := Estimate(runLambda, nanP, badP, nil, BacklogDrainSeconds, 0.85, false, runLambda*10)
+		_, present = h.ByRole[domain.RoleDecode]
+		Expect(present).To(BeFalse())
+
+		By("an infinite rate is not a reading either")
+		// +Inf passes `x > 0`, so positivity alone does not exclude it. It
+		// prices a replica at zero cost, and it makes the published
+		// PerReplica (cost x mu) a NaN through 0 x +Inf.
+		infMu := []capacity.ReplicaCapacity{
+			{VariantName: "v", SaturatedThroughput: math.Inf(1), SaturatedThroughputSamples: 3}}
+		i := Estimate(runLambda, infMu, v, nil, BacklogDrainSeconds, 0.85, false, runLambda*10)
+		_, present = i.ByRole[domain.RoleDecode]
+		Expect(present).To(BeFalse(), "no floor, rather than a zero-cost one")
+		Expect(math.IsNaN(i.Terms[domain.RoleDecode].PerReplica)).To(BeFalse(),
+			"and nothing NaN reaches the Term this package logs")
+	})
+
+	It("holds at zero when the anticipated supply is not a number", func() {
+		// The hold cap is scaleUp x the anticipated supply, and the builtin max
+		// does NOT clamp a NaN -- max(NaN, 0) is NaN -- so a NaN supply left
+		// `floor > hold` false and the cap never bound at all. That is the
+		// opposite failure from the negative case above: not a floor capped too
+		// low, but a floor never capped.
+		//
+		// The supply is aggregated over every variant of the role, including
+		// ones whose own reading was filtered out, so it needs its own guard:
+		// one variant carries the reading and another poisons the sum.
+		thin := []capacity.ReplicaCapacity{
+			{VariantName: "good", SaturatedThroughput: runMu, SaturatedThroughputSamples: 1}}
+		poisoned := []domain.VariantCapacity{
+			{VariantName: "good", Role: domain.RoleDecode,
+				ReplicaCount: 1, PerReplicaCapacity: float64(runK1)},
+			{VariantName: "bad", Role: domain.RoleDecode,
+				ReplicaCount: 1, PerReplicaCapacity: math.NaN()},
+		}
+		f := Estimate(runLambda, thin, poisoned, nil, BacklogDrainSeconds, 0.85, false, 0)
+		Expect(math.IsNaN(f.ByRole[domain.RoleDecode])).To(BeFalse(),
+			"a NaN supply must not pass a NaN through as the floor")
+		Expect(f.Terms[domain.RoleDecode].Held).To(BeTrue(),
+			"the cap binds, as it does for a negative supply")
+		Expect(f.ByRole[domain.RoleDecode]).To(BeZero(),
+			"read as zero anticipated supply, so held at zero")
 	})
 
 	It("lets a single reading order while the scheduler holds a queue", func() {
