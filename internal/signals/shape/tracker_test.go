@@ -94,6 +94,73 @@ var _ = Describe("Tracker", func() {
 		})
 	})
 
+	Describe("a workload that drifts rather than jumps", func() {
+		// The 1k/6000 -> 8k/1000 swap measured on 2026-09-23: generations
+		// already in flight keep the fleet average high, so the served output
+		// length walks down over minutes instead of stepping. Every 15-second
+		// cycle moves a few percent; the whole move is 83%.
+		It("declares a change once the cumulative move leaves the band", func() {
+			tracker.Observe(1000, 5900, 0.0)
+
+			declared := 0
+			last := 5900.0
+			for ol := 5900.0; ol > 1000; ol *= 0.95 { // -5% a cycle, never -20%
+				if _, changed := tracker.Observe(1000, ol, 0.0); changed {
+					declared++
+				}
+				last = ol
+			}
+			Expect(last).To(BeNumerically("<", 1100))
+			Expect(declared).To(BeNumerically(">", 0),
+				"a slide of 83%% must be declared: measuring the band from the "+
+					"previous reading makes the tolerance a per-cycle rate limit")
+		})
+
+		It("settles on the shape the workload arrived at", func() {
+			tracker.Observe(1000, 5900, 0.0)
+			for ol := 5900.0; ol > 1000; ol *= 0.95 {
+				tracker.Observe(1000, ol, 0.0)
+			}
+			// The slide is over; the workload now holds 1000. The anchor has
+			// come down with it, so it takes at most one more declaration to
+			// land on the new shape -- against a fixed 5900 anchor it would
+			// declare on every single cycle from here to the end of the run.
+			declared := 0
+			for i := 0; i < 10; i++ {
+				if _, changed := tracker.Observe(1000, 1000, 0.0); changed {
+					declared++
+				}
+			}
+			Expect(declared).To(BeNumerically("<=", 1))
+		})
+
+		It("reports the latest reading from Current, not the band's centre", func() {
+			// The anchor and the latest reading are separate fields now, and
+			// only a reading INSIDE the band tells them apart: on a declared
+			// change Observe writes the same value to both. The throughput
+			// analyzer asks Current what the fleet is serving, so it has to be
+			// the measurement.
+			tracker.Observe(5000, 200, 0.0)
+
+			_, changed := tracker.Observe(5750, 200, 0.0) // +15%, inside the band
+			Expect(changed).To(BeFalse())
+
+			shape, hasShape := tracker.Current()
+			Expect(hasShape).To(BeTrue())
+			Expect(shape.AvgInputTokens).To(Equal(5750.0))
+		})
+
+		It("does not re-declare while the workload holds its new shape", func() {
+			tracker.Observe(1000, 5900, 0.0)
+			tracker.Observe(1000, 1000, 0.0) // the change
+
+			for i := 0; i < 20; i++ {
+				_, changed := tracker.Observe(1000, 1000, 0.0)
+				Expect(changed).To(BeFalse())
+			}
+		})
+	})
+
 	Describe("Reset", func() {
 		It("clears the stored shape", func() {
 			tracker.Observe(5000, 200, 0.0)
