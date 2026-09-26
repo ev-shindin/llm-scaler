@@ -152,6 +152,9 @@ BENCHMARK_HARNESS    ?= guidellm
 BENCHMARK_WORKLOAD   ?= prefill_heavy
 BENCHMARK_FORCE      ?= true
 BENCHMARK_MONITORING ?= true
+# Collect results by streaming a gzipped tar over exec instead of kubectl cp.
+# See the note on the benchmark-run recipe for why this defaults on.
+BENCHMARK_FAST_COLLECT ?= true
 # Skip the chained smoketest after standup.
 #
 # For a MULTI-MODEL stack, which routes by PATH PREFIX. The smoketest's
@@ -2042,12 +2045,24 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@bash hack/benchmark/sample_replicas.sh start $(BENCHMARK_NAMESPACE) /tmp/wva_replica_samples.json || true
 	@rm -f /tmp/wva_controller_tail.log /tmp/wva_controller_tail.log.pid /tmp/wva_controller_tail.log.stderr
 	@bash hack/benchmark/tail_wva_logs.sh start $(BENCHMARK_NAMESPACE) /tmp/wva_controller_tail.log || true
+	@# Collect the results tree as a gzipped tar over exec rather than with
+	@# kubectl cp. The harness ships both paths and defaults to cp, which on a
+	@# large tree either runs for hours or drops: its own source puts cp at
+	@# ~0.3 MB/s through the apiserver exec stream, and runs here have lost
+	@# their client-side latencies to a copy that truncated mid-file on a run
+	@# that had otherwise succeeded.
+	@#
+	@# The retry is what makes the stream trustworthy, not the stream itself:
+	@# a dropped exec stream ("tar: Unexpected EOF") is transient and common,
+	@# and the harness retries the whole pipeline five times with a backoff,
+	@# overwriting on each attempt. Set BENCHMARK_FAST_COLLECT=false for cp.
 	-$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) run \
 		-p $(BENCHMARK_NAMESPACE) \
 		-l $(BENCHMARK_HARNESS) \
 		-w $(BENCHMARK_WORKLOAD).yaml \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
 		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,) \
+		$(if $(filter true,$(BENCHMARK_FAST_COLLECT)),--fast-collect,) \
 		--wait-timeout $(BENCHMARK_WAIT_TIMEOUT)
 	@# Stopped and filed even when the run above failed -- a run that errored in a
 	@# post-processing step still produced measurements worth reading, and every
@@ -2240,6 +2255,9 @@ benchmark-run-bursty: ## Run bursty traffic benchmark using inference-perf multi
 		cp "$(BENCHMARK_SCENARIOS_DIR)/$(BURSTY_WORKLOAD).in" \
 		   "$(BENCHMARK_REPO_DIR)/workload/profiles/inference-perf/$(BURSTY_WORKLOAD).in"; \
 	fi
+	@# --fast-collect as on benchmark-run above. The flag belongs to the run
+	@# subcommand rather than to a harness, so it applies to inference-perf
+	@# exactly as it does to guidellm.
 	$(LLMDBENCHMARK) $(BENCHMARK_CLI_FLAGS) run \
 		-p $(BENCHMARK_NAMESPACE) \
 		-l inference-perf \
@@ -2247,6 +2265,7 @@ benchmark-run-bursty: ## Run bursty traffic benchmark using inference-perf multi
 		-U $(BENCHMARK_GATEWAY_URL) \
 		$(if $(BENCHMARK_MODEL_ID),-m $(BENCHMARK_MODEL_ID),) \
 		$(if $(filter true,$(BENCHMARK_MONITORING)),--monitoring,) \
+		$(if $(filter true,$(BENCHMARK_FAST_COLLECT)),--fast-collect,) \
 		--wait-timeout $(BENCHMARK_WAIT_TIMEOUT)
 
 .PHONY: benchmark-run-all
