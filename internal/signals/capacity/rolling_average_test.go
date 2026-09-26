@@ -78,3 +78,37 @@ var _ = Describe("Rolling Average", func() {
 		})
 	})
 })
+
+var _ = Describe("RollingAverage.Median", func() {
+	It("takes the middle value, and the lower of two on an even count", func() {
+		r := NewRollingAverage(10)
+		for _, v := range []float64{5.4, 3.3, 3.5} {
+			r.Add(v)
+		}
+		Expect(r.Median()).To(Equal(3.5))
+		Expect(r.Max()).To(Equal(5.4), "the read this replaced")
+
+		r2 := NewRollingAverage(10)
+		r2.Add(4.0)
+		r2.Add(4.01)
+		Expect(r2.Median()).To(Equal(4.0), "the lower of the two middle values")
+	})
+
+	It("is not moved by a single burst, which is what Max was", func() {
+		// The generation-token rate this window holds bursts rather than
+		// under-reads: measured 2026-09-22, a per-replica rate of 4028 min,
+		// 7548 median, 11663 max. Read with Max the window ratcheted 0.92 ->
+		// 3.60 req/s and the demand floor asked for 1.6 replicas where about
+		// eight were needed.
+		r := NewRollingAverage(10)
+		for _, v := range []float64{0.90, 0.92, 0.88, 0.91, 3.60} {
+			r.Add(v)
+		}
+		Expect(r.Median()).To(BeNumerically("~", 0.91, 0.001))
+		Expect(r.Max()).To(Equal(3.60))
+	})
+
+	It("is zero on an empty window", func() {
+		Expect(NewRollingAverage(10).Median()).To(BeZero())
+	})
+})

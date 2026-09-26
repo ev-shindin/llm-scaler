@@ -105,7 +105,7 @@ metadata:
   name: ${binding}
   namespace: ${WVA_WATCH_NS}
   labels:
-    app.kubernetes.io/managed-by: workload-variant-autoscaler
+    app.kubernetes.io/managed-by: llm-scaling-manager
 subjects:
 - kind: ServiceAccount
   name: wva-controller-manager

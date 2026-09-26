@@ -6,6 +6,12 @@ metadata:
     control-plane: controller-manager
     app.kubernetes.io/name: workload-variant-autoscaler
 spec:
+  # DO NOT rename these values with the brand. A Deployment's spec.selector
+  # is IMMUTABLE: changing it makes every upgrade of an existing install
+  # fail with "field is immutable", and the only way through is to delete
+  # the Deployment first -- which takes the controller down. They are
+  # identifiers here, not branding, and the template labels below plus the
+  # Service selectors must keep matching them.
   selector:
     matchLabels:
       control-plane: controller-manager

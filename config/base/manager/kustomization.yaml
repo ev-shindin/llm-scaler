@@ -12,5 +12,5 @@ resources:
 
 images:
 - name: controller
-  newName: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
+  newName: ghcr.io/ev-shindin/llm-scaling-manager
   newTag: main

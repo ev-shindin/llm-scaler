@@ -2,7 +2,7 @@
 """
 Post-process llm-d-benchmark results into the WVA-vs-KEDA comparison table
 format (Avg/P50/P95/P99 TTFT+TPOT, GPU time in GPU-min), as used in
-workload-variant-autoscaler's comparison-* studies. postprocess.py produces
+llm-scaling-manager's comparison-* studies. postprocess.py produces
 docs/developer-guide/benchmark-results.md's format (P95/P99 only, "Cost" in
 GPU/hr) -- this is the wider row set for side-by-side arm comparisons; the two
 are not interchangeable.

@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: wva-scaling-policy-config
   labels:
-    app.kubernetes.io/instance: workload-variant-autoscaler
+    app.kubernetes.io/instance: llm-scaling-manager
     app.kubernetes.io/name: workload-variant-autoscaler
     app.kubernetes.io/managed-by: kustomize
 data:

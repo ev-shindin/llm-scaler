@@ -22,8 +22,8 @@ const (
 // RollingAverage maintains a fixed-size sliding window of float64 values.
 // The saturation analyzer keeps one per history key for two readings: the
 // compute-bound capacity (k2), read through Average, and the saturated
-// completion rate (mu) the throughput floor prices from, read through Max
-// (see Max for why the two differ).
+// throughput (mu) the demand floor prices from, read through Median. Each
+// read's own doc says why it is the right one for what that window holds.
 //
 // Not safe for concurrent use: the owner serialises access (the saturation
 // analyzer holds its own mutex around every window).
@@ -99,16 +99,39 @@ func (r *RollingAverage) Len() int {
 	return len(r.values)
 }
 
-// Max returns the largest stored value, or 0 if empty. The saturated
-// throughput window reads this rather than Average: see the saturation
-// analyzer's recordSaturatedThroughput for why a completion rate under saturation
-// under-reads while the replica is full -- and for the drain at an
-// episode's end, which it does not.
+// Max returns the largest stored value, or 0 if empty.
+//
+// The saturated throughput window used to read this, on the argument that a
+// COMPLETION rate under saturation under-reads while the replica is full, so
+// the largest reading is the best estimate of what it sustains. That argument
+// did not survive the move to a token rate, which bursts rather than
+// under-reads; the window reads Median. See "The mu window reads the median,
+// not the maximum" in docs/developer-guide/analyzer-evidence.md.
 func (r *RollingAverage) Max() float64 {
 	if len(r.values) == 0 {
 		return 0
 	}
 	return slices.Max(r.values)
+}
+
+// Median returns the middle value of the window, the lower of the two middle
+// values on an even count, or 0 when the window is empty.
+//
+// Where Max is the right read for a figure whose error is one-sided -- a
+// saturated COMPLETION rate under-reads while a replica fills, so the largest
+// reading is the best estimate of what it sustains -- Median is the right read
+// for one that bursts, and a generation-token rate is the latter. Read with
+// Max, the window ratcheted to a mu that asked for a fifth of the replicas the
+// fleet needed; see "The mu window reads the median, not the maximum" in
+// docs/developer-guide/analyzer-evidence.md.
+func (r *RollingAverage) Median() float64 {
+	if len(r.values) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(r.values))
+	copy(sorted, r.values)
+	slices.Sort(sorted)
+	return sorted[(len(sorted)-1)/2]
 }
 
 // Stale reports whether nothing has touched the window within the timeout:

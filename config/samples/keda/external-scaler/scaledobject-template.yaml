@@ -28,7 +28,7 @@ metadata:
   name: {{NAME}}-wva
   namespace: {{NAMESPACE}}
   labels:
-    app.kubernetes.io/managed-by: workload-variant-autoscaler
+    app.kubernetes.io/managed-by: llm-scaling-manager
 spec:
   scaleTargetRef:
     apiVersion: {{APIVERSION}}

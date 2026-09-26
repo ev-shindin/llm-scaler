@@ -54,6 +54,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/registry"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/scalingpolicy"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/signals/capacity"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
@@ -82,8 +83,9 @@ type Engine struct {
 
 	// policies reports which scaling policy tier each model resolved to, and the
 	// two ways that resolution goes wrong silently — an unknown tier name, and one
-	// model's variants naming different tiers. Change-throttled; see policyReporter.
-	policies *policyReporter
+	// model's variants naming different tiers. Change-throttled; see
+	// scalingpolicy.ChangeReporter.
+	policies *scalingpolicy.ChangeReporter
 
 	Config *config.Config // Unified configuration (injected from main.go)
 
@@ -269,7 +271,7 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 		ReplicaMetricsCollector: replicaCollector,
 		ScaleToZeroEnforcer:     allocation.NewEnforcer(requestCountFunc, cfg),
 		GPULimiter:              gpuLimiter,
-		policies:                newPolicyReporter(),
+		policies:                scalingpolicy.NewChangeReporter(),
 		metricsRegistry:         metricsRegistry,
 		saturationV2Analyzer:    satV2,
 		capacityStore:           capacityStore,
@@ -687,7 +689,7 @@ func (e *Engine) optimize(ctx context.Context) (retErr error) {
 	// collected inventory is currently only logged anyway (see comment at
 	// internal/collector/collector.go), so skipping it in quota mode loses
 	// nothing of operational value.
-	if e.Config.LimitedModeEnabled() && shouldCollectClusterInventory(e.Config) {
+	if e.Config.LimitedModeEnabled() && scalingpolicy.ShouldCollectClusterInventory(e.Config) {
 		inventory, err := collector.CollectInventoryK8S(ctx, e.client)
 		if err != nil {
 			logger.Error(err, "Failed to collect cluster inventory")
@@ -858,26 +860,26 @@ func (e *Engine) resolveModelPolicy(
 	modelID, namespace string,
 	vas []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 ) config.ScalingPolicy {
-	policy, conflicting := modelPolicy(vas)
+	tier, conflicting := modelPolicy(vas)
 	if len(conflicting) > 1 {
-		e.policies.reportPolicyConflict(ctx, namespace, modelID, conflicting, policy)
+		e.policies.ReportPolicyConflict(ctx, namespace, modelID, conflicting, tier)
 	}
 
 	// A named-but-absent tier resolves to the default entry, which is the right
 	// outcome and the wrong silence — report it against the variants that asked.
-	if policy != "" {
-		if entry, ok := configMap[policy]; !ok || !config.PolicyEntryKey(policy, entry) {
+	if tier != "" {
+		if entry, ok := configMap[tier]; !ok || !config.PolicyEntryKey(tier, entry) {
 			known := slices.Sorted(maps.Keys(config.NamedPolicies(configMap)))
 			for i := range vas {
-				if vas[i].Spec.ScalingPolicy == policy {
-					e.policies.reportUnknownPolicy(ctx, namespace, vas[i].Name, policy, known)
+				if vas[i].Spec.ScalingPolicy == tier {
+					e.policies.ReportUnknownPolicy(ctx, namespace, vas[i].Name, tier, known)
 				}
 			}
 		}
 	}
 
-	resolved := config.ResolveScalingPolicyForTier(configMap, modelID, namespace, policy)
-	e.policies.reportEffectivePolicy(ctx, namespace, modelID, policy, resolved)
+	resolved := config.ResolveScalingPolicyForTier(configMap, modelID, namespace, tier)
+	e.policies.ReportEffectivePolicy(ctx, namespace, modelID, tier, resolved)
 	return resolved
 }
 
@@ -1332,16 +1334,6 @@ func enrichDecisionsWithKvTokenData(decisions []domain.VariantDecision, modelRep
 	}
 }
 
-// hasMinReplicasAboveZero returns true if any variant in the states has MinReplicas > 0.
-func hasMinReplicasAboveZero(states []domain.VariantReplicaState) bool {
-	for _, state := range states {
-		if state.MinReplicas != nil && *state.MinReplicas > 0 {
-			return true
-		}
-	}
-	return false
-}
-
 // soleEngineFor returns the one engine a model's scale targets run, and whether
 // there is exactly one.
 //
@@ -1366,7 +1358,7 @@ func soleEngineFor(scaleTargets map[string]scaletarget.ScaleTargetAccessor) (inf
 // single model's decisions, unless a safety gate skips it:
 //   - the model runs MORE THAN ONE engine, so no single request counter measures
 //     its idleness (see soleEngineFor); or
-//   - any variant declares minReplicas > 0 (hasMinReplicasAboveZero).
+//   - any variant declares minReplicas > 0 (scalingpolicy.HasMinReplicasAboveZero).
 //
 // A single non-vLLM engine is now supported. It used to be refused outright,
 // because the enforcer asked for vllm:request_success_total whatever the model
@@ -1414,11 +1406,11 @@ func (e *Engine) applyScaleToZeroEnforcement(
 	retention := config.ResolveScaleToZeroRetention(&satConfig)
 	recentlyWoken := decision.WithinActivationRetention(namespace, modelID, retention)
 
-	blockedReasons := scaleToZeroBlockReasons(scaleToZeroEnabled, engineSupported, recentlyWoken, variantStates)
+	blockedReasons := scalingpolicy.ScaleToZeroBlockReasons(scaleToZeroEnabled, engineSupported, recentlyWoken, variantStates)
 	metrics.SetModelScalingBlockedReasons(namespace, modelID,
 		constants.ScalingBlockedReasonsPolicy, blockedReasons)
 	if e.recordBlockedModel(namespace, modelID, blockedReasons) {
-		logBlockedTransition(ctx, namespace, modelID, blockedReasons)
+		scalingpolicy.LogBlockedTransition(ctx, namespace, modelID, blockedReasons)
 	}
 
 	if len(decisions) == 0 {
@@ -1431,7 +1423,7 @@ func (e *Engine) applyScaleToZeroEnforcement(
 			"engines", inferenceengine.Present(scaleTargets))
 		return false
 	}
-	if hasMinReplicasAboveZero(variantStates) {
+	if scalingpolicy.HasMinReplicasAboveZero(variantStates) {
 		logger.V(logging.DEBUG).Info("Skipping scale-to-zero enforcement: variant has minReplicas > 0",
 			"modelID", modelID, "optimizer", optimizerName)
 		return false
@@ -1718,7 +1710,7 @@ func (e *Engine) applySaturationDecisions(
 		if hasDecision && sticky {
 			p, at, ok := published(va.Namespace, va.GetScaleTargetName())
 			var held bool
-			if decision, held = holdPublishedScaleDown(decision, p, at, ok, e.stickyAge(), time.Now()); held {
+			if decision, held = scalingpolicy.HoldPublishedScaleDown(decision, p, at, ok, e.stickyAge(), time.Now()); held {
 				logger.Info("holding the published scale-down against a fresh target that crept back up",
 					"variant", vaName, "published", p, "current", decision.CurrentReplicas,
 					"reason", decision.LastStep().Reason)
@@ -1822,7 +1814,7 @@ func (e *Engine) applySaturationDecisions(
 				// allocations map is empty, so before it targetReplicas is 0 for
 				// every real variant and there would be nothing to carry against.
 				// A cycle with no metrics cannot justify raising what the last
-				// cycle with metrics lowered; see carryPublished.
+				// cycle with metrics lowered; see scalingpolicy.CarryPublished.
 				p, at, ok := published(va.Namespace, va.GetScaleTargetName())
 				var floor *int
 				if va.Spec.MinReplicas != nil {
@@ -1830,7 +1822,7 @@ func (e *Engine) applySaturationDecisions(
 					floor = &f
 				}
 				missed := e.lastDecided[utils.GetNamespacedKey(va.Namespace, va.GetScaleTargetName())].missed
-				if carried := carryPublished(targetReplicas, resolvedRead, p, at, ok, floor, missed, time.Now()); carried != targetReplicas {
+				if carried := scalingpolicy.CarryPublished(targetReplicas, resolvedRead, p, at, ok, floor, missed, time.Now()); carried != targetReplicas {
 					logger.Info("no decision this cycle; republishing the held scale-down rather than the running count",
 						"variant", vaName, "published", carried, "running", targetReplicas)
 					targetReplicas = carried
@@ -1857,7 +1849,7 @@ func (e *Engine) applySaturationDecisions(
 		// cycle.
 		if !constants.IsAcceleratorResolved(acceleratorName) {
 			e.emitAcceleratorNotResolvedEvent(&updateVa)
-			e.policies.reportUnresolvedAccelerator(ctx, va.Namespace, vaName, string(e.Config.EffectiveLimiterMode()))
+			e.policies.ReportUnresolvedAccelerator(ctx, va.Namespace, vaName, string(e.Config.EffectiveLimiterMode()))
 		}
 
 		// Stage the just-computed decision on the in-memory VA so that

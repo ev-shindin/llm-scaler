@@ -23,20 +23,37 @@ MODULE="$(sed -n 's/^module //p' go.mod)"
 [ -n "$MODULE" ] || { echo "FATAL: cannot read the module path from go.mod" >&2; exit 1; }
 command -v go >/dev/null 2>&1 || { echo "FATAL: go is required to run this check" >&2; exit 1; }
 
-# Higher number = higher layer. A package may import a package with a
-# STRICTLY lower number, never a higher or an equal one in another package
-# of the same layer? Equal is allowed: analyzers import each other's
-# neighbours (aggregation) and the two drivers share nothing, but siblings
-# within a layer are not the concern of this check.
+# Higher number = higher layer. A package may import its own layer or any
+# below it; only an edge to a HIGHER number fails. Equal is deliberate --
+# analyzers sit beside each other and neither is above the other, and the two
+# drivers share nothing.
+#
+# Layers are spaced by ten so that a package CAN be ranked between two of them
+# where the order is real, without renumbering the layers around it.
+# internal/signals/floor is the case: it composes the packages that only
+# measure, so an edge from one of them back to it is an inversion, and at one
+# shared number the check could not see it. Nothing else moves -- aggregation,
+# common and the measuring signals packages stay equals, as the proposal has
+# them.
 layer_of() {
     case "$1" in
-        internal/engines/steadystate|internal/engines/scalefromzero) echo 7 ;;
-        internal/engines/allocation|internal/engines/allocation/*) echo 5 ;;
-        internal/engines/analyzers/*|internal/engines/executor|internal/engines/variantmeta) echo 4 ;;
-        internal/engines/aggregation|internal/engines/common|internal/signals/*) echo 3 ;;
-        internal/collector|internal/collector/*) echo 2 ;;
-        internal/actuator|internal/scaler|internal/registry) echo 2 ;;
-        internal/decision) echo 1 ;;
+        internal/engines/steadystate|internal/engines/scalefromzero) echo 70 ;;
+        internal/scalingpolicy) echo 60 ;;
+        internal/engines/allocation|internal/engines/allocation/*) echo 50 ;;
+        internal/engines/analyzers/*|internal/engines/executor|internal/engines/variantmeta) echo 40 ;;
+        # floor reads the capacity window and prices the load from it, so it
+        # is above the packages that only measure -- and above aggregation,
+        # which it imports. Those keep the one rank they have always shared.
+        #
+        # This arm MUST precede internal/signals/* below: case takes the first
+        # match and * matches a slash, so the catch-all would otherwise claim
+        # floor and its subpackages and put them back at 30 -- silently, with
+        # the clean tree still passing.
+        internal/signals/floor|internal/signals/floor/*) echo 31 ;;
+        internal/engines/aggregation|internal/engines/common|internal/signals/*) echo 30 ;;
+        internal/collector|internal/collector/*) echo 20 ;;
+        internal/actuator|internal/scaler|internal/registry) echo 20 ;;
+        internal/decision) echo 10 ;;
         internal/domain) echo 0 ;;
         *) echo "" ;;
     esac

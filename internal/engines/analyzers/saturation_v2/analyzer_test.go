@@ -2374,3 +2374,33 @@ var _ = Describe("aggregateByVariant DP>1 with pending replicas", func() {
 		Expect(aggregation.SumTotalAnticipatedSupply(result.VariantCapacities)).To(Equal(want))
 	})
 })
+
+var _ = Describe("the fleet-shape memo's lifetime", func() {
+	It("ages out with the rest of the analyzer's per-model state", func() {
+		// Every other memo on the analyzer is swept by EvictStaleHistory; this
+		// one was added without a sweep and grew for the life of the process.
+		// The real clock: EvictStaleHistory measures age with time.Since, as
+		// it does for every other memo on this struct, while lastSeen is
+		// stamped from a.now(). The two agree in production and a fake clock
+		// set in the past would read every entry as stale.
+		analyzer := NewSaturationAnalyzer(capacity.NewStore())
+
+		rm := makeReplicaMetrics("d0", "decode-v", 200_000, 1_162_240, 0, 1000, 6000)
+		rm.RequestRate = 0.6
+		rm.GenerationTokenRate = rm.RequestRate * 6000
+		rm.Ready = true
+		in := makeAnalyzerInput([]domain.ReplicaMetrics{rm}, []domain.VariantReplicaState{
+			{VariantName: "decode-v", Role: domain.RoleDecode, AcceleratorName: "H200", CurrentReplicas: 1, GPUsPerReplica: 1},
+		})
+		in.ArrivalRate = 6
+		_, err := analyzer.Analyze(context.Background(), in)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(analyzer.fleetShape).To(HaveLen(1), "one cycle records one model's shape")
+
+		analyzer.EvictStaleHistory(time.Hour)
+		Expect(analyzer.fleetShape).To(HaveLen(1), "a memo in use is kept")
+
+		analyzer.EvictStaleHistory(0)
+		Expect(analyzer.fleetShape).To(BeEmpty(), "and a stale one goes")
+	})
+})

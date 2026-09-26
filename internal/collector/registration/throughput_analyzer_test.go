@@ -2,6 +2,7 @@ package registration
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -64,6 +65,26 @@ var _ = Describe("RegisterThroughputAnalyzerQueries", func() {
 			}
 		})
 
+		It("builds the SGLang generation-token rate from the counter, falling back to the histogram", func() {
+			// The counter has not been read off a live SGLang engine, and a
+			// query naming a series that does not exist fails silently to zero
+			// and takes the demand floor with it. PromQL's `or` yields the
+			// left vector plus any right-hand series with no match on the
+			// left, so an engine with the counter is priced from it and one
+			// without keeps the behaviour it has today.
+			rendered, err := queryList.Build(EngineQuery(inferenceengine.EngineSGLang, QueryGenerationTokenRate),
+				map[string]string{source.ParamNamespace: "test-ns"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rendered).To(ContainSubstring(`sglang:generation_tokens_total`),
+				"the counter is preferred")
+			Expect(rendered).To(ContainSubstring(` or `),
+				"and the histogram remains as a fallback rather than a replacement")
+			Expect(rendered).To(ContainSubstring(`sglang:generation_tokens_histogram_sum`))
+			Expect(strings.Index(rendered, "generation_tokens_total")).To(BeNumerically("<",
+				strings.Index(rendered, "generation_tokens_histogram_sum")),
+				"the counter is the left-hand side, which is the one `or` prefers")
+		})
+
 		It("should build QueryGenerationTokenRate scoped to the namespace, grouped by model", func() {
 			rendered, err := queryList.Build(QueryGenerationTokenRate, map[string]string{
 				source.ParamNamespace: "test-ns",
@@ -73,7 +94,21 @@ var _ = Describe("RegisterThroughputAnalyzerQueries", func() {
 			Expect(rendered).To(ContainSubstring(`sum by (model_name,`))
 			Expect(rendered).NotTo(ContainSubstring(`model_name="`), "the model is partitioned in the collector, not matched in PromQL")
 			Expect(rendered).To(ContainSubstring(`[1m]`))
-			Expect(rendered).To(ContainSubstring(`vllm:request_generation_tokens_sum`))
+
+			// From the COUNTER, not the histogram sum. The two carry the same
+			// running total and picking the wrong one is invisible until a fleet
+			// is under load: vllm:request_generation_tokens is a histogram observed
+			// when a request FINISHES, so its _sum rate is zero while a long
+			// generation runs and jumps by the whole request at completion. The
+			// saturation analyzer prices mu from this rate and keeps a max, so one
+			// drain burst becomes the fleet's throughput for the rest of the phase
+			// -- measured 2026-09-22 as a ratchet from 0.92 to 3.60 req/s under a
+			// workload whose shape never changed, leaving the floor asking for 1.6
+			// replicas where about 8 were needed.
+			Expect(rendered).To(ContainSubstring(`vllm:generation_tokens_total`),
+				"tokens must be counted as they are produced")
+			Expect(rendered).NotTo(ContainSubstring(`request_generation_tokens_sum`),
+				"the histogram sum reports a request's tokens only once it has finished")
 		})
 
 		It("should build QueryKvUsageInstant without max_over_time", func() {
@@ -122,7 +157,7 @@ var _ = Describe("RegisterThroughputAnalyzerQueries", func() {
 // because every one of them builds AnalyzerInput in Go with the field already
 // populated. Only a live run surfaced it.
 var _ = Describe("arrival-rate query registration", func() {
-	It("registers lambda's sources without the throughput analyzer", func() {
+	It("registers the floor's rate sources without the throughput analyzer", func() {
 		reg := source.NewSourceRegistry()
 		Expect(reg.Register("prometheus", prometheus.NewPrometheusSource(
 			context.Background(), &mockPrometheusAPI{}, prometheus.DefaultPrometheusSourceConfig()))).To(Succeed())
@@ -136,6 +171,17 @@ var _ = Describe("arrival-rate query registration", func() {
 		Expect(ql.Get(QueryRequestRate)).NotTo(BeNil(),
 			"nor the completion-rate fallback it degrades to")
 		Expect(ql.Get(EngineQuery(inferenceengine.EngineSGLang, QueryRequestRate))).NotTo(BeNil(),
+			"including on SGLang")
+
+		// The saturation analyzer's floor prices mu from generated tokens over
+		// the shape's output length, so this is as load-bearing for it as
+		// lambda is, and as invisible when it is missing: left registered only
+		// with the opt-in throughput analyzer, the field was structurally zero
+		// and the floor recorded nothing for a whole benchmark run -- 21
+		// saturated cycles, no window, no floor, measured 2026-09-22.
+		Expect(ql.Get(QueryGenerationTokenRate)).NotTo(BeNil(),
+			"mu's source must not depend on the throughput analyzer either")
+		Expect(ql.Get(EngineQuery(inferenceengine.EngineSGLang, QueryGenerationTokenRate))).NotTo(BeNil(),
 			"including on SGLang")
 	})
 

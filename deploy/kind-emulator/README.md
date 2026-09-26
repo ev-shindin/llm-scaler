@@ -289,7 +289,7 @@ kubectl logs -n workload-variant-autoscaler-system \
 kubectl get crd variantautoscalings.llmd.ai
 
 # Check RBAC
-kubectl get clusterrole,clusterrolebinding -l app=workload-variant-autoscaler
+kubectl get clusterrole,clusterrolebinding -l app.kubernetes.io/name=workload-variant-autoscaler
 ```
 
 ### GPUs Not Appearing
@@ -326,8 +326,8 @@ KIND_IMAGE_PLATFORM=linux/arm64 make create-kind-cluster && make deploy-e2e-infr
 Alternatively, build the image locally and deploy with `IfNotPresent` so the script skips the registry pull and loads your local single-platform image:
 
 ```bash
-make docker-build IMG=ghcr.io/llm-d/llm-d-workload-variant-autoscaler:latest
-CREATE_CLUSTER=true WVA_IMAGE_PULL_POLICY=IfNotPresent make deploy-e2e-infra IMG=ghcr.io/llm-d/llm-d-workload-variant-autoscaler:latest
+make docker-build IMG=ghcr.io/ev-shindin/llm-scaling-manager:main
+CREATE_CLUSTER=true WVA_IMAGE_PULL_POLICY=IfNotPresent make deploy-e2e-infra IMG=ghcr.io/ev-shindin/llm-scaling-manager:main
 ```
 
 ## Development Workflow

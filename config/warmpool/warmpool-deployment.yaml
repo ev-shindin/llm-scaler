@@ -374,6 +374,14 @@ spec:
         # sleeping process keeps its socket, so they cannot take turns binding
         # the port the InferencePool dials. This owns it and follows whichever
         # model is awake; WVA re-points it through the control endpoint.
+        # NOTE ON THE IMAGE BELOW: it still carries the OLD package name,
+        # on purpose. The repository was renamed to llm-scaling-manager, but
+        # GHCR does NOT rename packages with the repository -- this digest
+        # exists only under .../llm-scaler/. Pointing it at the new name would
+        # name a package that does not exist and break every pool Pod. It moves
+        # when the proxy is republished, not before. (Kept above this entry:
+        # check-warmpool-manifests.sh reads the image with a -A12 window from
+        # `name: proxy`, so comments inserted below it break the check.)
         - name: proxy
           # Published under the PROJECT's namespace and pinned by digest, so the
           # bytes are fixed and the package belongs to the repository rather than

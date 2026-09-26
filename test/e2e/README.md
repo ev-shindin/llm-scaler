@@ -33,7 +33,7 @@ Before running tests, deploy **WVA + monitoring + scaler + llm-d EPP/gateway** (
 ```bash
 # From repository root (recommended)
 export ENVIRONMENT=kind-emulator   # or openshift, kubernetes
-make deploy-e2e-infra IMG=localhost/llm-d-workload-variant-autoscaler:dev
+make deploy-e2e-infra IMG=localhost/llm-scaling-manager:dev
 ```
 
 This deploys:
@@ -171,7 +171,7 @@ ENVIRONMENT=kind-emulator \
 USE_SIMULATOR=true \
 SCALE_TO_ZERO_ENABLED=false \
 CREATE_CLUSTER=true \
-IMG=ghcr.io/llm-d/llm-d-workload-variant-autoscaler:0.0.1-test \
+IMG=ghcr.io/ev-shindin/llm-scaling-manager:0.0.1-test \
 DELETE_CLUSTER=false \
 SCALER_BACKEND=keda \
 make test-e2e-smoke-with-setup 2>&1 | tee test/e2e/e2e-smoke-keda-with-setup.log

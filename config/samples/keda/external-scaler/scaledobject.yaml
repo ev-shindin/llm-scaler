@@ -29,7 +29,7 @@ metadata:
   namespace: llm-d-sim
   labels:
     app: sample-deployment
-    scaler: keda-workload-variant-autoscaler
+    scaler: keda-llm-scaling-manager
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
