@@ -68,7 +68,15 @@ type Term struct {
 	Held    bool
 	HeldWhy string
 	// OrderedBehindQueue reports that a window too thin to order on was
-	// allowed to anyway, because a backlog stood and no replica was pending.
+	// allowed to anyway, because the SCHEDULER's queue was standing.
+	//
+	// Not the engines' own queues: a request parked awaiting a remote KV
+	// transfer sits in num_requests_waiting and no further replica drains
+	// it, which is why the two are separate parameters. And whether or not a
+	// replica was already starting -- keeping supply in flight from being
+	// re-ordered is the engine's job, through its anticipated-supply
+	// subtraction, not this package's.
+	//
 	// Read it beside Held: the two are exclusive.
 	OrderedBehindQueue bool
 }

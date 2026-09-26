@@ -277,7 +277,12 @@ var _ = Describe("Estimate", func() {
 		}
 		f := Estimate(runLambda, thin, mixed, nil, BacklogDrainSeconds, 0.85, false, runLambda*10)
 		Expect(f.Terms[domain.RoleDecode].OrderedBehindQueue).To(BeTrue())
-		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("<=", 0.85*(fastP+slowP)+1e-6),
+		// Exact, not an upper bound. The floor here is 6 x median(P/mu) =
+		// 1,416,666.67 against a step of 1,300,500, so the cap BINDS and the
+		// figure is known. A bound of `<=` would also admit a step that drops
+		// the anticipated term altogether (0.85 x 600,000 = 510,000), which
+		// caps the floor at a third of what it should be.
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*(fastP+slowP), 1e-6),
 			"one replica of the SMALLEST variant beyond the fleet, never the blend")
 	})
 
@@ -289,9 +294,19 @@ var _ = Describe("Estimate", func() {
 		// that each release is bounded to one replica OF THAT ROLE, so a
 		// two-role fleet cannot be made to order two large replicas by one
 		// queue when one of the roles is small.
+		//
+		// mu is halved for both roles so that both caps BIND. At the honest
+		// reading neither does -- the floor sits under the step -- and then
+		// bounding prefill by a decode replica leaves the figure untouched,
+		// so an assertion on this fixture could not see the very bug the
+		// paragraph above describes. With the cap binding the figure is
+		// exact, and a swap is visible in either direction: prefill bounded
+		// by decode gives 1.111 x k1 rather than 0.85, and decode bounded by
+		// prefill gives 1.275 rather than 1.7.
+		const thinMu = runMu / 2
 		thin := []capacity.ReplicaCapacity{
-			{VariantName: "d", SaturatedThroughput: runMu, SaturatedThroughputSamples: 1},
-			{VariantName: "p", SaturatedThroughput: runMu, SaturatedThroughputSamples: 1},
+			{VariantName: "d", SaturatedThroughput: thinMu, SaturatedThroughputSamples: 1},
+			{VariantName: "p", SaturatedThroughput: thinMu, SaturatedThroughputSamples: 1},
 		}
 		pd := []domain.VariantCapacity{
 			{VariantName: "d", Role: domain.RoleDecode, PerReplicaCapacity: float64(runK1), ReplicaCount: 1},
@@ -301,10 +316,27 @@ var _ = Describe("Estimate", func() {
 
 		Expect(f.Terms[domain.RoleDecode].OrderedBehindQueue).To(BeTrue(), "decode released")
 		Expect(f.Terms[domain.RolePrefill].OrderedBehindQueue).To(BeTrue(), "prefill released by the same queue")
-		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("<=", 0.85*2*float64(runK1)+1e-6),
-			"decode bounded by a decode replica")
-		Expect(f.ByRole[domain.RolePrefill]).To(BeNumerically("<=", 0.85*float64(runK1)+1e-6),
-			"prefill bounded by a PREFILL replica, which is half the size")
+		Expect(f.ByRole[domain.RoleDecode]).To(BeNumerically("~", 0.85*2*float64(runK1), 1e-6),
+			"decode bounded by one DECODE replica beyond its fleet")
+		Expect(f.ByRole[domain.RolePrefill]).To(BeNumerically("~", 0.85*float64(runK1), 1e-6),
+			"prefill bounded by one PREFILL replica, which is half the size")
+	})
+
+	It("does not release when there is no scale-up threshold to bound the step", func() {
+		// The release skips the scaleUp cap and carries its own bound,
+		// scaleUpThreshold x (anticipated + one replica). With no threshold
+		// configured that product is zero; the floor is above zero, so the
+		// step would clamp it to nothing -- the inverse of a release, applied
+		// to every role a standing queue touched. Hence the positive-threshold
+		// conjunct, which nothing else in this file exercises: the existing
+		// zero-threshold case passes no queue, so it never reaches the branch.
+		one := []capacity.ReplicaCapacity{{VariantName: "v", SaturatedThroughput: runMu, SaturatedThroughputSamples: 1}}
+		z := Estimate(runLambda, one, variants(domain.RoleDecode, 1), nil, BacklogDrainSeconds, 0, false, runLambda*10)
+
+		Expect(z.Terms[domain.RoleDecode].OrderedBehindQueue).To(BeFalse(),
+			"there is nothing to bound the step with, so a queue must not release the hold")
+		Expect(z.ByRole[domain.RoleDecode]).To(BeNumerically("~", runLambda*float64(runK1)/runMu, 1e-6),
+			"and the figure is its own -- neither released nor zeroed")
 	})
 
 	It("holds but does not order on a single reading", func() {
